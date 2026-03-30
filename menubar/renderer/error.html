@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Sync Errors</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .error-container {
+            padding: 20px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            color: #d4d4d4;
+        }
+        
+        .error-header {
+            background: #252526;
+            padding: 16px 20px;
+            border-bottom: 1px solid #3e3e42;
+        }
+        
+        .error-header h1 {
+            font-size: 18px;
+            color: #f44336;
+            margin: 0;
+        }
+        
+        .error-content {
+            padding: 20px;
+            white-space: pre-wrap;
+            background: #1e1e1e;
+            color: #f44336;
+        }
+        
+        .no-errors {
+            text-align: center;
+            padding: 60px 20px;
+            color: #858585;
+        }
+    </style>
+</head>
+<body>
+    <div class="error-header">
+        <h1>⚠️ Sync Errors</h1>
+    </div>
+    <div id="error-content" class="error-content">
+        <!-- Error log will be loaded here -->
+    </div>
+    <script>
+        const { ipcRenderer } = require('electron');
+        
+        // Request error log
+        ipcRenderer.send('load-error-log');
+        
+        // Receive error log
+        ipcRenderer.on('error-log-loaded', (event, errorLog) => {
+            const content = document.getElementById('error-content');
+            if (errorLog && errorLog.trim()) {
+                content.textContent = errorLog;
+            } else {
+                content.innerHTML = '<div class="no-errors">No errors found in last sync.</div>';
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+
+
+

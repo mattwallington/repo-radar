@@ -1,0 +1,182 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.header {
+    background: #252526;
+    padding: 12px 16px;
+    border-bottom: 1px solid #3e3e42;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #cccccc;
+}
+
+.status-bar {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: #858585;
+}
+
+#status-text {
+    color: #4ec9b0;
+}
+
+#repo-count {
+    color: #858585;
+}
+
+.progress-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.progress-summary {
+    background: #252526;
+    padding: 12px 20px;
+    border-bottom: 1px solid #3e3e42;
+}
+
+.summary-stats {
+    display: flex;
+    gap: 24px;
+    justify-content: center;
+}
+
+.stat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+}
+
+.stat-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #4ec9b0;
+}
+
+.stat-label {
+    font-size: 10px;
+    color: #858585;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+#repos-errors.has-errors {
+    color: #f14c4c;
+}
+
+.repos-progress-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    align-content: start;
+}
+
+.repo-progress-item {
+    background: #252526;
+    border: 1px solid #3e3e42;
+    border-radius: 4px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.repo-progress-header {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.repo-progress-name {
+    font-size: 11px;
+    font-weight: 600;
+    font-family: 'Monaco', 'Menlo', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.repo-progress-status {
+    font-size: 10px;
+    color: #858585;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.repo-progress-bar-container {
+    width: 100%;
+    height: 4px;
+    background: #1e1e1e;
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.repo-progress-bar {
+    height: 100%;
+    background: #4ec9b0;
+    transition: width 0.3s ease, background-color 0.3s ease;
+    border-radius: 2px;
+}
+
+.repo-progress-bar.complete {
+    background: #0dbc79;
+}
+
+.repo-progress-bar.error {
+    background: #f14c4c;
+}
+
+.repo-progress-item.waiting .repo-progress-name {
+    color: #858585;
+}
+
+.repo-progress-item.syncing .repo-progress-name {
+    color: #4ec9b0;
+}
+
+.repo-progress-item.complete .repo-progress-name {
+    color: #0dbc79;
+}
+
+.repo-progress-item.error .repo-progress-name {
+    color: #f14c4c;
+}
+
+.empty-message {
+    text-align: center;
+    color: #858585;
+    padding: 60px 20px;
+    font-size: 14px;
+}
+
+.empty-message p {
+    margin-bottom: 12px;
+}
+

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Repo Radar - Progress</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="header">
+        <h1>Repo Radar</h1>
+        <div class="status-bar">
+            <span id="status-text">Ready</span>
+            <span id="repo-count"></span>
+        </div>
+    </div>
+    <div id="progress-container" class="progress-container">
+        <div class="progress-summary">
+            <div class="summary-stats">
+                <div class="stat">
+                    <span class="stat-value" id="repos-completed">0</span>
+                    <span class="stat-label">Completed</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="repos-running">0</span>
+                    <span class="stat-label">Running</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="repos-total">0</span>
+                    <span class="stat-label">Total</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-value" id="repos-errors">0</span>
+                    <span class="stat-label">Errors</span>
+                </div>
+            </div>
+        </div>
+        <div id="repos-list" class="repos-progress-list">
+            <!-- Progress bars will be added here -->
+        </div>
+    </div>
+    <script src="renderer.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Settings - Repo Radar</title>
+    <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+    <div class="header">
+        <h1>Settings</h1>
+        <div class="header-actions">
+            <button id="save-btn" class="btn btn-primary">Save</button>
+            <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+    </div>
+    
+    <div class="content">
+        <div class="section">
+            <h2>API Configuration</h2>
+            <div class="form-group">
+                <label for="github-token">GitHub Token</label>
+                <input type="password" id="github-token" placeholder="ghp_..." class="form-control">
+                <small class="form-help">Personal Access Token with 'repo' scope (<a href="https://github.com/settings/tokens/new" target="_blank">Get token</a>)</small>
+            </div>
+            <div class="form-group">
+                <label for="gemini-api-key">Gemini API Key</label>
+                <input type="password" id="gemini-api-key" placeholder="AI..." class="form-control">
+                <small class="form-help">For AI-powered metadata generation (<a href="https://makersuite.google.com/app/apikey" target="_blank">Get key</a>)</small>
+            </div>
+            <div class="form-group">
+                <label for="ai-model">AI Model</label>
+                <select id="ai-model" class="form-control">
+                    <optgroup label="Google Gemini (Latest)">
+                        <option value="gemini/gemini-3.0-flash">Gemini 3.0 Flash ⚡ (Fastest, Cheapest)</option>
+                        <option value="gemini/gemini-3.0-pro">Gemini 3.0 Pro (Best Quality)</option>
+                    </optgroup>
+                    <optgroup label="Google Gemini (Previous Gen)">
+                        <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash</option>
+                        <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro</option>
+                        <option value="gemini/gemini-1.5-flash">Gemini 1.5 Flash</option>
+                        <option value="gemini/gemini-1.5-pro">Gemini 1.5 Pro</option>
+                    </optgroup>
+                    <optgroup label="Anthropic Claude (Latest)">
+                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet (Best Overall)</option>
+                        <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku (Fast & Cheap)</option>
+                    </optgroup>
+                    <optgroup label="Anthropic Claude (Previous Gen)">
+                        <option value="claude-3-opus-20240229">Claude 3 Opus</option>
+                        <option value="claude-3-sonnet-20240229">Claude 3 Sonnet</option>
+                        <option value="claude-3-haiku-20240307">Claude 3 Haiku</option>
+                    </optgroup>
+                    <optgroup label="OpenAI GPT">
+                        <option value="gpt-4o">GPT-4o (Latest, Multimodal)</option>
+                        <option value="gpt-4o-mini">GPT-4o Mini (Fast & Cheap)</option>
+                        <option value="o1-preview">o1-preview (Advanced Reasoning)</option>
+                        <option value="o1-mini">o1-mini (Fast Reasoning)</option>
+                        <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                    </optgroup>
+                </select>
+                <small class="form-help">Choose the AI model for metadata generation (requires matching API key)</small>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Automatic Sync Schedule</h2>
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="schedule-enabled">
+                    Enable automatic sync
+                </label>
+            </div>
+            
+            <div id="schedule-options" class="schedule-options">
+                <div class="form-group">
+                    <label for="schedule-type">Frequency</label>
+                    <select id="schedule-type" class="form-control">
+                        <option value="daily">Daily</option>
+                        <option value="hourly">Every N hours</option>
+                        <option value="weekly">Weekly</option>
+                    </select>
+                </div>
+                
+                <div class="form-group" id="daily-options">
+                    <label for="schedule-time">Time</label>
+                    <input type="time" id="schedule-time" class="form-control" value="09:00">
+                    <small class="form-help">Sync will run once per day at this time</small>
+                </div>
+                
+                <div class="form-group" id="hourly-options" style="display: none;">
+                    <label for="schedule-interval">Interval (hours)</label>
+                    <input type="number" id="schedule-interval" class="form-control" min="1" max="24" value="6">
+                    <small class="form-help">Sync will run every N hours</small>
+                </div>
+                
+                <div class="form-group" id="weekly-options" style="display: none;">
+                    <label>Days of week</label>
+                    <div class="days-selector">
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="1" class="schedule-day">
+                            <span>Mon</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="2" class="schedule-day">
+                            <span>Tue</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="3" class="schedule-day">
+                            <span>Wed</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="4" class="schedule-day">
+                            <span>Thu</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="5" class="schedule-day">
+                            <span>Fri</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="6" class="schedule-day">
+                            <span>Sat</span>
+                        </label>
+                        <label class="day-checkbox">
+                            <input type="checkbox" value="0" class="schedule-day">
+                            <span>Sun</span>
+                        </label>
+                    </div>
+                    <input type="time" id="schedule-weekly-time" class="form-control" value="09:00" style="margin-top: 8px;">
+                    <small class="form-help">Sync on selected days at this time</small>
+                </div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>Repositories</h2>
+            <div class="repos-header">
+                <span class="repo-count" id="repo-count">0 repositories</span>
+                <button id="add-repo-btn" class="btn btn-small">+ Add Repository</button>
+            </div>
+            
+            <div id="repos-list" class="repos-list">
+                <!-- Repositories will be dynamically added here -->
+            </div>
+        </div>
+    </div>
+    
+    <script src="settings.js"></script>
+</body>
+</html>
+
