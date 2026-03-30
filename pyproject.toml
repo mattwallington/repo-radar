@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "repo-radar"
+dynamic = ["version"]
+description = "Pristine repository mirrors with AI-powered metadata"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "litellm==1.82.6",
+    "requests>=2.32.0",
+    "inquirer>=3.4.0",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+repo-radar = "repo_radar.cli:main"
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.pytest.ini_options]
+testpaths = ["repo_radar/tests"]
