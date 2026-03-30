@@ -1,6 +1,6 @@
 {
   "name": "repo-radar",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Menu bar app for Repo Radar - pristine repository mirrors with AI-powered metadata",
   "main": "main.js",
   "scripts": {
@@ -85,7 +85,11 @@
       {
         "from": "../repo_radar",
         "to": "resources/repo_radar",
-        "filter": ["!**/__pycache__/**", "!**/tests/**", "!**/*.pyc"]
+        "filter": [
+          "!**/__pycache__/**",
+          "!**/tests/**",
+          "!**/*.pyc"
+        ]
       },
       {
         "from": "../requirements.txt",
