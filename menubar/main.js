@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage } = require('electron');
+const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, dialog } = require('electron');
 const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -26,6 +26,32 @@ function getVersion() {
 const APP_VERSION = getVersion();
 
 const STATUS_PORT = 3847;
+
+// Request single instance lock - only one app instance allowed
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  console.error('Another instance of Repo Radar is already running!');
+  dialog.showErrorBox(
+    'Already Running',
+    'Repo Radar is already running.\n\nOnly one instance can run at a time.\n\nCheck your menubar for the sync icon.'
+  );
+  app.quit();
+}
+
+// If someone tries to run a second instance, focus the existing one
+app.on('second-instance', (event, commandLine, workingDirectory) => {
+  console.log('Second instance detected, focusing existing instance');
+  
+  // Show the log window if available
+  if (logWindow && !logWindow.isDestroyed()) {
+    logWindow.show();
+    logWindow.focus();
+  } else if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.show();
+    settingsWindow.focus();
+  }
+});
 const STATUS_FILE = path.join(process.env.HOME, '.config', 'repo-radar', 'status.json');
 const CONFIG_DIR = path.join(process.env.HOME, '.config', 'repo-radar');
 
@@ -77,10 +103,73 @@ let lastStatus = null;
 let animationInterval = null;
 let animationFrame = 0;
 let successTimeout = null;
+let versionInfo = null;
+
+// Load version info
+function loadVersionInfo() {
+  try {
+    const buildInfoPath = path.join(__dirname, 'build-info.json');
+    if (fs.existsSync(buildInfoPath)) {
+      versionInfo = JSON.parse(fs.readFileSync(buildInfoPath, 'utf8'));
+      // Prefer APP_VERSION from VERSION file if available
+      if (APP_VERSION !== '2.0.0') {
+        versionInfo.version = APP_VERSION;
+      }
+    } else {
+      versionInfo = {
+        version: APP_VERSION,
+        buildDate: new Date().toISOString(),
+        buildTimestamp: Date.now()
+      };
+    }
+  } catch (e) {
+    versionInfo = {
+      version: APP_VERSION,
+      buildDate: new Date().toISOString(),
+      buildTimestamp: Date.now()
+    };
+  }
+  return versionInfo;
+}
+
+function getVersionString() {
+  if (!versionInfo) loadVersionInfo();
+  return `v${versionInfo.version}`;
+}
 
 // Ensure config directory exists
 if (!fs.existsSync(CONFIG_DIR)) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
+}
+
+// Single source of truth for sync state - process-based instead of file-based
+function isSyncing() {
+  if (!currentSyncProcess) return false;
+  if (currentSyncProcess.killed) return false;
+  if (currentSyncProcess.exitCode !== null) return false;  // Process exited (includes zombies)
+  return isProcessAlive(currentSyncProcess);
+}
+
+function isProcessAlive(proc) {
+  if (!proc || !proc.pid) return false;
+  try {
+    // Check if process exists without killing it
+    // Signal 0 doesn't actually send a signal, just checks if we CAN
+    process.kill(proc.pid, 0);
+    return true;
+  } catch (e) {
+    return false;  // Process doesn't exist or we don't have permission
+  }
+}
+
+function logSyncState(context) {
+  console.log(`[${context}] Sync state:`, {
+    processExists: !!currentSyncProcess,
+    processPID: currentSyncProcess?.pid,
+    processKilled: currentSyncProcess?.killed,
+    processExitCode: currentSyncProcess?.exitCode,
+    isSyncing: isSyncing()
+  });
 }
 
 // Load last status
@@ -96,7 +185,8 @@ function loadStatus() {
     lastSync: null,
     stats: { total: 0, cloned: 0, updated: 0, errors: 0 },
     repos: [],
-    logOutput: ''
+    logOutput: '',
+    errorList: []  // Array of error objects
   };
 }
 
@@ -184,7 +274,7 @@ function showSuccessIcon() {
     if (icon) {
       tray.setImage(icon);
     }
-    tray.setToolTip('Repo Radar');
+    tray.setToolTip(`Repo Radar ${getVersionString()}`);
     successTimeout = null;
   }, 5000);
 }
@@ -249,21 +339,27 @@ function stopIconAnimation() {
   }
   
   // Clear tooltip
-  tray.setToolTip(`Repo Radar v${APP_VERSION}`);
+  tray.setToolTip(`Repo Radar ${getVersionString()}`);
 }
 
 // Update tray menu
 function updateTrayMenu() {
   const status = loadStatus();
   
-  // Handle icon animation/state
-  if (status.syncing) {
+  // Handle icon animation/state based on actual process state
+  if (isSyncing()) {
     startIconAnimation();
   } else if (status.hasErrors) {
     // Keep showing error icon
     showErrorIcon();
+  } else {
+    // Ensure icon is white when idle
+    const idleIcon = createTrayIcon('white', 0);
+    if (idleIcon) {
+      tray.setImage(idleIcon);
+      tray.setToolTip(`Repo Radar ${getVersionString()}`);
+    }
   }
-  // Otherwise leave icon as-is (could be green, white, etc.)
   
   // Load schedule info
   let scheduleText = 'Manual only';
@@ -308,21 +404,39 @@ function updateTrayMenu() {
       enabled: false
     },
     { type: 'separator' },
-    {
+  ];
+  
+  // Conditionally add sync/progress menu items based on actual process state
+  if (isSyncing()) {
+    // Sync is running - show View Progress only
+    menuItems.push({
+      label: '📊 View Progress',
+      click: () => showLogWindow()
+    });
+  } else {
+    // Sync not running - show Sync Now
+    menuItems.push({
       label: '▶ Sync Now',
       click: () => triggerSync()
-    },
-    {
-      label: status.hasErrors ? '⚠️  View Errors' : '📊 View Progress',
-      click: () => status.hasErrors ? showErrorWindow() : showLogWindow()
-    },
+    });
+    
+    // Optionally show View Errors if there are errors
+    if (status.hasErrors) {
+      menuItems.push({
+        label: '⚠️  View Errors',
+        click: () => showErrorWindow()
+      });
+    }
+  }
+  
+  menuItems.push(
     {
       label: '⚙️  Settings',
       click: () => showSettingsWindow()
     },
     { type: 'separator' },
     {
-      label: `v${APP_VERSION}`,
+      label: getVersionString(),
       enabled: false
     },
     {
@@ -331,7 +445,7 @@ function updateTrayMenu() {
         app.quit();
       }
     }
-  ];
+  );
   
   const menu = Menu.buildFromTemplate(menuItems);
   tray.setContextMenu(menu);
@@ -345,7 +459,12 @@ function startStatusServer() {
   expressApp.post('/status', (req, res) => {
     const data = req.body;
     
-    console.log('Received status update:', data.type, data.repo || '');
+    // Validate repo name format (should be full name with /)
+    if (data.repo && !data.repo.includes('/')) {
+      console.warn('WARNING: Received short name instead of full name:', data.repo);
+    }
+    
+    console.log('Received status update:', data.type, data.repo || '', 'percent:', data.percent || '');
     
     if (data.type === 'output') {
       // Send terminal output to renderer
@@ -379,7 +498,6 @@ function startStatusServer() {
         });
       }
       
-      status.syncing = true;
       saveStatus(status);
       updateTrayMenu();
       
@@ -387,20 +505,74 @@ function startStatusServer() {
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('progress-update', data);
       }
+      
+      // Check if this is an error status and capture it
+      if (data.status && (data.status.includes('✗') || data.status.includes('failed') || data.status.includes('error'))) {
+        const status = loadStatus();
+        if (!status.errorList) status.errorList = [];
+        
+        // Add detailed error to list (newest first)
+        status.errorList.unshift({
+          timestamp: new Date().toISOString(),
+          repo: data.repo,
+          message: data.status,
+          fullError: data.fullError || data.status
+        });
+        
+        saveStatus(status);
+      }
+    } else if (data.type === 'error') {
+      // Detailed error message from Python script
+      const status = loadStatus();
+      if (!status.errorList) status.errorList = [];
+      
+      // Add to error list (newest first)
+      status.errorList.unshift({
+        timestamp: new Date().toISOString(),
+        repo: data.repo || 'Unknown',
+        message: data.message || 'Unknown error',
+        fullError: data.fullError || data.message || 'Unknown error',
+        stackTrace: data.stackTrace || null
+      });
+      
+      status.hasErrors = true;
+      saveStatus(status);
+      
+      // Send to renderer
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('terminal-output', `\n❌ ERROR: ${data.message}\n`);
+      }
+    } else if (data.type === 'rate-limit') {
+      // Update rate limit display
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('rate-limit-update', data);
+      }
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();
-      status.syncing = false;
       status.lastSync = new Date().toISOString();
       status.stats = data.stats || status.stats;
       
       console.log('Sync complete with stats:', data.stats);
       
-      // Update icon based on success/error
+      // Check for warnings (only from explicit warning message from Python)
+      const hasWarning = data.warning;
+      
+      // Store warning in status if present
+      if (data.warning) {
+        status.errorLog = (status.errorLog || '') + '\n' + data.warning;
+        console.warn('Sync warning:', data.warning);
+      }
+      
+      // Update icon based on success/error/warning
       if (data.stats && data.stats.errors > 0) {
         console.log('Sync had errors:', data.stats.errors);
         showErrorIcon();
         status.hasErrors = true;
+      } else if (hasWarning) {
+        console.log('Sync completed with warnings');
+        showSuccessIcon(); // Still show success, but flag for checking
+        status.hasErrors = true; // Set true so "View Errors" shows warning
       } else {
         console.log('Sync successful, showing green icon');
         showSuccessIcon();
@@ -413,6 +585,11 @@ function startStatusServer() {
       // Send to renderer
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('sync-complete', data.stats);
+        
+        // Send warning if present
+        if (data.warning) {
+          logWindow.webContents.send('terminal-output', `\n\n${data.warning}\n\n`);
+        }
       }
       
       // Show notification
@@ -421,6 +598,13 @@ function startStatusServer() {
           tray.displayBalloon({
             title: 'Sync Complete (with errors)',
             content: `${data.stats.errors} error${data.stats.errors !== 1 ? 's' : ''} occurred during sync`
+          });
+        }
+      } else if (hasWarning) {
+        if (tray.displayBalloon) {
+          tray.displayBalloon({
+            title: 'Sync Complete (with warnings)',
+            content: 'Repos synced but no metadata generated - check settings'
           });
         }
       } else {
@@ -447,34 +631,94 @@ function triggerSync() {
     return; // Already syncing
   }
   
-  // Reset status
+  // Reset status for new sync
   const status = loadStatus();
-  status.syncing = true;
   status.logOutput = '';
-  status.errorLog = '';  // Clear previous errors
+  status.errorLog = '';  // Clear previous error log text
+  status.errorList = [];  // Clear previous error array
   status.repos = [];
+  status.hasErrors = false;  // Reset error flag
   saveStatus(status);
   updateTrayMenu();
+  
+  // Load config to prepare repos array
+  const configFile = path.join(CONFIG_DIR, 'config.json');
+  let repoCount = 0;
+  let reposForUI = [];
+  let configValid = true;
+  let validationMessage = '';
+  
+  try {
+    if (fs.existsSync(configFile)) {
+      const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+      repoCount = config.repositories?.length || 0;
+      
+      // Prepare repos array with metadata for UI
+      // Use full_name as the identifier to match Python's send_status_update calls
+      reposForUI = (config.repositories || []).map((repo, index) => ({
+        name: repo.full_name || repo.name,  // Use FULL name as identifier
+        fullName: repo.full_name || repo.name,
+        shortName: repo.name,  // Keep short name for compact display
+        color: ['cyan', 'magenta', 'green', 'red', 'yellow', 'blue', 'bright_cyan', 'bright_red', 'bright_green', 'bright_magenta'][index % 10]
+      }));
+      
+      // Validate API key for selected model
+      const model = config.ai_model || 'gemini/gemini-3-pro-preview';
+      if (model.startsWith('gemini/')) {
+        if (!config.gemini_api_key) {
+          configValid = false;
+          validationMessage = '⚠️ Gemini API Key not configured. Metadata generation will be skipped.\n\nPlease configure in Settings → API Configuration.';
+        }
+      } else if (model.startsWith('claude')) {
+        if (!config.anthropic_api_key) {
+          configValid = false;
+          validationMessage = '⚠️ Anthropic API Key not configured. Metadata generation will be skipped.\n\nPlease configure in Settings → API Configuration.';
+        }
+      } else if (model.startsWith('gpt') || model.startsWith('o1')) {
+        if (!config.openai_api_key) {
+          configValid = false;
+          validationMessage = '⚠️ OpenAI API Key not configured. Metadata generation will be skipped.\n\nPlease configure in Settings → API Configuration.';
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error loading config for repo count:', e);
+  }
+  
+  // Store repos in status so window can retrieve them
+  status.syncRepos = reposForUI;
+  saveStatus(status);
   
   // Show log window
   showLogWindow();
   
-  // Notify window that sync is starting
-  if (logWindow && !logWindow.isDestroyed()) {
-    // Load config to get repo count
-    const configFile = path.join(CONFIG_DIR, 'config.json');
-    let repoCount = 0;
-    try {
-      if (fs.existsSync(configFile)) {
-        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-        repoCount = config.repositories?.length || 0;
+  // Wait for window to be fully ready before sending sync-started event
+  const sendSyncStartedWhenReady = () => {
+    if (logWindow && !logWindow.isDestroyed() && logWindow.webContents) {
+      // Check if page has finished loading
+      if (logWindow.webContents.isLoading()) {
+        console.log('Window still loading, waiting...');
+        setTimeout(sendSyncStartedWhenReady, 100);
+        return;
       }
-    } catch (e) {
-      console.error('Error loading config for repo count:', e);
+      
+      console.log('Window ready, sending sync-started event with', reposForUI.length, 'repos');
+      
+      // Show warning if key is missing
+      if (!configValid) {
+        console.warn(validationMessage);
+        logWindow.webContents.send('terminal-output', `\n${validationMessage}\n\n`);
+      }
+      
+      // Send event
+      logWindow.webContents.send('sync-started', { total: repoCount, repos: reposForUI });
+    } else {
+      console.warn('Log window not available for sync-started event');
     }
-    
-    logWindow.webContents.send('sync-started', { total: repoCount });
-  }
+  };
+  
+  // Start checking after 300ms
+  setTimeout(sendSyncStartedWhenReady, 300);
   
   // Spawn sync process
   const syncScript = getSyncScriptPath();
@@ -513,28 +757,62 @@ function triggerSync() {
       const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
       if (config.github_token) {
         shellEnv.GITHUB_TOKEN = config.github_token;
+        console.log('✓ Loaded GITHUB_TOKEN from config');
       }
       if (config.gemini_api_key) {
         shellEnv.GEMINI_API_KEY = config.gemini_api_key;
+        console.log('✓ Loaded GEMINI_API_KEY from config');
+      }
+      if (config.anthropic_api_key) {
+        shellEnv.ANTHROPIC_API_KEY = config.anthropic_api_key;
+        console.log('✓ Loaded ANTHROPIC_API_KEY from config');
+      }
+      if (config.openai_api_key) {
+        shellEnv.OPENAI_API_KEY = config.openai_api_key;
+        console.log('✓ Loaded OPENAI_API_KEY from config');
       }
       if (config.ai_model) {
         shellEnv.AI_MODEL = config.ai_model;
+        console.log('✓ Loaded AI_MODEL from config:', config.ai_model);
       }
+    } else {
+      console.warn('⚠️  Config file not found:', configFile);
+      console.warn('⚠️  Please configure API keys in Settings before running sync');
     }
   } catch (e) {
     console.error('Error loading config:', e);
   }
   
   console.log('Starting sync:', syncScript, ['sync', '--status-server']);
+  console.log('Environment - GEMINI_API_KEY:', !!shellEnv.GEMINI_API_KEY);
+  console.log('Environment - ANTHROPIC_API_KEY:', !!shellEnv.ANTHROPIC_API_KEY);
+  console.log('Environment - OPENAI_API_KEY:', !!shellEnv.OPENAI_API_KEY);
+  console.log('Environment - AI_MODEL:', shellEnv.AI_MODEL || 'not set (will use default)');
   
   currentSyncProcess = spawn('/usr/bin/env', ['python3', syncScript, 'sync', '--status-server'], {
     env: shellEnv,
     cwd: path.dirname(syncScript)
   });
   
+  logSyncState('process-spawned');
+  
+  // Create log file for this sync run
+  const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  const syncLogFile = path.join(logDir, 'latest-sync.log');
+  const syncLogStream = fs.createWriteStream(syncLogFile, { flags: 'w' });
+  
+  console.log('Sync log file:', syncLogFile);
+  
   // Capture output
   currentSyncProcess.stdout.on('data', (data) => {
     const output = data.toString();
+    
+    // Write to log file
+    syncLogStream.write(output);
+    
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', output);
     }
@@ -545,6 +823,10 @@ function triggerSync() {
   
   currentSyncProcess.stderr.on('data', (data) => {
     const output = data.toString();
+    
+    // Write to log file
+    syncLogStream.write('STDERR: ' + output);
+    
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', output);
     }
@@ -555,51 +837,80 @@ function triggerSync() {
   });
   
   currentSyncProcess.on('close', (code) => {
-    console.log('Sync process exited with code:', code);
-    
-    // Small delay to ensure final status update is received
-    setTimeout(() => {
+    try {
+      console.log('Sync process exited with code:', code);
+      logSyncState('process-exited');
+      
+      // IMMEDIATE cleanup and UI update - don't wait
       currentSyncProcess = null;
-      const status = loadStatus();
+      stopIconAnimation();
+      updateTrayMenu();
       
-      console.log('Final status check - hasErrors:', status.hasErrors, 'errors:', status.stats?.errors);
-      
-      status.syncing = false;
-      
-      if (code === 0) {
-        status.lastSync = new Date().toISOString();
-        // Check if errors were reported via status updates
-        if (status.stats && status.stats.errors > 0) {
-          console.log('Sync completed but had errors');
-          showErrorIcon();
-          status.hasErrors = true;
-        } else {
-          console.log('Sync completed successfully');
-          showSuccessIcon();
-          status.hasErrors = false;
-        }
-      } else {
-        // Non-zero exit code means error
-        console.error('Sync failed with exit code:', code);
-        showErrorIcon();
-        status.hasErrors = true;
+      // Close log file
+      if (syncLogStream) {
+        syncLogStream.end();
       }
       
-      saveStatus(status);
+      // Then handle status update asynchronously
+      setTimeout(() => {
+        const status = loadStatus();
+        
+        console.log('Final status check - hasErrors:', status.hasErrors, 'errors:', status.stats?.errors);
+        
+        if (code === 0) {
+          status.lastSync = new Date().toISOString();
+          // Check if errors were reported via status updates
+          if (status.stats && status.stats.errors > 0) {
+            console.log('Sync completed but had errors');
+            showErrorIcon();
+            status.hasErrors = true;
+          } else {
+            console.log('Sync completed successfully');
+            showSuccessIcon();
+            status.hasErrors = false;
+          }
+        } else {
+          // Non-zero exit code means error
+          console.error('Sync failed with exit code:', code);
+          showErrorIcon();
+          status.hasErrors = true;
+        }
+        
+        saveStatus(status);
+        updateTrayMenu();
+      }, 500); // Wait 500ms for final status updates to arrive
+    } catch (e) {
+      console.error('Error in exit handler:', e);
+      // Force cleanup anyway to prevent stuck state
+      currentSyncProcess = null;
+      stopIconAnimation();
       updateTrayMenu();
-    }, 500); // Wait 500ms for final status updates to arrive
+    }
   });
   
   currentSyncProcess.on('error', (err) => {
-    console.error('Failed to start sync process:', err);
-    currentSyncProcess = null;
-    const status = loadStatus();
-    status.syncing = false;
-    status.hasErrors = true;
-    status.errorLog = `Failed to start sync: ${err.message}`;
-    saveStatus(status);
-    showErrorIcon();
-    updateTrayMenu();
+    try {
+      console.error('Failed to start sync process:', err);
+      logSyncState('process-error');
+      
+      // IMMEDIATE cleanup
+      currentSyncProcess = null;
+      stopIconAnimation();
+      
+      const status = loadStatus();
+      status.hasErrors = true;
+      status.errorLog = `Failed to start sync: ${err.message}`;
+      saveStatus(status);
+      
+      showErrorIcon();
+      updateTrayMenu();
+    } catch (e) {
+      console.error('Error in error handler:', e);
+      // Force cleanup
+      currentSyncProcess = null;
+      stopIconAnimation();
+      updateTrayMenu();
+    }
   });
 }
 
@@ -611,16 +922,27 @@ function showLogWindow() {
     return;
   }
   
+  // Get screen dimensions and use 2/3 of the screen
+  const { screen } = require('electron');
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width: screenWidth, height: screenHeight } = primaryDisplay.workAreaSize;
+  
+  const windowWidth = Math.floor(screenWidth * 0.67);  // 2/3 of screen width
+  const windowHeight = Math.floor(screenHeight * 0.67); // 2/3 of screen height
+  
   logWindow = new BrowserWindow({
-    width: 1000,
-    height: 700,
+    width: windowWidth,
+    height: windowHeight,
+    minWidth: 900,
+    minHeight: 600,
     title: 'Repo Radar - Progress',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: true,
       contextIsolation: false  // Need this for require() to work
     },
-    show: false
+    show: false,
+    center: true  // Center the window on screen
   });
   
   logWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -669,15 +991,26 @@ function showSettingsWindow() {
     return;
   }
   
+  // Get screen dimensions and use 2/3 of the screen
+  const { screen } = require('electron');
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width: screenWidth, height: screenHeight } = primaryDisplay.workAreaSize;
+  
+  const windowWidth = Math.floor(screenWidth * 0.67);  // 2/3 of screen width
+  const windowHeight = Math.floor(screenHeight * 0.67); // 2/3 of screen height
+  
   settingsWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
+    width: windowWidth,
+    height: windowHeight,
+    minWidth: 1000,  // Minimum width to ensure UI looks good
+    minHeight: 700,  // Minimum height
     title: 'Settings - Repo Radar',
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
     },
-    show: false
+    show: false,
+    center: true  // Center the window on screen
   });
   
   settingsWindow.loadFile(path.join(__dirname, 'renderer', 'settings.html'));
@@ -961,7 +1294,31 @@ ipcMain.on('load-config', (event) => {
 
 ipcMain.on('load-error-log', (event) => {
   const status = loadStatus();
-  event.reply('error-log-loaded', status.errorLog || '');
+  event.reply('error-log-loaded', {
+    errors: status.errorList || [],
+    errorLog: status.errorLog || ''
+  });
+});
+
+ipcMain.on('open-error-window', (event) => {
+  showErrorWindow();
+});
+
+ipcMain.on('clear-errors', (event) => {
+  const status = loadStatus();
+  status.errorList = [];
+  status.errorLog = '';
+  status.hasErrors = false;
+  saveStatus(status);
+  updateTrayMenu();
+  
+  // Notify error window if open
+  if (errorWindow && !errorWindow.isDestroyed()) {
+    errorWindow.webContents.send('error-log-loaded', {
+      errors: [],
+      errorLog: ''
+    });
+  }
 });
 
 ipcMain.on('save-config', (event, config) => {
@@ -989,6 +1346,92 @@ ipcMain.on('save-config', (event, config) => {
     setTimeout(() => {
       updateTrayMenu();
     }, 500);
+  }
+});
+
+// Get version info handler
+ipcMain.on('get-version', (event) => {
+  if (!versionInfo) loadVersionInfo();
+  event.reply('version-info', versionInfo);
+});
+
+// Stop sync handler with aggressive termination
+ipcMain.on('stop-sync', (event) => {
+  console.log('⏹ Stop sync requested by user');
+  logSyncState('before-stop');
+  
+  if (!currentSyncProcess) {
+    console.log('No sync process running');
+    return;
+  }
+  
+  console.log('Attempting to terminate sync process (PID:', currentSyncProcess.pid, ')');
+  
+  // Track if process actually terminates
+  let processTerminated = false;
+  
+  // Listen for process exit
+  currentSyncProcess.once('exit', (code, signal) => {
+    console.log('✓ Sync process terminated (code:', code, 'signal:', signal, ')');
+    processTerminated = true;
+  });
+  
+  try {
+    // Try graceful SIGTERM first
+    currentSyncProcess.kill('SIGTERM');
+    console.log('Sent SIGTERM to sync process');
+    
+    // Check if process responded after 1 second
+    setTimeout(() => {
+      if (!processTerminated && currentSyncProcess) {
+        console.log('⚠️  Process did not respond to SIGTERM, sending SIGKILL...');
+        try {
+          currentSyncProcess.kill('SIGKILL');
+          console.log('Sent SIGKILL to sync process');
+        } catch (e) {
+          console.error('Failed to send SIGKILL:', e);
+        }
+      }
+    }, 1000);
+    
+    // Final check after 3 seconds - kill via system if needed
+    setTimeout(() => {
+      if (!processTerminated && currentSyncProcess && currentSyncProcess.pid) {
+        console.log('⚠️  Process still running, attempting system kill...');
+        try {
+          const { spawn } = require('child_process');
+          spawn('kill', ['-9', currentSyncProcess.pid.toString()], { stdio: 'ignore' });
+          console.log('Executed system kill -9');
+        } catch (e) {
+          console.error('Failed system kill:', e);
+        }
+      }
+      
+      // Force cleanup regardless
+      if (currentSyncProcess) {
+        console.log('Force cleaning up process reference');
+        currentSyncProcess.removeAllListeners();
+        currentSyncProcess = null;
+      }
+    }, 3000);
+    
+  } catch (e) {
+    console.error('Error killing sync process:', e);
+  }
+  
+  // Update status immediately (don't wait for process to exit)
+  const status = loadStatus();
+  status.logOutput = (status.logOutput || '') + '\n\n⏹ Sync cancelled by user\n';
+  saveStatus(status);
+  
+  // Stop icon animation
+  stopIconAnimation();
+  updateTrayMenu();
+  
+  // Notify renderer
+  if (logWindow && !logWindow.isDestroyed()) {
+    logWindow.webContents.send('sync-stopped');
+    logWindow.webContents.send('terminal-output', '\n\n⏹ Sync cancelled by user\n\n');
   }
 });
 
@@ -1078,6 +1521,22 @@ function checkMissedSync() {
 
 // App ready
 app.whenReady().then(() => {
+  // Kill any orphaned sync processes from previous app crash
+  // This handles the case where app crashed while Python was running
+  try {
+    const { execSync } = require('child_process');
+    const result = execSync('pgrep -f "repo-radar sync --status-server"', 
+      { encoding: 'utf8', stdio: 'pipe' }).trim();
+    
+    if (result) {
+      console.log('Found orphaned sync process(es), killing:', result);
+      execSync(`kill -9 ${result}`, { stdio: 'ignore' });
+      console.log('Killed orphaned processes');
+    }
+  } catch (e) {
+    // No orphans found (pgrep returns error if no matches) - this is normal
+  }
+  
   // Create tray
   const icon = createTrayIcon('white', 0);
   if (!icon) {
@@ -1103,7 +1562,23 @@ app.whenReady().then(() => {
   startStatusServer();
   
   // Load initial status
-  loadStatus();
+  const status = loadStatus();
+  
+  // currentSyncProcess is already null on startup - no stale state possible
+  
+  // Clear error state from previous runs - start fresh
+  // User can view old errors from "View Errors" but icon should be neutral
+  console.log('Starting fresh - clearing error state from previous session');
+  status.hasErrors = false;
+  saveStatus(status);
+  
+  // Always start with white (idle) icon - no stale error indicators
+  stopIconAnimation();  // Ensure not spinning
+  const freshIcon = createTrayIcon('white', 0);
+  if (freshIcon) {
+    tray.setImage(freshIcon);
+    tray.setToolTip(`Repo Radar ${getVersionString()}`);
+  }
   
   // Check for missed syncs after a short delay (let everything initialize)
   setTimeout(() => {
@@ -1116,6 +1591,25 @@ app.whenReady().then(() => {
     console.log('Periodic check for missed syncs...');
     checkMissedSync();
   }, 30 * 60 * 1000); // 30 minutes in milliseconds
+  
+  // Fallback safety check (1 minute interval as ultimate backup)
+  // This catches extremely rare cases where exit events don't fire
+  // Primarily event-driven now, this is just a safety net
+  setInterval(() => {
+    if (currentSyncProcess && !isSyncing()) {
+      console.warn('FALLBACK: Process detected as dead by safety check');
+      logSyncState('fallback-check');
+      currentSyncProcess = null;
+      stopIconAnimation();
+      updateTrayMenu();
+      
+      // Notify renderer if window open
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('terminal-output', '\n\n⚠️ Process terminated unexpectedly\n\n');
+        logWindow.webContents.send('sync-stopped');
+      }
+    }
+  }, 60000); // Check every minute (not 10 seconds)
   
   // Prevent dock icon
   if (app.dock) {

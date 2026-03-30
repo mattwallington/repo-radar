@@ -7,8 +7,9 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "build": "electron-builder",
+    "build:version": "node scripts/build-with-version.js",
     "postinstall": "electron-builder install-app-deps",
-    "package": "npm run build && node scripts/create-installer.js"
+    "package": "npm run build:version && node scripts/create-installer.js"
   },
   "keywords": [],
   "author": "Matt Wallington",
@@ -61,7 +62,8 @@
     },
     "files": [
       "**/*",
-      "!scripts/create-installer.js"
+      "!scripts/create-installer.js",
+      "build-info.json"
     ],
     "extraResources": [
       {

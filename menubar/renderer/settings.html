@@ -7,7 +7,10 @@
 </head>
 <body>
     <div class="header">
-        <h1>Settings</h1>
+        <div class="header-left">
+            <h1>Settings</h1>
+            <span class="version-text" id="settings-version-text">Loading...</span>
+        </div>
         <div class="header-actions">
             <button id="save-btn" class="btn btn-primary">Save</button>
             <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
@@ -22,42 +25,62 @@
                 <input type="password" id="github-token" placeholder="ghp_..." class="form-control">
                 <small class="form-help">Personal Access Token with 'repo' scope (<a href="https://github.com/settings/tokens/new" target="_blank">Get token</a>)</small>
             </div>
-            <div class="form-group">
-                <label for="gemini-api-key">Gemini API Key</label>
-                <input type="password" id="gemini-api-key" placeholder="AI..." class="form-control">
-                <small class="form-help">For AI-powered metadata generation (<a href="https://makersuite.google.com/app/apikey" target="_blank">Get key</a>)</small>
+            <div class="form-group api-key-group" data-provider="gemini">
+                <label for="gemini-api-key">
+                    Gemini API Key
+                    <span class="key-required-badge" style="display: none;">REQUIRED for selected model</span>
+                </label>
+                <input type="password" id="gemini-api-key" placeholder="AIza..." class="form-control">
+                <small class="form-help">For all Gemini models (<a href="https://makersuite.google.com/app/apikey" target="_blank">Get key</a>)</small>
+            </div>
+            <div class="form-group api-key-group" data-provider="anthropic">
+                <label for="anthropic-api-key">
+                    Anthropic API Key
+                    <span class="key-required-badge" style="display: none;">REQUIRED for selected model</span>
+                </label>
+                <input type="password" id="anthropic-api-key" placeholder="sk-ant-..." class="form-control">
+                <small class="form-help">For all Claude models (<a href="https://console.anthropic.com/settings/keys" target="_blank">Get key</a>)</small>
+            </div>
+            <div class="form-group api-key-group" data-provider="openai">
+                <label for="openai-api-key">
+                    OpenAI API Key
+                    <span class="key-required-badge" style="display: none;">REQUIRED for selected model</span>
+                </label>
+                <input type="password" id="openai-api-key" placeholder="sk-..." class="form-control">
+                <small class="form-help">For GPT and o1 models (<a href="https://platform.openai.com/api-keys" target="_blank">Get key</a>)</small>
             </div>
             <div class="form-group">
                 <label for="ai-model">AI Model</label>
                 <select id="ai-model" class="form-control">
-                    <optgroup label="Google Gemini (Latest)">
-                        <option value="gemini/gemini-3.0-flash">Gemini 3.0 Flash ⚡ (Fastest, Cheapest)</option>
-                        <option value="gemini/gemini-3.0-pro">Gemini 3.0 Pro (Best Quality)</option>
+                    <optgroup label="Google Gemini (Recommended - Auto-fallback enabled)">
+                        <option value="gemini/gemini-3-pro-preview">Gemini 3.0 Pro Preview 🔥 [1M context → ~785K chunks]</option>
+                        <option value="gemini/gemini-3-flash-preview">Gemini 3.0 Flash Preview ⚡ [1M context → ~785K chunks]</option>
+                        <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro [1M context → ~785K chunks]</option>
+                        <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash [1M context → ~785K chunks]</option>
+                        <option value="gemini/gemini-2.0-flash-exp">Gemini 2.0 Flash Experimental [1M context → ~785K chunks]</option>
+                        <option value="gemini/gemini-2.0-flash-001">Gemini 2.0 Flash [1M context → ~785K chunks]</option>
                     </optgroup>
-                    <optgroup label="Google Gemini (Previous Gen)">
-                        <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash</option>
-                        <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro</option>
-                        <option value="gemini/gemini-1.5-flash">Gemini 1.5 Flash</option>
-                        <option value="gemini/gemini-1.5-pro">Gemini 1.5 Pro</option>
+                    <optgroup label="Anthropic Claude (Latest - Sep 2025)">
+                        <option value="claude-sonnet-4-5-20250929">Claude Sonnet 4.5 🔥 [200K context → 150K usable]</option>
                     </optgroup>
-                    <optgroup label="Anthropic Claude (Latest)">
-                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet (Best Overall)</option>
-                        <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku (Fast & Cheap)</option>
+                    <optgroup label="Anthropic Claude (Stable)">
+                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet [200K context → 150K usable]</option>
+                        <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku [200K context → 150K usable]</option>
                     </optgroup>
-                    <optgroup label="Anthropic Claude (Previous Gen)">
-                        <option value="claude-3-opus-20240229">Claude 3 Opus</option>
-                        <option value="claude-3-sonnet-20240229">Claude 3 Sonnet</option>
-                        <option value="claude-3-haiku-20240307">Claude 3 Haiku</option>
+                    <optgroup label="Anthropic Claude (Older)">
+                        <option value="claude-3-opus-20240229">Claude 3 Opus [200K context → 150K usable]</option>
+                        <option value="claude-3-sonnet-20240229">Claude 3 Sonnet [200K context → 150K usable]</option>
+                        <option value="claude-3-haiku-20240307">Claude 3 Haiku [200K context → 150K usable]</option>
                     </optgroup>
                     <optgroup label="OpenAI GPT">
-                        <option value="gpt-4o">GPT-4o (Latest, Multimodal)</option>
-                        <option value="gpt-4o-mini">GPT-4o Mini (Fast & Cheap)</option>
-                        <option value="o1-preview">o1-preview (Advanced Reasoning)</option>
-                        <option value="o1-mini">o1-mini (Fast Reasoning)</option>
-                        <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                        <option value="gpt-4o">GPT-4o [128K context → 96K usable]</option>
+                        <option value="gpt-4o-mini">GPT-4o Mini [128K context → 96K usable]</option>
+                        <option value="o1-preview">o1-preview [128K context → 96K usable]</option>
+                        <option value="o1-mini">o1-mini [128K context → 96K usable]</option>
+                        <option value="gpt-4-turbo">GPT-4 Turbo [128K context → 96K usable]</option>
                     </optgroup>
                 </select>
-                <small class="form-help">Choose the AI model for metadata generation (requires matching API key)</small>
+                <small class="form-help">Choose the AI model for metadata generation. All Gemini models have ~785K per chunk. If rate limited, auto-falls back to next model (each has separate quota). Fallback chain: 3.0 Pro → 3.0 Flash → 2.5 Pro → 2.5 Flash → 2.0 models.</small>
             </div>
         </div>
         
@@ -134,11 +157,37 @@
             <h2>Repositories</h2>
             <div class="repos-header">
                 <span class="repo-count" id="repo-count">0 repositories</span>
-                <button id="add-repo-btn" class="btn btn-small">+ Add Repository</button>
+                <div class="repo-actions">
+                    <button id="fetch-repos-btn" class="btn btn-small btn-primary">🔍 Fetch from GitHub</button>
+                    <button id="add-repo-btn" class="btn btn-small">+ Add Manually</button>
+                </div>
+            </div>
+            
+            <div id="fetch-progress" class="fetch-progress" style="display: none;">
+                <div class="spinner"></div>
+                <span id="fetch-status">Fetching repositories from GitHub...</span>
+            </div>
+            
+            <div id="repo-browser" class="repo-browser" style="display: none;">
+                <div class="repo-browser-header">
+                    <div class="browser-controls">
+                        <input type="text" id="repo-search" class="form-control" placeholder="Search repositories...">
+                        <button id="select-all-btn" class="btn btn-small">Select All</button>
+                        <button id="deselect-all-btn" class="btn btn-small">Deselect All</button>
+                        <button id="apply-selection-btn" class="btn btn-small btn-primary">Apply Selection</button>
+                    </div>
+                    <div class="repo-stats">
+                        <span id="available-count">0 available</span> • 
+                        <span id="selected-count">0 selected</span>
+                    </div>
+                </div>
+                <div id="available-repos-list" class="available-repos-list">
+                    <!-- Available repos from GitHub will be shown here -->
+                </div>
             </div>
             
             <div id="repos-list" class="repos-list">
-                <!-- Repositories will be dynamically added here -->
+                <!-- Selected repositories will be shown here -->
             </div>
         </div>
     </div>

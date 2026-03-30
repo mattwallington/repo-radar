@@ -180,3 +180,160 @@ body {
     margin-bottom: 12px;
 }
 
+
+/* Rate Limit Bar */
+.rate-limit-bar {
+    padding: 8px 20px;
+    background: #2a2d2e;
+    border-bottom: 1px solid #3e3e42;
+    font-size: 12px;
+    color: #858585;
+}
+
+#rate-limit-text {
+    font-family: 'SF Mono', 'Monaco', 'Courier New', monospace;
+}
+
+.rate-limit-warning {
+    color: #e5e510 !important;
+}
+
+.rate-limit-critical {
+    color: #f14c4c !important;
+}
+
+/* Status Bar with Stop Button */
+.status-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+/* Stop Button Icon */
+.btn-stop-icon {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    background: #3e3e42;
+    color: #858585;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+    cursor: not-allowed;
+    transition: all 0.15s;
+    opacity: 0.5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-stop-icon.active {
+    background: #c72525;
+    color: white;
+    cursor: pointer;
+    opacity: 1;
+    box-shadow: 0 0 0 2px rgba(199, 37, 37, 0.3);
+    animation: pulse-red 2s ease-in-out infinite;
+}
+
+@keyframes pulse-red {
+    0%, 100% {
+        box-shadow: 0 0 0 2px rgba(199, 37, 37, 0.3);
+    }
+    50% {
+        box-shadow: 0 0 0 4px rgba(199, 37, 37, 0.5);
+    }
+}
+
+.btn-stop-icon.active:hover {
+    background: #e53935;
+    transform: scale(1.1);
+    box-shadow: 0 2px 8px rgba(199, 37, 37, 0.5), 0 0 0 2px rgba(199, 37, 37, 0.3);
+}
+
+.btn-stop-icon.active:active {
+    background: #b71c1c;
+    transform: scale(1.0);
+}
+
+.btn-stop-icon:disabled {
+    background: #3e3e42;
+    color: #858585;
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+/* Header Title with Version */
+.header-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+.version-text {
+    font-size: 11px;
+    color: #858585;
+    font-weight: normal;
+}
+
+/* Clickable Error Stat */
+.stat-clickable {
+    cursor: pointer;
+    transition: background 0.15s;
+    border-radius: 4px;
+    padding: 8px;
+    margin: -8px;
+}
+
+.stat-clickable:hover {
+    background: #2a2d2e;
+}
+
+.stat-clickable:active {
+    background: #323435;
+}
+
+/* Smooth sorting animation */
+.repos-progress-list {
+    position: relative;
+}
+
+.repo-progress-item {
+    transition: all 0.3s ease-out;
+}
+
+/* Completed repos - green styling */
+.repo-progress-item.complete .repo-progress-name {
+    color: #0dbc79 !important;
+}
+
+.repo-progress-item.complete .repo-progress-bar {
+    background-color: #0dbc79 !important;
+}
+
+/* Error repos - red styling */
+.repo-progress-item.error .repo-progress-name {
+    color: #f14c4c !important;
+}
+
+.repo-progress-item.error .repo-progress-bar {
+    background-color: #f14c4c !important;
+}
+
+/* Repo Details Row */
+.repo-details {
+    display: none;
+    padding: 8px 16px;
+    background: #252526;
+    border-top: 1px solid #3e3e42;
+    gap: 16px;
+    font-size: 11px;
+    color: #858585;
+    flex-wrap: wrap;
+}
+
+.repo-detail-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}

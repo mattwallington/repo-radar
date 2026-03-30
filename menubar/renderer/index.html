@@ -7,10 +7,17 @@
 </head>
 <body>
     <div class="header">
-        <h1>Repo Radar</h1>
+        <div class="header-title">
+            <h1>Repo Radar</h1>
+            <span class="version-text" id="version-text">Loading...</span>
+        </div>
         <div class="status-bar">
             <span id="status-text">Ready</span>
             <span id="repo-count"></span>
+            <button id="stop-sync-btn" class="btn-stop-icon" disabled title="Stop Sync">⏹</button>
+        </div>
+        <div class="rate-limit-bar" id="rate-limit-bar" style="display: none;">
+            <span id="rate-limit-text">Rate Limits: Unknown</span>
         </div>
     </div>
     <div id="progress-container" class="progress-container">
@@ -28,7 +35,7 @@
                     <span class="stat-value" id="repos-total">0</span>
                     <span class="stat-label">Total</span>
                 </div>
-                <div class="stat">
+                <div class="stat stat-clickable" id="errors-stat">
                     <span class="stat-value" id="repos-errors">0</span>
                     <span class="stat-label">Errors</span>
                 </div>

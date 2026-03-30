@@ -359,3 +359,282 @@ select.form-control {
     color: #4ec9b0;
 }
 
+/* Repo Actions */
+.repo-actions {
+    display: flex;
+    gap: 8px;
+}
+
+/* Fetch Progress */
+.fetch-progress {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px;
+    background: #2a2d2e;
+    border: 1px solid #3e3e42;
+    border-radius: 4px;
+    margin-bottom: 16px;
+}
+
+.spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #3e3e42;
+    border-top-color: #4ec9b0;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+#fetch-status {
+    font-size: 13px;
+    color: #cccccc;
+}
+
+/* Repo Browser */
+.repo-browser {
+    margin-bottom: 20px;
+    border: 1px solid #3e3e42;
+    border-radius: 4px;
+    background: #252526;
+}
+
+.repo-browser-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid #3e3e42;
+    background: #2a2d2e;
+}
+
+.browser-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.browser-controls input[type="text"] {
+    flex: 1;
+}
+
+.repo-stats {
+    font-size: 12px;
+    color: #858585;
+}
+
+.repo-stats span {
+    color: #cccccc;
+}
+
+/* Available Repos List */
+.available-repos-list {
+    max-height: calc(100vh - 350px);  /* Use viewport height minus header space */
+    min-height: 500px;
+    overflow-y: auto;
+}
+
+.available-repo-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 12px 16px;
+    border-bottom: 1px solid #3e3e42;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.available-repo-item:hover {
+    background: #2a2d2e;
+}
+
+.available-repo-item:last-child {
+    border-bottom: none;
+}
+
+.available-repo-checkbox {
+    margin-right: 12px;
+    margin-top: 2px;
+    cursor: pointer;
+}
+
+.available-repo-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.available-repo-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #4ec9b0;
+    margin-bottom: 4px;
+}
+
+.available-repo-description {
+    font-size: 12px;
+    color: #858585;
+    margin-bottom: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.available-repo-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 11px;
+    color: #858585;
+}
+
+.available-repo-meta span {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.meta-icon {
+    width: 12px;
+    height: 12px;
+}
+
+.available-repo-item.selected {
+    background: #2a3a4a;
+}
+
+.available-repo-item.selected .available-repo-name {
+    color: #5fb0ff;
+}
+
+/* Empty state for repo browser */
+.repo-browser-empty {
+    padding: 40px 20px;
+    text-align: center;
+    color: #858585;
+}
+
+.repo-browser-empty p {
+    margin-bottom: 8px;
+}
+
+/* Organization Sections */
+.org-section {
+    border-bottom: 1px solid #3e3e42;
+}
+
+.org-section:last-child {
+    border-bottom: none;
+}
+
+.org-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    background: #2a2d2e;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+}
+
+.org-header:hover {
+    background: #323435;
+}
+
+.org-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+}
+
+.org-icon {
+    color: #4ec9b0;
+    flex-shrink: 0;
+}
+
+.org-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: #cccccc;
+}
+
+.org-count {
+    font-size: 12px;
+    color: #858585;
+    background: #1e1e1e;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.org-selected {
+    font-size: 12px;
+    color: #4ec9b0;
+}
+
+.org-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.org-select-all {
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.org-header:hover .org-select-all {
+    opacity: 1;
+}
+
+.org-chevron {
+    font-size: 10px;
+    color: #858585;
+    transition: transform 0.2s;
+}
+
+.org-section.collapsed .org-chevron {
+    transform: rotate(-90deg);
+}
+
+.org-repos {
+    max-height: 50000px;  /* Very large to accommodate any number of repos */
+    overflow: visible;
+    transition: max-height 0.3s ease-out;
+}
+
+.org-section.collapsed .org-repos {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease-out;
+}
+
+/* API Key Groups with Required Badge */
+.api-key-group {
+    transition: background 0.2s, border 0.2s;
+}
+
+.api-key-group.required {
+    background: rgba(78, 201, 176, 0.05);
+    border-left: 3px solid #4ec9b0;
+    padding-left: 13px;
+    margin-left: -16px;
+}
+
+.key-required-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 8px;
+    background: #4ec9b0;
+    color: #1e1e1e;
+    font-size: 10px;
+    font-weight: 600;
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+
+/* Settings Header with Version */
+.header-left {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
