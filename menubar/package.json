@@ -35,6 +35,14 @@
     "publish": null,
     "mac": {
       "category": "public.app-category.utilities",
+      "identity": "Matthew Wallington (5S875AN2HU)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.plist",
+      "entitlementsInherit": "entitlements.plist",
+      "notarize": {
+        "teamId": "5S875AN2HU"
+      },
       "target": [
         {
           "target": "dir",
