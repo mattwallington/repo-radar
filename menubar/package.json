@@ -73,6 +73,11 @@
         "to": "resources/repo-radar"
       },
       {
+        "from": "../repo_radar",
+        "to": "resources/repo_radar",
+        "filter": ["!**/__pycache__/**", "!**/tests/**", "!**/*.pyc"]
+      },
+      {
         "from": "../requirements.txt",
         "to": "resources/requirements.txt"
       },
