@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, dialog } = require('electron');
+const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog } = require('electron');
 const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -342,6 +342,62 @@ function stopIconAnimation() {
   tray.setToolTip(`Repo Radar ${getVersionString()}`);
 }
 
+// Generate LLM config snippet and copy to clipboard
+function copyLLMConfig() {
+  const configFile = path.join(CONFIG_DIR, 'config.json');
+  let config = null;
+  try {
+    if (fs.existsSync(configFile)) {
+      config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Error loading config for LLM snippet:', e);
+  }
+
+  // Determine repos directory
+  let reposDir = '~/repos-pristine';
+  if (config && config.repos_dir) {
+    reposDir = config.repos_dir;
+    // Normalize home dir for display
+    if (reposDir.startsWith(process.env.HOME)) {
+      reposDir = reposDir.replace(process.env.HOME, '~');
+    }
+  }
+
+  const snippet = `# Repository Context Discovery
+
+Pristine repo cache at \`${reposDir}/\` contains clean, up-to-date copies of frequently-used repos (always on dev/main).
+
+## When to Check INDEX.md
+
+Read \`${reposDir}/INDEX.md\` if your task involves understanding, calling, or integrating with other services/systems.
+
+Common scenarios: API calls, database schemas, auth flows, service integrations, shared code, environment config, webhooks, "how does X work?" questions.
+
+## Required 3-Step Workflow
+
+Once you've identified a relevant repo from INDEX.md:
+
+1. **Read metadata first** - \`${reposDir}/<repo-name>.md\` (Quick Reference + full analysis)
+2. **Read code second** - \`${reposDir}/<repo-name>/\` (only if metadata confirms relevance)
+
+**Never skip step 1.** Metadata filters whether code is worth reading.
+
+Note: Read-only reference. Current working directory may differ.
+`;
+
+  clipboard.writeText(snippet);
+
+  // Show notification
+  const { Notification } = require('electron');
+  if (Notification.isSupported()) {
+    new Notification({
+      title: 'Repo Radar',
+      body: 'LLM config snippet copied to clipboard. Paste it into your CLAUDE.md or AGENTS.md file.'
+    }).show();
+  }
+}
+
 // Update tray menu
 function updateTrayMenu() {
   const status = loadStatus();
@@ -433,6 +489,10 @@ function updateTrayMenu() {
     {
       label: '⚙️  Settings',
       click: () => showSettingsWindow()
+    },
+    {
+      label: '📋 Copy LLM Config',
+      click: () => copyLLMConfig()
     },
     { type: 'separator' },
     {

@@ -26,6 +26,15 @@ fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n');
 
 console.log('✓ Updated package.json\n');
 
+// Update root VERSION file to stay in sync
+const versionFilePath = path.join(__dirname, '..', '..', 'VERSION');
+if (fs.existsSync(versionFilePath)) {
+  fs.writeFileSync(versionFilePath, newVersion + '\n');
+  console.log('✓ Updated VERSION file\n');
+} else {
+  console.log('⚠ VERSION file not found at repo root\n');
+}
+
 // Create build info file
 const buildDate = new Date().toISOString();
 const buildInfo = {
@@ -43,9 +52,10 @@ console.log(`✓ Created build-info.json\n`);
 // Run electron-builder
 console.log('🚀 Running electron-builder...\n');
 try {
-    execSync('electron-builder', { 
+    execSync('npx electron-builder --mac --arm64 --x64', {
         stdio: 'inherit',
-        cwd: path.join(__dirname, '..')
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env }
     });
     
     console.log('\n✅ Build complete!');
