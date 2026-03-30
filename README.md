@@ -1,4 +1,4 @@
-# Repo Radar
+# <img src="menubar/assets/icon-app-256.png" width="32" height="32" align="top"> Repo Radar
 
 Maintain pristine, read-only mirrors of GitHub repositories with AI-powered metadata for efficient context discovery.
 
@@ -6,7 +6,6 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 
 ## Features
 
-- **Signed and notarized** — download, install, and run with no Gatekeeper warnings
 - **Automated sync** of GitHub repositories on a configurable schedule
 - **AI-powered metadata** generation using 60+ models from Anthropic, Google, and OpenAI
 - **macOS menubar app** with progress tracking, settings UI, and scheduling
@@ -27,7 +26,7 @@ Download the latest release from [GitHub Releases](https://github.com/mattwallin
 | Intel | `Repo-Radar-*-x64-mac.zip` or `.dmg` |
 
 1. Unzip and drag **Repo Radar.app** to `/Applications`
-2. Open it — the app is signed and notarized, no workarounds needed
+2. Open it from Applications
 3. The app runs first-time setup automatically (installs Python dependencies)
 4. Configure via the menubar icon -> Settings
 
