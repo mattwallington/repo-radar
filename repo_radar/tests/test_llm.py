@@ -8,8 +8,12 @@ from repo_radar.llm import (
 
 
 def test_known_model_context_window():
-    assert get_model_context_window("claude-sonnet-4-6-1m") == 1_000_000
+    assert get_model_context_window("claude-sonnet-4-6") == 1_000_000
+    assert get_model_context_window("claude-opus-4-6") == 1_000_000
     assert get_model_context_window("gpt-4o") == 128_000
+    assert get_model_context_window("gpt-5.4") == 1_050_000
+    assert get_model_context_window("o3") == 200_000
+    assert get_model_context_window("gemini/gemini-3.1-pro-preview") == 1_048_576
 
 
 def test_unknown_model_gets_default():
@@ -23,19 +27,19 @@ def test_chunking_threshold_is_75_percent():
 
 
 def test_fallback_model_chain():
-    first = "gemini/gemini-3-pro-preview"
+    first = "gemini/gemini-3.1-pro-preview"
     second = get_fallback_model(first)
-    assert second == "gemini/gemini-3-flash-preview"
+    assert second == "gemini/gemini-3-pro-preview"
 
 
 def test_fallback_returns_none_at_end():
-    last = "gemini/gemini-2.0-flash-001"
+    last = "gemini/gemini-2.0-flash"
     assert get_fallback_model(last) is None
 
 
 def test_fallback_unknown_returns_first():
     result = get_fallback_model("unknown-model")
-    assert result == "gemini/gemini-3-pro-preview"
+    assert result == "gemini/gemini-3.1-pro-preview"
 
 
 def test_chunk_repo_files_small_repo():

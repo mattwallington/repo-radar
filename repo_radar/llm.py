@@ -10,17 +10,17 @@ from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
 
 def get_ai_model():
     """Get the AI model from environment variable or use default."""
-    return os.environ.get('AI_MODEL', 'claude-sonnet-4-6-1m')
+    return os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
 
 
 # Fallback model chain - each model has separate rate limit quotas
 GEMINI_FALLBACK_CHAIN = [
+    'gemini/gemini-3.1-pro-preview',
     'gemini/gemini-3-pro-preview',
     'gemini/gemini-3-flash-preview',
     'gemini/gemini-2.5-pro',
     'gemini/gemini-2.5-flash',
-    'gemini/gemini-2.0-flash-exp',
-    'gemini/gemini-2.0-flash-001',
+    'gemini/gemini-2.0-flash',
 ]
 
 def get_fallback_model(current_model):
@@ -47,51 +47,87 @@ def get_model_context_window(model):
     """Get the maximum input context window for a model.
 
     These are INPUT context windows, not output token limits.
-    Based on official model documentation as of December 2025.
+    Based on litellm model cost map as of March 2026.
     """
     KNOWN_LIMITS = {
-        # Google Gemini models (Latest) - Official docs show 1,048,576 tokens
-        "gemini/gemini-3-pro-preview": 1048576,      # Dec 2025 - 1M tokens
-        "gemini/gemini-3-flash-preview": 1048576,    # Dec 2025 - 1M tokens
-        "gemini/gemini-3.0-pro": 1048576,            # Alternate naming
-        "gemini/gemini-3.0-flash": 1048576,          # Alternate naming
-        # Google Gemini 2.x models - All 1M tokens per official docs
+        # ── Anthropic Claude ──────────────────────────────────────────────
+        # Claude 4.6 (latest)
+        "claude-opus-4-6": 1000000,
+        "claude-opus-4-6-20260205": 1000000,
+        "claude-sonnet-4-6": 1000000,
+        # Claude 4.5
+        "claude-opus-4-5": 200000,
+        "claude-opus-4-5-20251101": 200000,
+        "claude-sonnet-4-5": 200000,
+        "claude-sonnet-4-5-20250929": 200000,
+        "claude-haiku-4-5": 200000,
+        "claude-haiku-4-5-20251001": 200000,
+        # Claude 4.x
+        "claude-opus-4-1": 200000,
+        "claude-opus-4-1-20250805": 200000,
+        "claude-opus-4-20250514": 200000,
+        "claude-4-opus-20250514": 200000,
+        "claude-sonnet-4-20250514": 200000,
+        "claude-4-sonnet-20250514": 200000,
+        # Claude 3.x
+        "claude-3-7-sonnet-20250219": 200000,
+        "claude-3-5-sonnet-20241022": 200000,
+        "claude-3-haiku-20240307": 200000,
+        "claude-3-opus-20240229": 200000,
+
+        # ── Google Gemini ─────────────────────────────────────────────────
+        # Gemini 3.x
+        "gemini/gemini-3.1-pro-preview": 1048576,
+        "gemini/gemini-3.1-flash-lite-preview": 1048576,
+        "gemini/gemini-3-pro-preview": 1048576,
+        "gemini/gemini-3-flash-preview": 1048576,
+        # Gemini 2.5
         "gemini/gemini-2.5-pro": 1048576,
         "gemini/gemini-2.5-flash": 1048576,
+        "gemini/gemini-2.5-flash-lite": 1048576,
+        # Gemini 2.0
         "gemini/gemini-2.0-flash": 1048576,
-        "gemini/gemini-2.0-flash-exp": 1048576,
         "gemini/gemini-2.0-flash-001": 1048576,
-        # Google Gemini 1.5 models - Also 1M (not 2M as previously thought)
-        "gemini/gemini-1.5-pro": 1048576,
-        "gemini/gemini-1.5-pro-002": 1048576,
-        "gemini/gemini-1.5-flash": 1048576,
-        "gemini/gemini-1.5-flash-002": 1048576,
-        # Anthropic Claude 4.6 models (1M context)
-        "claude-opus-4-6-1m": 1000000,               # Opus 4.6 - 1M context
-        "claude-sonnet-4-6-1m": 1000000,              # Sonnet 4.6 - 1M context
-        # Anthropic Claude 4.6 models (standard)
-        "claude-opus-4-6": 200000,
-        "claude-sonnet-4-6": 200000,
-        "claude-haiku-4-5": 200000,
-        # Anthropic Claude 4.5 models
-        "claude-sonnet-4-5-20250929": 200000,
-        "claude-4.5-sonnet": 200000,
-        # Anthropic Claude 4.x models
-        "claude-4.1-opus-20250115": 200000,
-        "claude-4-opus-20250514": 200000,
-        "claude-4-sonnet-20250514": 200000,
-        "claude-3.7-sonnet-20250219": 200000,
-        # Anthropic Claude 3.5 models
-        "claude-3-5-sonnet-20241022": 200000,
-        "claude-3-5-haiku-20241022": 200000,
-        # OpenAI models
-        "chatgpt/gpt-5.3-codex": 200000,             # Codex CLI model
+        "gemini/gemini-2.0-flash-lite": 1048576,
+        # Convenience aliases
+        "gemini/gemini-pro-latest": 1048576,
+        "gemini/gemini-flash-latest": 1048576,
+        "gemini/gemini-flash-lite-latest": 1048576,
+
+        # ── OpenAI ────────────────────────────────────────────────────────
+        # GPT-5.x (latest)
+        "gpt-5.4": 1050000,
+        "gpt-5.4-pro": 1050000,
+        "gpt-5.4-mini": 272000,
+        "gpt-5.4-nano": 272000,
+        "gpt-5.3-codex": 272000,
+        "gpt-5.2": 272000,
+        "gpt-5.2-codex": 272000,
+        "gpt-5.2-pro": 272000,
+        "gpt-5.1": 272000,
+        "gpt-5.1-codex": 272000,
+        "gpt-5.1-codex-max": 272000,
+        "gpt-5.1-codex-mini": 272000,
+        "gpt-5": 272000,
+        "gpt-5-codex": 272000,
+        "gpt-5-mini": 272000,
+        "gpt-5-nano": 272000,
+        # GPT-4.x
+        "gpt-4.1": 1047576,
+        "gpt-4.1-mini": 1047576,
+        "gpt-4.1-nano": 1047576,
         "gpt-4o": 128000,
         "gpt-4o-mini": 128000,
-        "gpt-4.1": 128000,
         "gpt-4-turbo": 128000,
-        "o1-preview": 128000,
-        "o1-mini": 128000,
+        # Codex CLI
+        "codex-mini-latest": 200000,
+        # Reasoning models
+        "o4-mini": 200000,
+        "o3": 200000,
+        "o3-mini": 200000,
+        "o3-pro": 200000,
+        "o1": 200000,
+        "o1-pro": 200000,
     }
     return KNOWN_LIMITS.get(model, 128000)  # Conservative default
 
