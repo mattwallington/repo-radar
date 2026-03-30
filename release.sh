@@ -259,22 +259,6 @@ if [[ ${#ASSETS[@]} -eq 0 ]]; then
   error "No zip files found in $DIST_DIR - build may have failed"
 fi
 
-# ── Create GitHub release ─────────────────────────────────────────────────────
-
-step "Creating GitHub release"
-
-ASSET_FLAGS=""
-for asset in "${ASSETS[@]}"; do
-  ASSET_FLAGS="$ASSET_FLAGS $asset"
-done
-
-gh release create "v$NEW_VERSION" \
-  --title "Repo Radar v$NEW_VERSION" \
-  --generate-notes \
-  ${ASSETS[@]}
-
-success "GitHub release created: Repo Radar v$NEW_VERSION"
-
 # ── Push ──────────────────────────────────────────────────────────────────────
 
 step "Pushing to remote"
@@ -282,6 +266,17 @@ step "Pushing to remote"
 git push origin main
 git push origin "v$NEW_VERSION"
 success "Pushed commit and tag to origin"
+
+# ── Create GitHub release ─────────────────────────────────────────────────────
+
+step "Creating GitHub release"
+
+gh release create "v$NEW_VERSION" \
+  --title "Repo Radar v$NEW_VERSION" \
+  --generate-notes \
+  ${ASSETS[@]}
+
+success "GitHub release created: Repo Radar v$NEW_VERSION"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
