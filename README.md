@@ -1,4 +1,8 @@
-# <img src="menubar/assets/icon-app-256.png" width="32" height="32" align="top"> Repo Radar
+<p align="center">
+  <img src="menubar/assets/icon-app-256.png" width="128" height="128">
+</p>
+
+<h1 align="center">Repo Radar</h1>
 
 Maintain pristine, read-only mirrors of GitHub repositories with AI-powered metadata for efficient context discovery.
 
