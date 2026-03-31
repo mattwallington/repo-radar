@@ -1,4 +1,5 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog } = require('electron');
+const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog, Notification } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -493,6 +494,28 @@ function updateTrayMenu() {
     {
       label: '📋 Copy LLM Config',
       click: () => copyLLMConfig()
+    },
+    {
+      label: '🔄 Check for Updates',
+      click: () => {
+        autoUpdater.checkForUpdates().then((result) => {
+          if (!result || !result.updateInfo || result.updateInfo.version === app.getVersion()) {
+            dialog.showMessageBox({
+              type: 'info',
+              title: 'No Updates',
+              message: 'You are running the latest version.',
+              detail: `Repo Radar v${app.getVersion()}`
+            });
+          }
+        }).catch((err) => {
+          dialog.showMessageBox({
+            type: 'error',
+            title: 'Update Check Failed',
+            message: 'Could not check for updates.',
+            detail: err.message
+          });
+        });
+      }
     },
     { type: 'separator' },
     {
@@ -1579,6 +1602,66 @@ function checkMissedSync() {
   }
 }
 
+// Auto-updater setup
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on('update-available', (info) => {
+    console.log('Update available:', info.version);
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Update Available',
+      message: `Repo Radar v${info.version} is available`,
+      detail: `You are currently running v${app.getVersion()}. Would you like to download the update?`,
+      buttons: ['Download', 'Later'],
+      defaultId: 0
+    }).then((result) => {
+      if (result.response === 0) {
+        autoUpdater.downloadUpdate();
+        if (Notification.isSupported()) {
+          new Notification({
+            title: 'Repo Radar',
+            body: 'Downloading update in the background...'
+          }).show();
+        }
+      }
+    });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log('Update downloaded:', info.version);
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Update Ready',
+      message: `Repo Radar v${info.version} has been downloaded`,
+      detail: 'The update will be installed when you restart the app. Restart now?',
+      buttons: ['Restart Now', 'Later'],
+      defaultId: 0
+    }).then((result) => {
+      if (result.response === 0) {
+        autoUpdater.quitAndInstall();
+      }
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('Auto-updater error:', err.message);
+  });
+
+  // Check for updates after a short delay
+  setTimeout(() => {
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.log('Update check failed (may be offline):', err.message);
+    });
+  }, 5000);
+
+  // Check again every 4 hours
+  setInterval(() => {
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, 4 * 60 * 60 * 1000);
+}
+
 // App ready
 app.whenReady().then(() => {
   // Kill any orphaned sync processes from previous app crash
@@ -1640,6 +1723,9 @@ app.whenReady().then(() => {
     tray.setToolTip(`Repo Radar ${getVersionString()}`);
   }
   
+  // Set up auto-updater
+  setupAutoUpdater();
+
   // Check for missed syncs after a short delay (let everything initialize)
   setTimeout(() => {
     checkMissedSync();
