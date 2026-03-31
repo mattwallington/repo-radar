@@ -289,7 +289,7 @@ step "Creating GitHub release"
 gh release create "v$NEW_VERSION" \
   --title "Repo Radar v$NEW_VERSION" \
   --generate-notes \
-  ${ASSETS[@]}
+  "${ASSETS[@]}"
 
 success "GitHub release created: Repo Radar v$NEW_VERSION"
 
