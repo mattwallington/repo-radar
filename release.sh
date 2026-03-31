@@ -237,26 +237,41 @@ success "Distribution packages created"
 step "Locating release artifacts"
 
 DIST_DIR="$SCRIPT_DIR/menubar/dist"
-ARM64_ZIP=$(find "$DIST_DIR" -maxdepth 1 -name "*arm64*.zip" -type f | sort | tail -1)
-X64_ZIP=$(find "$DIST_DIR" -maxdepth 1 -name "*x64*.zip" -type f | sort | tail -1)
 
+# electron-builder generates these files (needed for auto-updater)
 ASSETS=()
-if [[ -n "$ARM64_ZIP" ]]; then
-  success "Found arm64: $(basename "$ARM64_ZIP")"
-  ASSETS+=("$ARM64_ZIP")
-else
-  warn "No arm64 zip found in dist/"
-fi
 
-if [[ -n "$X64_ZIP" ]]; then
-  success "Found x64: $(basename "$X64_ZIP")"
-  ASSETS+=("$X64_ZIP")
+# Zips (for auto-updater and manual download)
+for f in "$DIST_DIR/Repo Radar-$NEW_VERSION-arm64-mac.zip" \
+         "$DIST_DIR/Repo Radar-$NEW_VERSION-mac.zip"; do
+  if [[ -f "$f" ]]; then
+    success "Found: $(basename "$f")"
+    ASSETS+=("$f")
+  else
+    warn "Missing: $(basename "$f")"
+  fi
+done
+
+# DMGs (for manual download)
+for f in "$DIST_DIR/Repo Radar-$NEW_VERSION-arm64.dmg" \
+         "$DIST_DIR/Repo Radar-$NEW_VERSION.dmg"; do
+  if [[ -f "$f" ]]; then
+    success "Found: $(basename "$f")"
+    ASSETS+=("$f")
+  fi
+done
+
+# Update manifest (required for electron-updater)
+LATEST_YML="$DIST_DIR/latest-mac.yml"
+if [[ -f "$LATEST_YML" ]]; then
+  success "Found: latest-mac.yml"
+  ASSETS+=("$LATEST_YML")
 else
-  warn "No x64 zip found in dist/"
+  warn "Missing latest-mac.yml (auto-updater won't work)"
 fi
 
 if [[ ${#ASSETS[@]} -eq 0 ]]; then
-  error "No zip files found in $DIST_DIR - build may have failed"
+  error "No release artifacts found in $DIST_DIR - build may have failed"
 fi
 
 # ── Push ──────────────────────────────────────────────────────────────────────
