@@ -872,9 +872,13 @@ function triggerSync() {
   console.log('Environment - OPENAI_API_KEY:', !!shellEnv.OPENAI_API_KEY);
   console.log('Environment - AI_MODEL:', shellEnv.AI_MODEL || 'not set (will use default)');
   
+  // Set PYTHONPATH so the thin wrapper can find the repo_radar package
+  const scriptDir = path.dirname(syncScript);
+  shellEnv.PYTHONPATH = scriptDir + (shellEnv.PYTHONPATH ? ':' + shellEnv.PYTHONPATH : '');
+
   currentSyncProcess = spawn('/usr/bin/env', ['python3', syncScript, 'sync', '--status-server'], {
     env: shellEnv,
-    cwd: path.dirname(syncScript)
+    cwd: scriptDir
   });
   
   logSyncState('process-spawned');
@@ -1319,7 +1323,7 @@ ${intervals}
         <string>/bin/zsh</string>
         <string>-l</string>
         <string>-c</string>
-        <string>source ~/.zshrc 2>/dev/null; ${syncScript} sync --status-server</string>
+        <string>source ~/.zshrc 2>/dev/null; PYTHONPATH="$(dirname "${syncScript}"):$PYTHONPATH" python3 "${syncScript}" sync --status-server</string>
     </array>
     
 ${calendarInterval}
