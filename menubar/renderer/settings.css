@@ -323,7 +323,7 @@ body {
 .form-control[type="time"],
 .form-control[type="number"],
 select.form-control {
-    max-width: 200px;
+    max-width: 400px;
 }
 
 .days-selector {
