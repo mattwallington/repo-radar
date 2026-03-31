@@ -1117,13 +1117,23 @@ function showSettingsWindow() {
 }
 
 // Show error window
+function sendErrorData(win) {
+  const status = loadStatus();
+  win.webContents.send('error-log-loaded', {
+    errors: status.errorList || [],
+    errorLog: status.errorLog || ''
+  });
+}
+
 function showErrorWindow() {
   if (errorWindow && !errorWindow.isDestroyed()) {
     errorWindow.show();
     errorWindow.focus();
+    // Re-send error data to refresh the display
+    sendErrorData(errorWindow);
     return;
   }
-  
+
   errorWindow = new BrowserWindow({
     width: 800,
     height: 600,
@@ -1134,13 +1144,15 @@ function showErrorWindow() {
     },
     show: false
   });
-  
+
   errorWindow.loadFile(path.join(__dirname, 'renderer', 'error.html'));
-  
+
   errorWindow.once('ready-to-show', () => {
     errorWindow.show();
+    // Push error data after window is ready (don't rely solely on renderer requesting it)
+    setTimeout(() => sendErrorData(errorWindow), 100);
   });
-  
+
   errorWindow.on('closed', () => {
     errorWindow = null;
   });
