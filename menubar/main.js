@@ -1039,14 +1039,21 @@ function showLogWindow() {
   });
   
   // Load previous sync status after window is fully loaded
+  // BUT only if a sync is not currently running (otherwise sendSyncStartedWhenReady handles it)
   logWindow.webContents.once('did-finish-load', () => {
     setTimeout(() => {
+      // If a sync is actively running, don't replay old data - the sync flow will send fresh data
+      if (currentSyncProcess) {
+        console.log('Sync in progress, skipping old status replay');
+        return;
+      }
+
       const status = loadStatus();
-      
+
       // If there was a previous sync, show those repos
       if (status.repos && status.repos.length > 0) {
-        logWindow.webContents.send('sync-started', { total: status.stats?.total || status.repos.length });
-        
+        logWindow.webContents.send('sync-started', { total: status.stats?.total || status.repos.length, repos: status.repos.map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' })) });
+
         // Send each repo's final state
         status.repos.forEach(repo => {
           logWindow.webContents.send('progress-update', {
@@ -1056,7 +1063,7 @@ function showLogWindow() {
             color: repo.color || 'cyan'
           });
         });
-        
+
         // Update stats
         if (status.stats) {
           logWindow.webContents.send('sync-complete', status.stats);
