@@ -172,6 +172,15 @@ def sync_mode(args):
 
                 if result.returncode != 0:
                     progress.update(task_id, completed=100, status=f"[red]✗ clone failed[/red]")
+                    if args.status_server:
+                        send_status_update('progress', {
+                            'repo': full_name, 'short_name': short_id,
+                            'status': '✗ clone failed',
+                            'percent': 100,
+                            'color': color
+                        }, args.status_server)
+                    with stats_lock:
+                        stats['errors'] += 1
                     return (False, 'error', cache_name, None, False, short_id, color)
 
                 progress.update(task_id, completed=50, status=f"[{color}]checking out branch...[/{color}]")
@@ -278,6 +287,13 @@ def sync_mode(args):
                 result = run_git_command(['git', 'fetch', 'origin'], cwd=repo_path, check=False)
                 if result.returncode != 0:
                     progress.update(task_id, completed=100, status=f"[red]✗ fetch failed[/red]")
+                    if args.status_server:
+                        send_status_update('progress', {
+                            'repo': full_name, 'short_name': short_id,
+                            'status': '✗ fetch failed',
+                            'percent': 100,
+                            'color': color
+                        }, args.status_server)
                     with stats_lock:
                         stats['errors'] += 1
                     return (False, 'error', cache_name, old_commit, False, short_id, color)
@@ -299,6 +315,13 @@ def sync_mode(args):
                     result = run_git_command(['git', 'pull'], cwd=repo_path, check=False)
                     if result.returncode != 0:
                         progress.update(task_id, completed=100, status=f"[red]✗ pull failed[/red]")
+                        if args.status_server:
+                            send_status_update('progress', {
+                                'repo': full_name, 'short_name': short_id,
+                                'status': '✗ pull failed',
+                                'percent': 100,
+                                'color': color
+                            }, args.status_server)
                         with stats_lock:
                             stats['errors'] += 1
                         return (False, 'error', cache_name, old_commit, False, short_id, color)
@@ -391,6 +414,12 @@ Stack Trace:
 
             # Send detailed error to status server
             if args.status_server:
+                send_status_update('progress', {
+                    'repo': repo_config['full_name'], 'short_name': short_id,
+                    'status': f'✗ error: {error_msg_short}',
+                    'percent': 100,
+                    'color': color
+                }, args.status_server)
                 send_status_update('error', {
                     'repo': repo_config['full_name'],
                     'message': f'Git sync failed: {error_msg_short}',

@@ -38,6 +38,7 @@
       "owner": "mattwallington",
       "repo": "repo-radar"
     },
+    "artifactName": "${name}-${version}-${arch}-${os}.${ext}",
     "mac": {
       "category": "public.app-category.utilities",
       "identity": "Matthew Wallington (5S875AN2HU)",

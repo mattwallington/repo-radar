@@ -1,6 +1,7 @@
 #!/bin/bash
 # release.sh - Full release workflow for Repo Radar
-# Usage: ./release.sh [--dry-run] <patch|minor|major|X.Y.Z>
+# Usage: ./release.sh [--minor|--major|--dry-run|--help]
+# Default: patch bump (1.0.4 -> 1.0.5)
 set -euo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -24,38 +25,53 @@ dry()     { echo -e "${YELLOW}[dry-run]${NC} $1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DRY_RUN=false
+BUMP_TYPE="patch"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
-BUMP_TYPE=""
-
 for arg in "$@"; do
   case "$arg" in
-    --dry-run) DRY_RUN=true ;;
-    patch|minor|major) BUMP_TYPE="$arg" ;;
+    --dry-run)  DRY_RUN=true ;;
+    --minor)    BUMP_TYPE="minor" ;;
+    --major)    BUMP_TYPE="major" ;;
+    --help|-h)
+      echo -e "${BOLD}Repo Radar Release Script${NC}"
+      echo ""
+      echo -e "${BOLD}Usage:${NC} ./release.sh [options]"
+      echo ""
+      echo "  With no arguments, bumps the patch version and releases."
+      echo "  e.g. 1.0.4 -> 1.0.5"
+      echo ""
+      echo -e "${BOLD}Options:${NC}"
+      echo "  --minor     Bump minor version (1.0.4 -> 1.1.0)"
+      echo "  --major     Bump major version (1.0.4 -> 2.0.0)"
+      echo "  --dry-run   Show what would happen without doing it"
+      echo "  --help, -h  Show this help message"
+      echo ""
+      echo -e "${BOLD}What it does:${NC}"
+      echo "  1. Bumps the version (VERSION + package.json)"
+      echo "  2. Commits the version bump and creates a git tag"
+      echo "  3. Builds the Electron app (arm64 + x64)"
+      echo "  4. Pushes to GitHub"
+      echo "  5. Creates a GitHub Release with artifacts"
+      echo ""
+      echo -e "${BOLD}Branches:${NC}"
+      echo "  main   Production release (Repo Radar)"
+      echo "  dev    Dev pre-release (Repo Radar Dev — separate app, orange icon)"
+      echo ""
+      echo -e "${BOLD}Requirements:${NC}"
+      echo "  - Must be on main or dev branch"
+      echo "  - GitHub CLI (gh) installed and authenticated"
+      echo "  - Node.js and npm installed"
+      exit 0
+      ;;
     *)
-      # Check if it looks like a semver (X.Y.Z)
-      if [[ "$arg" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        BUMP_TYPE="$arg"
-      else
-        echo -e "${BOLD}Usage:${NC} ./release.sh [--dry-run] <patch|minor|major|X.Y.Z>"
-        echo ""
-        echo "  patch   Bump patch version (1.0.0 -> 1.0.1)"
-        echo "  minor   Bump minor version (1.0.0 -> 1.1.0)"
-        echo "  major   Bump major version (1.0.0 -> 2.0.0)"
-        echo "  X.Y.Z   Set explicit version"
-        echo ""
-        echo "  --dry-run  Show what would happen without doing it"
-        exit 1
-      fi
+      echo -e "${RED}Unknown argument:${NC} $arg"
+      echo "Run ./release.sh --help for usage"
+      exit 1
       ;;
   esac
 done
-
-if [[ -z "$BUMP_TYPE" ]]; then
-  echo -e "${BOLD}Usage:${NC} ./release.sh [--dry-run] <patch|minor|major|X.Y.Z>"
-  exit 1
-fi
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
 
@@ -68,54 +84,36 @@ fi
 cd "$SCRIPT_DIR"
 
 # Check for required tools
-if ! command -v gh &>/dev/null; then
-  error "GitHub CLI (gh) is not installed. Install with: brew install gh"
-fi
-
-if ! command -v node &>/dev/null; then
-  error "Node.js is not installed"
-fi
-
-if ! command -v npm &>/dev/null; then
-  error "npm is not installed"
-fi
-
-if ! command -v git &>/dev/null; then
-  error "git is not installed"
-fi
-
+for tool in gh node npm git; do
+  if ! command -v "$tool" &>/dev/null; then
+    error "$tool is not installed"
+  fi
+done
 success "Required tools available"
 
-# Check we're on main branch
+# Check branch and determine release channel
 CURRENT_BRANCH=$(git branch --show-current)
-if [[ "$CURRENT_BRANCH" != "main" ]]; then
-  error "Must be on main branch (currently on: $CURRENT_BRANCH)"
+IS_DEV=false
+if [[ "$CURRENT_BRANCH" == "dev" ]]; then
+  IS_DEV=true
+  info "Dev branch — will build Repo Radar Dev and create pre-release"
+elif [[ "$CURRENT_BRANCH" == "main" ]]; then
+  info "Main branch — production release"
+else
+  error "Must be on main or dev branch (currently on: $CURRENT_BRANCH)"
 fi
-success "On main branch"
-
-# Check for uncommitted changes
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  error "Working directory has uncommitted changes. Commit or stash them first."
-fi
-
-# Check for untracked files (warn only)
-UNTRACKED=$(git ls-files --others --exclude-standard)
-if [[ -n "$UNTRACKED" ]]; then
-  warn "Untracked files detected (these will NOT be included in the release):"
-  echo "$UNTRACKED" | head -10 | sed 's/^/         /'
-  UNTRACKED_COUNT=$(echo "$UNTRACKED" | wc -l | tr -d ' ')
-  if [[ "$UNTRACKED_COUNT" -gt 10 ]]; then
-    echo "         ... and $((UNTRACKED_COUNT - 10)) more"
-  fi
-fi
-
-success "Working directory clean"
 
 # Check gh auth status
 if ! gh auth status &>/dev/null; then
   error "Not authenticated with GitHub CLI. Run: gh auth login"
 fi
 success "GitHub CLI authenticated"
+
+# Check for staged changes (these would accidentally go into the release commit)
+if ! git diff --cached --quiet; then
+  error "You have staged changes. Commit or unstage them first."
+fi
+success "No staged changes"
 
 # ── Version calculation ───────────────────────────────────────────────────────
 
@@ -131,23 +129,29 @@ else
   warn "No VERSION file found, starting from 0.0.0"
 fi
 
-info "Current version: ${BOLD}$CURRENT_VERSION${NC}"
+# Strip any existing pre-release suffix for base version
+BASE_VERSION="${CURRENT_VERSION%%-*}"
 
-# Parse current version
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+# Parse base version
+IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
 
 # Calculate new version
-if [[ "$BUMP_TYPE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  NEW_VERSION="$BUMP_TYPE"
-else
-  case "$BUMP_TYPE" in
-    patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
-    minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
-    major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
-  esac
+case "$BUMP_TYPE" in
+  patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+  minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
+  major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
+esac
+
+# For dev builds, add -dev.N suffix using build number
+if $IS_DEV; then
+  DEV_BUILD=$(date +%Y%m%d%H%M)
+  NEW_VERSION="${NEW_VERSION}-dev.${DEV_BUILD}"
 fi
 
-success "New version: ${BOLD}$NEW_VERSION${NC}"
+info "Current version: ${BOLD}$CURRENT_VERSION${NC}"
+DEV_LABEL=""
+if $IS_DEV; then DEV_LABEL=", dev channel"; fi
+success "New version:     ${BOLD}$NEW_VERSION${NC} ($BUMP_TYPE$DEV_LABEL)"
 
 # ── Dry run summary ──────────────────────────────────────────────────────────
 
@@ -160,25 +164,10 @@ if $DRY_RUN; then
   dry "Build Electron app (arm64 + x64)"
   dry "Run create-installer script"
   dry "Create GitHub release: Repo Radar v$NEW_VERSION"
-  dry "Attach arm64 and x64 zip files"
+  dry "Attach arm64 and x64 zip files + latest-mac.yml"
   dry "Push commit and tag to origin"
   echo ""
   info "No changes were made. Remove --dry-run to execute."
-  exit 0
-fi
-
-# ── Confirmation ──────────────────────────────────────────────────────────────
-
-step "Confirmation"
-
-echo ""
-echo -e "  Version:  ${BOLD}$CURRENT_VERSION${NC} -> ${BOLD}${GREEN}$NEW_VERSION${NC}"
-echo -e "  Tag:      ${BOLD}v$NEW_VERSION${NC}"
-echo -e "  Branch:   ${BOLD}$CURRENT_BRANCH${NC}"
-echo ""
-read -p "$(echo -e "${YELLOW}Proceed with release? (y/N):${NC} ")" CONFIRM
-if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-  info "Release cancelled."
   exit 0
 fi
 
@@ -186,12 +175,10 @@ fi
 
 step "Updating version files"
 
-# Update VERSION file
 echo "$NEW_VERSION" > "$VERSION_FILE"
 success "Updated VERSION -> $NEW_VERSION"
 
-# Update package.json
-# Use node for reliable JSON manipulation
+# Update version in package.json (but NOT appId/productName — those are build-time only)
 node -e "
   const fs = require('fs');
   const pkg = JSON.parse(fs.readFileSync('menubar/package.json', 'utf8'));
@@ -200,11 +187,16 @@ node -e "
 "
 success "Updated menubar/package.json -> $NEW_VERSION"
 
+# Sync package-lock.json version
+cd "$SCRIPT_DIR/menubar" && npm install --package-lock-only --silent
+cd "$SCRIPT_DIR"
+success "Updated menubar/package-lock.json -> $NEW_VERSION"
+
 # ── Git commit and tag ────────────────────────────────────────────────────────
 
 step "Creating git commit and tag"
 
-git add VERSION menubar/package.json
+git add VERSION menubar/package.json menubar/package-lock.json
 git commit -m "release: v$NEW_VERSION"
 success "Committed: release: v$NEW_VERSION"
 
@@ -215,6 +207,31 @@ success "Tagged: v$NEW_VERSION"
 
 step "Building Electron app"
 
+# Write build-info.json with channel (consumed by the app at runtime)
+CHANNEL="stable"
+if $IS_DEV; then CHANNEL="dev"; fi
+node -e "
+  const fs = require('fs');
+  fs.writeFileSync('menubar/build-info.json', JSON.stringify({
+    version: '$NEW_VERSION',
+    channel: '$CHANNEL',
+    buildDate: new Date().toISOString(),
+    buildTimestamp: Date.now()
+  }, null, 2));
+"
+
+# For dev builds, temporarily swap appId and productName for the build
+if $IS_DEV; then
+  node -e "
+    const fs = require('fs');
+    const pkg = JSON.parse(fs.readFileSync('menubar/package.json', 'utf8'));
+    pkg.build.appId = 'com.mattwallington.repo-radar-dev';
+    pkg.build.productName = 'Repo Radar Dev';
+    fs.writeFileSync('menubar/package.json', JSON.stringify(pkg, null, 2) + '\n');
+  "
+  success "Temporarily set appId/productName for dev build"
+fi
+
 info "Installing dependencies..."
 cd "$SCRIPT_DIR/menubar"
 npm install
@@ -224,6 +241,12 @@ npx electron-builder --mac --arm64 --x64
 
 cd "$SCRIPT_DIR"
 success "Build complete"
+
+# Revert temporary dev changes to package.json
+if $IS_DEV; then
+  git checkout menubar/package.json
+  success "Reverted package.json to committed state"
+fi
 
 # ── Create installer zips ─────────────────────────────────────────────────────
 
@@ -238,12 +261,18 @@ step "Locating release artifacts"
 
 DIST_DIR="$SCRIPT_DIR/menubar/dist"
 
-# electron-builder generates these files (needed for auto-updater)
 ASSETS=()
 
+# Artifact name prefix matches electron-builder's ${name} from package.json
+if $IS_DEV; then
+  ART_PREFIX="repo-radar-dev"
+else
+  ART_PREFIX="repo-radar"
+fi
+
 # Zips (for auto-updater and manual download)
-for f in "$DIST_DIR/Repo Radar-$NEW_VERSION-arm64-mac.zip" \
-         "$DIST_DIR/Repo Radar-$NEW_VERSION-mac.zip"; do
+for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.zip" \
+         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-mac.zip"; do
   if [[ -f "$f" ]]; then
     success "Found: $(basename "$f")"
     ASSETS+=("$f")
@@ -253,8 +282,8 @@ for f in "$DIST_DIR/Repo Radar-$NEW_VERSION-arm64-mac.zip" \
 done
 
 # DMGs (for manual download)
-for f in "$DIST_DIR/Repo Radar-$NEW_VERSION-arm64.dmg" \
-         "$DIST_DIR/Repo Radar-$NEW_VERSION.dmg"; do
+for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64.dmg" \
+         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION.dmg"; do
   if [[ -f "$f" ]]; then
     success "Found: $(basename "$f")"
     ASSETS+=("$f")
@@ -278,7 +307,7 @@ fi
 
 step "Pushing to remote"
 
-git push origin main
+git push origin "$CURRENT_BRANCH"
 git push origin "v$NEW_VERSION"
 success "Pushed commit and tag to origin"
 
@@ -286,12 +315,23 @@ success "Pushed commit and tag to origin"
 
 step "Creating GitHub release"
 
-gh release create "v$NEW_VERSION" \
-  --title "Repo Radar v$NEW_VERSION" \
-  --generate-notes \
-  "${ASSETS[@]}"
+RELEASE_ARGS=(
+  "v$NEW_VERSION"
+  --title "Repo Radar v$NEW_VERSION"
+  --generate-notes
+)
 
-success "GitHub release created: Repo Radar v$NEW_VERSION"
+if $IS_DEV; then
+  RELEASE_ARGS+=(--prerelease)
+fi
+
+gh release create "${RELEASE_ARGS[@]}" "${ASSETS[@]}"
+
+if $IS_DEV; then
+  success "GitHub pre-release created: Repo Radar Dev v$NEW_VERSION"
+else
+  success "GitHub release created: Repo Radar v$NEW_VERSION"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
