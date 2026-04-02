@@ -26,11 +26,22 @@ function getVersion() {
 
 const APP_VERSION = getVersion();
 
+// Detect dev build early (before versionInfo is initialized)
+const IS_DEV_BUILD = (() => {
+  try {
+    const buildInfoPath = path.join(__dirname, 'build-info.json');
+    if (fs.existsSync(buildInfoPath)) {
+      return JSON.parse(fs.readFileSync(buildInfoPath, 'utf8')).channel === 'dev';
+    }
+  } catch (e) {}
+  return false;
+})();
+
 // Dev builds use a different port so they don't conflict with production
-const STATUS_PORT = isDevBuild() ? 3848 : 3847;
+const STATUS_PORT = IS_DEV_BUILD ? 3848 : 3847;
 
 // Request single instance lock per app variant (dev and prod can coexist)
-const gotTheLock = app.requestSingleInstanceLock({ appId: isDevBuild() ? 'repo-radar-dev' : 'repo-radar' });
+const gotTheLock = app.requestSingleInstanceLock({ appId: IS_DEV_BUILD ? 'repo-radar-dev' : 'repo-radar' });
 
 if (!gotTheLock) {
   const appName = getAppDisplayName();
@@ -141,8 +152,7 @@ function getVersionString() {
 }
 
 function isDevBuild() {
-  if (!versionInfo) loadVersionInfo();
-  return versionInfo.channel === 'dev';
+  return IS_DEV_BUILD;
 }
 
 function getAppDisplayName() {
