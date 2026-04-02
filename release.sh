@@ -263,16 +263,12 @@ DIST_DIR="$SCRIPT_DIR/menubar/dist"
 
 ASSETS=()
 
-# Artifact name prefix matches electron-builder's ${name} from package.json
-if $IS_DEV; then
-  ART_PREFIX="repo-radar-dev"
-else
-  ART_PREFIX="repo-radar"
-fi
+# Artifact prefix is always "repo-radar" (the npm package name, used by ${name} in artifactName)
+ART_PREFIX="repo-radar"
 
 # Zips (for auto-updater and manual download)
 for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.zip" \
-         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-mac.zip"; do
+         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-x64-mac.zip"; do
   if [[ -f "$f" ]]; then
     success "Found: $(basename "$f")"
     ASSETS+=("$f")
@@ -282,8 +278,8 @@ for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.zip" \
 done
 
 # DMGs (for manual download)
-for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64.dmg" \
-         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION.dmg"; do
+for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.dmg" \
+         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-x64-mac.dmg"; do
   if [[ -f "$f" ]]; then
     success "Found: $(basename "$f")"
     ASSETS+=("$f")
