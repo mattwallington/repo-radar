@@ -111,7 +111,9 @@ def send_status_update(status_type, data=None, status_server_enabled=False):
         if data:
             payload.update(data)
 
-        requests.post('http://localhost:3847/status', json=payload, timeout=1.0)
+        import os
+        port = os.environ.get('REPO_RADAR_STATUS_PORT', '3847')
+        requests.post(f'http://localhost:{port}/status', json=payload, timeout=1.0)
     except ImportError:
         # requests not available, skip
         pass

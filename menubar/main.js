@@ -897,6 +897,7 @@ function triggerSync() {
   // Set PYTHONPATH so the thin wrapper can find the repo_radar package
   const scriptDir = path.dirname(syncScript);
   shellEnv.PYTHONPATH = scriptDir + (shellEnv.PYTHONPATH ? ':' + shellEnv.PYTHONPATH : '');
+  shellEnv.REPO_RADAR_STATUS_PORT = String(STATUS_PORT);
 
   currentSyncProcess = spawn('/usr/bin/env', ['python3', syncScript, 'sync', '--status-server'], {
     env: shellEnv,
@@ -1386,6 +1387,7 @@ if [ -d "$HOME/.pyenv" ]; then
 fi
 export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 export PYTHONPATH='${escScriptDir}':"$PYTHONPATH"
+export REPO_RADAR_STATUS_PORT='${STATUS_PORT}'
 ${envExports}exec python3 '${escSyncScript}' sync --status-server
 `;
     fs.writeFileSync(wrapperScript, wrapperContent, { mode: 0o755 });
