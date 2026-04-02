@@ -13,10 +13,12 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 - **Automated sync** of GitHub repositories on a configurable schedule
 - **AI-powered metadata** generation using 60+ models from Anthropic, Google, and OpenAI
 - **macOS menubar app** with progress tracking, settings UI, and scheduling
+- **Auto-updates** — the app checks for new versions and offers one-click updates
 - **Copy LLM Config** — one-click copy of the config snippet for CLAUDE.md / AGENTS.md
 - **CLI mode** for standalone or scripted use
 - **Smart chunking** for large repos with model-aware context window management
 - **Rate limit handling** with automatic fallback and UI display
+- **Clean uninstall** — tray menu option to remove all config, logs, and scheduled tasks
 
 ## Install
 
@@ -26,8 +28,8 @@ Download the latest release from [GitHub Releases](https://github.com/mattwallin
 
 | Mac Type | Download |
 |----------|----------|
-| Apple Silicon (M1-M4) | `Repo-Radar-*-arm64-mac.zip` or `.dmg` |
-| Intel | `Repo-Radar-*-x64-mac.zip` or `.dmg` |
+| Apple Silicon (M1-M4) | `repo-radar-*-arm64-mac.zip` or `.dmg` |
+| Intel | `repo-radar-*-x64-mac.zip` or `.dmg` |
 
 1. Unzip and drag **Repo Radar.app** to `/Applications`
 2. Open it from Applications
@@ -133,7 +135,7 @@ repo-radar/
 **How it works:**
 1. The Electron menubar app spawns `python3 repo-radar sync --status-server`
 2. The Python script handles git operations, GitHub API discovery, and LLM metadata generation
-3. Progress updates flow back to the menubar via HTTP POST to a local Express server (port 3847)
+3. Progress updates flow back to the menubar via HTTP POST to a local Express server (port 3847, or 3848 for dev builds)
 4. Generated metadata and an `INDEX.md` are written to `~/repos-pristine/`
 
 ## Development
@@ -160,33 +162,59 @@ npm run dev
 
 ## Releasing
 
-Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases.
+Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases. The app includes auto-update — existing users are prompted when a new version is available.
 
 ```bash
-# Patch release (1.0.1 -> 1.0.2)
-./release.sh patch
+# Patch release (default, no args needed)
+./release.sh
 
-# Minor release (1.0.1 -> 1.1.0)
-./release.sh minor
+# Minor release (1.0.5 -> 1.1.0)
+./release.sh --minor
 
-# Major release (1.0.1 -> 2.0.0)
-./release.sh major
+# Major release (1.0.5 -> 2.0.0)
+./release.sh --major
 
 # Dry run (show what would happen)
-./release.sh --dry-run patch
+./release.sh --dry-run
+
+# Help
+./release.sh --help
 ```
 
 The script will:
-1. Bump the version in `VERSION` and `menubar/package.json`
+1. Bump the version in `VERSION`, `package.json`, and `package-lock.json`
 2. Commit and tag
 3. Build the Electron app for arm64 + x64
 4. Sign with Developer ID and notarize with Apple
 5. Push and create a GitHub Release with artifacts attached
 
-**Requirements for signing/notarization:**
+### Dev branch
+
+The `dev` branch builds a separate **Repo Radar Dev** app that can run alongside production:
+
+- Separate app ID (`com.mattwallington.repo-radar-dev`) and orange icon
+- Releases are created as GitHub pre-releases
+- Auto-updater only checks pre-releases (doesn't affect production users)
+- Uses port 3848 for status updates (production uses 3847)
+
+```bash
+git checkout dev
+# make changes, commit
+./release.sh          # builds "Repo Radar Dev", creates pre-release
+
+# when ready for production:
+git checkout main
+git merge dev
+./release.sh          # builds "Repo Radar", creates stable release
+```
+
+### Requirements for signing/notarization
+
 - Developer ID Application certificate in Keychain
-- `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD` environment variables set
-- `APPLE_TEAM_ID` passed to the build (or set in env)
+- Environment variables:
+  - `APPLE_ID` — your Apple ID email
+  - `APPLE_APP_SPECIFIC_PASSWORD` — generated at [appleid.apple.com](https://appleid.apple.com)
+  - `APPLE_TEAM_ID` — your Apple Developer team ID
 
 ## Config & Data Locations
 
@@ -194,6 +222,8 @@ The script will:
 |------|------|
 | App config | `~/.config/repo-radar/config.json` |
 | Sync status | `~/.config/repo-radar/status.json` |
+| Scheduled sync wrapper | `~/.config/repo-radar/run-sync.sh` |
+| LaunchAgent | `~/Library/LaunchAgents/com.user.repo-radar.plist` |
 | Synced repos | `~/repos-pristine/` (default) |
 | Logs | `~/Library/Logs/repo-radar/` |
 
