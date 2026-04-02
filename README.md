@@ -15,14 +15,11 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 - **macOS menubar app** with progress tracking, settings UI, and scheduling
 - **Auto-updates** — the app checks for new versions and offers one-click updates
 - **Copy LLM Config** — one-click copy of the config snippet for CLAUDE.md / AGENTS.md
-- **CLI mode** for standalone or scripted use
 - **Smart chunking** for large repos with model-aware context window management
 - **Rate limit handling** with automatic fallback and UI display
 - **Clean uninstall** — tray menu option to remove all config, logs, and scheduled tasks
 
 ## Install
-
-### Menubar App (recommended)
 
 Download the latest release from [GitHub Releases](https://github.com/mattwallington/repo-radar/releases):
 
@@ -38,20 +35,6 @@ Download the latest release from [GitHub Releases](https://github.com/mattwallin
 
 See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
 
-### CLI Only
-
-```bash
-# Clone the repo
-git clone https://github.com/mattwallington/repo-radar.git
-cd repo-radar
-
-# Install Python dependencies
-pip3 install -r requirements.txt
-
-# Run directly
-./repo-radar help
-```
-
 ## Configuration
 
 ### Required
@@ -64,7 +47,7 @@ pip3 install -r requirements.txt
 
 ### AI Models
 
-The default model is `claude-sonnet-4-6` (1M context window). Override with the `AI_MODEL` environment variable or in the menubar Settings.
+The default model is `claude-sonnet-4-6` (1M context window). Override in the menubar Settings.
 
 Supported models include:
 
@@ -106,115 +89,14 @@ To make your AI assistant (Claude Code, etc.) aware of your pristine repos, clic
 ./repo-radar --version
 ```
 
-## Architecture
+## Uninstall
 
-```
-repo-radar/
-├── repo-radar                 # Python CLI entry point
-├── repo_radar/                # Python package
-│   ├── cli.py                 # Argument parsing, mode dispatch
-│   ├── config.py              # Paths, load/save config
-│   ├── git.py                 # Git operations
-│   ├── files.py               # File collection and filtering
-│   ├── llm.py                 # Model config, chunking, rate limiting
-│   ├── metadata.py            # Response parsing, index generation
-│   ├── ui.py                  # Help text, formatting, status updates
-│   ├── modes/                 # CLI modes (configure, sync, analyze, clean)
-│   └── tests/                 # 33 unit tests
-├── VERSION                    # Single source of truth for version
-├── requirements.txt           # Python dependencies (litellm pinned)
-├── release.sh                 # Build + sign + notarize + release workflow
-└── menubar/                   # Electron menubar app
-    ├── main.js                # Main process (tray, scheduling, IPC)
-    ├── entitlements.plist     # macOS hardened runtime entitlements
-    ├── renderer/              # UI (progress, settings, errors)
-    ├── resources/             # Bundled script + setup
-    └── package.json           # Electron build config
-```
+To fully remove Repo Radar:
 
-**How it works:**
-1. The Electron menubar app spawns `python3 repo-radar sync --status-server`
-2. The Python script handles git operations, GitHub API discovery, and LLM metadata generation
-3. Progress updates flow back to the menubar via HTTP POST to a local Express server (port 3847, or 3848 for dev builds)
-4. Generated metadata and an `INDEX.md` are written to `~/repos-pristine/`
+1. Click the menubar icon -> **Uninstall...** (removes config, logs, and scheduled tasks)
+2. Drag the app from `/Applications` to the Trash
 
-## Development
-
-```bash
-# Clone
-git clone https://github.com/mattwallington/repo-radar.git
-cd repo-radar
-
-# Install Python deps
-pip3 install -r requirements.txt
-
-# Run the CLI directly
-./repo-radar help
-
-# Run tests
-python -m pytest repo_radar/tests/ -v
-
-# Run the menubar app in dev mode
-cd menubar
-npm install
-npm run dev
-```
-
-## Releasing
-
-Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases. The app includes auto-update — existing users are prompted when a new version is available.
-
-```bash
-# Patch release (default, no args needed)
-./release.sh
-
-# Minor release (1.0.5 -> 1.1.0)
-./release.sh --minor
-
-# Major release (1.0.5 -> 2.0.0)
-./release.sh --major
-
-# Dry run (show what would happen)
-./release.sh --dry-run
-
-# Help
-./release.sh --help
-```
-
-The script will:
-1. Bump the version in `VERSION`, `package.json`, and `package-lock.json`
-2. Commit and tag
-3. Build the Electron app for arm64 + x64
-4. Sign with Developer ID and notarize with Apple
-5. Push and create a GitHub Release with artifacts attached
-
-### Dev branch
-
-The `dev` branch builds a separate **Repo Radar Dev** app that can run alongside production:
-
-- Separate app ID (`com.mattwallington.repo-radar-dev`) and orange icon
-- Releases are created as GitHub pre-releases
-- Auto-updater only checks pre-releases (doesn't affect production users)
-- Uses port 3848 for status updates (production uses 3847)
-
-```bash
-git checkout dev
-# make changes, commit
-./release.sh          # builds "Repo Radar Dev", creates pre-release
-
-# when ready for production:
-git checkout main
-git merge dev
-./release.sh          # builds "Repo Radar", creates stable release
-```
-
-### Requirements for signing/notarization
-
-- Developer ID Application certificate in Keychain
-- Environment variables:
-  - `APPLE_ID` — your Apple ID email
-  - `APPLE_APP_SPECIFIC_PASSWORD` — generated at [appleid.apple.com](https://appleid.apple.com)
-  - `APPLE_TEAM_ID` — your Apple Developer team ID
+Your synced repositories are **not** deleted.
 
 ## Config & Data Locations
 
@@ -237,6 +119,10 @@ Set `repos_dir` in your `config.json` to change where repos are synced:
   "strip_prefixes": ["myorg-"]
 }
 ```
+
+## Contributing
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for development setup, architecture, release process, and the dev branch workflow.
 
 ## License
 
