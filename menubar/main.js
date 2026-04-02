@@ -545,6 +545,10 @@ function updateTrayMenu() {
       enabled: false
     },
     {
+      label: '🗑️  Uninstall...',
+      click: () => uninstallApp()
+    },
+    {
       label: 'Quit',
       click: () => {
         app.quit();
@@ -554,6 +558,101 @@ function updateTrayMenu() {
   
   const menu = Menu.buildFromTemplate(menuItems);
   tray.setContextMenu(menu);
+}
+
+// Uninstall app - remove all persistent files and quit
+function uninstallApp() {
+  const appName = getAppDisplayName();
+
+  dialog.showMessageBox({
+    type: 'warning',
+    title: `Uninstall ${appName}`,
+    message: `Are you sure you want to uninstall ${appName}?`,
+    detail: 'This will remove:\n• Scheduled sync (LaunchAgent)\n• Configuration and status files\n• Log files\n• Wrapper scripts\n\nYour synced repositories will NOT be deleted.',
+    buttons: ['Cancel', 'Uninstall'],
+    defaultId: 0,
+    cancelId: 0
+  }).then((result) => {
+    if (result.response !== 1) return;
+
+    console.log('Uninstalling...');
+
+    // 1. Unload and remove LaunchAgent
+    const plistFile = path.join(process.env.HOME, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+    try {
+      if (fs.existsSync(plistFile)) {
+        spawn('launchctl', ['unload', plistFile], { stdio: 'ignore' });
+        fs.unlinkSync(plistFile);
+        console.log('Removed LaunchAgent');
+      }
+    } catch (e) {
+      console.error('Error removing LaunchAgent:', e);
+    }
+
+    // 2. Remove config directory (~/.config/repo-radar/)
+    try {
+      if (fs.existsSync(CONFIG_DIR)) {
+        fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
+        console.log('Removed config directory');
+      }
+    } catch (e) {
+      console.error('Error removing config:', e);
+    }
+
+    // 3. Remove log directory (~/Library/Logs/repo-radar/)
+    const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
+    try {
+      if (fs.existsSync(logDir)) {
+        fs.rmSync(logDir, { recursive: true, force: true });
+        console.log('Removed log directory');
+      }
+    } catch (e) {
+      console.error('Error removing logs:', e);
+    }
+
+    // 4. Remove installed script (~/.repo-radar/)
+    const installedDir = path.join(process.env.HOME, '.repo-radar');
+    try {
+      if (fs.existsSync(installedDir)) {
+        fs.rmSync(installedDir, { recursive: true, force: true });
+        console.log('Removed installed scripts');
+      }
+    } catch (e) {
+      console.error('Error removing installed scripts:', e);
+    }
+
+    // Show confirmation
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Uninstall Complete',
+      message: `${appName} has been uninstalled.`,
+      detail: 'You can now drag the app to the Trash to finish removal.\n\nYour synced repositories were not deleted.',
+      buttons: ['OK']
+    }).then(() => {
+      app.quit();
+    });
+  });
+}
+
+// Clean up orphaned files from a previous uninstalled version
+function cleanupOrphans() {
+  // Check if a LaunchAgent exists but points to an app that no longer exists
+  const plistFile = path.join(process.env.HOME, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+  try {
+    if (fs.existsSync(plistFile)) {
+      const content = fs.readFileSync(plistFile, 'utf8');
+      // Extract the script path from the plist
+      const scriptMatch = content.match(/<string>(\/[^<]*run-sync\.sh)<\/string>/);
+      if (scriptMatch && !fs.existsSync(scriptMatch[1])) {
+        console.log('Found orphaned LaunchAgent pointing to missing script:', scriptMatch[1]);
+        spawn('launchctl', ['unload', plistFile], { stdio: 'ignore' });
+        fs.unlinkSync(plistFile);
+        console.log('Cleaned up orphaned LaunchAgent');
+      }
+    }
+  } catch (e) {
+    console.error('Error checking for orphaned LaunchAgent:', e);
+  }
 }
 
 // Start status server
@@ -1816,6 +1915,9 @@ app.whenReady().then(() => {
     tray.setToolTip(`${getAppDisplayName()} ${getVersionString()}`);
   }
   
+  // Clean up orphaned files from previous installs
+  cleanupOrphans();
+
   // Set up auto-updater
   setupAutoUpdater();
 
