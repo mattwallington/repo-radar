@@ -26,16 +26,18 @@ function getVersion() {
 
 const APP_VERSION = getVersion();
 
-const STATUS_PORT = 3847;
+// Dev builds use a different port so they don't conflict with production
+const STATUS_PORT = isDevBuild() ? 3848 : 3847;
 
-// Request single instance lock - only one app instance allowed
-const gotTheLock = app.requestSingleInstanceLock();
+// Request single instance lock per app variant (dev and prod can coexist)
+const gotTheLock = app.requestSingleInstanceLock({ appId: isDevBuild() ? 'repo-radar-dev' : 'repo-radar' });
 
 if (!gotTheLock) {
-  console.error('Another instance of Repo Radar is already running!');
+  const appName = getAppDisplayName();
+  console.error(`Another instance of ${appName} is already running!`);
   dialog.showErrorBox(
     'Already Running',
-    'Repo Radar is already running.\n\nOnly one instance can run at a time.\n\nCheck your menubar for the sync icon.'
+    `${appName} is already running.\n\nOnly one instance can run at a time.\n\nCheck your menubar for the sync icon.`
   );
   app.quit();
 }
