@@ -227,9 +227,10 @@ if $IS_DEV; then
     const pkg = JSON.parse(fs.readFileSync('menubar/package.json', 'utf8'));
     pkg.build.appId = 'com.mattwallington.repo-radar-dev';
     pkg.build.productName = 'Repo Radar Dev';
+    pkg.build.mac.icon = 'assets/icon-dev.icns';
     fs.writeFileSync('menubar/package.json', JSON.stringify(pkg, null, 2) + '\n');
   "
-  success "Temporarily set appId/productName for dev build"
+  success "Temporarily set appId/productName/icon for dev build"
 fi
 
 info "Installing dependencies..."
