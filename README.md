@@ -10,7 +10,7 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 
 ## Features
 
-- **Automated sync** of GitHub repositories on a configurable schedule
+- **Automated sync** of GitHub repositories on a configurable schedule (with network-aware retries after sleep)
 - **AI-powered metadata** generation using 60+ models from Anthropic, Google, and OpenAI
 - **macOS menubar app** with progress tracking, settings UI, and scheduling
 - **Auto-updates** — the app checks for new versions and offers one-click updates
@@ -123,6 +123,8 @@ Set `repos_dir` in your `config.json` to change where repos are synced:
 ## Contributing
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for development setup, architecture, release process, and the dev branch workflow.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
