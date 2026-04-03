@@ -113,6 +113,7 @@ let settingsWindow = null;
 let errorWindow = null;
 let statusServer = null;
 let currentSyncProcess = null;
+let syncCancelledByUser = false;
 let lastStatus = null;
 let animationInterval = null;
 let animationFrame = 0;
@@ -834,7 +835,9 @@ function triggerSync() {
   if (currentSyncProcess) {
     return; // Already syncing
   }
-  
+
+  syncCancelledByUser = false;
+
   // Reset status for new sync
   const status = loadStatus();
   status.logOutput = '';
@@ -1051,21 +1054,32 @@ function triggerSync() {
       logSyncState('process-exited');
       
       // IMMEDIATE cleanup and UI update - don't wait
+      const wasCancelled = syncCancelledByUser;
       currentSyncProcess = null;
+      syncCancelledByUser = false;
       stopIconAnimation();
       updateTrayMenu();
-      
+
       // Close log file
       if (syncLogStream) {
         syncLogStream.end();
       }
-      
+
+      // If user cancelled, stay on idle icon — don't show error
+      if (wasCancelled) {
+        console.log('Sync was cancelled by user, keeping idle icon');
+        const status = loadStatus();
+        saveStatus(status);
+        updateTrayMenu();
+        return;
+      }
+
       // Then handle status update asynchronously
       setTimeout(() => {
         const status = loadStatus();
-        
+
         console.log('Final status check - hasErrors:', status.hasErrors, 'errors:', status.stats?.errors);
-        
+
         if (code === 0) {
           status.lastSync = new Date().toISOString();
           // Check if errors were reported via status updates
@@ -1084,7 +1098,7 @@ function triggerSync() {
           showErrorIcon();
           status.hasErrors = true;
         }
-        
+
         saveStatus(status);
         updateTrayMenu();
       }, 500); // Wait 500ms for final status updates to arrive
@@ -1684,11 +1698,14 @@ ipcMain.on('stop-sync', (event) => {
     console.error('Error killing sync process:', e);
   }
   
+  // Mark as user-cancelled so the close handler doesn't show error icon
+  syncCancelledByUser = true;
+
   // Update status immediately (don't wait for process to exit)
   const status = loadStatus();
   status.logOutput = (status.logOutput || '') + '\n\n⏹ Sync cancelled by user\n';
   saveStatus(status);
-  
+
   // Stop icon animation
   stopIconAnimation();
   updateTrayMenu();
@@ -1875,11 +1892,19 @@ app.whenReady().then(() => {
   // Create tray
   const icon = createTrayIcon('white', 0);
   if (!icon) {
-    console.error('Failed to create tray icon!');
+    console.error('Failed to create tray icon, quitting to avoid invisible process');
+    app.quit();
     return;
   }
   tray = new Tray(icon);
-  
+
+  // Safety: if tray creation succeeded but becomes invalid, quit rather than run invisibly
+  if (!tray || tray.isDestroyed()) {
+    console.error('Tray creation failed silently, quitting to avoid invisible process');
+    app.quit();
+    return;
+  }
+
   // Update menu initially
   updateTrayMenu();
   
@@ -1952,6 +1977,14 @@ app.whenReady().then(() => {
     }
   }, 60000); // Check every minute (not 10 seconds)
   
+  // Quit if tray disappears (prevents invisible zombie process)
+  setInterval(() => {
+    if (!tray || tray.isDestroyed()) {
+      console.error('Tray icon lost, quitting to avoid invisible process');
+      app.quit();
+    }
+  }, 30000);
+
   // Prevent dock icon
   if (app.dock) {
     app.dock.hide();
