@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import random
+import socket
 import traceback
 import hashlib
 from pathlib import Path
@@ -19,6 +20,22 @@ from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker
 from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
+
+
+def wait_for_network(host="github.com", port=443, timeout=60, interval=3):
+    """Wait for network connectivity before starting sync.
+
+    Returns True if network is available, False if timed out.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.close()
+            return True
+        except OSError:
+            time.sleep(interval)
+    return False
 
 
 def sync_mode(args):
@@ -53,6 +70,17 @@ def sync_mode(args):
 
     console.print(f"[bold]Repository Sync[/bold]")
     console.print()
+
+    # Wait for network connectivity (handles laptop wake from sleep)
+    if not wait_for_network():
+        console.print(f"[red]No network connectivity after 60s. Aborting sync.[/red]")
+        if args.status_server:
+            send_status_update('complete', {
+                'total': 0, 'errors': 0, 'cloned': 0, 'updated': 0,
+                'skipped': 0, 'metadata_generated': 0,
+                'message': 'No network connectivity'
+            }, args.status_server)
+        return 1
 
     # Load configuration
     config = load_config()
@@ -283,9 +311,17 @@ def sync_mode(args):
                 if branch:
                     run_git_command(['git', 'checkout', branch], cwd=repo_path, check=False)
 
-                # Fetch from origin
-                result = run_git_command(['git', 'fetch', 'origin'], cwd=repo_path, check=False)
-                if result.returncode != 0:
+                # Fetch from origin (retry up to 3 times for transient network issues)
+                fetch_ok = False
+                for attempt in range(3):
+                    result = run_git_command(['git', 'fetch', 'origin'], cwd=repo_path, check=False)
+                    if result.returncode == 0:
+                        fetch_ok = True
+                        break
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))  # 2s, 4s backoff
+
+                if not fetch_ok:
                     progress.update(task_id, completed=100, status=f"[red]✗ fetch failed[/red]")
                     if args.status_server:
                         send_status_update('progress', {
