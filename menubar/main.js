@@ -1875,11 +1875,19 @@ app.whenReady().then(() => {
   // Create tray
   const icon = createTrayIcon('white', 0);
   if (!icon) {
-    console.error('Failed to create tray icon!');
+    console.error('Failed to create tray icon, quitting to avoid invisible process');
+    app.quit();
     return;
   }
   tray = new Tray(icon);
-  
+
+  // Safety: if tray creation succeeded but becomes invalid, quit rather than run invisibly
+  if (!tray || tray.isDestroyed()) {
+    console.error('Tray creation failed silently, quitting to avoid invisible process');
+    app.quit();
+    return;
+  }
+
   // Update menu initially
   updateTrayMenu();
   
@@ -1952,6 +1960,14 @@ app.whenReady().then(() => {
     }
   }, 60000); // Check every minute (not 10 seconds)
   
+  // Quit if tray disappears (prevents invisible zombie process)
+  setInterval(() => {
+    if (!tray || tray.isDestroyed()) {
+      console.error('Tray icon lost, quitting to avoid invisible process');
+      app.quit();
+    }
+  }, 30000);
+
   // Prevent dock icon
   if (app.dock) {
     app.dock.hide();
