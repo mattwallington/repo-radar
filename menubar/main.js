@@ -752,6 +752,16 @@ function startStatusServer() {
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('rate-limit-update', data);
       }
+    } else if (data.type === 'waiting-for-network') {
+      console.log('Sync waiting for network connectivity...');
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('waiting-for-network');
+      }
+    } else if (data.type === 'network-timeout') {
+      console.log('Network timeout:', data.message);
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('network-timeout', data.message);
+      }
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();
