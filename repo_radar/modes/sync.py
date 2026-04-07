@@ -22,18 +22,24 @@ from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
 
-def wait_for_network(host="github.com", port=443, timeout=60, interval=3):
+def wait_for_network(host="github.com", port=443, timeout=120, interval=2, on_waiting=None):
     """Wait for network connectivity before starting sync.
 
     Returns True if network is available, False if timed out.
+    Calls on_waiting(elapsed) periodically while waiting.
     """
-    deadline = time.time() + timeout
+    start = time.time()
+    deadline = start + timeout
+    notified = False
     while time.time() < deadline:
         try:
             sock = socket.create_connection((host, port), timeout=5)
             sock.close()
             return True
         except OSError:
+            if on_waiting and not notified:
+                on_waiting(0)
+                notified = True
             time.sleep(interval)
     return False
 
@@ -72,13 +78,16 @@ def sync_mode(args):
     console.print()
 
     # Wait for network connectivity (handles laptop wake from sleep)
-    if not wait_for_network():
-        console.print(f"[red]No network connectivity after 60s. Aborting sync.[/red]")
+    def _notify_waiting(elapsed):
+        console.print(f"[yellow]Waiting for network connectivity...[/yellow]")
         if args.status_server:
-            send_status_update('complete', {
-                'total': 0, 'errors': 0, 'cloned': 0, 'updated': 0,
-                'skipped': 0, 'metadata_generated': 0,
-                'message': 'No network connectivity'
+            send_status_update('waiting-for-network', {}, args.status_server)
+
+    if not wait_for_network(on_waiting=_notify_waiting):
+        console.print(f"[red]No network connectivity after 120s. Aborting sync.[/red]")
+        if args.status_server:
+            send_status_update('network-timeout', {
+                'message': 'No network connectivity after 120s'
             }, args.status_server)
         return 1
 

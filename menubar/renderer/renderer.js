@@ -409,6 +409,32 @@ ipcRenderer.on('sync-complete', (event, syncStats) => {
     recalculateStats();
 });
 
+ipcRenderer.on('waiting-for-network', (event) => {
+    console.log('Waiting for network connectivity...');
+    const statusText = document.getElementById('status-text');
+    if (statusText) {
+        statusText.textContent = 'Waiting for network...';
+        statusText.style.color = '#f0ad4e';
+    }
+});
+
+ipcRenderer.on('network-timeout', (event, message) => {
+    console.log('Network timeout:', message);
+    const statusText = document.getElementById('status-text');
+    if (statusText) {
+        statusText.textContent = 'No network — sync aborted';
+        statusText.style.color = '#d9534f';
+    }
+
+    // Disable stop button
+    const stopBtn = document.getElementById('stop-sync-btn');
+    if (stopBtn) {
+        stopBtn.disabled = true;
+        stopBtn.classList.remove('active');
+        stopBtn.textContent = '⏹';
+    }
+});
+
 ipcRenderer.on('sync-stopped', (event) => {
     console.log('Sync was stopped by user');
     
