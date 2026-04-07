@@ -114,6 +114,7 @@ let errorWindow = null;
 let statusServer = null;
 let currentSyncProcess = null;
 let syncCancelledByUser = false;
+let syncShowWindow = true;
 let lastStatus = null;
 let animationInterval = null;
 let animationFrame = 0;
@@ -841,12 +842,13 @@ function startStatusServer() {
 }
 
 // Trigger sync
-function triggerSync() {
+function triggerSync({ showWindow = true } = {}) {
   if (currentSyncProcess) {
     return; // Already syncing
   }
 
   syncCancelledByUser = false;
+  syncShowWindow = showWindow;
 
   // Reset status for new sync
   const status = loadStatus();
@@ -906,8 +908,10 @@ function triggerSync() {
   status.syncRepos = reposForUI;
   saveStatus(status);
   
-  // Show log window
-  showLogWindow();
+  // Show log window (only for manual syncs; scheduled syncs run in background)
+  if (showWindow) {
+    showLogWindow();
+  }
   
   // Wait for window to be fully ready before sending sync-started event
   const sendSyncStartedWhenReady = () => {
@@ -1097,6 +1101,10 @@ function triggerSync() {
             console.log('Sync completed but had errors');
             showErrorIcon();
             status.hasErrors = true;
+            // Show progress window on errors if it was a background sync
+            if (!syncShowWindow) {
+              showLogWindow();
+            }
           } else {
             console.log('Sync completed successfully');
             showSuccessIcon();
@@ -1107,6 +1115,10 @@ function triggerSync() {
           console.error('Sync failed with exit code:', code);
           showErrorIcon();
           status.hasErrors = true;
+          // Show progress window on errors if it was a background sync
+          if (!syncShowWindow) {
+            showLogWindow();
+          }
         }
 
         saveStatus(status);
@@ -1763,7 +1775,7 @@ function checkMissedSync() {
     // If never synced before, definitely need to sync
     if (!lastSync) {
       console.log('No previous sync found, triggering initial sync...');
-      setTimeout(() => triggerSync(), 5000); // Wait 5 seconds after startup
+      setTimeout(() => triggerSync({ showWindow: false }), 5000); // Wait 5 seconds after startup
       return;
     }
     
@@ -1777,7 +1789,7 @@ function checkMissedSync() {
       // If it's past the scheduled time today and last sync was before today's scheduled time
       if (now > todayScheduled && lastSync < todayScheduled) {
         console.log(`Missed scheduled sync at ${schedule.time}, catching up now...`);
-        setTimeout(() => triggerSync(), 5000);
+        setTimeout(() => triggerSync({ showWindow: false }), 5000);
         return;
       }
     } else if (schedule.type === 'hourly') {
@@ -1785,7 +1797,7 @@ function checkMissedSync() {
       const interval = schedule.interval || 6;
       if (hoursSinceLastSync >= interval) {
         console.log(`Last sync was ${hoursSinceLastSync.toFixed(1)} hours ago, interval is ${interval} hours. Catching up...`);
-        setTimeout(() => triggerSync(), 5000);
+        setTimeout(() => triggerSync({ showWindow: false }), 5000);
         return;
       }
     } else if (schedule.type === 'weekly') {
@@ -1799,7 +1811,7 @@ function checkMissedSync() {
         
         if (now > todayScheduled && lastSync < todayScheduled) {
           console.log(`Missed scheduled sync on ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][today]} at ${schedule.time}, catching up...`);
-          setTimeout(() => triggerSync(), 5000);
+          setTimeout(() => triggerSync({ showWindow: false }), 5000);
           return;
         }
       }
