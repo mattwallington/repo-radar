@@ -4,6 +4,13 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.16] - 2026-04-07
+
+### Fixed
+- Scheduled syncs now run in the background instead of popping up the progress window (window still appears on manual sync or if errors occur)
+- Sync waits up to 120s for network connectivity after laptop wake, with visible "Waiting for network..." status in the UI
+- Network timeout now shows "No network — sync aborted" instead of a confusing "Complete!" with all repos at "Waiting..."
+
 ## [1.0.15] - 2026-04-03
 
 ### Fixed
