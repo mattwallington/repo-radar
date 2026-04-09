@@ -1,6 +1,6 @@
 {
   "name": "repo-radar",
-  "version": "1.0.20-dev.202604091151",
+  "version": "1.0.21-dev.202604091155",
   "description": "Menu bar app for Repo Radar - pristine repository mirrors with AI-powered metadata",
   "main": "main.js",
   "scripts": {
