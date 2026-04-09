@@ -2,36 +2,51 @@ const { ipcRenderer } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-// Set up logging for renderer
+// Renderer logging.
+//
+// Previous behavior: every log() call was appended to renderer.log, producing
+// a ~130KB dump of DOM-creation chatter and full repos-array JSON on every
+// run. Useless for LLM review and a token hog.
+//
+// New behavior: log() still writes to the devtools console (so live debugging
+// works), but only messages that look like errors/warnings/failures are
+// persisted to renderer.log. On a healthy run, renderer.log doesn't grow.
 const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
 if (!fs.existsSync(logDir)) {
     fs.mkdirSync(logDir, { recursive: true });
 }
 const rendererLogFile = path.join(logDir, 'renderer.log');
 
-// Create log function that writes to file and console
+// Cap renderer.log at ~1MB. On startup, if it's oversized (e.g. from an old
+// chatty version), truncate it — the file is for error signal, not history.
+try {
+    const stat = fs.statSync(rendererLogFile);
+    if (stat.size > 1024 * 1024) {
+        fs.writeFileSync(rendererLogFile, '');
+    }
+} catch (e) {
+    // File doesn't exist yet — nothing to do
+}
+
+const ERROR_PATTERN = /(?:\bERROR\b|\bWARN(?:ING)?\b|\bfail(?:ed|ure)?\b|✗)/i;
+
 function log(...args) {
+    // Always write to the devtools console
+    console.log(...args);
+
+    // Only persist errors/warnings to disk
+    const message = args
+        .map(arg => (typeof arg === 'object' ? JSON.stringify(arg) : String(arg)))
+        .join(' ');
+    if (!ERROR_PATTERN.test(message)) return;
+
     const timestamp = new Date().toISOString();
-    const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
     const logLine = `[${timestamp}] ${message}\n`;
-    
-    // Write to file
     try {
         fs.appendFileSync(rendererLogFile, logLine);
     } catch (e) {
         console.error('Failed to write to log:', e);
     }
-    
-    // Also log to console
-    console.log(...args);
-}
-
-// Clear log on startup
-try {
-    fs.writeFileSync(rendererLogFile, `=== Renderer Log Started ${new Date().toISOString()} ===\n`);
-    log('Renderer initialized');
-} catch (e) {
-    console.error('Failed to initialize log file:', e);
 }
 
 let repoStates = new Map(); // Map of repo name -> { status, percent, color, fullName, details }

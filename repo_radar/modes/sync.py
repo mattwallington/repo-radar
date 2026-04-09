@@ -22,6 +22,103 @@ from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
 
+# Keep the most recent N per-run log files; older ones are pruned on each sync.
+SYNC_LOG_RETENTION = 10
+
+
+class SyncLogger:
+    """Terse, line-oriented log for an individual sync run.
+
+    One line per meaningful event so the file is cheap for an LLM to review.
+    No progress-bar output, no ANSI codes, no duplicated per-repo chatter.
+    Thread-safe — callable from the git and metadata worker pools.
+    """
+
+    def __init__(self, log_file):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._fh = open(log_file, 'w', buffering=1)  # line-buffered
+
+    def _ts(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def event(self, name, **fields):
+        """Log a single-line event: [HH:MM:SS] event_name k=v k=v"""
+        parts = [f"[{self._ts()}]", name]
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={v}")
+        line = " ".join(parts) + "\n"
+        with self._lock:
+            if self._fh:
+                self._fh.write(line)
+
+    def error(self, name, repo=None, detail=None, **fields):
+        """Log an error event with an indented detail block (e.g. git stderr)."""
+        parts = [f"[{self._ts()}]", name]
+        if repo:
+            parts.append(f"repo={repo}")
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={v}")
+        lines = [" ".join(parts)]
+        if detail:
+            # Trim to the first few non-empty lines to avoid dumping huge tracebacks
+            trimmed = [ln.rstrip() for ln in str(detail).splitlines() if ln.strip()]
+            for ln in trimmed[:8]:
+                lines.append(f"    {ln}")
+            if len(trimmed) > 8:
+                lines.append(f"    ... ({len(trimmed) - 8} more lines)")
+        text = "\n".join(lines) + "\n"
+        with self._lock:
+            if self._fh:
+                self._fh.write(text)
+
+    def close(self):
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+
+
+def _rotate_sync_logs(log_dir, retention=SYNC_LOG_RETENTION):
+    """Keep only the most recent `retention` sync-*.log files in log_dir."""
+    try:
+        existing = sorted(
+            log_dir.glob("sync-*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # Keep (retention - 1) existing files; the new run will become the Nth.
+        for old in existing[max(retention - 1, 0):]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _open_sync_logger():
+    """Create a new per-run log file and return a SyncLogger for it."""
+    log_dir = Path.home() / "Library" / "Logs" / "repo-radar"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    _rotate_sync_logs(log_dir)
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    log_file = log_dir / f"sync-{timestamp}.log"
+    try:
+        return SyncLogger(log_file)
+    except OSError:
+        return None
+
+
 def wait_for_network(host="github.com", port=443, timeout=300, interval=2, required_successes=3, on_waiting=None):
     """Wait for stable network connectivity before starting sync.
 
@@ -87,14 +184,31 @@ def sync_mode(args):
     console.print(f"[bold]Repository Sync[/bold]")
     console.print()
 
+    # Open a per-run log file for LLM-friendly review. Kept separate from the
+    # UI's rich console output: one line per meaningful event, no progress bars,
+    # no ANSI, rotated to the most recent runs.
+    sync_logger = _open_sync_logger()
+    if sync_logger:
+        sync_logger.event(
+            "sync_start",
+            trigger=("scheduled" if not getattr(args, 'show_window', True) else "manual"),
+            dry_run=bool(getattr(args, 'dry_run', False)),
+            skip_metadata=bool(getattr(args, 'skip_metadata', False)),
+        )
+
     # Wait for network connectivity (handles laptop wake from sleep)
     def _notify_waiting(elapsed):
         console.print(f"[yellow]Waiting for network connectivity...[/yellow]")
+        if sync_logger:
+            sync_logger.event("network_wait")
         if args.status_server:
             send_status_update('waiting-for-network', {}, args.status_server)
 
     if not wait_for_network(on_waiting=_notify_waiting):
         console.print(f"[red]No network connectivity. Aborting sync.[/red]")
+        if sync_logger:
+            sync_logger.event("sync_aborted", reason="no_network_connectivity")
+            sync_logger.close()
         if args.status_server:
             send_status_update('network-timeout', {
                 'message': 'No network connectivity'
@@ -143,6 +257,9 @@ def sync_mode(args):
 
     console.print(f"Processing {len(repos)} repositories in parallel...")
     console.print()
+
+    if sync_logger:
+        sync_logger.event("repos_loaded", count=len(repos))
 
     # Create progress bars for each repo
     progress = Progress(
@@ -226,6 +343,12 @@ def sync_mode(args):
 
                 if result.returncode != 0:
                     progress.update(task_id, completed=100, status=f"[red]✗ clone failed[/red]")
+                    if sync_logger:
+                        sync_logger.error(
+                            "clone_failed",
+                            repo=full_name,
+                            detail=getattr(result, 'stderr', None),
+                        )
                     if args.status_server:
                         send_status_update('progress', {
                             'repo': full_name, 'short_name': short_id,
@@ -289,6 +412,13 @@ def sync_mode(args):
                 with stats_lock:
                     stats['cloned'] += 1
 
+                if sync_logger:
+                    sync_logger.event(
+                        "repo_cloned",
+                        repo=full_name,
+                        commit=(commit_hash[:7] if commit_hash else None),
+                    )
+
                 if needs_metadata:
                     with metadata_lock:
                         repos_needing_metadata.append((repo_config, cache_name, commit_hash, short_id, color, task_id))
@@ -339,8 +469,10 @@ def sync_mode(args):
 
                 # Fetch from origin (retry up to 3 times for transient network issues)
                 fetch_ok = False
+                last_fetch_result = None
                 for attempt in range(3):
                     result = run_git_command(['git', 'fetch', 'origin'], cwd=repo_path, check=False)
+                    last_fetch_result = result
                     if result.returncode == 0:
                         fetch_ok = True
                         break
@@ -349,6 +481,12 @@ def sync_mode(args):
 
                 if not fetch_ok:
                     progress.update(task_id, completed=100, status=f"[red]✗ fetch failed[/red]")
+                    if sync_logger:
+                        sync_logger.error(
+                            "fetch_failed",
+                            repo=full_name,
+                            detail=getattr(last_fetch_result, 'stderr', None),
+                        )
                     if args.status_server:
                         send_status_update('progress', {
                             'repo': full_name, 'short_name': short_id,
@@ -377,6 +515,12 @@ def sync_mode(args):
                     result = run_git_command(['git', 'pull'], cwd=repo_path, check=False)
                     if result.returncode != 0:
                         progress.update(task_id, completed=100, status=f"[red]✗ pull failed[/red]")
+                        if sync_logger:
+                            sync_logger.error(
+                                "pull_failed",
+                                repo=full_name,
+                                detail=getattr(result, 'stderr', None),
+                            )
                         if args.status_server:
                             send_status_update('progress', {
                                 'repo': full_name, 'short_name': short_id,
@@ -448,6 +592,17 @@ def sync_mode(args):
                 with stats_lock:
                     stats['updated'] += 1
 
+                if sync_logger:
+                    if old_commit and new_commit and old_commit != new_commit:
+                        sync_logger.event(
+                            "repo_updated",
+                            repo=full_name,
+                            old=old_commit[:7],
+                            new=new_commit[:7],
+                        )
+                    else:
+                        sync_logger.event("repo_unchanged", repo=full_name)
+
                 if needs_metadata:
                     with metadata_lock:
                         repos_needing_metadata.append((repo_config, cache_name, new_commit, short_id, color, task_id))
@@ -473,6 +628,14 @@ Stack Trace:
 {stack_trace}"""
 
             progress.update(task_id, completed=100, status=f"[red]✗ error: {error_msg_short}[/red]")
+
+            if sync_logger:
+                sync_logger.error(
+                    "repo_exception",
+                    repo=repo_config['full_name'],
+                    error_type=error_type,
+                    detail=full_error,
+                )
 
             # Send detailed error to status server
             if args.status_server:
@@ -1092,6 +1255,13 @@ related_repos: {json.dumps(related_repos)}
                     stats['metadata_generated'] += 1
                     stats['api_cost'] += total_api_cost
 
+                if sync_logger:
+                    sync_logger.event(
+                        "metadata_generated",
+                        repo=full_name,
+                        cost=f"${total_api_cost:.4f}",
+                    )
+
                 return total_api_cost
 
             except Exception as e:
@@ -1188,6 +1358,14 @@ Stack Trace:
                 with stats_lock:
                     stats['errors'] += 1
 
+                if sync_logger:
+                    sync_logger.error(
+                        "metadata_failed",
+                        repo=full_name,
+                        error_type=error_type,
+                        detail=full_error,
+                    )
+
                 return 0.0
 
         # Run metadata generation with live progress
@@ -1277,5 +1455,18 @@ Stack Trace:
             completion_data['warning'] = warning_msg
 
         send_status_update('complete', completion_data, args.status_server)
+
+    if sync_logger:
+        sync_logger.event(
+            "sync_complete",
+            total=stats['total'],
+            updated=stats['updated'],
+            cloned=stats['cloned'],
+            skipped=stats['skipped'],
+            errors=stats['errors'],
+            metadata=stats['metadata_generated'],
+            cost=f"${stats['api_cost']:.4f}",
+        )
+        sync_logger.close()
 
     return 0 if stats['errors'] == 0 else 1

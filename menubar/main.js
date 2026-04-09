@@ -1022,23 +1022,15 @@ function triggerSync({ showWindow = true } = {}) {
   
   logSyncState('process-spawned');
   
-  // Create log file for this sync run
-  const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
-  }
-  const syncLogFile = path.join(logDir, 'latest-sync.log');
-  const syncLogStream = fs.createWriteStream(syncLogFile, { flags: 'w' });
-  
-  console.log('Sync log file:', syncLogFile);
-  
-  // Capture output
+  // Per-run sync logs are written directly by the Python sync process to
+  // ~/Library/Logs/repo-radar/sync-<timestamp>.log (with rotation). We no
+  // longer write a duplicate latest-sync.log here — it only captured the
+  // noisy rich-formatted UI stream with ANSI codes and progress bars.
+
+  // Capture output for the UI + in-memory status
   currentSyncProcess.stdout.on('data', (data) => {
     const output = data.toString();
-    
-    // Write to log file
-    syncLogStream.write(output);
-    
+
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', output);
     }
@@ -1046,13 +1038,10 @@ function triggerSync({ showWindow = true } = {}) {
     status.logOutput = (status.logOutput || '') + output;
     saveStatus(status);
   });
-  
+
   currentSyncProcess.stderr.on('data', (data) => {
     const output = data.toString();
-    
-    // Write to log file
-    syncLogStream.write('STDERR: ' + output);
-    
+
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', output);
     }
@@ -1073,11 +1062,6 @@ function triggerSync({ showWindow = true } = {}) {
       syncCancelledByUser = false;
       stopIconAnimation();
       updateTrayMenu();
-
-      // Close log file
-      if (syncLogStream) {
-        syncLogStream.end();
-      }
 
       // If user cancelled, stay on idle icon — don't show error
       if (wasCancelled) {
