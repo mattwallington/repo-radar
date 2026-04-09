@@ -24,11 +24,15 @@ Then open it normally.
 You'll need a GitHub token and at least one AI provider key:
 
 #### GitHub Token (required)
-1. Visit: https://github.com/settings/tokens/new
+
+Repo Radar needs a **classic personal access token** — *not* a fine-grained token. Fine-grained tokens have to be approved by an org admin before they'll work and don't return org repos from the `/user/repos` API that Repo Radar uses for discovery.
+
+1. Visit: https://github.com/settings/tokens/new (this is the "Tokens (classic)" page — make sure the URL ends in `/tokens/new`, not `/tokens?type=beta`)
 2. Name it: "Repo Radar"
 3. Check the box for: `repo` (Full control of private repositories)
 4. Click "Generate token" at the bottom
 5. **Copy the token** (starts with `ghp_...`)
+6. **If your organization uses SAML SSO**, you'll see a "Configure SSO" button next to the new token on the token list page. Click it, pick your org, and click "Authorize" — without this step the token will silently return 404s for org repos. This is self-service and doesn't need admin approval.
 
 #### Anthropic API Key (default AI provider)
 1. Visit: https://console.anthropic.com/settings/keys
@@ -104,6 +108,7 @@ pip3 install litellm==1.82.6 requests inquirer rich
 
 **Sync fails:**
 - Verify your GitHub token: https://github.com/settings/tokens
+- If your org uses SAML SSO, make sure the token is SSO-authorized for the org (click "Configure SSO" next to the token on the tokens page)
 - Verify your API key for the selected model
 - Check Settings -> View the error logs
 

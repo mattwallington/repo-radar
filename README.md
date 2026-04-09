@@ -39,7 +39,7 @@ See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
 
 ### Required
 
-- **GitHub Token** (`GITHUB_TOKEN`) - Personal access token with `repo` scope
+- **GitHub Token** (`GITHUB_TOKEN`) - Classic personal access token with `repo` scope (not a fine-grained token). If your org uses SAML SSO, authorize the token for the org via "Configure SSO" on the [tokens page](https://github.com/settings/tokens).
 - **AI Provider Key** - At least one of:
   - `ANTHROPIC_API_KEY` (default provider)
   - `GEMINI_API_KEY`
