@@ -422,7 +422,7 @@ ipcRenderer.on('network-timeout', (event, message) => {
     console.log('Network timeout:', message);
     const statusText = document.getElementById('status-text');
     if (statusText) {
-        statusText.textContent = 'No network — sync aborted';
+        statusText.textContent = 'No network connectivity — sync aborted';
         statusText.style.color = '#d9534f';
     }
 

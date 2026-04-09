@@ -22,21 +22,31 @@ from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
 
-def wait_for_network(host="github.com", port=443, timeout=120, interval=2, on_waiting=None):
-    """Wait for network connectivity before starting sync.
+def wait_for_network(host="github.com", port=443, timeout=300, interval=2, required_successes=3, on_waiting=None):
+    """Wait for stable network connectivity before starting sync.
 
-    Returns True if network is available, False if timed out.
-    Calls on_waiting(elapsed) periodically while waiting.
+    Requires `required_successes` consecutive successful TCP probes to declare
+    the network stable. A single successful handshake isn't enough — right after
+    the laptop wakes from sleep, one packet may squeak through while DNS, routing,
+    or the VPN are still warming up, causing the sync to start and then fail.
+
+    Returns True if network is stable, False if timed out.
+    Calls on_waiting(elapsed) the first time a probe fails.
     """
     start = time.time()
     deadline = start + timeout
     notified = False
+    successes = 0
     while time.time() < deadline:
         try:
             sock = socket.create_connection((host, port), timeout=5)
             sock.close()
-            return True
+            successes += 1
+            if successes >= required_successes:
+                return True
+            time.sleep(interval)
         except OSError:
+            successes = 0
             if on_waiting and not notified:
                 on_waiting(0)
                 notified = True
@@ -84,10 +94,17 @@ def sync_mode(args):
             send_status_update('waiting-for-network', {}, args.status_server)
 
     if not wait_for_network(on_waiting=_notify_waiting):
-        console.print(f"[red]No network connectivity after 120s. Aborting sync.[/red]")
+        console.print(f"[red]No network connectivity. Aborting sync.[/red]")
         if args.status_server:
             send_status_update('network-timeout', {
-                'message': 'No network connectivity after 120s'
+                'message': 'No network connectivity'
+            }, args.status_server)
+            # Also surface as an error so the "View Errors" list picks it up
+            # for background/scheduled syncs that have no open log window.
+            send_status_update('error', {
+                'repo': 'Network',
+                'message': 'No network connectivity',
+                'fullError': 'Sync aborted: network was unavailable after retrying for 5 minutes.'
             }, args.status_server)
         return 1
 
