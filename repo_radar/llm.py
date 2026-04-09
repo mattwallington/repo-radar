@@ -101,6 +101,7 @@ def get_model_context_window(model):
         "gpt-5.4-mini": 272000,
         "gpt-5.4-nano": 272000,
         "gpt-5.3-codex": 272000,
+        "gpt-5.3-codex-spark": 272000,  # Responses API only
         "gpt-5.2": 272000,
         "gpt-5.2-codex": 272000,
         "gpt-5.2-pro": 272000,
@@ -130,6 +131,80 @@ def get_model_context_window(model):
         "o1-pro": 200000,
     }
     return KNOWN_LIMITS.get(model, 128000)  # Conservative default
+
+
+def _needs_responses_api(model):
+    """True if this model only supports OpenAI's /v1/responses endpoint.
+
+    Newer OpenAI models (all ``-codex`` and most ``-pro`` / ``-deep-research``
+    variants) don't accept /v1/chat/completions requests — they have to go
+    through the Responses API. We check litellm's model cost map to find out,
+    with a name-based heuristic as a fallback for models litellm doesn't know
+    about yet.
+    """
+    try:
+        import litellm
+        info = litellm.model_cost.get(model) or litellm.model_cost.get(f"openai/{model}") or {}
+        endpoints = info.get('supported_endpoints', []) or []
+        mode = info.get('mode', '')
+        if endpoints:
+            return '/v1/responses' in endpoints and '/v1/chat/completions' not in endpoints
+        if mode == 'responses':
+            return True
+    except Exception:
+        pass
+
+    # Fallback heuristic — only for models that look like OpenAI ones
+    lower = model.lower()
+    bare = lower.split('/', 1)[-1] if lower.startswith('openai/') else lower
+    if '/' in bare and not bare.startswith('openai'):
+        return False  # Anthropic / Gemini / etc. never use Responses API
+    return any(marker in bare for marker in ('-codex', '-pro', '-deep-research', 'codex-mini'))
+
+
+def call_llm(model, prompt, max_tokens=8192):
+    """Call an LLM and return (text, api_cost, raw_response).
+
+    Transparently routes between ``litellm.completion`` (Chat Completions,
+    works for Anthropic/Gemini/older OpenAI) and ``litellm.responses``
+    (Responses API, required for newer OpenAI codex/pro/deep-research models).
+
+    Callers get back a single string of generated text, the dollar cost if
+    litellm reports it, and the raw response object so they can still feed
+    it to ``rate_limit_tracker.update_from_response``.
+    """
+    import litellm
+
+    if _needs_responses_api(model):
+        response = litellm.responses(
+            model=model,
+            input=prompt,
+            max_output_tokens=max_tokens,
+        )
+        # Prefer the convenience attribute; fall back to manual extraction.
+        text = getattr(response, 'output_text', None)
+        if not text:
+            try:
+                text = response.output[0].content[0].text
+            except (AttributeError, IndexError, TypeError):
+                text = ''
+    else:
+        response = litellm.completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        try:
+            text = response.choices[0].message.content or ''
+        except (AttributeError, IndexError):
+            text = ''
+
+    api_cost = 0.0
+    hidden = getattr(response, '_hidden_params', None)
+    if isinstance(hidden, dict):
+        api_cost = hidden.get('response_cost') or 0.0
+
+    return text, api_cost, response
 
 
 def get_chunking_threshold(model):
@@ -314,8 +389,6 @@ def chunk_repo_files(files, model, max_tokens=None):
 
 def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
     """Analyze a chunk of repository files."""
-    import litellm
-
     # Format files for prompt
     files_content = []
     for file_info in chunk:
@@ -351,19 +424,7 @@ Repository files:
 
     for retry in range(max_retries):
         try:
-            response = litellm.completion(
-                model=get_ai_model(),
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=8192
-            )
-
-            analysis = response.choices[0].message.content
-
-            # Get API cost
-            api_cost = 0.0
-            if hasattr(response, '_hidden_params') and 'response_cost' in response._hidden_params:
-                api_cost = response._hidden_params['response_cost']
-
+            analysis, api_cost, _ = call_llm(get_ai_model(), prompt, max_tokens=8192)
             return analysis, api_cost
 
         except Exception as e:
@@ -399,7 +460,6 @@ Repository files:
 
 def combine_chunk_analyses(full_name, analyses):
     """Combine multiple chunk analyses into a cohesive report."""
-    import litellm
 
     combined_prompt = f"""You are reviewing multiple analyses of different parts of the repository "{full_name}".
 
@@ -451,19 +511,9 @@ Here are the analyses to combine:
 
     for retry in range(max_retries):
         try:
-            response = litellm.completion(
-                model=get_ai_model(),
-                messages=[{"role": "user", "content": combined_prompt}],
-                max_tokens=16384
+            final_analysis, api_cost, _ = call_llm(
+                get_ai_model(), combined_prompt, max_tokens=16384
             )
-
-            final_analysis = response.choices[0].message.content
-
-            # Get API cost
-            api_cost = 0.0
-            if hasattr(response, '_hidden_params') and 'response_cost' in response._hidden_params:
-                api_cost = response._hidden_params['response_cost']
-
             return final_analysis, api_cost
 
         except Exception as e:

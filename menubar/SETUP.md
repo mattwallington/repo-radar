@@ -88,24 +88,25 @@ The snippet tells the assistant where `~/repos-pristine/` is, how to read the `I
 
 ## AI Model Options
 
-The app supports multiple AI models for metadata generation. Set via Settings or the `AI_MODEL` environment variable.
+Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown groups models into "⭐ Recommended" (the current picks) and a longer list of older-but-still-usable options.
 
-**Anthropic Claude (Default):**
-- **Claude Sonnet 4.6 (1M context)** - Default. Excellent quality with massive context window
-- **Claude Opus 4.6 (1M context)** - Highest quality, 1M context
-- Claude Haiku 4.5 - Fast and efficient
+**⭐ Recommended — Anthropic Claude:**
+- **Claude Sonnet 4.6** — default, 1M context window
+- **Claude Opus 4.6** — highest quality, 1M context
+- **Claude Haiku 4.5** — fast and cheap, 200K context
 - Requires: `ANTHROPIC_API_KEY`
 
-**Google Gemini:**
-- Gemini 3.0 Pro/Flash - 1M token context
-- Gemini 2.5 Pro/Flash - Previous generation
+**⭐ Recommended — Google Gemini:**
+- **Gemini 3.1 Pro Preview** — 1M context
+- **Gemini 3.0 Flash Preview** — 1M context, fastest
 - Requires: `GEMINI_API_KEY`
 
-**OpenAI:**
-- **Codex (gpt-5.3-codex)** - Code-optimized model
-- GPT-4o / GPT-4o Mini
-- o1-preview / o1-mini
+**⭐ Recommended — OpenAI:**
+- **GPT-5.4** — 1M context
+- **GPT-5.4 Mini** — 272K context, cheaper
+- **GPT-5.3 Codex Spark** — code-optimized, 272K context
 - Requires: `OPENAI_API_KEY`
+- Note: OpenAI `codex` and `-pro` variants use the newer Responses API. The app routes them automatically, so you can pick them freely.
 
 ## Troubleshooting
 

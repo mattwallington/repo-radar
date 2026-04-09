@@ -47,15 +47,15 @@ See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
 
 ### AI Models
 
-The default model is `claude-sonnet-4-6` (1M context window). Override in the menubar Settings.
+The default model is `claude-sonnet-4-6` (1M context window). Override in the menubar Settings — the top "⭐ Recommended" section lists the current picks; older models are still available in the other sections.
 
-Supported models include:
+Pinned recommended models:
 
 | Provider | Models | Context |
 |----------|--------|---------|
-| Anthropic | **Claude Sonnet 4.6**, Claude Opus 4.6, Haiku 4.5, and older | Up to 1M tokens |
-| Google | Gemini 3.1 Pro, 3.0 Pro/Flash, 2.5 Pro/Flash | 1M tokens |
-| OpenAI | GPT-5.4/Pro (1M), GPT-5.x, Codex, GPT-4.1/4o, o1/o3/o4 | 128K-1M tokens |
+| Anthropic | **Claude Sonnet 4.6** (default), Claude Opus 4.6, Claude Haiku 4.5 | 1M / 1M / 200K |
+| Google | Gemini 3.1 Pro Preview, Gemini 3.0 Flash Preview | 1M |
+| OpenAI | GPT-5.4, GPT-5.4 Mini, GPT-5.3 Codex Spark | 1M / 272K / 272K |
 
 ### LLM Integration
 

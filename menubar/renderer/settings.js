@@ -13,7 +13,7 @@ ipcRenderer.on('config-loaded', (event, config) => {
         gemini_api_key: '',
         anthropic_api_key: '',
         openai_api_key: '',
-        ai_model: 'gemini/gemini-3-pro-preview',
+        ai_model: 'claude-sonnet-4-6',
         repositories: [],
         last_configured: null
     };
@@ -80,7 +80,7 @@ function renderForm() {
     // Render AI model
     const aiModelSelect = document.getElementById('ai-model');
     if (aiModelSelect) {
-        aiModelSelect.value = configData.ai_model || 'gemini/gemini-3-pro-preview';
+        aiModelSelect.value = configData.ai_model || 'claude-sonnet-4-6';
         // Highlight the required API key for the selected model
         highlightRequiredApiKey(aiModelSelect.value);
     }

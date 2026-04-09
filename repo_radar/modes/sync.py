@@ -17,7 +17,7 @@ from repo_radar.config import load_config, save_config, load_cache_index, save_c
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker
+from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm
 from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
@@ -877,10 +877,8 @@ Repository files:
 {combined_content}
 """
 
-                                response = litellm.completion(
-                                    model=current_model,
-                                    messages=[{"role": "user", "content": prompt}],
-                                    max_tokens=8192
+                                analysis, api_cost, response = call_llm(
+                                    current_model, prompt, max_tokens=8192
                                 )
 
                                 # Update rate limit tracker
@@ -890,11 +888,6 @@ Repository files:
                                 rate_status = rate_limit_tracker.get_status_string()
                                 if rate_status != "Rate limits: Unknown":
                                     console.print(f"    [dim]{rate_status}[/dim]")
-
-                                analysis = response.choices[0].message.content
-                                api_cost = 0.0
-                                if hasattr(response, '_hidden_params') and 'response_cost' in response._hidden_params:
-                                    api_cost = response._hidden_params['response_cost']
 
                                 chunk_analyses.append(analysis)
                                 total_api_cost += api_cost
@@ -982,16 +975,12 @@ Here are the analyses to combine:
                                 for part_idx, analysis_part in enumerate(chunk_analyses, 1):
                                     combined_prompt += f"\n--- Analysis Part {part_idx} ---\n{analysis_part}\n"
 
-                                response = litellm.completion(
-                                    model=current_model_combine,
-                                    messages=[{"role": "user", "content": combined_prompt}],
-                                    max_tokens=16384
+                                analysis, combine_cost, response = call_llm(
+                                    current_model_combine, combined_prompt, max_tokens=16384
                                 )
 
                                 # Update rate limit tracker
                                 rate_limit_tracker.update_from_response(response)
-
-                                analysis = response.choices[0].message.content
 
                                 # Success! Break out of retry loop
                                 break
@@ -1026,8 +1015,7 @@ Here are the analyses to combine:
                                         raise Exception(f"Rate limit exceeded on combine after {max_retries} retries")
                                 else:
                                     raise
-                        if hasattr(response, '_hidden_params') and 'response_cost' in response._hidden_params:
-                            total_api_cost += response._hidden_params['response_cost']
+                        total_api_cost += combine_cost
                 else:
                     # Repo fits in context - single analysis
                     meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
@@ -1088,10 +1076,8 @@ Repository files:
 
                             meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
 
-                            response = litellm.completion(
-                                model=current_model,
-                                messages=[{"role": "user", "content": prompt}],
-                                max_tokens=16384
+                            analysis, single_cost, response = call_llm(
+                                current_model, prompt, max_tokens=16384
                             )
 
                             # Update rate limit tracker
@@ -1112,10 +1098,7 @@ Repository files:
                                     'limit_tokens': rate_limit_tracker.limits.get('tokens')
                                 }, args.status_server)
 
-                            analysis = response.choices[0].message.content
-                            total_api_cost = 0.0
-                            if hasattr(response, '_hidden_params') and 'response_cost' in response._hidden_params:
-                                total_api_cost = response._hidden_params['response_cost']
+                            total_api_cost = single_cost
 
                             # Success! Break out of retry loop
                             break
