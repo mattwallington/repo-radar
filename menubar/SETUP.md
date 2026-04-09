@@ -97,22 +97,23 @@ Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown g
 - Requires: `ANTHROPIC_API_KEY`
 
 **⭐ Recommended — Google Gemini:**
-- **Gemini 3.1 Pro Preview** — 1M context
+- **Gemini 3.1 Pro Preview** — 1M context, highest quality
 - **Gemini 3.0 Flash Preview** — 1M context, fastest
+- **Gemini 3.1 Flash Lite Preview** — 1M context, cheapest
 - Requires: `GEMINI_API_KEY`
 
 **⭐ Recommended — OpenAI:**
 - **GPT-5.4** — 1M context
 - **GPT-5.4 Mini** — 272K context, cheaper
-- **GPT-5.3 Codex Spark** — code-optimized, 272K context
+- **GPT-5.4 Nano** — 272K context, cheapest
 - Requires: `OPENAI_API_KEY`
-- Note: OpenAI `codex` and `-pro` variants use the newer Responses API. The app routes them automatically, so you can pick them freely.
+- Note: OpenAI `codex` and `-pro` variants (in the "other" section of the dropdown) use the newer Responses API. The app routes them automatically, so you can pick them freely.
 
 ## Troubleshooting
 
 **"Command not found" or Python errors:**
 ```bash
-pip3 install litellm==1.82.6 requests inquirer rich
+pip3 install litellm==1.83.4 requests inquirer rich
 ```
 
 **App doesn't appear in menu bar:**

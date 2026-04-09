@@ -54,8 +54,8 @@ Pinned recommended models:
 | Provider | Models | Context |
 |----------|--------|---------|
 | Anthropic | **Claude Sonnet 4.6** (default), Claude Opus 4.6, Claude Haiku 4.5 | 1M / 1M / 200K |
-| Google | Gemini 3.1 Pro Preview, Gemini 3.0 Flash Preview | 1M |
-| OpenAI | GPT-5.4, GPT-5.4 Mini, GPT-5.3 Codex Spark | 1M / 272K / 272K |
+| Google | Gemini 3.1 Pro Preview, Gemini 3.0 Flash Preview, Gemini 3.1 Flash Lite Preview | 1M |
+| OpenAI | GPT-5.4, GPT-5.4 Mini, GPT-5.4 Nano | 1M / 272K / 272K |
 
 ### LLM Integration
 

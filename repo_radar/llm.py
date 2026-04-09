@@ -101,7 +101,6 @@ def get_model_context_window(model):
         "gpt-5.4-mini": 272000,
         "gpt-5.4-nano": 272000,
         "gpt-5.3-codex": 272000,
-        "gpt-5.3-codex-spark": 272000,  # Responses API only
         "gpt-5.2": 272000,
         "gpt-5.2-codex": 272000,
         "gpt-5.2-pro": 272000,
