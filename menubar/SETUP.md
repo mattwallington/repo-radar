@@ -67,6 +67,18 @@ Click the menu bar icon -> **Sync Now**
 
 Your repositories will be cloned to `~/repos-pristine/` by default (configurable via `repos_dir` in config.json).
 
+### 5. Tell your AI assistant where the repos live
+
+So Claude Code (or any other AI assistant you use) can actually take advantage of the pristine mirrors, point it at them.
+
+1. Click the menu bar icon -> **Copy LLM Config**
+2. Paste the snippet into one of:
+   - `~/.claude/CLAUDE.md` (global, applies to every Claude Code session)
+   - `~/.claude/rules/` (global rules directory — one file per topic)
+   - A project's `CLAUDE.md` / `AGENTS.md` (per-repo)
+
+The snippet tells the assistant where `~/repos-pristine/` is, how to read the `INDEX.md` file to discover related repos, and the metadata workflow for pulling in cross-repo context without reading full source trees.
+
 ## Daily Use
 
 - **Auto-sync**: Happens automatically at your scheduled time
