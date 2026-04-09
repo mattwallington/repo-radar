@@ -23,7 +23,7 @@
             <div class="form-group">
                 <label for="github-token">GitHub Token</label>
                 <input type="password" id="github-token" placeholder="ghp_..." class="form-control">
-                <small class="form-help">Personal Access Token with 'repo' scope (<a href="https://github.com/settings/tokens/new" target="_blank">Get token</a>)</small>
+                <small class="form-help">Classic PAT with <code>repo</code> scope — not a fine-grained token (<a href="https://github.com/settings/tokens/new" target="_blank">Get token</a>). For SSO orgs, click "Configure SSO" next to the token after creating it.</small>
             </div>
             <div class="form-group api-key-group" data-provider="gemini">
                 <label for="gemini-api-key">
@@ -52,35 +52,44 @@
             <div class="form-group">
                 <label for="ai-model">AI Model</label>
                 <select id="ai-model" class="form-control">
-                    <optgroup label="Google Gemini (Recommended - Auto-fallback enabled)">
-                        <option value="gemini/gemini-3-pro-preview">Gemini 3.0 Pro Preview 🔥 [1M context → ~785K chunks]</option>
-                        <option value="gemini/gemini-3-flash-preview">Gemini 3.0 Flash Preview ⚡ [1M context → ~785K chunks]</option>
-                        <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro [1M context → ~785K chunks]</option>
-                        <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash [1M context → ~785K chunks]</option>
-                        <option value="gemini/gemini-2.0-flash-exp">Gemini 2.0 Flash Experimental [1M context → ~785K chunks]</option>
-                        <option value="gemini/gemini-2.0-flash-001">Gemini 2.0 Flash [1M context → ~785K chunks]</option>
+                    <optgroup label="⭐ Recommended (latest)">
+                        <option value="claude-sonnet-4-6">Claude Sonnet 4.6 [1M context]</option>
+                        <option value="claude-opus-4-6">Claude Opus 4.6 [1M context]</option>
+                        <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 [200K context]</option>
+                        <option value="gemini/gemini-3.1-pro-preview">Gemini 3.1 Pro Preview [1M context]</option>
+                        <option value="gemini/gemini-3-flash-preview">Gemini 3.0 Flash Preview [1M context]</option>
+                        <option value="gemini/gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite Preview [1M context, cheap]</option>
+                        <option value="gpt-5.4">GPT-5.4 [1M context]</option>
+                        <option value="gpt-5.4-mini">GPT-5.4 Mini [272K context]</option>
+                        <option value="gpt-5.4-nano">GPT-5.4 Nano [272K context, cheapest]</option>
                     </optgroup>
-                    <optgroup label="Anthropic Claude (Latest - Sep 2025)">
-                        <option value="claude-sonnet-4-5-20250929">Claude Sonnet 4.5 🔥 [200K context → 150K usable]</option>
+                    <optgroup label="Anthropic Claude (other)">
+                        <option value="claude-opus-4-5">Claude Opus 4.5 [200K context]</option>
+                        <option value="claude-sonnet-4-5">Claude Sonnet 4.5 [200K context]</option>
+                        <option value="claude-opus-4-1">Claude Opus 4.1 [200K context]</option>
+                        <option value="claude-3-7-sonnet-20250219">Claude 3.7 Sonnet [200K context]</option>
+                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet [200K context]</option>
                     </optgroup>
-                    <optgroup label="Anthropic Claude (Stable)">
-                        <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet [200K context → 150K usable]</option>
-                        <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku [200K context → 150K usable]</option>
+                    <optgroup label="Google Gemini (other)">
+                        <option value="gemini/gemini-3-pro-preview">Gemini 3.0 Pro Preview [1M context]</option>
+                        <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro [1M context]</option>
+                        <option value="gemini/gemini-2.5-flash">Gemini 2.5 Flash [1M context]</option>
+                        <option value="gemini/gemini-2.0-flash-001">Gemini 2.0 Flash [1M context]</option>
                     </optgroup>
-                    <optgroup label="Anthropic Claude (Older)">
-                        <option value="claude-3-opus-20240229">Claude 3 Opus [200K context → 150K usable]</option>
-                        <option value="claude-3-sonnet-20240229">Claude 3 Sonnet [200K context → 150K usable]</option>
-                        <option value="claude-3-haiku-20240307">Claude 3 Haiku [200K context → 150K usable]</option>
-                    </optgroup>
-                    <optgroup label="OpenAI GPT">
-                        <option value="gpt-4o">GPT-4o [128K context → 96K usable]</option>
-                        <option value="gpt-4o-mini">GPT-4o Mini [128K context → 96K usable]</option>
-                        <option value="o1-preview">o1-preview [128K context → 96K usable]</option>
-                        <option value="o1-mini">o1-mini [128K context → 96K usable]</option>
-                        <option value="gpt-4-turbo">GPT-4 Turbo [128K context → 96K usable]</option>
+                    <optgroup label="OpenAI GPT (other)">
+                        <option value="gpt-5.4-pro">GPT-5.4 Pro [1M context]</option>
+                        <option value="gpt-5.3-codex">GPT-5.3 Codex [272K context]</option>
+                        <option value="gpt-5.2">GPT-5.2 [272K context]</option>
+                        <option value="gpt-5.2-codex">GPT-5.2 Codex [272K context]</option>
+                        <option value="gpt-5.1">GPT-5.1 [272K context]</option>
+                        <option value="gpt-5">GPT-5 [272K context]</option>
+                        <option value="gpt-5-mini">GPT-5 Mini [272K context]</option>
+                        <option value="gpt-4.1">GPT-4.1 [1M context]</option>
+                        <option value="gpt-4.1-mini">GPT-4.1 Mini [1M context]</option>
+                        <option value="gpt-4o">GPT-4o [128K context]</option>
                     </optgroup>
                 </select>
-                <small class="form-help">Choose the AI model for metadata generation. All Gemini models have ~785K per chunk. If rate limited, auto-falls back to next model (each has separate quota). Fallback chain: 3.0 Pro → 3.0 Flash → 2.5 Pro → 2.5 Flash → 2.0 models.</small>
+                <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Chunk size is ~75% of context (1M → ~785K, 200K → ~150K). OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
             </div>
         </div>
         

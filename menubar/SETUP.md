@@ -24,11 +24,15 @@ Then open it normally.
 You'll need a GitHub token and at least one AI provider key:
 
 #### GitHub Token (required)
-1. Visit: https://github.com/settings/tokens/new
+
+Repo Radar needs a **classic personal access token** — *not* a fine-grained token. Fine-grained tokens have to be approved by an org admin before they'll work and don't return org repos from the `/user/repos` API that Repo Radar uses for discovery.
+
+1. Visit: https://github.com/settings/tokens/new (this is the "Tokens (classic)" page — make sure the URL ends in `/tokens/new`, not `/tokens?type=beta`)
 2. Name it: "Repo Radar"
 3. Check the box for: `repo` (Full control of private repositories)
 4. Click "Generate token" at the bottom
 5. **Copy the token** (starts with `ghp_...`)
+6. **If your organization uses SAML SSO**, you'll see a "Configure SSO" button next to the new token on the token list page. Click it, pick your org, and click "Authorize" — without this step the token will silently return 404s for org repos. This is self-service and doesn't need admin approval.
 
 #### Anthropic API Key (default AI provider)
 1. Visit: https://console.anthropic.com/settings/keys
@@ -63,6 +67,18 @@ Click the menu bar icon -> **Sync Now**
 
 Your repositories will be cloned to `~/repos-pristine/` by default (configurable via `repos_dir` in config.json).
 
+### 5. Tell your AI assistant where the repos live
+
+So Claude Code (or any other AI assistant you use) can actually take advantage of the pristine mirrors, point it at them.
+
+1. Click the menu bar icon -> **Copy LLM Config**
+2. Paste the snippet into one of:
+   - `~/.claude/CLAUDE.md` (global, applies to every Claude Code session)
+   - `~/.claude/rules/` (global rules directory — one file per topic)
+   - A project's `CLAUDE.md` / `AGENTS.md` (per-repo)
+
+The snippet tells the assistant where `~/repos-pristine/` is, how to read the `INDEX.md` file to discover related repos, and the metadata workflow for pulling in cross-repo context without reading full source trees.
+
 ## Daily Use
 
 - **Auto-sync**: Happens automatically at your scheduled time
@@ -72,30 +88,32 @@ Your repositories will be cloned to `~/repos-pristine/` by default (configurable
 
 ## AI Model Options
 
-The app supports multiple AI models for metadata generation. Set via Settings or the `AI_MODEL` environment variable.
+Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown groups models into "⭐ Recommended" (the current picks) and a longer list of older-but-still-usable options.
 
-**Anthropic Claude (Default):**
-- **Claude Sonnet 4.6 (1M context)** - Default. Excellent quality with massive context window
-- **Claude Opus 4.6 (1M context)** - Highest quality, 1M context
-- Claude Haiku 4.5 - Fast and efficient
+**⭐ Recommended — Anthropic Claude:**
+- **Claude Sonnet 4.6** — default, 1M context window
+- **Claude Opus 4.6** — highest quality, 1M context
+- **Claude Haiku 4.5** — fast and cheap, 200K context
 - Requires: `ANTHROPIC_API_KEY`
 
-**Google Gemini:**
-- Gemini 3.0 Pro/Flash - 1M token context
-- Gemini 2.5 Pro/Flash - Previous generation
+**⭐ Recommended — Google Gemini:**
+- **Gemini 3.1 Pro Preview** — 1M context, highest quality
+- **Gemini 3.0 Flash Preview** — 1M context, fastest
+- **Gemini 3.1 Flash Lite Preview** — 1M context, cheapest
 - Requires: `GEMINI_API_KEY`
 
-**OpenAI:**
-- **Codex (gpt-5.3-codex)** - Code-optimized model
-- GPT-4o / GPT-4o Mini
-- o1-preview / o1-mini
+**⭐ Recommended — OpenAI:**
+- **GPT-5.4** — 1M context
+- **GPT-5.4 Mini** — 272K context, cheaper
+- **GPT-5.4 Nano** — 272K context, cheapest
 - Requires: `OPENAI_API_KEY`
+- Note: OpenAI `codex` and `-pro` variants (in the "other" section of the dropdown) use the newer Responses API. The app routes them automatically, so you can pick them freely.
 
 ## Troubleshooting
 
 **"Command not found" or Python errors:**
 ```bash
-pip3 install litellm==1.82.6 requests inquirer rich
+pip3 install litellm==1.83.4 requests inquirer rich
 ```
 
 **App doesn't appear in menu bar:**
@@ -104,6 +122,7 @@ pip3 install litellm==1.82.6 requests inquirer rich
 
 **Sync fails:**
 - Verify your GitHub token: https://github.com/settings/tokens
+- If your org uses SAML SSO, make sure the token is SSO-authorized for the org (click "Configure SSO" next to the token on the tokens page)
 - Verify your API key for the selected model
 - Check Settings -> View the error logs
 
