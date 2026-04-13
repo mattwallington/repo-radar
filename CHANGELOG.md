@@ -4,7 +4,7 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased
+## [1.0.26] - 2026-04-13
 
 ### Fixed
 - Reopening the progress window during an active sync no longer shows a blank "Waiting for sync to start…" screen. The window now replays the current live state (repos list + per-repo progress from the persisted status file) on mid-sync reopen and continues updating as new progress events arrive. Previously the `did-finish-load` handler early-returned whenever a sync was running, leaving the freshly-loaded renderer with no repo rows and silently dropping every incoming `progress-update`.
