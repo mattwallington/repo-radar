@@ -115,6 +115,10 @@ let statusServer = null;
 let currentSyncProcess = null;
 let syncCancelledByUser = false;
 let syncShowWindow = true;
+// One-shot flag: triggerSync sets this before creating the progress window so
+// that the window's did-finish-load handler knows a fresh sync-started event
+// is already on its way and should skip the mid-sync replay path.
+let pendingFreshSync = false;
 let lastStatus = null;
 let animationInterval = null;
 let animationFrame = 0;
@@ -908,11 +912,15 @@ function triggerSync({ showWindow = true } = {}) {
   status.syncRepos = reposForUI;
   saveStatus(status);
   
-  // Show log window (only for manual syncs; scheduled syncs run in background)
+  // Show log window (only for manual syncs; scheduled syncs run in background).
+  // Set pendingFreshSync BEFORE creating the window so showLogWindow's
+  // did-finish-load handler skips its mid-sync replay — sendSyncStartedWhenReady
+  // below will deliver the fresh sync-started event instead.
   if (showWindow) {
+    pendingFreshSync = true;
     showLogWindow();
   }
-  
+
   // Wait for window to be fully ready before sending sync-started event
   const sendSyncStartedWhenReady = () => {
     if (logWindow && !logWindow.isDestroyed() && logWindow.webContents) {
@@ -922,19 +930,21 @@ function triggerSync({ showWindow = true } = {}) {
         setTimeout(sendSyncStartedWhenReady, 100);
         return;
       }
-      
+
       console.log('Window ready, sending sync-started event with', reposForUI.length, 'repos');
-      
+
       // Show warning if key is missing
       if (!configValid) {
         console.warn(validationMessage);
         logWindow.webContents.send('terminal-output', `\n${validationMessage}\n\n`);
       }
-      
+
       // Send event
       logWindow.webContents.send('sync-started', { total: repoCount, repos: reposForUI });
+      pendingFreshSync = false;
     } else {
       console.warn('Log window not available for sync-started event');
+      pendingFreshSync = false;
     }
   };
   
@@ -1180,19 +1190,50 @@ function showLogWindow() {
     logWindow.show();
   });
   
-  // Load previous sync status after window is fully loaded
-  // BUT only if a sync is not currently running (otherwise sendSyncStartedWhenReady handles it)
+  // After the window finishes loading, decide what to show:
+  //   1. Fresh sync (pendingFreshSync): skip — sendSyncStartedWhenReady will
+  //      deliver the authoritative sync-started event with the live repos list.
+  //   2. Mid-sync reopen (currentSyncProcess active, flag not set): replay the
+  //      current live state from disk so the new renderer rebuilds its DOM
+  //      rows and can receive subsequent progress-update events.
+  //   3. Idle reopen: replay the most recent completed sync's status.
   logWindow.webContents.once('did-finish-load', () => {
     setTimeout(() => {
-      // If a sync is actively running, don't replay old data - the sync flow will send fresh data
-      if (currentSyncProcess) {
-        console.log('Sync in progress, skipping old status replay');
+      if (pendingFreshSync) {
+        console.log('Fresh sync pending, skipping replay (sendSyncStartedWhenReady will send sync-started)');
         return;
       }
 
       const status = loadStatus();
 
-      // If there was a previous sync, show those repos
+      if (currentSyncProcess) {
+        // Mid-sync reopen: the sync is running but no sync-started event is
+        // queued for this new window. Rebuild the view from persisted live
+        // state so incoming progress-update events land on existing DOM rows.
+        const liveRepos = (status.syncRepos && status.syncRepos.length > 0)
+          ? status.syncRepos
+          : (status.repos || []).map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' }));
+
+        if (liveRepos.length === 0) {
+          console.log('Mid-sync reopen but no repos on disk to replay');
+          return;
+        }
+
+        console.log('Mid-sync reopen: replaying live state for', liveRepos.length, 'repos');
+        logWindow.webContents.send('sync-started', { total: liveRepos.length, repos: liveRepos });
+
+        (status.repos || []).forEach(repo => {
+          logWindow.webContents.send('progress-update', {
+            repo: repo.name,
+            status: repo.status,
+            percent: repo.percent || 0,
+            color: repo.color || 'cyan'
+          });
+        });
+        return;
+      }
+
+      // Idle reopen: replay the most recent completed sync.
       if (status.repos && status.repos.length > 0) {
         logWindow.webContents.send('sync-started', { total: status.stats?.total || status.repos.length, repos: status.repos.map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' })) });
 
