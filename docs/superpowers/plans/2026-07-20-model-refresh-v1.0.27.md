@@ -21,6 +21,20 @@
 - **Provider detection** must handle `gemini/`, `claude`/`anthropic/`, and `gpt`/`openai/`/o-series (`o1`/`o3`/`o4`)/`codex`/`chatgpt/`/`chatgpt-`.
 - **Release gate is stdlib-only** — no pytest dependency on the release path.
 - **Commit discipline:** stage by exact path (never `git add -A`). All work on `feature/model-refresh-2026`.
+- **Release window:** target release date is **≥ 2026-07-23** (five codex keys die that day). All gate verifications use `--target-date 2026-07-23`; the July-21-fails case is an *expected* failure (proves the gate blocks a premature release).
+
+---
+
+## Prerequisites — dev environment (do first)
+The worktree's system `python3` lacks `pytest` and litellm 1.93.0, and a Python 3.10 interpreter may be absent. Before Task 1, provision a dev venv used by every `.venv/bin/python -m pytest` / matrix step below:
+```bash
+cd /Users/matt/.claude-worktrees/repo-radar-model-refresh
+# Ensure a 3.10–3.14 python exists (pyenv: `pyenv install 3.10.14 && pyenv local 3.10.14`, or `brew install python@3.12`).
+python3.12 -m venv .venv           # or python3.10/3.11/3.13/3.14 — any in [3.10,3.15)
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -r requirements.txt pytest   # requirements pins litellm==1.93.0 after Task 7
+```
+> `.venv/` is gitignored (verify) — never commit it. Run all pytest and the litellm-matrix test with `.venv/bin/python -m pytest ...`. The **release gate** (`scripts/check_model_lifecycle.py`) is stdlib-only and runs under any `python3`, not the venv.
 
 ---
 
@@ -39,7 +53,7 @@
 - `menubar/SETUP.md`, `README.md`, `CHANGELOG.md` — **modify.** model tables + entry.
 - `release.sh` — **modify.** invoke the gate in preflight.
 - `repo_radar/tests/test_llm.py` — **modify.** Update assertions.
-- `repo_radar/tests/test_lifecycle_gate.py`, `menubar/__tests__/model-policy.test.js`, `menubar/__tests__/drift-check.js` — **new.**
+- `repo_radar/tests/test_lifecycle_gate.py`, `repo_radar/tests/test_litellm_matrix.py`, `menubar/__tests__/model-policy.test.js`, `menubar/__tests__/drift-check.js`, `menubar/__tests__/dropdown.test.js` — **new.**
 
 ---
 
@@ -118,7 +132,7 @@ Also update the existing window assertions in `test_llm.py` (were `claude-sonnet
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/matt/.claude-worktrees/repo-radar-model-refresh && python3 -m pytest repo_radar/tests/test_llm.py -q`
+Run: `cd /Users/matt/.claude-worktrees/repo-radar-model-refresh && .venv/bin/python -m pytest repo_radar/tests/test_llm.py -q`
 Expected: FAIL (AttributeError: module has no attribute `DEFAULT_MODEL` / `provider_for_model`, etc.)
 
 - [ ] **Step 3: Implement the policy in `repo_radar/llm.py`**
@@ -223,7 +237,7 @@ def provider_for_model(model):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python3 -m pytest repo_radar/tests/test_llm.py -q`
+Run: `.venv/bin/python -m pytest repo_radar/tests/test_llm.py -q`
 Expected: PASS (all tests). If `gpt-5.1-codex-mini`→`gpt-5.4-mini` fails the provider invariant, both are `openai` — it passes.
 
 - [ ] **Step 5: Commit**
@@ -248,55 +262,120 @@ git commit -m "feat(llm): centralized model policy, refreshed catalog, non-Gemin
 
 `repo_radar/tests/test_lifecycle_gate.py`:
 ```python
-import json, subprocess, sys, datetime
+import json, subprocess, sys, datetime, tempfile, os
 from pathlib import Path
 from repo_radar import llm
 from scripts import check_model_lifecycle as gate
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "repo_radar" / "model_lifecycle.json"
+JUL23 = datetime.date(2026, 7, 23)
+OK = "https://example.com/x"
 
-def test_manifest_covers_exact_model_set():
+def _tmp(rows):
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(rows, f); f.close(); return f.name
+
+def _run(rows, known, migs, target=JUL23):
+    p = _tmp(rows)
+    try:
+        return gate.check(p, set(known), set(migs), target)
+    finally:
+        os.unlink(p)
+
+def test_real_manifest_exact_set_and_passes_at_release():
     rows = json.loads(MANIFEST.read_text())
     ids = [r["id"] for r in rows]
     assert len(ids) == len(set(ids)), "duplicate ids in manifest"
     assert set(ids) == set(llm.KNOWN_LIMITS) | set(llm.MODEL_MIGRATIONS)
+    assert gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS), JUL23) == []
 
-def test_gate_passes_for_release_on_or_after_jul23():
-    failures = gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS),
-                          datetime.date(2026, 7, 23))
-    assert failures == [], failures
+def test_happy_row_passes():
+    assert _run(
+        [{"id": "k", "status": "active", "shutdown_date": None, "source_url": OK},
+         {"id": "m", "status": "retired", "shutdown_date": "2026-07-01", "source_url": OK}],
+        {"k"}, {"m"}) == []
 
-def test_gate_fails_if_known_model_shutdown_before_target():
-    # a KNOWN_LIMITS id whose manifest shutdown_date is before target must fail
-    failures = gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS),
-                          datetime.date(2099, 1, 1))
-    # by 2099 everything with any shutdown date is down; active-null-shutdown stay ok,
-    # but any KNOWN_LIMITS id with a future-but-now-past date fails -> non-empty is acceptable here
-    assert isinstance(failures, list)
+def test_failures_are_returned_not_raised():
+    cases = [
+        # (rows, known, migs, substring-in-some-failure)
+        ([{"id":"k","status":"active","shutdown_date":None,"source_url":OK},
+          {"id":"k","status":"retired","shutdown_date":"2026-01-01","source_url":OK}], {"k"}, set(), "duplicate"),
+        ([], {"k"}, set(), "missing"),                                                    # missing row
+        ([{"id":"x","status":"active","shutdown_date":None,"source_url":OK}], set(), set(), "extra"),
+        ([{"id":"k","status":"retired","shutdown_date":None,"source_url":OK}], {"k"}, set(), "status=active"),
+        ([{"id":"m","status":"active","shutdown_date":"2026-07-01","source_url":OK}], set(), {"m"}, "status=retired"),
+        ([{"id":"k","status":"active","shutdown_date":"2026-07-01","source_url":OK}], {"k"}, set(), "<= target"),  # known dies before target
+        ([{"id":"m","status":"retired","shutdown_date":None,"source_url":OK}], set(), {"m"}, "not on/before"),      # migration key null
+        ([{"id":"m","status":"retired","shutdown_date":"2026-08-01","source_url":OK}], set(), {"m"}, "not on/before"),# future
+        ([{"id":"k","status":"active","shutdown_date":"nope","source_url":OK}], {"k"}, set(), None),                # malformed date -> some failure, no raise
+        ([{"id":"k","status":"active","shutdown_date":None,"source_url":"http://x"}], {"k"}, set(), "source_url"),  # non-https
+        ([{"id":"k","status":"active","source_url":OK}], {"k"}, set(), None),                                       # missing shutdown_date key -> failure, no raise
+    ]
+    for rows, known, migs, sub in cases:
+        fails = _run(rows, known, migs)   # must not raise
+        assert fails, (rows, "expected failures")
+        if sub:
+            assert any(sub in f for f in fails), (sub, fails)
 
 def test_cli_requires_iso_date():
     p = subprocess.run([sys.executable, str(ROOT / "scripts" / "check_model_lifecycle.py"),
                         "--target-date", "not-a-date"], capture_output=True, text=True)
-    assert p.returncode != 0
+    assert p.returncode != 0 and "invalid" in p.stderr.lower()
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `python3 -m pytest repo_radar/tests/test_lifecycle_gate.py -q`
+Run: `.venv/bin/python -m pytest repo_radar/tests/test_lifecycle_gate.py -q`
 Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 
-- [ ] **Step 3: Write the manifest**
+- [ ] **Step 3: Write the manifest from the checked source table**
 
-`repo_radar/model_lifecycle.json` — one row per KNOWN_LIMITS id (status `"active"`, shutdown `null` or a future date) and per MODEL_MIGRATIONS key (status `"retired"`, shutdown ≤ 2026-07-23). Use the vendor deprecation pages as `source_url`. Shape:
-```json
-[
-  {"id": "claude-sonnet-5", "status": "active", "shutdown_date": null, "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"},
-  {"id": "gpt-5.2-codex", "status": "retired", "shutdown_date": "2026-07-23", "source_url": "https://developers.openai.com/api/docs/deprecations"},
-  {"id": "gemini/gemini-2.0-flash-001", "status": "retired", "shutdown_date": "2026-06-01", "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"}
-]
-```
-Enumerate **every** id in `llm.KNOWN_LIMITS` and `llm.MODEL_MIGRATIONS`. Source URLs: Anthropic `https://platform.claude.com/docs/en/about-claude/model-deprecations`; OpenAI `https://developers.openai.com/api/docs/deprecations`; Google `https://ai.google.dev/gemini-api/docs/deprecations`. Active models with no announced shutdown → `shutdown_date: null`. (A generator one-liner may seed the rows, but the file is committed and hand-verified.)
+`repo_radar/model_lifecycle.json` has one row per id in `llm.KNOWN_LIMITS` ∪ `llm.MODEL_MIGRATIONS`. Generate mechanically from the two tables below, then **the operator manually re-verifies each date against its `source_url` before commit** (§8). Source URLs: Anthropic `A = https://platform.claude.com/docs/en/about-claude/model-deprecations`; OpenAI `O = https://developers.openai.com/api/docs/deprecations`; Google `G = https://ai.google.dev/gemini-api/docs/deprecations`.
+
+**(a) Migration keys → `status:"retired"`, exact `shutdown_date` (all ≤ 2026-07-23):**
+| id | shutdown_date | src |
+|---|---|---|
+| claude-3-7-sonnet-20250219 | 2026-02-19 | A |
+| claude-3-5-sonnet-20241022 | 2025-10-28 | A |
+| claude-3-5-sonnet-20240620 | 2025-10-28 | A |
+| claude-3-sonnet-20240229 | 2025-07-21 | A |
+| claude-3-5-haiku-20241022 | 2026-02-19 | A |
+| claude-3-haiku-20240307 | 2026-04-19 | A |
+| claude-3-opus-20240229 | 2026-01-05 | A |
+| claude-opus-4-20250514 | 2026-06-15 | A |
+| claude-4-opus-20250514 | 2026-06-15 | A |
+| claude-sonnet-4-20250514 | 2026-06-15 | A |
+| claude-4-sonnet-20250514 | 2026-06-15 | A |
+| o1-preview | 2025-07-28 | O |
+| o1-mini | 2025-10-27 | O |
+| codex-mini-latest | 2026-02-12 | O |
+| gpt-5-codex | 2026-07-23 | O |
+| gpt-5.1-codex | 2026-07-23 | O |
+| gpt-5.1-codex-max | 2026-07-23 | O |
+| gpt-5.1-codex-mini | 2026-07-23 | O |
+| gpt-5.2-codex | 2026-07-23 | O |
+| gemini/gemini-2.0-flash | 2026-06-01 | G |
+| gemini/gemini-2.0-flash-001 | 2026-06-01 | G |
+| gemini/gemini-2.0-flash-exp | 2026-06-01 | G |
+| gemini/gemini-2.0-flash-lite | 2026-06-01 | G |
+| gemini/gemini-3-pro-preview | 2026-03-09 | G |
+| gemini/gemini-3.1-flash-lite-preview | 2026-05-25 | G |
+| gemini/gemini-1.5-pro | 2025-09-24 | G |
+| gemini/gemini-1.5-flash | 2025-09-24 | G |
+
+**(b) KNOWN_LIMITS → `status:"active"`.** `shutdown_date` is a **future** date for the deprecated-but-active ones, else `null`:
+| id (or family) | shutdown_date | src |
+|---|---|---|
+| claude-opus-4-1, claude-opus-4-1-20250805 | 2026-08-05 | A |
+| gemini/gemini-2.5-pro, -flash, -flash-lite | 2026-10-16 | G |
+| gpt-4-turbo | 2026-10-23 | O |
+| o1, o1-pro | 2026-10-23 | O |
+| o3, o3-mini, o3-pro | 2026-12-11 | O |
+| gpt-5, gpt-5-mini, gpt-5-nano | 2026-12-11 | O |
+| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+*), gpt-5.3-codex, gpt-5.1, gpt-4.1(+*), gpt-4o(+mini), o4-mini, gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
+
+Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
 
 - [ ] **Step 4: Write the stdlib gate**
 
@@ -308,43 +387,65 @@ import argparse, json, sys, datetime
 from pathlib import Path
 
 
+def _parsed(sd):
+    try:
+        return datetime.date.fromisoformat(sd)
+    except (TypeError, ValueError):
+        return None
+
+
 def check(manifest_path, known_ids, migration_keys, target_date):
+    """Return a list of failure strings (never raises for malformed rows)."""
     failures = []
-    rows = json.loads(Path(manifest_path).read_text())
-    ids = [r["id"] for r in rows]
+    try:
+        rows = json.loads(Path(manifest_path).read_text())
+    except Exception as e:
+        return [f"manifest unreadable: {e}"]
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        return ["manifest must be a JSON array of objects"]
+    ids = [r.get("id") for r in rows]
     if len(ids) != len(set(ids)):
         failures.append("duplicate ids in manifest")
     manifest_ids = set(ids)
     expected = set(known_ids) | set(migration_keys)
-    if manifest_ids != expected:
-        failures.append(f"manifest != KNOWN∪MIGRATIONS; missing={expected-manifest_ids}; extra={manifest_ids-expected}")
-    by_id = {r["id"]: r for r in rows}
+    if expected - manifest_ids:
+        failures.append(f"manifest missing ids: {sorted(expected - manifest_ids)}")
+    if manifest_ids - expected:
+        failures.append(f"manifest has extra ids: {sorted(manifest_ids - expected)}")
+    by_id = {r.get("id"): r for r in rows}
     for r in rows:
-        if not (isinstance(r.get("source_url"), str) and r["source_url"].startswith("https://")):
-            failures.append(f"{r['id']}: source_url must be non-empty https")
+        rid = r.get("id", "<no-id>")
+        url = r.get("source_url")
+        if not (isinstance(url, str) and url.startswith("https://")):
+            failures.append(f"{rid}: source_url must be non-empty https")
+        if "shutdown_date" not in r:
+            failures.append(f"{rid}: missing shutdown_date key")
     for kid in known_ids:
         r = by_id.get(kid)
         if not r:
             continue
-        sd = r.get("shutdown_date")
         if r.get("status") != "active":
             failures.append(f"{kid}: KNOWN model must be status=active")
-        if sd is not None and _parse(sd) <= target_date:
-            failures.append(f"{kid}: KNOWN model shutdown {sd} <= target {target_date}")
+        sd = r.get("shutdown_date")
+        if sd is not None:
+            d = _parsed(sd)
+            if d is None:
+                failures.append(f"{kid}: malformed shutdown_date {sd!r}")
+            elif d <= target_date:
+                failures.append(f"{kid}: KNOWN model shutdown {sd} <= target {target_date}")
     for mk in migration_keys:
         r = by_id.get(mk)
         if not r:
             continue
-        sd = r.get("shutdown_date")
         if r.get("status") != "retired":
             failures.append(f"{mk}: migration key must be status=retired")
-        if sd is None or _parse(sd) > target_date:
+        sd = r.get("shutdown_date")
+        d = _parsed(sd) if sd is not None else None
+        if sd is not None and d is None:
+            failures.append(f"{mk}: malformed shutdown_date {sd!r}")
+        elif d is None or d > target_date:
             failures.append(f"{mk}: migration key shutdown {sd} not on/before target {target_date}")
     return failures
-
-
-def _parse(s):
-    return datetime.date.fromisoformat(s)
 
 
 def main():
@@ -379,7 +480,7 @@ Add empty `scripts/__init__.py` if `from scripts import` needs it (create it so 
 
 Run:
 ```bash
-python3 -m pytest repo_radar/tests/test_lifecycle_gate.py -q
+.venv/bin/python -m pytest repo_radar/tests/test_lifecycle_gate.py -q
 python3 scripts/check_model_lifecycle.py --target-date 2026-07-23
 ```
 Expected: pytest PASS; CLI prints "model lifecycle gate OK ..." and exits 0.
@@ -408,15 +509,18 @@ Add to `repo_radar/tests/test_modes.py` (or create `test_sync_provider.py`):
 import repo_radar.modes.sync as sync
 import inspect
 
-def test_sync_uses_provider_for_model():
+def test_sync_all_three_clusters_use_provider_for_model():
     src = inspect.getsource(sync)
-    assert "provider_for_model(" in src
-    assert "startswith('o1')" not in src  # old o1-only checks removed
+    # all three detection clusters replaced (>=3 calls), and the old model-shaped
+    # startswith branches gone entirely (so no cluster silently remains).
+    assert src.count("provider_for_model(") >= 3
+    for old in ("startswith('o1')", "startswith('gpt')", "startswith('claude')", "startswith('gemini/')"):
+        assert old not in src, f"stale provider branch remains: {old}"
 ```
 
 - [ ] **Step 2: Run to verify fail**
 
-Run: `python3 -m pytest repo_radar/tests/test_modes.py -q -k provider`
+Run: `.venv/bin/python -m pytest repo_radar/tests/test_modes.py -q -k provider`
 Expected: FAIL (`provider_for_model(` not yet in sync.py).
 
 - [ ] **Step 3: Edit the three clusters**
@@ -435,7 +539,7 @@ Preserve each cluster's surrounding message/return logic (`:753-758` sets `api_k
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `python3 -m pytest repo_radar/tests/ -q`
+Run: `.venv/bin/python -m pytest repo_radar/tests/ -q`
 Expected: PASS (full suite).
 
 - [ ] **Step 5: Commit**
@@ -586,8 +690,8 @@ git commit -m "feat(menubar): shared JS model-policy + cross-language drift chec
 ## Task 5: Wire the JS consumers (main.js + settings.js)
 
 **Files:**
-- Modify: `menubar/main.js` (require at top; `:889-905` validation; `:1014` AI_MODEL export; `:1523-1539` LaunchAgent wrapper)
-- Modify: `menubar/renderer/settings.js` (require at top; `:83` load; `:408-414` + `:460-475` provider; save handler)
+- Modify: `menubar/main.js` (require at top; `:889-905` validation; `~:1005-1007` AI_MODEL export; `:1523-1539` LaunchAgent wrapper)
+- Modify: `menubar/renderer/settings.js` (require at top; config default `:11`; `:83` load; `:408-414` + `:460-475` provider; save handler)
 
 **Interfaces — Consumes:** `providerForModel`, `migrateModel`, `DEFAULT_MODEL`, `KNOWN_MODEL_IDS` from `model-policy`.
 
@@ -595,12 +699,13 @@ git commit -m "feat(menubar): shared JS model-policy + cross-language drift chec
 
 Near the top of `menubar/main.js` add: `const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-policy');`
 - `:889` replace the stray default `'gemini/gemini-3-pro-preview'` and detection: `const model = migrateModel(config.ai_model || DEFAULT_MODEL); const provider = providerForModel(model);` then `if (provider === 'gemini') {...} else if (provider === 'anthropic') {...} else if (provider === 'openai') {...}`.
-- `:1014` where `AI_MODEL` is exported to the spawned sync: `shellEnv.AI_MODEL = migrateModel(config.ai_model || DEFAULT_MODEL);`
-- `:1523-1539` in the LaunchAgent `run-sync.sh` generation, export the migrated model: compute `const aiModel = migrateModel(config.ai_model || DEFAULT_MODEL);` and write `export AI_MODEL="${aiModel}"`.
+- `~:1005-1007` (grep `shellEnv.AI_MODEL` to confirm the exact line) where `AI_MODEL` is exported to the spawned sync: `shellEnv.AI_MODEL = migrateModel(config.ai_model || DEFAULT_MODEL);`
+- `:1523-1539` in the LaunchAgent `run-sync.sh` generation: **preserve the file's existing shell-escaping pattern** (the wrapper already single-quotes exported values). Compute `const aiModel = migrateModel(config.ai_model || DEFAULT_MODEL);` and emit the export using the **same single-quote form already used for the API keys** in that block (e.g. `export AI_MODEL='${aiModel}'` matching the surrounding `export GEMINI_API_KEY='...'` lines) — do NOT switch to double quotes (would allow `$`/backtick/`"` in a saved value to alter the wrapper). Model IDs are `[a-z0-9._/-]`, but keep the escape for consistency + safety.
 
 - [ ] **Step 2: Add requires + migrate load/save (settings.js)**
 
 Near the top add: `const { providerForModel, migrateModel, DEFAULT_MODEL, KNOWN_MODEL_IDS } = require('../model-policy');`
+- **`:11` config-object default** — the fallback `configData = { ..., ai_model: 'claude-sonnet-4-6', ... }` must become `ai_model: DEFAULT_MODEL` (else a first-run/empty config defaults to 4.6, since 4.6 is valid+unmigrated and never reaches `DEFAULT_MODEL`).
 - `:408-414` and `:460-475`: replace the `startsWith('gpt')||startsWith('o1')` branches with `const p = providerForModel(model); if (p === 'gemini') requiredProvider='gemini'; else if (p==='anthropic') requiredProvider='anthropic'; else if (p==='openai') requiredProvider='openai';` (and the save-validation equivalent).
 - `:83` load block — replace `aiModelSelect.value = configData.ai_model` with:
 ```js
@@ -616,7 +721,7 @@ if ([...select.options].some(o => o.value === migrated)) {
   select.value = DEFAULT_MODEL;
 }
 ```
-- Save handler: persist `migrateModel(select.value)` into `configData.ai_model` before writing config.
+- **Save handler** (a *different* callback — the `select` above is scoped to `renderForm()`): re-query the element and persist migrated — `const sel = document.getElementById('ai-model'); configData.ai_model = migrateModel(sel.value || DEFAULT_MODEL);` before writing config.
 
 - [ ] **Step 3: Verify parse + require resolution**
 
@@ -643,19 +748,46 @@ git commit -m "feat(menubar): route consumers through model-policy; migrate at a
 
 - [ ] **Step 1: Replace the `<optgroup>` set** with the 18 IDs grouped per spec §2.3 (Recommended 7 / Anthropic 3 / Google 3 / OpenAI 3 / Advanced-Responses 2). Label `gemini/gemini-3.1-pro-preview` "(Preview)"; give the Advanced group a label like "Advanced — Responses API (higher cost/latency)". Set `claude-sonnet-5` as the pre-selected option. Update `:50` help "For GPT and o1 models" → "For GPT and o-series models".
 
-- [ ] **Step 2: Verify every option value ∈ KNOWN_MODEL_IDS**
+- [ ] **Step 2: Assert the dropdown structure executably** (`menubar/__tests__/dropdown.test.js`)
 
-Run:
-```bash
-node -e "const fs=require('fs');const {KNOWN_MODEL_IDS}=require('./menubar/model-policy');const html=fs.readFileSync('menubar/renderer/settings.html','utf8');const vals=[...html.matchAll(/<option value=\"([^\"]+)\">/g)].map(m=>m[1]).filter(v=>v.includes('/')||v.startsWith('claude')||v.startsWith('gpt')||v.startsWith('o'));vals.forEach(v=>{if(!KNOWN_MODEL_IDS.has(v))throw new Error('dropdown value not known: '+v)});console.log('dropdown OK',vals.length)"
+```js
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const { KNOWN_MODEL_IDS, DEFAULT_MODEL } = require('../model-policy');
+
+const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+// scope to the ai-model select
+const sel = html.slice(html.indexOf('id="ai-model"'));
+const selBody = sel.slice(0, sel.indexOf('</select>'));
+
+const groups = (selBody.match(/<optgroup/g) || []).length;
+assert.strictEqual(groups, 5, `expected 5 optgroups, got ${groups}`);
+
+const EXPECTED = [
+  'claude-sonnet-5','claude-opus-4-8','claude-haiku-4-5','gemini/gemini-3.5-flash','gemini/gemini-3.1-flash-lite','gpt-5.6-terra','gpt-5.6-luna',
+  'claude-fable-5','claude-opus-4-7','claude-sonnet-4-6',
+  'gemini/gemini-3.1-pro-preview','gemini/gemini-2.5-pro','gemini/gemini-2.5-flash',
+  'gpt-5.6-sol','gpt-5.5','o3',
+  'gpt-5.3-codex','gpt-5.5-pro',
+];
+const values = [...selBody.matchAll(/<option value="([^"]+)"/g)].map(m => m[1]);
+assert.strictEqual(values.length, 18, `expected 18 options, got ${values.length}`);
+assert.deepStrictEqual(values.slice().sort(), EXPECTED.slice().sort(), 'dropdown value set mismatch');
+for (const v of values) assert.ok(KNOWN_MODEL_IDS.has(v), `dropdown value not in KNOWN_MODEL_IDS: ${v}`);
+assert.ok(EXPECTED.includes(DEFAULT_MODEL), 'DEFAULT_MODEL must be a dropdown option');
+// default selected
+const defOpt = selBody.match(new RegExp(`<option value="${DEFAULT_MODEL}"[^>]*selected`));
+assert.ok(defOpt, `DEFAULT_MODEL (${DEFAULT_MODEL}) must be the pre-selected option`);
+console.log('dropdown OK: 18 options, 5 groups,', DEFAULT_MODEL, 'selected');
 ```
-Expected: "dropdown OK 18". (Adjust the filter if the schedule select's non-model options are caught.)
+Run: `node menubar/__tests__/dropdown.test.js` → Expected: "dropdown OK: 18 options, 5 groups, claude-sonnet-5 selected". Commit this test with the HTML in Step 3.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add menubar/renderer/settings.html
-git commit -m "feat(menubar): refresh AI-model dropdown to current lineups"
+git add menubar/renderer/settings.html menubar/__tests__/dropdown.test.js
+git commit -m "feat(menubar): refresh AI-model dropdown to current lineups (+structure test)"
 ```
 
 ---
@@ -680,22 +812,42 @@ if [ "$PYMAJ" -ne 3 ] || [ "$PYMIN" -lt 10 ] || [ "$PYMIN" -ge 15 ]; then
   exit 1
 fi
 ```
-Change the install line to `python3 -m pip install -r requirements.txt`. Fix the stale "Gemini API key" default wording if present.
+Check for pip via **`python3 -m pip`** (not a separate `pip3` binary), and make the install **resource-relative**: `python3 -m pip install -q -r "$SCRIPT_DIR/requirements.txt"` (setup.sh runs from an install path, not the repo root). Fix the stale "Gemini API key" default wording if present.
 
-- [ ] **Step 3: Verify in a clean 3.10 env**
+- [ ] **Step 3: Write the litellm 1.93.0 full-matrix test** (`repo_radar/tests/test_litellm_matrix.py`)
 
-Run (documented; requires a clean 3.10):
+This is the spec §2.1 invariant 6 check (dev-time; requires litellm 1.93.0 in `.venv`):
+```python
+import pytest
+from repo_radar import llm
+litellm = pytest.importorskip("litellm")
+
+def test_every_known_model_resolves_on_litellm_1_93():
+    import importlib.metadata as md
+    assert tuple(int(x) for x in md.version("litellm").split(".")[:2]) >= (1, 93)
+    for mid, ctx in llm.KNOWN_LIMITS.items():
+        info = litellm.get_model_info(mid)          # raises if unknown -> test fails loudly
+        assert info.get("litellm_provider") == llm.provider_for_model(mid), (mid, info.get("litellm_provider"))
+        assert info.get("mode") in ("chat", "responses"), (mid, info.get("mode"))
+        if mid == "gpt-5.3-codex":
+            continue                                 # vendor 400K != litellm 272K, per spec
+        assert info.get("max_input_tokens") == ctx, (mid, info.get("max_input_tokens"), ctx)
+```
+
+- [ ] **Step 4: Verify**
+
 ```bash
-python3.10 -m venv /tmp/rr310 && /tmp/rr310/bin/python -m pip install -r requirements.txt && /tmp/rr310/bin/python -c "import litellm; print(litellm.__version__ if hasattr(litellm,'__version__') else __import__('importlib.metadata').metadata.version('litellm'))"
+.venv/bin/python -m pytest repo_radar/tests/test_litellm_matrix.py -q   # needs litellm 1.93.0 in .venv
+python3.12 -m venv /tmp/rr312 && /tmp/rr312/bin/python -m pip install -q -r requirements.txt && /tmp/rr312/bin/python -c "import importlib.metadata as m;print('litellm',m.version('litellm'))"
 bash -n menubar/resources/setup.sh
 ```
-Expected: install succeeds; `bash -n` clean.
+Expected: matrix test PASS; clean-venv install prints `litellm 1.93.0`; `bash -n` clean. (Use whichever 3.10–3.14 interpreter is installed.)
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add requirements.txt pyproject.toml menubar/resources/setup.sh
-git commit -m "build: pin litellm==1.93.0, raise Python floor to >=3.10,<3.15 with setup guard"
+git add requirements.txt pyproject.toml menubar/resources/setup.sh repo_radar/tests/test_litellm_matrix.py
+git commit -m "build: pin litellm==1.93.0, Python >=3.10,<3.15 guard, full-matrix test"
 ```
 
 ---
@@ -732,10 +884,15 @@ python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
 }
 ```
 
-- [ ] **Step 2: Verify (dry-run friendly)**
+- [ ] **Step 2: Verify — gate is green at the release window, red before it**
 
-Run: `bash -n release.sh && python3 scripts/check_model_lifecycle.py --target-date "$(date +%Y-%m-%d)"`
-Expected: `bash -n` clean; gate prints OK for today's date (today ≥ 2026-07-23 given the release window).
+`release.sh` keeps `$(date +%Y-%m-%d)` (real date) so a genuine early release correctly blocks. Verify both directions explicitly:
+```bash
+bash -n release.sh
+python3 scripts/check_model_lifecycle.py --target-date 2026-07-23   # PASS (codex keys retired on/before target)
+python3 scripts/check_model_lifecycle.py --target-date 2026-07-21 ; echo "exit=$?"   # EXPECTED FAIL (codex keys still active) -> exit=1
+```
+Expected: `bash -n` clean; the 07-23 gate prints OK (exit 0); the 07-21 gate prints the codex-key failures and `exit=1` — that's the gate correctly refusing a pre-2026-07-23 release.
 
 - [ ] **Step 3: Commit**
 
@@ -751,14 +908,14 @@ git commit -m "feat(release): gate the release on the model lifecycle manifest"
 - [ ] **Step 1: Run the full suites**
 
 ```bash
-python3 -m pytest repo_radar/tests/ -q
-node menubar/__tests__/model-policy.test.js && node menubar/__tests__/drift-check.js
+.venv/bin/python -m pytest repo_radar/tests/ -q          # incl. test_llm, test_lifecycle_gate, test_litellm_matrix
+node menubar/__tests__/model-policy.test.js && node menubar/__tests__/drift-check.js && node menubar/__tests__/dropdown.test.js
 node --check menubar/main.js && node --check menubar/renderer/settings.js
-python3 scripts/check_model_lifecycle.py --target-date "$(date +%Y-%m-%d)"
+python3 scripts/check_model_lifecycle.py --target-date 2026-07-23
 ```
-Expected: pytest all pass; JS tests OK; parse clean; gate OK.
+Expected: pytest all pass (incl. the 19-ID litellm matrix); JS tests OK; parse clean; gate OK at the 2026-07-23 release window.
 
-- [ ] **Step 2: Manual settings smoke** (deferred to dev prerelease per spec §8, but sanity now): confirm `menubar/renderer/settings.html` renders the 4 groups and that a config with a retired `ai_model` (e.g. `gpt-5.2-codex`) loads as its migrated value.
+- [ ] **Step 2: Manual settings smoke** (deferred to dev prerelease per spec §8, but sanity now): confirm `menubar/renderer/settings.html` renders the **five** option groups and that a config with a retired `ai_model` (e.g. `gpt-5.2-codex`) loads as its migrated value (`gpt-5.3-codex`).
 
 - [ ] **Step 3:** No commit — this is verification only. Proceed to the spec's §8 release flow (merge to `dev`, dev prerelease + smoke incl. Sonnet 5 vs 4.6 latency/cost, then `main` → v1.0.27, reconcile `main`→`dev`).
 
@@ -767,4 +924,6 @@ Expected: pytest all pass; JS tests OK; parse clean; gate OK.
 ## Self-Review Notes
 - **Spec coverage:** §2.1 invariants → Task 1 tests + Task 2 gate; §2.3 dropdown → Task 6; §2.4 KNOWN_LIMITS union → Task 1; §2.5 migrations → Task 1/4; §3 centralization → Tasks 1/3/4/5; §4 boundaries → Tasks 1 (get_ai_model), 5 (main.js + settings.js); §5 fallback → Task 1; §6 litellm/floor/docs → Tasks 7/8; §7 tests → Tasks 1/2/4; §8 gate + release → Tasks 2/9 + §8 flow.
 - **Type consistency:** `provider_for_model`/`providerForModel`, `migrate_model`/`migrateModel`, `KNOWN_LIMITS`/`KNOWN_MODEL_IDS`, `DEFAULT_MODEL` used consistently across tasks.
-- **Known deferral:** the exact per-id context windows for retained legacy models come from canonical's existing `KNOWN_LIMITS` (already literal in the file); Task 1 applies deltas rather than re-typing them, and the §7 litellm matrix + Task 2 gate verify the result.
+- **litellm matrix:** the full-catalog provider/mode/context check (spec §2.1 inv 6) is `repo_radar/tests/test_litellm_matrix.py` (Task 7, gated on litellm 1.93.0 in `.venv`), and runs in Task 10's suite — not just spot assertions.
+- **Retained legacy windows:** come from canonical's existing `KNOWN_LIMITS` (already literal in `llm.py`); Task 1 applies deltas rather than re-typing them, and the matrix test + Task 2 gate verify the result.
+- **Two "generate-then-commit" spots** (both deterministic + guarded): `KNOWN_MODEL_IDS` paste in Task 4 (drift-tested vs Python) and the lifecycle manifest in Task 2 (built from the checked source table + operator vendor re-verification, gate-enforced).
