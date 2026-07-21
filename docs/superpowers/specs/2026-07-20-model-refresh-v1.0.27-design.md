@@ -1,6 +1,6 @@
 # Spec 1 — AI Model Refresh (Repo Radar v1.0.27)
 
-**Date:** 2026-07-20 · **rev 3** (incorporates Codex spec reviews R1+R2)
+**Date:** 2026-07-20 · **rev 4** (incorporates Codex spec reviews R1–R4)
 **Repo:** `mattwallington/repo-radar` (canonical) · **Branch:** `feature/model-refresh-2026` (off `dev` = `main` @ 1eb9c36)
 **Ship target:** **v1.0.27** via `release.sh` — signed + notarized + dual-arch (arm64+x64), published to `mattwallington/repo-radar`, dev prerelease first.
 
@@ -10,7 +10,7 @@ First of two specs. **Spec 2 (separate):** updater/release hardening + Electron 
 
 ## 0. Two cutoffs (rev 3)
 - **New-model *addition* cutoff — frozen:** only models mapped by **litellm 1.93.0** as of 2026-07-20 may be *added*. Google's 2026-07-21 `gemini-3.6-flash` / `gemini-3.5-flash-lite` (unmapped by 1.93.0) are **deferred** to a follow-up.
-- **Shutdown *safety* cutoff — current at release:** a model that has *become unavailable* by the actual release date must be a migration key, not a KNOWN_LIMITS entry. A **release gate** (§8) queries the vendor deprecation pages at build time and **fails the release** if any KNOWN_LIMITS ID is no longer callable — forcing a spec/code amendment rather than a call-time failure. Vendor lifecycle changes require an amendment, never silent implementation-time discretion.
+- **Shutdown *safety* cutoff — current at release:** a model that has *become unavailable* by the actual release date must be a migration key, not a KNOWN_LIMITS entry. A **release gate** (§8) compares a checked-in lifecycle manifest against the target release date and **fails the release** if any KNOWN_LIMITS ID is shut down by then (or any migration key is still active) — forcing a committed amendment rather than a call-time failure. Vendor lifecycle changes require an amendment, never silent implementation-time discretion.
 
 ---
 
@@ -114,7 +114,12 @@ gemini/gemini-2.5-flash-lite
 ---
 
 ## 8. Release flow + shutdown gate (rev 3)
-**Shutdown gate** (new) — no live scraping. A **checked-in lifecycle manifest** (`repo_radar/model_lifecycle.json`) records, for every KNOWN_LIMITS ID and every `MODEL_MIGRATIONS` key: `{id, status, shutdown_date | null, source_url}`. The automated gate (a pytest run by `release.sh` preflight) takes an explicit **`TARGET_RELEASE_DATE`** and **fails the release** if (a) any KNOWN_LIMITS ID has a `shutdown_date ≤ TARGET_RELEASE_DATE`, or (b) any migration key has `shutdown_date > TARGET_RELEASE_DATE` or is missing/marked active. Before each release the operator **manually re-verifies the linked vendor pages** and, on any vendor drift, commits a manifest amendment (and any resulting KNOWN_LIMITS/MODEL_MIGRATIONS change) — release stays blocked until the manifest and maps agree. Live vendor availability is never trusted at build time; the manifest + human re-verification is the source of truth.
+**Shutdown gate** (new) — **stdlib-only, no live scraping, no pytest dependency** (release safety must not depend on undeclared test tooling). A **checked-in lifecycle manifest** `repo_radar/model_lifecycle.json` records one row per model: `{id, status: "active"|"retired", shutdown_date: "YYYY-MM-DD"|null, source_url}`. A **stdlib-only script `scripts/check_model_lifecycle.py --target-date YYYY-MM-DD`**, invoked **directly** by `release.sh` preflight (`--target-date` required + ISO-validated, or derived from the release date), **fails the release** unless ALL hold:
+- manifest IDs are **unique** and **exactly equal** to `set(KNOWN_LIMITS keys) ∪ set(MODEL_MIGRATIONS keys)` — no missing, extra, or duplicate rows;
+- every **KNOWN_LIMITS** ID: `status == "active"` and (`shutdown_date is null` **or** `> target`);
+- every **MODEL_MIGRATIONS** key: `status == "retired"` and `shutdown_date` non-null and `≤ target`;
+- every row has a non-empty **HTTPS** `source_url`.
+`repo_radar/tests/test_lifecycle_gate.py` tests the *script's* logic (dev-time; not on the release-critical path). Before each release the operator **manually re-verifies the linked vendor pages**; on any drift, commit a manifest amendment (and any resulting KNOWN_LIMITS/MODEL_MIGRATIONS change) — release stays blocked until the script passes. The manifest + human re-verification is the source of truth; live vendor availability is never trusted at build.
 
 **Versioning flow** (dev release bumps `VERSION`→`1.0.27-dev.<ts>`; `release.sh:133` strips + increments, so merging the *dev release commit* to main yields 1.0.28):
 1. Implement on `feature/model-refresh-2026`; tests + shutdown gate green; update `CHANGELOG.md`.
@@ -126,4 +131,4 @@ gemini/gemini-2.5-flash-lite
 ---
 
 ## 9. File-change summary
-`repo_radar/llm.py` (module-level policy incl. `KNOWN_LIMITS` union + `provider_for_model`/`migrate_model` + migrated `get_ai_model` + non-Gemini guard + exact chain) · `repo_radar/modes/sync.py` (3 clusters → `provider_for_model`) · `repo_radar/ui.py` · **new** `menubar/model-policy.js` (incl. `KNOWN_MODEL_IDS`) · `menubar/main.js` (`require('./model-policy')`; migrate all boundaries; unify default) · `menubar/renderer/settings.html` (18-ID grouped dropdown + Advanced warnings + help) · `menubar/renderer/settings.js` (`require('../model-policy')`; migrate load/save with valid-but-unlisted `<option>` insertion; provider detection) · `requirements.txt` + `pyproject.toml` (`litellm==1.93.0`, `requires-python>=3.10,<3.15`) · `menubar/resources/setup.sh` (both-bounds guard, `python3 -m pip`, wording) · `menubar/SETUP.md` · `README.md` · **`CHANGELOG.md`** · **new** `repo_radar/model_lifecycle.json` (lifecycle manifest) · `release.sh` (invoke the manifest shutdown gate) · `repo_radar/tests/test_llm.py` (+ invariant/provider tests) · **new** `repo_radar/tests/test_lifecycle_gate.py` (manifest vs TARGET_RELEASE_DATE) · **new** `menubar/__tests__/model-policy.test.js` + drift check.
+`repo_radar/llm.py` (module-level policy incl. `KNOWN_LIMITS` union + `provider_for_model`/`migrate_model` + migrated `get_ai_model` + non-Gemini guard + exact chain) · `repo_radar/modes/sync.py` (3 clusters → `provider_for_model`) · `repo_radar/ui.py` · **new** `menubar/model-policy.js` (incl. `KNOWN_MODEL_IDS`) · `menubar/main.js` (`require('./model-policy')`; migrate all boundaries; unify default) · `menubar/renderer/settings.html` (18-ID grouped dropdown + Advanced warnings + help) · `menubar/renderer/settings.js` (`require('../model-policy')`; migrate load/save with valid-but-unlisted `<option>` insertion; provider detection) · `requirements.txt` + `pyproject.toml` (`litellm==1.93.0`, `requires-python>=3.10,<3.15`) · `menubar/resources/setup.sh` (both-bounds guard, `python3 -m pip`, wording) · `menubar/SETUP.md` · `README.md` · **`CHANGELOG.md`** · **new** `repo_radar/model_lifecycle.json` (manifest) · **new** `scripts/check_model_lifecycle.py` (stdlib gate) · `release.sh` (invoke the gate directly in preflight) · `repo_radar/tests/test_llm.py` (+ invariant/provider tests) · **new** `repo_radar/tests/test_lifecycle_gate.py` (tests the gate script) · **new** `menubar/__tests__/model-policy.test.js` + drift check.
