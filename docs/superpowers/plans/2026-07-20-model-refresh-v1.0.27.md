@@ -311,6 +311,7 @@ def test_failures_are_returned_not_raised():
         ([{"id":"k","status":"active","shutdown_date":"nope","source_url":OK}], {"k"}, set(), None),                # malformed date -> some failure, no raise
         ([{"id":"k","status":"active","shutdown_date":None,"source_url":"http://x"}], {"k"}, set(), "source_url"),  # non-https
         ([{"id":"k","status":"active","source_url":OK}], {"k"}, set(), None),                                       # missing shutdown_date key -> failure, no raise
+        ([{"id":123,"status":"active","shutdown_date":None,"source_url":OK}], {"k"}, set(), "non-string id"),       # non-string/unhashable id -> failure, no raise (no set() crash)
     ]
     for rows, known, migs, sub in cases:
         fails = _run(rows, known, migs)   # must not raise
@@ -341,7 +342,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | claude-3-5-sonnet-20240620 | 2025-10-28 | A |
 | claude-3-sonnet-20240229 | 2025-07-21 | A |
 | claude-3-5-haiku-20241022 | 2026-02-19 | A |
-| claude-3-haiku-20240307 | 2026-04-19 | A |
+| claude-3-haiku-20240307 | 2026-04-20 | A |
 | claude-3-opus-20240229 | 2026-01-05 | A |
 | claude-opus-4-20250514 | 2026-06-15 | A |
 | claude-4-opus-20250514 | 2026-06-15 | A |
@@ -371,9 +372,10 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | gemini/gemini-2.5-pro, -flash, -flash-lite | 2026-10-16 | G |
 | gpt-4-turbo | 2026-10-23 | O |
 | o1, o1-pro | 2026-10-23 | O |
-| o3, o3-mini, o3-pro | 2026-12-11 | O |
+| o3-mini, o4-mini, gpt-4.1-nano | 2026-10-23 | O |
+| o3, o3-pro | 2026-12-11 | O |
 | gpt-5, gpt-5-mini, gpt-5-nano | 2026-12-11 | O |
-| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+*), gpt-5.3-codex, gpt-5.1, gpt-4.1(+*), gpt-4o(+mini), o4-mini, gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
+| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
 
 Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
 
@@ -403,7 +405,10 @@ def check(manifest_path, known_ids, migration_keys, target_date):
         return [f"manifest unreadable: {e}"]
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         return ["manifest must be a JSON array of objects"]
-    ids = [r.get("id") for r in rows]
+    bad = [i for i, r in enumerate(rows) if not (isinstance(r.get("id"), str) and r.get("id"))]
+    if bad:
+        return [f"rows with missing/non-string id at indices {bad}"]
+    ids = [r["id"] for r in rows]
     if len(ids) != len(set(ids)):
         failures.append("duplicate ids in manifest")
     manifest_ids = set(ids)
@@ -655,19 +660,37 @@ Populate `KNOWN_MODEL_IDS` by running the shown Python one-liner and pasting eac
 const assert = require('assert');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { MODEL_MIGRATIONS, KNOWN_MODEL_IDS, DEFAULT_MODEL } = require('../model-policy');
+const { MODEL_MIGRATIONS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel } = require('../model-policy');
 const root = path.join(__dirname, '..', '..');
 const py = process.platform === 'win32' ? 'python' : 'python3';
+
+// Synthetic provider fixtures — identical list on both sides.
+const FIXTURES = ['anthropic/claude-x', 'openai/gpt-x', 'chatgpt/foo', 'chatgpt-4o-latest',
+                  'o3', 'o4-mini', 'codex-mini-latest', 'gemini/gemini-x', 'gemini-x', 'mystery', ''];
+
 const out = execFileSync(py, ['-c',
-  "import sys,json;sys.path.insert(0,'.');from repo_radar import llm;print(json.dumps({'d':llm.DEFAULT_MODEL,'m':llm.MODEL_MIGRATIONS,'k':sorted(llm.KNOWN_LIMITS)}))"],
+  "import sys,json;sys.path.insert(0,'.');from repo_radar import llm;" +
+  "fx=json.loads(sys.argv[1]);" +
+  "ids=sorted(set(llm.KNOWN_LIMITS)|set(llm.MODEL_MIGRATIONS)|set(fx));" +
+  "print(json.dumps({'d':llm.DEFAULT_MODEL,'m':llm.MODEL_MIGRATIONS,'k':sorted(llm.KNOWN_LIMITS)," +
+  "'prov':{i:llm.provider_for_model(i) for i in ids}}))",
+  JSON.stringify(FIXTURES)],
   { cwd: root, encoding: 'utf8' });
 const p = JSON.parse(out);
+
 assert.strictEqual(DEFAULT_MODEL, p.d, 'DEFAULT_MODEL drift');
 assert.deepStrictEqual(Object.keys(MODEL_MIGRATIONS).sort(), Object.keys(p.m).sort(), 'migration key drift');
 for (const k of Object.keys(MODEL_MIGRATIONS)) assert.strictEqual(MODEL_MIGRATIONS[k], p.m[k], `migration value drift ${k}`);
 assert.deepStrictEqual([...KNOWN_MODEL_IDS].sort(), p.k, 'KNOWN_MODEL_IDS drift');
-console.log('drift OK:', p.k.length, 'known,', Object.keys(p.m).length, 'migrations');
+
+// Provider parity over KNOWN ∪ MIGRATIONS ∪ synthetic fixtures.
+for (const [id, pyProv] of Object.entries(p.prov)) {
+  const jsProv = providerForModel(id);
+  assert.strictEqual(jsProv === undefined ? null : jsProv, pyProv, `provider drift for ${JSON.stringify(id)}: js=${jsProv} py=${pyProv}`);
+}
+console.log('drift OK:', p.k.length, 'known,', Object.keys(p.m).length, 'migrations,', Object.keys(p.prov).length, 'provider fixtures');
 ```
+> Note: JSON object keys are strings, so the empty-string fixture round-trips as `""`. If it collides with a real id it's harmless (same expected provider).
 
 - [ ] **Step 5: Run both to verify pass**
 
@@ -816,15 +839,16 @@ Check for pip via **`python3 -m pip`** (not a separate `pip3` binary), and make 
 
 - [ ] **Step 3: Write the litellm 1.93.0 full-matrix test** (`repo_radar/tests/test_litellm_matrix.py`)
 
-This is the spec §2.1 invariant 6 check (dev-time; requires litellm 1.93.0 in `.venv`):
+This is the spec §2.1 invariant 6 check (dev-time; **mandatory** litellm 1.93.0 in `.venv` — no importorskip, so a missing/wrong litellm fails loudly):
 ```python
-import pytest
+import importlib.metadata as md
+import litellm                       # mandatory: fail if absent
 from repo_radar import llm
-litellm = pytest.importorskip("litellm")
+
+def test_litellm_is_exactly_1_93_0():
+    assert md.version("litellm") == "1.93.0", md.version("litellm")
 
 def test_every_known_model_resolves_on_litellm_1_93():
-    import importlib.metadata as md
-    assert tuple(int(x) for x in md.version("litellm").split(".")[:2]) >= (1, 93)
     for mid, ctx in llm.KNOWN_LIMITS.items():
         info = litellm.get_model_info(mid)          # raises if unknown -> test fails loudly
         assert info.get("litellm_provider") == llm.provider_for_model(mid), (mid, info.get("litellm_provider"))
@@ -837,11 +861,17 @@ def test_every_known_model_resolves_on_litellm_1_93():
 - [ ] **Step 4: Verify**
 
 ```bash
-.venv/bin/python -m pytest repo_radar/tests/test_litellm_matrix.py -q   # needs litellm 1.93.0 in .venv
-python3.12 -m venv /tmp/rr312 && /tmp/rr312/bin/python -m pip install -q -r requirements.txt && /tmp/rr312/bin/python -c "import importlib.metadata as m;print('litellm',m.version('litellm'))"
+# The Prerequisites .venv was built against the OLD requirements (litellm 1.83.4).
+# Re-install now that requirements.txt pins 1.93.0, THEN run the matrix.
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0', m.version('litellm'); print('venv litellm 1.93.0 OK')"
+.venv/bin/python -m pytest repo_radar/tests/test_litellm_matrix.py -q
+# Spec-required clean install specifically on Python 3.10 (the declared floor):
+python3.10 -m venv /tmp/rr310 && /tmp/rr310/bin/python -m pip install -q -r requirements.txt \
+  && /tmp/rr310/bin/python -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0'; print('py3.10 clean install OK')"
 bash -n menubar/resources/setup.sh
 ```
-Expected: matrix test PASS; clean-venv install prints `litellm 1.93.0`; `bash -n` clean. (Use whichever 3.10–3.14 interpreter is installed.)
+Expected: `.venv` re-install prints `venv litellm 1.93.0 OK`; matrix test PASS; the **Python 3.10** clean install prints `py3.10 clean install OK`; `bash -n` clean. (If `python3.10` isn't installed, install it first — `pyenv install 3.10.14` or `brew install python@3.10` — the 3.10 floor smoke is required by the spec.)
 
 - [ ] **Step 5: Commit**
 
@@ -873,9 +903,9 @@ git commit -m "docs: model tables, install command, CHANGELOG for v1.0.27"
 
 **Files:** Modify `release.sh` (preflight section, `~:76-116`).
 
-- [ ] **Step 1: Invoke the gate in preflight**
+- [ ] **Step 1: Add `python3` to the tool preflight + invoke the gate**
 
-After the existing preflight checks, before version calc, add:
+Add `python3` to release.sh's required-tool check (the existing `gh node npm git` loop at `~:87-91` → `gh node npm git python3`). Then, after the existing preflight checks and before version calc, add:
 ```bash
 RELEASE_DATE=$(date +%Y-%m-%d)
 python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
@@ -890,9 +920,14 @@ python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
 ```bash
 bash -n release.sh
 python3 scripts/check_model_lifecycle.py --target-date 2026-07-23   # PASS (codex keys retired on/before target)
-python3 scripts/check_model_lifecycle.py --target-date 2026-07-21 ; echo "exit=$?"   # EXPECTED FAIL (codex keys still active) -> exit=1
+# 07-21 MUST fail; assert it (don't just print the code):
+if python3 scripts/check_model_lifecycle.py --target-date 2026-07-21 >/dev/null 2>&1; then
+  echo "BUG: pre-2026-07-23 gate unexpectedly PASSED"; exit 1
+else
+  echo "07-21 correctly blocked"
+fi
 ```
-Expected: `bash -n` clean; the 07-23 gate prints OK (exit 0); the 07-21 gate prints the codex-key failures and `exit=1` — that's the gate correctly refusing a pre-2026-07-23 release.
+Expected: `bash -n` clean; the 07-23 gate prints OK (exit 0); the 07-21 branch prints "07-21 correctly blocked" (and the script would `exit 1` if it had wrongly passed) — the gate correctly refusing a pre-2026-07-23 release.
 
 - [ ] **Step 3: Commit**
 
@@ -913,7 +948,7 @@ node menubar/__tests__/model-policy.test.js && node menubar/__tests__/drift-chec
 node --check menubar/main.js && node --check menubar/renderer/settings.js
 python3 scripts/check_model_lifecycle.py --target-date 2026-07-23
 ```
-Expected: pytest all pass (incl. the 19-ID litellm matrix); JS tests OK; parse clean; gate OK at the 2026-07-23 release window.
+Expected: pytest all pass (incl. the full-KNOWN_LIMITS litellm matrix — the deterministic union is ~53 ids); JS tests OK; parse clean; gate OK at the 2026-07-23 release window.
 
 - [ ] **Step 2: Manual settings smoke** (deferred to dev prerelease per spec §8, but sanity now): confirm `menubar/renderer/settings.html` renders the **five** option groups and that a config with a retired `ai_model` (e.g. `gpt-5.2-codex`) loads as its migrated value (`gpt-5.3-codex`).
 
