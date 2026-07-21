@@ -1,3 +1,4 @@
+from repo_radar import llm
 from repo_radar.llm import (
     get_model_context_window,
     get_chunking_threshold,
@@ -14,6 +15,8 @@ def test_known_model_context_window():
     assert get_model_context_window("gpt-5.4") == 1_050_000
     assert get_model_context_window("o3") == 200_000
     assert get_model_context_window("gemini/gemini-3.1-pro-preview") == 1_048_576
+    assert get_model_context_window("gpt-5.3-codex") == 400_000
+    assert get_model_context_window("claude-sonnet-5") == 1_000_000
 
 
 def test_unknown_model_gets_default():
@@ -27,19 +30,20 @@ def test_chunking_threshold_is_75_percent():
 
 
 def test_fallback_model_chain():
-    first = "gemini/gemini-3.1-pro-preview"
+    first = "gemini/gemini-3.5-flash"
     second = get_fallback_model(first)
-    assert second == "gemini/gemini-3-pro-preview"
+    assert second == "gemini/gemini-3.1-flash-lite"
 
 
 def test_fallback_returns_none_at_end():
-    last = "gemini/gemini-2.0-flash"
+    last = "gemini/gemini-2.5-flash-lite"
     assert get_fallback_model(last) is None
 
 
-def test_fallback_unknown_returns_first():
-    result = get_fallback_model("unknown-model")
-    assert result == "gemini/gemini-3.1-pro-preview"
+def test_fallback_unknown_gemini_shaped_returns_chain_head():
+    # Unknown but Gemini-shaped model names still get the chain head; only
+    # non-Gemini models are guarded to None (see test_fallback_guard_non_gemini_returns_none).
+    assert get_fallback_model("gemini/gemini-99") == "gemini/gemini-3.5-flash"
 
 
 def test_chunk_repo_files_small_repo():
@@ -53,3 +57,60 @@ def test_rate_limit_tracker_initial_state():
     assert tracker.should_wait() is False
     assert tracker.get_wait_time() == 0
     assert "Unknown" in tracker.get_status_string()
+
+
+def test_default_model():
+    assert llm.DEFAULT_MODEL == 'claude-sonnet-5'
+    assert llm.DEFAULT_MODEL in llm.KNOWN_LIMITS
+
+
+def test_provider_for_model():
+    assert llm.provider_for_model('gemini/gemini-3.5-flash') == 'gemini'
+    assert llm.provider_for_model('claude-sonnet-5') == 'anthropic'
+    assert llm.provider_for_model('anthropic/claude-opus-4-8') == 'anthropic'
+    assert llm.provider_for_model('gpt-5.6-terra') == 'openai'
+    assert llm.provider_for_model('o3') == 'openai'
+    assert llm.provider_for_model('o4-mini') == 'openai'
+    assert llm.provider_for_model('gpt-5.3-codex') == 'openai'
+    assert llm.provider_for_model('chatgpt-4o-latest') == 'openai'
+    assert llm.provider_for_model('chatgpt/foo') == 'openai'
+    assert llm.provider_for_model('mystery-model') is None
+    assert llm.provider_for_model('') is None
+
+
+def test_migrate_model_every_row_and_passthrough():
+    for old, new in llm.MODEL_MIGRATIONS.items():
+        assert llm.migrate_model(old) == new, old
+    assert llm.migrate_model('claude-sonnet-5') == 'claude-sonnet-5'
+    assert llm.migrate_model(llm.DEFAULT_MODEL) == llm.DEFAULT_MODEL
+
+
+def test_invariants():
+    known = set(llm.KNOWN_LIMITS)
+    keys = set(llm.MODEL_MIGRATIONS)
+    targets = set(llm.MODEL_MIGRATIONS.values())
+    assert targets <= known, targets - known                 # inv 2
+    assert keys.isdisjoint(known), keys & known              # inv 3
+    for old, new in llm.MODEL_MIGRATIONS.items():             # inv 4
+        assert llm.provider_for_model(old) == llm.provider_for_model(new), old
+
+
+def test_fallback_guard_non_gemini_returns_none():
+    assert llm.get_fallback_model('claude-sonnet-5') is None
+    assert llm.get_fallback_model('o3') is None
+    assert llm.get_fallback_model('gpt-5.6-terra') is None
+
+
+def test_fallback_chain_gemini():
+    chain = llm.GEMINI_FALLBACK_CHAIN
+    assert chain[0] == 'gemini/gemini-3.5-flash'
+    for i in range(len(chain) - 1):
+        assert llm.get_fallback_model(chain[i]) == chain[i + 1]
+    assert llm.get_fallback_model(chain[-1]) is None
+
+
+def test_get_ai_model_migrates(monkeypatch):
+    monkeypatch.setenv('AI_MODEL', 'gpt-5.2-codex')
+    assert llm.get_ai_model() == 'gpt-5.3-codex'
+    monkeypatch.delenv('AI_MODEL', raising=False)
+    assert llm.get_ai_model() == llm.DEFAULT_MODEL

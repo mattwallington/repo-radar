@@ -1,134 +1,174 @@
 """LLM integration, model configuration, and rate limiting."""
 
 import os
+import re
 from datetime import datetime
 
 from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
 
 # TODO: refactor sync_mode to use analyze_repo_chunk and combine_chunk_analyses
 
+DEFAULT_MODEL = 'claude-sonnet-5'
+
+# Maximum input context window for each supported model.
+#
+# These are INPUT context windows, not output token limits.
+# Based on litellm model cost map as of March 2026.
+KNOWN_LIMITS = {
+    # ── Anthropic Claude ──────────────────────────────────────────────
+    # Claude 5.x / newest 4.x (latest)
+    "claude-sonnet-5": 1000000,
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-fable-5": 1000000,
+    # Claude 4.6
+    "claude-opus-4-6": 1000000,
+    "claude-opus-4-6-20260205": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    # Claude 4.5
+    "claude-opus-4-5": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "claude-sonnet-4-5": 200000,
+    "claude-sonnet-4-5-20250929": 200000,
+    "claude-haiku-4-5": 200000,
+    "claude-haiku-4-5-20251001": 200000,
+    # Claude 4.x
+    "claude-opus-4-1": 200000,
+    "claude-opus-4-1-20250805": 200000,
+
+    # ── Google Gemini ─────────────────────────────────────────────────
+    # Gemini 3.x
+    "gemini/gemini-3.5-flash": 1048576,
+    "gemini/gemini-3.1-pro-preview": 1048576,
+    "gemini/gemini-3.1-flash-lite": 1048576,
+    "gemini/gemini-3-flash-preview": 1048576,
+    # Gemini 2.5
+    "gemini/gemini-2.5-pro": 1048576,
+    "gemini/gemini-2.5-flash": 1048576,
+    "gemini/gemini-2.5-flash-lite": 1048576,
+    # Convenience aliases
+    "gemini/gemini-pro-latest": 1048576,
+    "gemini/gemini-flash-latest": 1048576,
+    "gemini/gemini-flash-lite-latest": 1048576,
+
+    # ── OpenAI ────────────────────────────────────────────────────────
+    # GPT-5.6 / 5.5 (latest)
+    "gpt-5.6-sol": 1050000,
+    "gpt-5.6-terra": 1050000,
+    "gpt-5.6-luna": 1050000,
+    "gpt-5.5": 1050000,
+    "gpt-5.5-pro": 1050000,
+    # GPT-5.x
+    "gpt-5.4": 1050000,
+    "gpt-5.4-pro": 1050000,
+    "gpt-5.4-mini": 272000,
+    "gpt-5.4-nano": 272000,
+    "gpt-5.3-codex": 400000,
+    "gpt-5.2": 272000,
+    "gpt-5.2-pro": 272000,
+    "gpt-5.1": 272000,
+    "gpt-5": 272000,
+    "gpt-5-mini": 272000,
+    "gpt-5-nano": 272000,
+    # GPT-4.x
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    # Reasoning models
+    "o4-mini": 200000,
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o3-pro": 200000,
+    "o1": 200000,
+    "o1-pro": 200000,
+}
+
+# Retired model ids -> their current replacement. Keys must never overlap
+# with KNOWN_LIMITS (a model is either live or migrated, not both).
+MODEL_MIGRATIONS = {
+    # Anthropic
+    "claude-3-7-sonnet-20250219": "claude-sonnet-5",
+    "claude-3-5-sonnet-20241022": "claude-sonnet-5",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-5",
+    "claude-3-sonnet-20240229": "claude-sonnet-5",
+    "claude-3-5-haiku-20241022": "claude-haiku-4-5",
+    "claude-3-haiku-20240307": "claude-haiku-4-5",
+    "claude-3-opus-20240229": "claude-opus-4-8",
+    "claude-opus-4-20250514": "claude-opus-4-8",
+    "claude-4-opus-20250514": "claude-opus-4-8",
+    "claude-sonnet-4-20250514": "claude-sonnet-5",
+    "claude-4-sonnet-20250514": "claude-sonnet-5",
+    # OpenAI
+    "o1-preview": "o3",
+    "o1-mini": "o3",
+    "codex-mini-latest": "gpt-5.4-mini",
+    "gpt-5-codex": "gpt-5.3-codex",
+    "gpt-5.1-codex": "gpt-5.3-codex",
+    "gpt-5.1-codex-max": "gpt-5.3-codex",
+    "gpt-5.2-codex": "gpt-5.3-codex",
+    "gpt-5.1-codex-mini": "gpt-5.4-mini",
+    # Google
+    "gemini/gemini-2.0-flash": "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.0-flash-001": "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.0-flash-exp": "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.0-flash-lite": "gemini/gemini-2.5-flash-lite",
+    "gemini/gemini-3-pro-preview": "gemini/gemini-3.1-pro-preview",
+    "gemini/gemini-3.1-flash-lite-preview": "gemini/gemini-3.1-flash-lite",
+    "gemini/gemini-1.5-pro": "gemini/gemini-2.5-pro",
+    "gemini/gemini-1.5-flash": "gemini/gemini-2.5-flash",
+}
+
+
+def migrate_model(model):
+    """Map a retired model id to its current replacement, or pass through."""
+    return MODEL_MIGRATIONS.get(model, model)
+
+
+def provider_for_model(model):
+    """Classify a model id as 'gemini', 'anthropic', 'openai', or None."""
+    if not model:
+        return None
+    if model.startswith('gemini/') or model.startswith('gemini-'):
+        return 'gemini'
+    if model.startswith('claude') or model.startswith('anthropic/'):
+        return 'anthropic'
+    if (model.startswith('gpt') or model.startswith('openai/') or model.startswith('chatgpt/')
+            or model.startswith('chatgpt-') or model.startswith('codex') or re.match(r'^o\d', model)):
+        return 'openai'
+    return None
+
 
 def get_ai_model():
-    """Get the AI model from environment variable or use default."""
-    return os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
+    """Get the AI model from env or default, migrating retired ids."""
+    return migrate_model(os.environ.get('AI_MODEL', DEFAULT_MODEL))
 
 
 # Fallback model chain - each model has separate rate limit quotas
 GEMINI_FALLBACK_CHAIN = [
-    'gemini/gemini-3.1-pro-preview',
-    'gemini/gemini-3-pro-preview',
-    'gemini/gemini-3-flash-preview',
-    'gemini/gemini-2.5-pro',
+    'gemini/gemini-3.5-flash',
+    'gemini/gemini-3.1-flash-lite',
     'gemini/gemini-2.5-flash',
-    'gemini/gemini-2.0-flash',
+    'gemini/gemini-2.5-flash-lite',
 ]
 
+
 def get_fallback_model(current_model):
-    """Get the next fallback model in the chain.
-
-    Args:
-        current_model: The model that just failed
-
-    Returns:
-        Next model in fallback chain, or None if at end
-    """
+    """Next Gemini fallback model, or None. Non-Gemini models have no fallback
+    (returning a Gemini model here would switch providers and fail auth)."""
+    if provider_for_model(current_model) != 'gemini':
+        return None
     try:
-        current_index = GEMINI_FALLBACK_CHAIN.index(current_model)
-        if current_index < len(GEMINI_FALLBACK_CHAIN) - 1:
-            return GEMINI_FALLBACK_CHAIN[current_index + 1]
+        i = GEMINI_FALLBACK_CHAIN.index(current_model)
+        return GEMINI_FALLBACK_CHAIN[i + 1] if i < len(GEMINI_FALLBACK_CHAIN) - 1 else None
     except ValueError:
-        # Not in fallback chain, return first one
         return GEMINI_FALLBACK_CHAIN[0]
-
-    return None  # No more fallbacks
 
 
 def get_model_context_window(model):
-    """Get the maximum input context window for a model.
-
-    These are INPUT context windows, not output token limits.
-    Based on litellm model cost map as of March 2026.
-    """
-    KNOWN_LIMITS = {
-        # ── Anthropic Claude ──────────────────────────────────────────────
-        # Claude 4.6 (latest)
-        "claude-opus-4-6": 1000000,
-        "claude-opus-4-6-20260205": 1000000,
-        "claude-sonnet-4-6": 1000000,
-        # Claude 4.5
-        "claude-opus-4-5": 200000,
-        "claude-opus-4-5-20251101": 200000,
-        "claude-sonnet-4-5": 200000,
-        "claude-sonnet-4-5-20250929": 200000,
-        "claude-haiku-4-5": 200000,
-        "claude-haiku-4-5-20251001": 200000,
-        # Claude 4.x
-        "claude-opus-4-1": 200000,
-        "claude-opus-4-1-20250805": 200000,
-        "claude-opus-4-20250514": 200000,
-        "claude-4-opus-20250514": 200000,
-        "claude-sonnet-4-20250514": 200000,
-        "claude-4-sonnet-20250514": 200000,
-        # Claude 3.x
-        "claude-3-7-sonnet-20250219": 200000,
-        "claude-3-5-sonnet-20241022": 200000,
-        "claude-3-haiku-20240307": 200000,
-        "claude-3-opus-20240229": 200000,
-
-        # ── Google Gemini ─────────────────────────────────────────────────
-        # Gemini 3.x
-        "gemini/gemini-3.1-pro-preview": 1048576,
-        "gemini/gemini-3.1-flash-lite-preview": 1048576,
-        "gemini/gemini-3-pro-preview": 1048576,
-        "gemini/gemini-3-flash-preview": 1048576,
-        # Gemini 2.5
-        "gemini/gemini-2.5-pro": 1048576,
-        "gemini/gemini-2.5-flash": 1048576,
-        "gemini/gemini-2.5-flash-lite": 1048576,
-        # Gemini 2.0
-        "gemini/gemini-2.0-flash": 1048576,
-        "gemini/gemini-2.0-flash-001": 1048576,
-        "gemini/gemini-2.0-flash-lite": 1048576,
-        # Convenience aliases
-        "gemini/gemini-pro-latest": 1048576,
-        "gemini/gemini-flash-latest": 1048576,
-        "gemini/gemini-flash-lite-latest": 1048576,
-
-        # ── OpenAI ────────────────────────────────────────────────────────
-        # GPT-5.x (latest)
-        "gpt-5.4": 1050000,
-        "gpt-5.4-pro": 1050000,
-        "gpt-5.4-mini": 272000,
-        "gpt-5.4-nano": 272000,
-        "gpt-5.3-codex": 272000,
-        "gpt-5.2": 272000,
-        "gpt-5.2-codex": 272000,
-        "gpt-5.2-pro": 272000,
-        "gpt-5.1": 272000,
-        "gpt-5.1-codex": 272000,
-        "gpt-5.1-codex-max": 272000,
-        "gpt-5.1-codex-mini": 272000,
-        "gpt-5": 272000,
-        "gpt-5-codex": 272000,
-        "gpt-5-mini": 272000,
-        "gpt-5-nano": 272000,
-        # GPT-4.x
-        "gpt-4.1": 1047576,
-        "gpt-4.1-mini": 1047576,
-        "gpt-4.1-nano": 1047576,
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
-        "gpt-4-turbo": 128000,
-        # Codex CLI
-        "codex-mini-latest": 200000,
-        # Reasoning models
-        "o4-mini": 200000,
-        "o3": 200000,
-        "o3-mini": 200000,
-        "o3-pro": 200000,
-        "o1": 200000,
-        "o1-pro": 200000,
-    }
+    """Get the maximum input context window for a model."""
     return KNOWN_LIMITS.get(model, 128000)  # Conservative default
 
 
