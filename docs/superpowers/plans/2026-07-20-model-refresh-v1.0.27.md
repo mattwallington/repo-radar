@@ -332,7 +332,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 
 - [ ] **Step 3: Write the manifest from the checked source table**
 
-`repo_radar/model_lifecycle.json` has one row per id in `llm.KNOWN_LIMITS` ∪ `llm.MODEL_MIGRATIONS`. Generate mechanically from the two tables below, then **the operator manually re-verifies each date against its `source_url` before commit** (§8). Source URLs: Anthropic `A = https://platform.claude.com/docs/en/about-claude/model-deprecations`; OpenAI `O = https://developers.openai.com/api/docs/deprecations`; Google `G = https://ai.google.dev/gemini-api/docs/deprecations`.
+`repo_radar/model_lifecycle.json` has one row per id in `llm.KNOWN_LIMITS` ∪ `llm.MODEL_MIGRATIONS`. Generate mechanically from the two tables below, then **the operator manually re-verifies each date against its `source_url` before commit** (§8). Source URLs: Anthropic `A = https://platform.claude.com/docs/en/about-claude/model-deprecations`; OpenAI `O = https://developers.openai.com/api/docs/deprecations`; Google `G = https://ai.google.dev/gemini-api/docs/deprecations`; `G-exp = https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash` (the model page explicitly lists the `-exp` id shut down 2026-06-01).
 
 **(a) Migration keys → `status:"retired"`, exact `shutdown_date` (all ≤ 2026-07-23):**
 | id | shutdown_date | src |
@@ -358,7 +358,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | gpt-5.2-codex | 2026-07-23 | O |
 | gemini/gemini-2.0-flash | 2026-06-01 | G |
 | gemini/gemini-2.0-flash-001 | 2026-06-01 | G |
-| gemini/gemini-2.0-flash-exp | 2026-06-01 | G |
+| gemini/gemini-2.0-flash-exp | 2026-06-01 | G-exp |
 | gemini/gemini-2.0-flash-lite | 2026-06-01 | G |
 | gemini/gemini-3-pro-preview | 2026-03-09 | G |
 | gemini/gemini-3.1-flash-lite-preview | 2026-05-25 | G |
@@ -373,9 +373,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | gpt-4-turbo | 2026-10-23 | O |
 | o1, o1-pro | 2026-10-23 | O |
 | o3-mini, o4-mini, gpt-4.1-nano | 2026-10-23 | O |
-| o3, o3-pro | 2026-12-11 | O |
-| gpt-5, gpt-5-mini, gpt-5-nano | 2026-12-11 | O |
-| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
+| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), **gpt-5, gpt-5-mini, gpt-5-nano, o3, o3-pro** [aliases — OpenAI dates only the dated snapshots, not these aliases, so `null`], gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
 
 Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
 
@@ -865,13 +863,16 @@ def test_every_known_model_resolves_on_litellm_1_93():
 # Re-install now that requirements.txt pins 1.93.0, THEN run the matrix.
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0', m.version('litellm'); print('venv litellm 1.93.0 OK')"
-.venv/bin/python -m pytest repo_radar/tests/test_litellm_matrix.py -q
-# Spec-required clean install specifically on Python 3.10 (the declared floor):
-python3.10 -m venv /tmp/rr310 && /tmp/rr310/bin/python -m pip install -q -r requirements.txt \
-  && /tmp/rr310/bin/python -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0'; print('py3.10 clean install OK')"
+# This commit changes deps + Python range -> run the WHOLE suite so the commit is green:
+.venv/bin/python -m pytest repo_radar/tests/ -q
+# Spec-required clean install specifically on Python 3.10 (the declared floor), in a fresh temp dir:
+RR310=$(mktemp -d)
+python3.10 -m venv "$RR310" && "$RR310/bin/python" -m pip install -q -r requirements.txt \
+  && "$RR310/bin/python" -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0'; print('py3.10 clean install OK')"
+rm -rf "$RR310"
 bash -n menubar/resources/setup.sh
 ```
-Expected: `.venv` re-install prints `venv litellm 1.93.0 OK`; matrix test PASS; the **Python 3.10** clean install prints `py3.10 clean install OK`; `bash -n` clean. (If `python3.10` isn't installed, install it first — `pyenv install 3.10.14` or `brew install python@3.10` — the 3.10 floor smoke is required by the spec.)
+Expected: `.venv` re-install prints `venv litellm 1.93.0 OK`; the **full pytest suite** passes; the **Python 3.10** clean install prints `py3.10 clean install OK`; `bash -n` clean. (If `python3.10` isn't installed, install it first — `pyenv install 3.10.14` or `brew install python@3.10` — the 3.10 floor smoke is required by the spec.)
 
 - [ ] **Step 5: Commit**
 
