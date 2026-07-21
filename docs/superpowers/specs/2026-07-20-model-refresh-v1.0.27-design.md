@@ -8,7 +8,7 @@ First of two specs. **Spec 2 (separate):** updater/release hardening + Electron 
 
 ---
 
-## 0. Two cutoffs (rev 3)
+## 0. Two cutoffs
 - **New-model *addition* cutoff — frozen:** only models mapped by **litellm 1.93.0** as of 2026-07-20 may be *added*. Google's 2026-07-21 `gemini-3.6-flash` / `gemini-3.5-flash-lite` (unmapped by 1.93.0) are **deferred** to a follow-up.
 - **Shutdown *safety* cutoff — current at release:** a model that has *become unavailable* by the actual release date must be a migration key, not a KNOWN_LIMITS entry. A **release gate** (§8) compares a checked-in lifecycle manifest against the target release date and **fails the release** if any KNOWN_LIMITS ID is shut down by then (or any migration key is still active) — forcing a committed amendment rather than a call-time failure. Vendor lifecycle changes require an amendment, never silent implementation-time discretion.
 
@@ -45,7 +45,7 @@ Refresh Repo Radar's selectable AI models from its April-2026 baseline (default 
 
 No invented `gpt-5.6-pro` (it's a Sol reasoning mode). Sol/Terra/Luna = Chat Completions; `gpt-5.3-codex`+`gpt-5.5-pro` = Responses (canonical's `call_llm` routes them).
 
-### 2.4 KNOWN_LIMITS — deterministic union (rev 3)
+### 2.4 KNOWN_LIMITS — deterministic union
 **KNOWN_LIMITS = (canonical's current `repo_radar/llm.py` KNOWN_LIMITS set) − (the §2.5 migration keys) + (the new IDs below).** This makes it the exact union of {new models} ∪ {still-callable historically-shipped values} ∪ {migration targets}, so any model selectable in a shipped version that is still callable is preserved (satisfies invariant + §4 preservation). No "optional" entries.
 
 - **New IDs added** (all litellm-1.93.0-recognized): Anthropic `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-5` (all `1000000`); OpenAI `gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna`/`gpt-5.5`/`gpt-5.5-pro` (all `1050000`); Gemini `gemini/gemini-3.5-flash`, `gemini/gemini-3.1-flash-lite` (`1048576`).
@@ -69,7 +69,7 @@ This map is fixed at approval. The §8 gate enforces that these keys are unavail
 `DEFAULT_MODEL`, `KNOWN_LIMITS`, `MODEL_MIGRATIONS`, `provider_for_model(model)`, `migrate_model(model)`. `provider_for_model` handles bare + prefixed IDs, o-series (`o1`/`o3`/`o4`), `codex`, `openai/`, `chatgpt/` **and** `chatgpt-`. Consumers: `sync.py` `:753-758`/`:1397-1404`/`:1427-1432` + `ui.py:35-38` (fix invalid `claude-sonnet-4-6-1m`).
 
 ### 3.2 JavaScript — new `menubar/model-policy.js` (CommonJS; committed)
-Exports `DEFAULT_MODEL`, `MODEL_MIGRATIONS`, **`KNOWN_MODEL_IDS`** (a Set mirroring Python's KNOWN_LIMITS keys, covered by the drift test), `providerForModel`, `migrateModel`. Require paths (rev 3, corrected):
+Exports `DEFAULT_MODEL`, `MODEL_MIGRATIONS`, **`KNOWN_MODEL_IDS`** (a Set mirroring Python's KNOWN_LIMITS keys, covered by the drift test), `providerForModel`, `migrateModel`. Require paths (corrected):
 - `menubar/main.js` → `require('./model-policy')`
 - `menubar/renderer/settings.js` → `require('../model-policy')`
 Replaces `settings.js:408-414`/`:460-475` + `main.js:889-905`; fixes `settings.html:50` help text. `providerForModel` handles `chatgpt-`+`chatgpt/`.
@@ -78,7 +78,7 @@ Replaces `settings.js:408-414`/`:460-475` + `main.js:889-905`; fixes `settings.h
 
 ---
 
-## 4. Migration boundaries + healing (rev 3)
+## 4. Migration boundaries + healing
 Migration runs at **runtime everywhere** (a stale/retired ID never reaches litellm); `config.json` is persisted **only on Settings Save**; smoke includes Save.
 1. **Python `get_ai_model()`** — `migrate_model(env AI_MODEL or DEFAULT_MODEL)` (covers LaunchAgent wrappers).
 2. **`main.js`** — `migrateModel` before pre-sync validation (`:889-905`), before `AI_MODEL` export (`:1014`), and into the regenerated LaunchAgent wrapper (`:1523-1539`).
@@ -98,7 +98,7 @@ gemini/gemini-2.5-flash-lite
 
 ---
 
-## 6. litellm pin + Python floor + docs (rev 3)
+## 6. litellm pin + Python floor + docs
 - `requirements.txt` + `pyproject.toml`: `litellm==1.83.4` → **`litellm==1.93.0`**.
 - litellm 1.93.0 requires **Python ≥3.10,<3.15** → set `requires-python = ">=3.10,<3.15"`; add a **numeric guard in `menubar/resources/setup.sh` checking both bounds** (fail clearly on <3.10 or ≥3.15); install via **`python3 -m pip`**. Test setup in a clean 3.10 env.
 - Update: `menubar/SETUP.md` (model table + manual install), `menubar/resources/setup.sh` (stale "Gemini API key" wording), `README.md`, `repo_radar/ui.py`, **`CHANGELOG.md`** (AGENTS.md requires an entry for dev + prod releases; `release.sh` stages only version files, so CHANGELOG is a manual edit committed with the feature work).
@@ -113,7 +113,7 @@ gemini/gemini-2.5-flash-lite
 
 ---
 
-## 8. Release flow + shutdown gate (rev 3)
+## 8. Release flow + shutdown gate
 **Shutdown gate** (new) — **stdlib-only, no live scraping, no pytest dependency** (release safety must not depend on undeclared test tooling). A **checked-in lifecycle manifest** `repo_radar/model_lifecycle.json` records one row per model: `{id, status: "active"|"retired", shutdown_date: "YYYY-MM-DD"|null, source_url}`. A **stdlib-only script `scripts/check_model_lifecycle.py --target-date YYYY-MM-DD`**, invoked **directly** by `release.sh` preflight (`--target-date` required + ISO-validated, or derived from the release date), **fails the release** unless ALL hold:
 - manifest IDs are **unique** and **exactly equal** to `set(KNOWN_LIMITS keys) ∪ set(MODEL_MIGRATIONS keys)` — no missing, extra, or duplicate rows;
 - every **KNOWN_LIMITS** ID: `status == "active"` and (`shutdown_date is null` **or** `> target`);
