@@ -375,7 +375,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | o3-mini, o4-mini, gpt-4.1-nano | 2026-10-23 | O |
 | *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), **gpt-5, gpt-5-mini, gpt-5-nano, o3, o3-pro** [aliases — OpenAI dates only the dated snapshots, not these aliases, so `null`], gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
 
-Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
+Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G|G-exp>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
 
 - [ ] **Step 4: Write the stdlib gate**
 
@@ -859,17 +859,18 @@ def test_every_known_model_resolves_on_litellm_1_93():
 - [ ] **Step 4: Verify**
 
 ```bash
+set -euo pipefail                          # any required check failing aborts the block
+RR310=$(mktemp -d); trap 'rm -rf "$RR310"' EXIT   # cleanup on any exit, success or failure
 # The Prerequisites .venv was built against the OLD requirements (litellm 1.83.4).
 # Re-install now that requirements.txt pins 1.93.0, THEN run the matrix.
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0', m.version('litellm'); print('venv litellm 1.93.0 OK')"
 # This commit changes deps + Python range -> run the WHOLE suite so the commit is green:
 .venv/bin/python -m pytest repo_radar/tests/ -q
-# Spec-required clean install specifically on Python 3.10 (the declared floor), in a fresh temp dir:
-RR310=$(mktemp -d)
-python3.10 -m venv "$RR310" && "$RR310/bin/python" -m pip install -q -r requirements.txt \
-  && "$RR310/bin/python" -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0'; print('py3.10 clean install OK')"
-rm -rf "$RR310"
+# Spec-required clean install specifically on Python 3.10 (the declared floor):
+python3.10 -m venv "$RR310"
+"$RR310/bin/python" -m pip install -q -r requirements.txt
+"$RR310/bin/python" -c "import importlib.metadata as m; assert m.version('litellm')=='1.93.0'; print('py3.10 clean install OK')"
 bash -n menubar/resources/setup.sh
 ```
 Expected: `.venv` re-install prints `venv litellm 1.93.0 OK`; the **full pytest suite** passes; the **Python 3.10** clean install prints `py3.10 clean install OK`; `bash -n` clean. (If `python3.10` isn't installed, install it first — `pyenv install 3.10.14` or `brew install python@3.10` — the 3.10 floor smoke is required by the spec.)
