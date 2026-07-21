@@ -373,7 +373,7 @@ Expected: FAIL (no `scripts/check_model_lifecycle.py`, no manifest).
 | gpt-4-turbo | 2026-10-23 | O |
 | o1, o1-pro | 2026-10-23 | O |
 | o3-mini, o4-mini, gpt-4.1-nano | 2026-10-23 | O |
-| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), **gpt-5, gpt-5-mini, gpt-5-nano, o3, o3-pro** [aliases — OpenAI dates only the dated snapshots, not these aliases, so `null`], gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
+| *all other KNOWN_LIMITS ids* (fable-5, opus-4-8/4-7/4-6, sonnet-5/4-6, opus-4-5, sonnet-4-5, haiku-4-5, gpt-5.6-*, gpt-5.5(+pro), gpt-5.4(+pro/mini/nano), gpt-5.3-codex, gpt-5.1, gpt-5.2, gpt-5.2-pro, gpt-4.1, gpt-4.1-mini, gpt-4o(+mini), **gpt-5, gpt-5-mini, gpt-5-nano, o3, o3-pro** [aliases — OpenAI dates only the dated snapshots, not these aliases, so `null`; `gpt-5.2`/`gpt-5.2-pro` likewise have no listed shutdown date], gemini-3.5-flash, gemini-3.1-flash-lite, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-*-latest) | null | vendor page |
 
 Row shape: `{"id": <id>, "status": "active"|"retired", "shutdown_date": "YYYY-MM-DD"|null, "source_url": <A|O|G|G-exp>}`. **Any date the operator cannot confirm on the linked page blocks the release** (§8) — do not invent.
 
