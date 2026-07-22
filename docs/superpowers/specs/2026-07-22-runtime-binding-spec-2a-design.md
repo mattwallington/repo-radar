@@ -1,10 +1,9 @@
 # Spec 2A — Packaged Python Runtime Binding (Repo Radar v1.0.27)
 
-**Status:** rev 6 — addresses Codex R5 blockers 1–3 + minors (fd-mode `lockf`,
-lock-first-then-resolve, managed-only dev coexistence). Architecture is converged per Codex R5;
-remaining changes are the runner lock/resolution contract and the dev-detection predicate. For
-Codex Round 6. Do NOT implement or merge into `dev` before the Spec 1
-(`feature/model-refresh-2026`) dev-prerelease smoke completes.
+**Status:** rev 7 — addresses Codex R6 (the `VERSION`-in-generation invariant + wording minors).
+Codex R6: the architecture is converged and, with the `VERSION` invariant added, "no further
+architectural review should be needed." For a final Codex plan-ready confirmation. Do NOT implement
+or merge into `dev` before the Spec 1 (`feature/model-refresh-2026`) dev-prerelease smoke completes.
 
 **Branch:** `feature/runtime-binding-v1.0.27` (cut from `dev` @ `6621882`).
 
@@ -24,7 +23,7 @@ channel; **stable** solely owns the `repo-radar` CLI, the persistent schedule, s
 and legacy migration; **dev** fully namespaced); kernel-backed locking (a root **execution**
 lock across channels + a per-channel **activation** lock, via `/usr/bin/lockf` in fd mode); crash-safe
 activation via a published intent record (`desired.json`) whose publication is the first
-fallible mutation, plus one atomic pointer flip; verifiable identity against a real-install
+managed-update / activation-intent mutation, plus one atomic pointer flip; verifiable identity against a real-install
 expected-distribution manifest; CLI continuity; failure/offline hard-block; scripted logic
 harness + built-artifact packaged upgrade smoke.
 
@@ -62,7 +61,7 @@ scheduled sync = a deliberately-installed transient `com.user.repo-radar-dev` ag
   <channel>/
     .activation.lock                  # per-channel provisioning/activation lock file (lockf, fd mode)
     desired.json                      # published INTENT (atomic; first managed-update/activation-intent mutation)
-    generations/<version>-<fingerprint>-<nonce>/   # IMMUTABLE, unique; venv/ repo_radar/ repo-radar .runtime.json
+    generations/<version>-<fingerprint>-<nonce>/   # IMMUTABLE, unique; venv/ repo_radar/ repo-radar VERSION .runtime.json
     current -> generations/<...>      # single ACTIVATION POINTER (commit point)
     run-sync.sh                       # generic self-verifying runner (0700)
     provision.log                     # redacted (0600)
@@ -70,7 +69,7 @@ scheduled sync = a deliberately-installed transient `com.user.repo-radar-dev` ag
 
 `desired.json` (per channel, atomic temp+rename, schema-versioned) is the Electron provisioner's
 authoritative intent: channel, complete build identity (`app.getVersion()` corroborated with
-bundled `VERSION`), target generation id, and expected source/launcher/lock hashes.
+bundled `VERSION`), target generation id, and expected source/launcher/**VERSION**/lock hashes.
 **Electron-less shell/CLI runners validate `current` + its marker only against `desired.json`.**
 An unsupported/incompatible `desired.json` schema fails closed.
 
@@ -129,7 +128,9 @@ mutation**) so a newly-installed build can never keep serving the previous runti
    activation-intent mutation.
 3. **Provision** the nonce-unique generation (adopt an already-complete generation only if its
    marker matches the *entire* desired identity, else build fresh): venv,
-   `pip install --require-hashes -r <lock>`, copy source+launcher, smoke (import + exact-version
+   `pip install --require-hashes -r <lock>`, **copy bundled source + launcher + `VERSION`** into the
+   generation root (Codex R6-1: `repo_radar/__init__.py` reads `../VERSION`, i.e. `<current>/VERSION`;
+   without it the package silently reports `1.0.0`), smoke (import + exact-version
    asserts + installed-set == expected manifest), write `.runtime.json`.
 4. **Flip `current`** atomically (temp symlink + `rename(2)`, same dir). Commit point.
 Crash before step 2 → old `desired` still governs (legacy bootstrap: none yet → fail closed);
@@ -139,7 +140,8 @@ complete-matching generation or rebuilds. `ensureRuntime()` runs at startup + af
 
 **Verification.** Under the appropriate lock, a runtime is valid iff: `realpath(current)` inside
 the channel generations tree; `current` + marker match `desired.json`; live
-`hashTree(current/repo_radar)` + launcher hash == marker == bundle; the venv's normalized
+`hashTree(current/repo_radar)` + launcher hash + **`current/VERSION` value/hash** == marker ==
+bundle (and the runtime's `repo-radar --version` must equal `app.getVersion()`); the venv's normalized
 installed set == the **expected manifest** for its (Python-minor, arch); interpreter fingerprint
 matches. Any miss → fail closed. A **channel desired-state** ensures a healthy *old* `current` is
 never accepted for a *new* build whose provisioning failed.
@@ -167,7 +169,10 @@ healthy predicate — failing closed on any mismatch. **No `current` path is int
 command before the lock is held**, so a managed update that publishes+flips while the runner was
 blocked on the lock is seen *after* acquisition: the runner then resolves the new generation, not a
 stale pre-lock one. It then `exec`s `<current>/venv/bin/python <current>/repo-radar sync
---status-server` with `PYTHONPATH=<current>/repo_radar`, inheriting the locked fd so the lock ==
+--status-server` with `PYTHONPATH=<current>` (the generation root that *contains* `repo_radar/`,
+so `import repo_radar` resolves and its `../VERSION` lookup finds `<current>/VERSION`; executing
+`<current>/repo-radar` already puts `<current>` on `sys.path`, so PYTHONPATH is belt-and-braces),
+inheriting the locked fd so the lock ==
 the worker's lifetime. A generation a running sync resolved stays retained (2A GC never removes
 activated generations), so a concurrent flip cannot pull it out from under an in-flight sync.
 Concurrent runs (any channel) serialize on the root lock. The scheduled `run-sync.sh` is generic
@@ -198,8 +203,9 @@ fingerprint; freshness verification independently recreates and compares the man
 
 **New** `menubar/runtime-manager.js`: `ensureRuntime()` (both transitions), generic-runner emit +
 Node runner (via `lockf`), `resolveBaseInterpreter()`, `authoritativeIdentity()`/`publishDesired()`,
-`quiesceLegacyStable()`, `provision()` (nonce gen + hashed install + source copy + smoke +
-installed-set vs expected manifest), atomic activation, legacy migration + CLI dispatcher, redacted
+`quiesceLegacyStable()`, `provision()` (nonce gen + hashed install + source + launcher + **VERSION**
+copy + smoke + installed-set vs expected manifest), atomic activation, legacy migration + CLI
+dispatcher, redacted
 logging, incomplete/invalid-generation GC. `menubar/main.js`: call `ensureRuntime()`; replace spawn
 with the `lockf` runner; channel-namespace + stable-sole-own the schedule; emit generic `run-sync.sh`;
 drop the fictitious `getVersion()` fallback; dev hard-block vs unmanaged legacy. **Repo:** checked-in
@@ -210,8 +216,9 @@ retired as an app dependency.
 
 Legacy bootstrap and managed update/rollback both make `desired.json` publication the first
 managed-update / activation-intent mutation, then provision the nonce generation, then flip `current`. Stable alone migrates the legacy
-1.0.26 jobs and owns the schedule + `repo-radar`; dev is namespaced and hard-blocks while an unmanaged
-legacy stable agent is loaded. Every sync child (either channel) serializes on the root `lockf` lock.
+1.0.26 jobs and owns the schedule + `repo-radar`; dev is namespaced and hard-blocks on **any
+unmanaged or ambiguous stable state** (not merely a *loaded* legacy agent). Every sync child (either
+channel) serializes on the root `lockf` lock.
 Steady state: predicate holds → no pip → sync.
 
 ## 6. Failure / offline
@@ -245,10 +252,12 @@ environment; resourcesPath, launchd, signed paths with spaces, real identity):
    `DEFAULT_MODEL=='claude-sonnet-5'`; both envs `sys.executable==current/venv/bin/python` +
    `litellm==1.93.0`; `migrate_model('gpt-5.2-codex')=='gpt-5.3-codex'`, `get_fallback_model('o3') is
    None`, `KNOWN_LIMITS['gpt-5.4-mini']==1050000`.
-5. **CLI:** `repo-radar` runs the new runtime.
+5. **CLI + version identity (Codex R6-1):** `repo-radar` runs the new runtime and
+   `repo-radar --version` (and the help banner) == `app.getVersion()` — **not `1.0.0`** — because the
+   generation carries `current/VERSION`; **upgrade and rollback both report the activated version**.
 6. **Crash recovery** after each cutover boundary; **downgrade/rollback** to a prior managed build.
-7. **Tamper** → next reconcile builds a replacement generation, flips, retains the old (no active-gen
-   mutation pre-flip).
+7. **Tamper** (source, venv set, **or `current/VERSION`**) → next reconcile builds a replacement
+   generation, flips, retains the old (no active-gen mutation pre-flip).
 8. **Lock lifetime + cross-channel serialization:** stable-scheduled vs another sync contend on the
    root lock (both directions); killing a holder auto-releases.
 9. **Offline** → hard-block + Retry; **partial/interrupted** provision → prior runtime intact, only an
@@ -271,7 +280,8 @@ riding the worker's inherited descriptor so its lifetime == the worker's and the
 death — no owner records or stale recovery; runners acquire **before** resolving `current`. Activation = publish `desired.json` (first managed-update /
 activation-intent mutation) → provision nonce generation → single atomic `current` flip; two transition flavors (legacy bootstrap,
 managed update/rollback), direction-agnostic on compatible schemas, else fail closed. Verification =
-active-payload hashing + installed-set vs a real-install expected manifest. Ownership = stable sole
+active-payload hashing (source + launcher + **`VERSION`**, so `repo-radar --version` ==
+`app.getVersion()`) + installed-set vs a real-install expected manifest. Ownership = stable sole
 owner of `repo-radar` + schedule + config + legacy migration; dev namespaced and hard-blocks vs an
 unmanaged legacy stable agent; channel-missing fails closed. Generations = nonce-unique immutable
 dirs. GC = only incomplete/invalid never-activated generations (retain activated); no refcount/grace
