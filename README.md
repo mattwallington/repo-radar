@@ -47,15 +47,17 @@ See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
 
 ### AI Models
 
-The default model is `claude-sonnet-4-6` (1M context window). Override in the menubar Settings — the top "⭐ Recommended" section lists the current picks; older models are still available in the other sections.
+The default model is `claude-sonnet-5` (1M context window). Override in the menubar Settings — the dropdown has 18 models across 5 groups: a pinned "⭐ Recommended" section at the top, an "(other)" section per provider, and an "Advanced — Responses API" section for the higher-cost/latency models.
 
 Pinned recommended models:
 
 | Provider | Models | Context |
 |----------|--------|---------|
-| Anthropic | **Claude Sonnet 4.6** (default), Claude Opus 4.6, Claude Haiku 4.5 | 1M / 1M / 200K |
-| Google | Gemini 3.1 Pro Preview, Gemini 3.0 Flash Preview, Gemini 3.1 Flash Lite Preview | 1M |
-| OpenAI | GPT-5.4, GPT-5.4 Mini, GPT-5.4 Nano | 1M / 272K / 272K |
+| Anthropic | **Claude Sonnet 5** (default), Claude Opus 4.8, Claude Haiku 4.5 | 1M / 1M / 200K |
+| Google | Gemini 3.5 Flash, Gemini 3.1 Flash Lite | 1M |
+| OpenAI | GPT-5.6 Terra, GPT-5.6 Luna | 1M |
+
+Also available: Claude Fable 5, Claude Opus 4.7, Claude Sonnet 4.6 (Anthropic); Gemini 3.1 Pro (Preview), Gemini 2.5 Pro, Gemini 2.5 Flash (Google); GPT-5.6 Sol, GPT-5.5, o3 (OpenAI); GPT-5.3 Codex (400K), GPT-5.5 Pro (Advanced — Responses API, higher cost/latency).
 
 ### LLM Integration
 

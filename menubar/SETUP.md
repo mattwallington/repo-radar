@@ -48,7 +48,7 @@ Click it -> **Settings**
 **API Configuration:**
 1. Paste your GitHub Token (from step 2)
 2. Paste your Anthropic API Key (from step 2)
-3. Select your preferred AI Model (Claude Sonnet 4.6 is the default)
+3. Select your preferred AI Model (Claude Sonnet 5 is the default)
 
 **Repository Configuration:**
 1. Click "Add Repository"
@@ -88,32 +88,45 @@ The snippet tells the assistant where `~/repos-pristine/` is, how to read the `I
 
 ## AI Model Options
 
-Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown groups models into "⭐ Recommended" (the current picks) and a longer list of older-but-still-usable options.
+Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown has 18 models grouped into 5 sections: a pinned "⭐ Recommended" section at the top, an "(other)" section per provider, and an "Advanced — Responses API" section.
 
-**⭐ Recommended — Anthropic Claude:**
-- **Claude Sonnet 4.6** — default, 1M context window
-- **Claude Opus 4.6** — highest quality, 1M context
-- **Claude Haiku 4.5** — fast and cheap, 200K context
+**⭐ Recommended:**
+- **Claude Sonnet 5** — default, 1M context window (Anthropic)
+- **Claude Opus 4.8** — highest quality, 1M context (Anthropic)
+- **Claude Haiku 4.5** — fast and cheap, 200K context (Anthropic)
+- **Gemini 3.5 Flash** — 1M context (Google)
+- **Gemini 3.1 Flash Lite** — 1M context, cheapest Gemini (Google)
+- **GPT-5.6 Terra** — 1M context (OpenAI)
+- **GPT-5.6 Luna** — 1M context (OpenAI)
+
+**Anthropic (other):**
+- Claude Fable 5 — 1M context
+- Claude Opus 4.7 — 1M context
+- Claude Sonnet 4.6 — 1M context
 - Requires: `ANTHROPIC_API_KEY`
 
-**⭐ Recommended — Google Gemini:**
-- **Gemini 3.1 Pro Preview** — 1M context, highest quality
-- **Gemini 3.0 Flash Preview** — 1M context, fastest
-- **Gemini 3.1 Flash Lite Preview** — 1M context, cheapest
+**Google (other):**
+- Gemini 3.1 Pro (Preview) — 1M context
+- Gemini 2.5 Pro — 1M context
+- Gemini 2.5 Flash — 1M context
 - Requires: `GEMINI_API_KEY`
 
-**⭐ Recommended — OpenAI:**
-- **GPT-5.4** — 1M context
-- **GPT-5.4 Mini** — 272K context, cheaper
-- **GPT-5.4 Nano** — 272K context, cheapest
+**OpenAI (other):**
+- GPT-5.6 Sol — 1M context
+- GPT-5.5 — 1M context
+- o3 — 200K context
 - Requires: `OPENAI_API_KEY`
-- Note: OpenAI `codex` and `-pro` variants (in the "other" section of the dropdown) use the newer Responses API. The app routes them automatically, so you can pick them freely.
+
+**Advanced — Responses API (higher cost/latency):**
+- GPT-5.3 Codex — 400K context
+- GPT-5.5 Pro — 1M context
+- Note: these route through the newer Responses API. The app detects and routes them automatically, so you can pick them freely.
 
 ## Troubleshooting
 
 **"Command not found" or Python errors:**
 ```bash
-pip3 install litellm==1.83.4 requests inquirer rich
+python3 -m pip install -r requirements.txt
 ```
 
 **App doesn't appear in menu bar:**

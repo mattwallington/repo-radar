@@ -4,6 +4,16 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.27] - 2026-07-21
+
+### Changed
+- Model catalog refreshed to the current Anthropic, Google, and OpenAI lineups. Default model is now **Claude Sonnet 5** (was Claude Sonnet 4.6). The Settings dropdown now has 18 models across 5 groups: ⭐ Recommended (Claude Sonnet 5, Claude Opus 4.8, Claude Haiku 4.5, Gemini 3.5 Flash, Gemini 3.1 Flash Lite, GPT-5.6 Terra, GPT-5.6 Luna), Anthropic (other), Google (other), OpenAI (other), and Advanced — Responses API (GPT-5.3 Codex, GPT-5.5 Pro).
+- litellm bumped from 1.83.4 → 1.93.0. Python requirement raised to `>=3.10,<3.15`.
+
+### Fixed
+- Selecting or loading a saved retired model ID (e.g. `gpt-5-codex`, `gpt-5.2-codex`, `codex-mini-latest`) now auto-migrates it to the current same-provider equivalent instead of failing, while still-supported older models (e.g. Claude Opus 4.6, Gemini 3 Flash Preview) are left as-is. Provider is always preserved across the migration.
+- The automatic model-fallback chain now applies only to Gemini models. Non-Gemini providers no longer fall back across providers on rate limits or errors.
+
 ## [1.0.26] - 2026-04-13
 
 ### Fixed
