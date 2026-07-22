@@ -4,6 +4,7 @@
 let configData = null;
 
 const { ipcRenderer } = require('electron');
+const { providerForModel, migrateModel, DEFAULT_MODEL, KNOWN_MODEL_IDS } = require('../model-policy');
 
 // Handle config loaded
 ipcRenderer.on('config-loaded', (event, config) => {
@@ -13,7 +14,7 @@ ipcRenderer.on('config-loaded', (event, config) => {
         gemini_api_key: '',
         anthropic_api_key: '',
         openai_api_key: '',
-        ai_model: 'claude-sonnet-4-6',
+        ai_model: DEFAULT_MODEL,
         repositories: [],
         last_configured: null
     };
@@ -80,7 +81,18 @@ function renderForm() {
     // Render AI model
     const aiModelSelect = document.getElementById('ai-model');
     if (aiModelSelect) {
-        aiModelSelect.value = configData.ai_model || 'claude-sonnet-4-6';
+        const migratedModel = migrateModel(configData.ai_model || DEFAULT_MODEL);
+        if ([...aiModelSelect.options].some(o => o.value === migratedModel)) {
+            aiModelSelect.value = migratedModel;
+        } else if (KNOWN_MODEL_IDS.has(migratedModel)) {
+            const opt = document.createElement('option');
+            opt.value = migratedModel;
+            opt.textContent = `${migratedModel} — Saved model (still supported)`;
+            aiModelSelect.appendChild(opt);
+            aiModelSelect.value = migratedModel;
+        } else {
+            aiModelSelect.value = DEFAULT_MODEL;
+        }
         // Highlight the required API key for the selected model
         highlightRequiredApiKey(aiModelSelect.value);
     }
@@ -405,11 +417,12 @@ function highlightRequiredApiKey(model) {
     
     // Highlight the required key for selected model
     let requiredProvider = null;
-    if (model.startsWith('gemini/')) {
+    const p = providerForModel(model);
+    if (p === 'gemini') {
         requiredProvider = 'gemini';
-    } else if (model.startsWith('claude')) {
+    } else if (p === 'anthropic') {
         requiredProvider = 'anthropic';
-    } else if (model.startsWith('gpt') || model.startsWith('o1')) {
+    } else if (p === 'openai') {
         requiredProvider = 'openai';
     }
     
@@ -430,7 +443,8 @@ document.getElementById('save-btn').addEventListener('click', () => {
     configData.gemini_api_key = document.getElementById('gemini-api-key').value;
     configData.anthropic_api_key = document.getElementById('anthropic-api-key').value;
     configData.openai_api_key = document.getElementById('openai-api-key').value;
-    configData.ai_model = document.getElementById('ai-model').value;
+    const sel = document.getElementById('ai-model');
+    configData.ai_model = migrateModel(sel.value || DEFAULT_MODEL);
     
     // Update schedule settings
     configData.schedule = {
@@ -457,17 +471,18 @@ document.getElementById('save-btn').addEventListener('click', () => {
     
     // AI key validation depends on model selected
     const selectedModel = configData.ai_model || '';
-    if (selectedModel.startsWith('gemini/')) {
+    const selectedProvider = providerForModel(selectedModel);
+    if (selectedProvider === 'gemini') {
         if (!configData.gemini_api_key) {
             showNotification('Gemini API key is required for Gemini models', 'error');
             return;
         }
-    } else if (selectedModel.startsWith('claude')) {
+    } else if (selectedProvider === 'anthropic') {
         if (!configData.anthropic_api_key) {
             showNotification('Anthropic API key is required for Claude models', 'error');
             return;
         }
-    } else if (selectedModel.startsWith('gpt') || selectedModel.startsWith('o1')) {
+    } else if (selectedProvider === 'openai') {
         if (!configData.openai_api_key) {
             showNotification('OpenAI API key is required for GPT models', 'error');
             return;
