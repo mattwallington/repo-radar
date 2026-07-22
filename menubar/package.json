@@ -104,6 +104,10 @@
       {
         "from": "../VERSION",
         "to": "VERSION"
+      },
+      {
+        "from": "../resources/pydeps",
+        "to": "resources/pydeps"
       }
     ],
     "directories": {
