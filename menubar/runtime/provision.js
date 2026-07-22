@@ -17,26 +17,42 @@ function _cpDir(src, dst) {
   });
 }
 
-function provision({ home, channel, identity, bundle, logPath }) {
-  const L = layout(home, channel);
-  fs.mkdirSync(L.generations, { recursive: true, mode: 0o700 });
-  // Only accept an interpreter whose env has a checked-in hash-pinned lock+manifest
-  // (spec §3.6): skip uncovered interpreters (e.g. a homebrew 3.14 with no cp314 lock)
-  // and fail closed if none of the host's interpreters is covered.
+// Deterministically plan a generation WITHOUT building it: resolve a covered base
+// interpreter, mint a nonce-unique genId, and pre-hash the bundle + selected lock.
+// ensureRuntime publishes desired.json from this plan BEFORE the (slow) build, so a
+// newly-installed build fails closed rather than serving the previous runtime.
+function planGeneration({ identity, bundle }) {
   const base = resolveBaseInterpreter({
     accept: (exe, info) => isCovered(`${info.impl}-${info.version.join('.')}-${info.arch}`),
   });
   const fp = `${base.impl}-${base.version.join('.')}-${base.arch}`;
+  const { lockPath, manifestPath } = selectFor(fp);
+  if (!fs.existsSync(lockPath)) throw new ProvisionError(`no dependency lock for env ${fp}`);
   const nonce = newNonce();
   const genId = generationId(identity.version, fp, nonce);
-  const staging = path.join(L.generations, `${genId}.staging-${process.pid}`);
-  const genDir = path.join(L.generations, genId);
+  const expected = {
+    sourceSha: hashTree(bundle.repoRadarDir),
+    launcherSha: hashFile(bundle.launcher),
+    versionSha: hashFile(bundle.versionFile),
+    lockSha: hashFile(lockPath),
+  };
+  return { base, fp, nonce, genId, lockPath, manifestPath, expected };
+}
+
+function provision({ home, channel, identity, bundle, logPath, plan }) {
+  const L = layout(home, channel);
+  fs.mkdirSync(L.generations, { recursive: true, mode: 0o700 });
+  let staging = null;
+  let genId = null;
   try {
+    const p = plan || planGeneration({ identity, bundle });
+    const { base, fp, lockPath, manifestPath } = p;
+    genId = p.genId;
+    staging = path.join(L.generations, `${genId}.staging-${process.pid}`);
+    const genDir = path.join(L.generations, genId);
     fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
     execFileSync(base.exe, ['-m', 'venv', path.join(staging, 'venv')], { stdio: 'pipe' });
     const venvPy = path.join(staging, 'venv', 'bin', 'python');
-    const { lockPath, manifestPath } = selectFor(fp);
-    if (!fs.existsSync(lockPath)) throw new ProvisionError(`no dependency lock for env ${fp}`);
     execFileSync(venvPy, ['-m', 'pip', 'install', '--require-hashes', '-r', lockPath], {
       stdio: 'pipe',
     });
@@ -79,13 +95,11 @@ function provision({ home, channel, identity, bundle, logPath }) {
     fs.renameSync(staging, genDir); // atomic: staging complete -> immutable generation
     return { genId, genDir, marker };
   } catch (e) {
-    try {
-      fs.rmSync(staging, { recursive: true, force: true });
-    } catch (_) {
-      // best-effort cleanup
+    if (staging) {
+      try { fs.rmSync(staging, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
     }
     try {
-      fs.appendFileSync(logPath, redact(`[provision ${genId}] ${e.stack || e.message}\n`), {
+      fs.appendFileSync(logPath, redact(`[provision ${genId || '?'}] ${e.stack || e.message}\n`), {
         mode: 0o600,
       });
     } catch (_) {
@@ -95,4 +109,4 @@ function provision({ home, channel, identity, bundle, logPath }) {
   }
 }
 
-module.exports = { ProvisionError, provision };
+module.exports = { ProvisionError, planGeneration, provision };
