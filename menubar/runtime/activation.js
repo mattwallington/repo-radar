@@ -51,16 +51,18 @@ function verifyRuntime({ home, channel, genDir, desired }) {
     if (hashFile(path.join(genDir, 'VERSION')) !== marker.versionSha) reasons.push('live versionSha != marker');
   } catch (e) { reasons.push(`payload hash error: ${e.message}`); }
 
-  // interpreter fingerprint of the venv python matches the marker
+  // interpreter fingerprint + ABI of the venv python match the marker
   const venvPy = path.join(genDir, 'venv', 'bin', 'python');
   const info = probe(venvPy);
   const fp = info ? `${info.impl}-${info.version.join('.')}-${info.arch}` : null;
   if (fp !== marker.fingerprint) reasons.push(`venv fingerprint ${fp} != marker ${marker.fingerprint}`);
+  if (marker.abi != null && (!info || info.abi !== marker.abi)) reasons.push(`venv ABI ${info && info.abi} != marker ${marker.abi}`);
 
-  // venv installed set == expected manifest for the env
+  // venv installed set == expected manifest for the env; manifest & marker agree on the lock
   try {
     const { manifestPath } = selectFor(marker.fingerprint);
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (manifest.lockSha256 != null && manifest.lockSha256 !== marker.lockSha) reasons.push('manifest lockSha256 != marker lockSha');
     const setCheck = verifyInstalledSet(venvPy, manifest);
     if (!setCheck.ok) reasons.push(`installed set != manifest: ${JSON.stringify(setCheck)}`);
   } catch (e) { reasons.push(`installed-set check error: ${e.message}`); }

@@ -2,8 +2,9 @@
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
-const { layout } = require('./paths');
-const { readDesired, schemaCompatible } = require('./desired');
+const { layout, cliPath } = require('./paths');
+const { readDesired, isActive } = require('./desired');
+const { verifyRuntime } = require('./activation');
 
 function _defaultExec(cmd, args) {
   try { return { status: 0, out: cp.execFileSync(cmd, args, { encoding: 'utf8' }) }; }
@@ -39,17 +40,25 @@ async function quiesceLegacyStable({
   }
 }
 
-// READ-ONLY (spec §3.3, Codex R5-3): is stable provably *managed*? Dev may share the
-// data plane only when this is true. ANY legacy stable install/state or ambiguity
-// means "unmanaged" -> dev must fail closed / isolate.
+// READ-ONLY (spec §3.3, Codex R5-3/I3): is stable provably *managed AND healthy*? Dev may
+// share the data plane only when this is true. ANY legacy stable install/state, an
+// incomplete managed footprint, or a runtime that doesn't verify means "unmanaged" ->
+// dev must fail closed / isolate. Strong predicate, not just "a desired.json exists".
 function detectStableManaged({ home, exec = _defaultExec } = {}) {
   const legacyLauncher = path.join(home, '.repo-radar', 'repo-radar');
   if (fs.existsSync(legacyLauncher)) return { managed: false, reason: 'legacy ~/.repo-radar/repo-radar present' };
+  if (_legacyProcessRunning(exec, home)) return { managed: false, reason: 'a legacy stable process is running' };
   const L = layout(home, 'stable');
+  if (!fs.existsSync(cliPath(home, 'stable'))) return { managed: false, reason: 'no stable CLI dispatcher' };
+  if (!fs.existsSync(L.runSync)) return { managed: false, reason: 'no stable run-sync dispatcher' };
   const desired = readDesired(L.desired);
-  if (!desired || !schemaCompatible(desired)) return { managed: false, reason: 'no compatible stable desired.json' };
-  try { fs.lstatSync(L.current); } catch (e) { return { managed: false, reason: 'no stable current symlink' }; }
-  return { managed: true, reason: 'stable has compatible desired.json + current' };
+  if (!isActive(desired)) return { managed: false, reason: 'stable desired is not ACTIVE' };
+  let genDir;
+  try { genDir = fs.realpathSync(L.current); } catch (e) { return { managed: false, reason: 'no stable current runtime' }; }
+  if (!verifyRuntime({ home, channel: 'stable', genDir, desired }).ok) {
+    return { managed: false, reason: 'stable runtime fails the healthy predicate' };
+  }
+  return { managed: true, reason: 'stable dispatcher + ACTIVE desired + healthy runtime' };
 }
 
 module.exports = { quiesceLegacyStable, detectStableManaged };

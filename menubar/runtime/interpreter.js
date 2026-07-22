@@ -4,14 +4,15 @@ const { execFileSync } = require('child_process');
 class NoInterpreterError extends Error {}
 
 const PROBE =
-  'import sys,platform;print(sys.version_info[0],sys.version_info[1],sys.version_info[2],sys.implementation.name,platform.machine())';
+  'import sys,platform,sysconfig;' +
+  "print(sys.version_info[0],sys.version_info[1],sys.version_info[2],sys.implementation.name,platform.machine(),(sysconfig.get_config_var('SOABI') or 'none'))";
 
 function probe(exe) {
   try {
     const out = execFileSync(exe, ['-c', PROBE], { encoding: 'utf8', timeout: 8000 })
       .trim()
       .split(/\s+/);
-    return { version: [+out[0], +out[1], +out[2]], impl: out[3], arch: out[4] };
+    return { version: [+out[0], +out[1], +out[2]], impl: out[3], arch: out[4], abi: out[5] };
   } catch (e) {
     return null;
   }

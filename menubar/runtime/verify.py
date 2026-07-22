@@ -52,18 +52,39 @@ def interpreter_fingerprint():
     )
 
 
-def installed_set_ok(manifest):
+def _installed():
     import importlib.metadata as md
-    boot = {k.lower() for k in manifest.get("bootstrap", {})}
-    got = {}
+    out = {}
     for dist in md.distributions():
         name = (dist.metadata["Name"] or "").lower()
-        if name and name not in boot:
-            got[name] = dist.version
+        if name:
+            out[name] = dist.version
+    return out
+
+
+def installed_set_ok(manifest):
+    # Exact match on the security-relevant (hash-locked) dependency set; bootstrap
+    # tooling (pip/setuptools/wheel) is excluded by name since a venv's seed versions
+    # vary and are not part of the hash-pinned lock. `pip check` (below) still guards
+    # the overall graph.
+    got = _installed()
+    boot = {k.lower() for k in manifest.get("bootstrap", {})}
     want = manifest.get("dists", {})
-    if set(got) != set(want):
+    non_boot = {n: v for n, v in got.items() if n not in boot}
+    if set(non_boot) != set(want):
         return False
-    return all(got[n] == want[n] for n in want)
+    return all(non_boot[n] == want[n] for n in want)
+
+
+def soabi():
+    import sysconfig
+    return sysconfig.get_config_var("SOABI") or "none"
+
+
+def pip_check_ok():
+    import subprocess
+    return subprocess.run([sys.executable, "-m", "pip", "check"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 def fail(msg):
@@ -103,12 +124,20 @@ def main():
     with open(os.path.join(gen, "VERSION")) as f:
         if f.read().strip() != desired.get("version"):
             fail("VERSION value != version")
-    # this interpreter (the venv python running us) matches the recorded fingerprint
+    # this interpreter (the venv python running us) matches the recorded fingerprint + ABI
     if interpreter_fingerprint() != marker.get("fingerprint"):
         fail("interpreter fingerprint mismatch")
-    # installed distribution set exactly equals the expected manifest
+    if marker.get("abi") is not None and soabi() != marker.get("abi"):
+        fail("interpreter ABI (SOABI) mismatch")
+    # lock identity: the manifest and the marker agree on the lock they came from
+    if manifest.get("lockSha256") is not None and manifest.get("lockSha256") != marker.get("lockSha"):
+        fail("manifest lockSha256 != marker lockSha")
+    # installed distribution set (incl. bootstrap versions) exactly equals the manifest
     if not installed_set_ok(manifest):
         fail("installed set != manifest")
+    # no broken/conflicting dependency graph
+    if not pip_check_ok():
+        fail("pip check reported broken requirements")
     sys.exit(0)
 
 

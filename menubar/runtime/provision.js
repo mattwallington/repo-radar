@@ -86,6 +86,8 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
       channel,
       genId,
       fingerprint: fp,
+      baseExe: base.exe, // provenance: which interpreter built this generation (Codex I7)
+      abi: base.abi,     // SOABI, verified against the venv python at run time
       sourceSha: hashTree(path.join(staging, 'repo_radar')),
       launcherSha: hashFile(path.join(staging, 'repo-radar')),
       versionSha: hashFile(path.join(staging, 'VERSION')),
