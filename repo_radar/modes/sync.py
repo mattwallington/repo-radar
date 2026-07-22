@@ -17,7 +17,7 @@ from repo_radar.config import load_config, save_config, load_cache_index, save_c
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm
+from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model
 from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
@@ -750,11 +750,12 @@ Stack Trace:
                 model = get_ai_model()
                 api_key_missing = False
 
-                if model.startswith('gemini/'):
+                provider = provider_for_model(model)
+                if provider == 'gemini':
                     api_key_missing = not os.getenv('GEMINI_API_KEY')
-                elif model.startswith('claude'):
+                elif provider == 'anthropic':
                     api_key_missing = not os.getenv('ANTHROPIC_API_KEY')
-                elif model.startswith('gpt') or model.startswith('o1') or model.startswith('o3') or model.startswith('o4') or model.startswith('chatgpt/') or model.startswith('codex'):
+                elif provider == 'openai':
                     api_key_missing = not os.getenv('OPENAI_API_KEY')
 
                 if api_key_missing:
@@ -1394,13 +1395,14 @@ Stack Trace:
                 model = get_ai_model()
                 console.print(f"[bold yellow]⚠️  WARNING: No metadata was generated![/bold yellow]")
 
-                if model.startswith('gemini/') and not os.getenv('GEMINI_API_KEY'):
+                provider = provider_for_model(model)
+                if provider == 'gemini' and not os.getenv('GEMINI_API_KEY'):
                     console.print(f"[yellow]   Reason: GEMINI_API_KEY not configured[/yellow]")
                     console.print(f"[yellow]   Fix: Configure Gemini API Key in Settings → API Configuration[/yellow]")
-                elif model.startswith('claude') and not os.getenv('ANTHROPIC_API_KEY'):
+                elif provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
                     console.print(f"[yellow]   Reason: ANTHROPIC_API_KEY not configured[/yellow]")
                     console.print(f"[yellow]   Fix: Configure Anthropic API Key in Settings → API Configuration[/yellow]")
-                elif (model.startswith('gpt') or model.startswith('o1') or model.startswith('o3') or model.startswith('o4') or model.startswith('chatgpt/') or model.startswith('codex')) and not os.getenv('OPENAI_API_KEY'):
+                elif provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
                     console.print(f"[yellow]   Reason: OPENAI_API_KEY not configured[/yellow]")
                     console.print(f"[yellow]   Fix: Configure OpenAI API Key in Settings → API Configuration[/yellow]")
                 elif stats['errors'] > 0:
@@ -1424,11 +1426,12 @@ Stack Trace:
             model = get_ai_model()
             warning_msg = ""
 
-            if model.startswith('gemini/') and not os.getenv('GEMINI_API_KEY'):
+            provider = provider_for_model(model)
+            if provider == 'gemini' and not os.getenv('GEMINI_API_KEY'):
                 warning_msg = "⚠️ No metadata generated: GEMINI_API_KEY not configured. Configure in Settings → API Configuration."
-            elif model.startswith('claude') and not os.getenv('ANTHROPIC_API_KEY'):
+            elif provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
                 warning_msg = "⚠️ No metadata generated: ANTHROPIC_API_KEY not configured. Configure in Settings → API Configuration."
-            elif (model.startswith('gpt') or model.startswith('o1') or model.startswith('o3') or model.startswith('o4') or model.startswith('chatgpt/') or model.startswith('codex')) and not os.getenv('OPENAI_API_KEY'):
+            elif provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
                 warning_msg = "⚠️ No metadata generated: OPENAI_API_KEY not configured. Configure in Settings → API Configuration."
             elif stats['errors'] > 0:
                 warning_msg = f"⚠️ No metadata generated: {stats['errors']} errors occurred (possible model not found or API issues)."

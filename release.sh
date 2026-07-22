@@ -84,7 +84,7 @@ fi
 cd "$SCRIPT_DIR"
 
 # Check for required tools
-for tool in gh node npm git; do
+for tool in gh node npm git python3; do
   if ! command -v "$tool" &>/dev/null; then
     error "$tool is not installed"
   fi
@@ -114,6 +114,12 @@ if ! git diff --cached --quiet; then
   error "You have staged changes. Commit or unstage them first."
 fi
 success "No staged changes"
+
+RELEASE_DATE=$(date +%Y-%m-%d)
+python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
+  echo "Release blocked: model lifecycle gate failed. Re-verify vendor deprecation pages and amend repo_radar/model_lifecycle.json + the model maps." >&2
+  exit 1
+}
 
 # ── Version calculation ───────────────────────────────────────────────────────
 

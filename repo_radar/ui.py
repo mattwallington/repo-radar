@@ -6,6 +6,7 @@ import json
 from repo_radar import VERSION, SCRIPT_NAME, SCRIPT_DESCRIPTION
 from repo_radar.config import load_config
 from repo_radar.constants import *
+from repo_radar.llm import DEFAULT_MODEL
 
 
 def print_help():
@@ -35,7 +36,7 @@ def print_help():
     print("  ANTHROPIC_API_KEY  For metadata generation with Claude models (default)")
     print("  GEMINI_API_KEY     For metadata generation with Gemini models")
     print("  OPENAI_API_KEY     For metadata generation with OpenAI/Codex models")
-    print(f"  AI_MODEL           Override AI model (default: claude-sonnet-4-6-1m)")
+    print(f"  AI_MODEL           Override AI model (default: {DEFAULT_MODEL})")
     print()
     print("Examples:")
     print(f"  {SCRIPT_NAME} configure")
