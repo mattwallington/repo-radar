@@ -77,8 +77,11 @@ async function ensureRuntime({ home, channel, appVersion, bundle, hooks = {}, qu
 }
 
 // "Sync Now" runner: acquire the ROOT exec lock (-t 0), then resolve+verify current,
-// then run the sync child holding the lock for its lifetime.
-async function runSync({ home, channel }) {
+// then run the sync child holding the lock for its lifetime. `env` (API keys, AI_MODEL,
+// REPO_RADAR_STATUS_PORT built by main.js) is merged with the resolved PYTHONPATH.
+// `onChild(child)` hands the spawned process back to the caller so it can wire
+// cancellation / the status window while runSync keeps the lock until the child exits.
+async function runSync({ home, channel, env = {}, args = [], stdio = 'inherit', onChild } = {}) {
   const L = layout(home, channel);
   fs.mkdirSync(L.root, { recursive: true, mode: 0o700 });
   return await withLock(L.execLock, 0, async () => {
@@ -89,9 +92,10 @@ async function runSync({ home, channel }) {
     return await new Promise((resolve, reject) => {
       const child = spawn(
         path.join(genDir, 'venv', 'bin', 'python'),
-        [path.join(genDir, 'repo-radar'), 'sync', '--status-server'],
-        { env: { ...process.env, PYTHONPATH: genDir }, stdio: 'inherit' }
+        [path.join(genDir, 'repo-radar'), 'sync', '--status-server', ...args],
+        { env: { ...process.env, ...env, PYTHONPATH: genDir }, cwd: genDir, stdio }
       );
+      if (typeof onChild === 'function') onChild(child);
       child.on('exit', (code) => resolve(code));
       child.on('error', reject);
     });
