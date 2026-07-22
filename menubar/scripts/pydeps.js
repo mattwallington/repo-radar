@@ -194,6 +194,31 @@ function check() {
   return drifted > 0 ? 1 : 0;
 }
 
+// Release preflight (maintainer requirement): the FULL supported matrix must exist as
+// real checked-in lock+manifest pairs — documentation is insufficient. Fails closed if
+// any of the 10 (CPython 3.10-3.14 x {arm64, x86_64}) cells is missing.
+function assertMatrix() {
+  const arches = ['arm64', 'x86_64'];
+  const minors = [10, 11, 12, 13, 14];
+  const missing = [];
+  for (const arch of arches) {
+    for (const m of minors) {
+      const tag = `cp3${m}-${arch}`;
+      for (const ext of ['lock', 'manifest.json']) {
+        const p = path.join(PYDEPS_DIR, `${tag}.${ext}`);
+        if (!fs.existsSync(p)) missing.push(`${tag}.${ext}`);
+      }
+    }
+  }
+  if (missing.length) {
+    console.error(`MATRIX INCOMPLETE — missing ${missing.length} artifact(s):\n  ${missing.join('\n  ')}`);
+    console.error('Generate them with pydeps.js/--emit-manifest or narrow the supported matrix (spec §3.6).');
+    return 1;
+  }
+  console.log('matrix OK: all 10 (CPython 3.10-3.14 x arm64/x86_64) lock+manifest cells present');
+  return 0;
+}
+
 function main() {
   const args = process.argv.slice(2);
   if (args[0] === '--emit-manifest') {
@@ -208,7 +233,10 @@ function main() {
   if (args[0] === '--check') {
     process.exit(check());
   }
-  console.error('usage: pydeps.js --emit-manifest <python> <out> | --check');
+  if (args[0] === '--assert-matrix') {
+    process.exit(assertMatrix());
+  }
+  console.error('usage: pydeps.js --emit-manifest <python> <out> | --check | --assert-matrix');
   process.exit(2);
 }
 
