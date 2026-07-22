@@ -1005,7 +1005,7 @@ function triggerSync({ showWindow = true } = {}) {
         console.log('✓ Loaded OPENAI_API_KEY from config');
       }
       shellEnv.AI_MODEL = migrateModel(config.ai_model || DEFAULT_MODEL);
-      console.log('✓ Loaded AI_MODEL from config:', shellEnv.AI_MODEL);
+      console.log('✓ AI_MODEL set to:', shellEnv.AI_MODEL, config.ai_model ? '(from config)' : '(default)');
     } else {
       console.warn('⚠️  Config file not found:', configFile);
       console.warn('⚠️  Please configure API keys in Settings before running sync');

@@ -120,6 +120,7 @@ Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown h
 **Advanced — Responses API (higher cost/latency):**
 - GPT-5.3 Codex — 400K context
 - GPT-5.5 Pro — 1M context
+- Requires: `OPENAI_API_KEY`
 - Note: these route through the newer Responses API. The app detects and routes them automatically, so you can pick them freely.
 
 ## Troubleshooting
