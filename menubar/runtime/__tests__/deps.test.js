@@ -67,6 +67,8 @@ test(
 test('isCovered reflects checked-in lock+manifest presence', () => {
   const { isCovered } = require('../deps');
   assert.strictEqual(isCovered('cpython-3.10.20-arm64'), true);   // cp310-arm64 checked in
-  assert.strictEqual(isCovered('cpython-3.14.4-arm64'), false);   // no cp314 lock
+  assert.strictEqual(isCovered('cpython-3.14.4-arm64'), true);    // cp314-arm64 now generated (10/10)
+  assert.strictEqual(isCovered('cpython-3.9.0-arm64'), false);    // 3.9 is below the supported floor -> no lock
+  assert.strictEqual(isCovered('pypy-3.10.0-arm64'), false);      // non-cpython impl unsupported
   assert.strictEqual(isCovered('garbage'), false);
 });
