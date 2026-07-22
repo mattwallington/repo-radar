@@ -1,287 +1,269 @@
 # Spec 2A — Packaged Python Runtime Binding (Repo Radar v1.0.27)
 
-**Status:** rev 3 — addresses Codex R2 blockers 1–5 and acceptance additions. For Codex
-Round 3. Do NOT implement or merge into `dev` before the Spec 1
-(`feature/model-refresh-2026`) dev-prerelease smoke completes.
+**Status:** rev 4 — addresses Codex R3 blockers 1–6 + minors. For Codex Round 4. Do NOT
+implement or merge into `dev` before the Spec 1 (`feature/model-refresh-2026`)
+dev-prerelease smoke completes.
 
 **Branch:** `feature/runtime-binding-v1.0.27` (cut from `dev` @ `6621882`).
 
 **Goal:** Guarantee that a given installed Repo Radar *build* (channel + version) always
 runs its own bundled Python package against its own fully-resolved, version-bound
 dependencies — on fresh install, upgrade, crash-recovery, and dev/stable coexistence, for
-manual ("Sync Now"), scheduled (LaunchAgent), and CLI runs — so the Spec 1 model refresh
-(and every future Python-side change) actually reaches users. Sole production blocker for
-`v1.0.27`.
+manual, scheduled, and CLI runs — so the Spec 1 model refresh (and future Python-side
+changes) reach users. Sole production blocker for `v1.0.27`.
 
 ---
 
 ## 1. Scope
 
-### In scope (2A)
-- **Dependency binding** from a **checked-in, hash-pinned, portable lock** into a
-  channel+build-bound venv, on fresh install and every build change.
-- **Interpreter binding:** resolve one base Python (`>=3.10,<3.15`) to its **real
-  executable**, fingerprint it, run everything through the app-managed venv.
-- **Source binding:** copy the shipped `repo_radar` into an **immutable generation
-  directory** (version + fingerprint); always import that copy.
-- **Ownership model:** exactly one **activation pointer** per channel; **stable** is the
-  sole owner of the `repo-radar` CLI and the persistent user schedule; **dev** is fully
-  namespaced and may not mutate stable's CLI or install a competing persistent schedule.
-- **Crash-safe activation:** install generic self-verifying dispatchers first, migrate the
-  legacy schedule, then flip **one atomic pointer** as the single commit point.
-- **One real cross-process lock** (Node + `/bin/sh` + CLI) held for a child's full lifetime
-  and through provisioning activation.
-- **Verifiable runtime identity:** validate the **active payload** (hash the live copy,
-  exact installed-distribution-set match, corroborated channel identity), not just an
-  input-file hash.
-- **CLI continuity**, **failure/offline hard-block** (redacted, restrictive perms),
-  **scripted logic harness + built-artifact packaged upgrade smoke**.
+**In scope (2A):** dependency binding from a checked-in, hash-pinned, portable lock into a
+channel+build-bound venv; interpreter binding (real executable, fingerprinted); source
+binding (copy into a nonce-unique immutable generation); an ownership model (one activation
+pointer per channel; stable is sole owner of the `repo-radar` CLI, the persistent schedule,
+and schedule config; dev fully namespaced); a two-tier lock (per-channel **activation** lock
++ one **root execution** lock serializing the shared data plane across channels); crash-safe
+activation via a published intent record + a single atomic pointer flip; verifiable identity
+against a precomputed expected-distribution manifest; checked legacy **quiescence**; CLI
+continuity; failure/offline hard-block (redacted, correct perms); scripted logic harness +
+built-artifact packaged upgrade smoke.
 
-### Out of scope (Spec 2B)
-- Broader updater UX; signing/notarization; Electron upgrade.
-- CI release hardening beyond a lock-freshness check; dev/prod gate channel semantics.
-- Dependency **wheel vendoring** for offline first-run.
-- Full old-runtime GC (2A GCs only abandoned staging/orphan generations).
-- Namespacing the entire shared **data plane** (config schedule, status file, cache,
-  pristine repos). 2A instead makes stable the sole persistent-schedule owner (below).
+**Out of scope (Spec 2B):** broader updater UX; signing/notarization; Electron upgrade; CI
+release hardening beyond a lock-freshness check; dev/prod gate semantics; wheel vendoring for
+offline first-run; **full data-plane namespacing** (2A uses stable-sole-schedule + a shared
+root execution lock); **GC of successful previously-activated generations** (2A deletes only
+incomplete/invalid never-activated generations).
 
 ---
 
-## 2. Current architecture (as-is) — gaps this spec closes
+## 2. As-is gaps (file:line on `dev` @ `6621882`)
 
-(file:line on `dev` @ `6621882`.)
-1. `setup.sh` orphaned; global pip; no venv (`setup.sh:33-57`).
-2. Deps not build-bound; auto-updater has no post-update hook (`main.js:1851-1918`).
-3. `getSyncScriptPath()` prefers stale `~/.repo-radar/repo-radar` (`main.js:88-91`).
-4. Manual (`/usr/bin/env python3`, pyenv-first, `main.js:1028`) vs scheduled (Homebrew after
-   pyenv, `main.js:1547-1548`) interpreter divergence.
-5. No runtime marker.
-6. No channel namespacing; `~/.repo-radar`, `run-sync.sh`, `com.user.repo-radar`,
-   `~/.local/bin/repo-radar` shared across builds.
-7. Unsafe `getVersion()` fictitious fallback (`main.js:11-26`).
-8. `~/.local/bin/repo-radar` CLI (`setup.sh:37`) is a public interface.
-9. **The installed 1.0.26 LaunchAgent wrapper has no self-check** — the first upgrade cannot
-   assume a stale wrapper fails closed.
+`setup.sh` orphaned + global pip, no venv (`setup.sh:33-57`); no post-update hook
+(`main.js:1851-1918`); prefers stale `~/.repo-radar/repo-radar` (`main.js:88`); manual
+(`main.js:1028`) vs scheduled (`main.js:1547-1548`) interpreter divergence; no marker; no
+channel namespacing; unsafe `getVersion()` fallback (`main.js:11-26`); `~/.local/bin/repo-radar`
+public CLI (`setup.sh:37`); **the installed 1.0.26 wrapper has no self-check and honors no lock**.
 
 ---
 
 ## 3. Design
 
-### 3.1 Channel ownership + immutable generations
+### 3.1 Ownership, layout, intent record
 
-`channel` ∈ {`stable`,`dev`} derived from build metadata (`build-info.json` CHANNEL,
-`main.js:33-38`). **Missing/malformed channel identity fails closed** (no provision, no
-activation, no schedule — surface an error); it never defaults to `stable`. Layout:
+`channel` ∈ {`stable`,`dev`} from build metadata; **missing/malformed channel identity fails
+closed** (never defaults to stable). Ownership (Codex R2-1/R3-2): **stable** solely owns the
+`repo-radar` CLI, the persistent LaunchAgent, and **schedule configuration**; **dev** owns
+`repo-radar-dev` and never persists schedule fields, invokes schedule IPC on shared config, or
+installs a persistent schedule (dev scheduled sync is only a deliberately-installed transient
+`com.user.repo-radar-dev` agent).
 
 ```
-~/.repo-radar/<channel>/
-  generations/
-    <app-version>-<interp-fingerprint>/     # IMMUTABLE once complete
-      venv/  repo_radar/  repo-radar  .runtime.json
-  current -> generations/<...>              # the single ACTIVATION POINTER
-  run-sync.sh                               # generic self-verifying runner (§3.4)
-  .lock.d/                                  # atomic lock directory (§3.3)
-  provision.log                             # redacted, 0600
+~/.repo-radar/
+  .exec.lock.d/                       # ROOT execution lock (all sync children, both channels)
+  <channel>/
+    .activation.lock.d/               # per-channel provisioning/activation lock
+    desired.json                      # published INTENT (atomic; the fail-closed transition)
+    generations/
+      <version>-<fingerprint>-<nonce>/  # IMMUTABLE, uniquely named; venv/ repo_radar/ repo-radar .runtime.json
+    current -> generations/<...>      # single ACTIVATION POINTER (commit point)
+    run-sync.sh                       # generic self-verifying runner (0700)
+    provision.log                     # redacted (0600)
 ```
 
-**Ownership (Codex R2-1):**
-- **CLI:** stable owns `~/.local/bin/repo-radar`; dev owns `~/.local/bin/repo-radar-dev`.
-  A dev build never writes/replaces the stable `repo-radar` command.
-- **Schedule:** **stable is the sole owner of the persistent user LaunchAgent**
-  (`com.user.repo-radar`) that syncs the shared data plane (config schedule, status file,
-  cache, pristine repos). **Dev does not infer/install a persistent schedule from shared
-  config**; dev scheduled sync, if ever needed, is an explicit, clearly-namespaced,
-  transient smoke agent (`com.user.repo-radar-dev`) a tester sets up deliberately — never
-  auto-derived. This prevents two schedules racing on shared files (separate status ports
-  do not prevent filesystem races). Fully namespacing the data plane is broader → Spec 2B.
+`desired.json` (per channel, atomically written temp+rename, schema-versioned) is the
+Electron provisioner's authoritative statement of the current build's intent — channel,
+complete build identity (`app.getVersion()` corroborated with bundled `VERSION`), and the
+expected source/launcher/lock hashes + generation id. **Electron-less shell/CLI runners
+validate `current` + its marker only against `desired.json`** (they have no app object,
+Codex R3-3).
 
-Generation directories are **immutable and uniquely named** (`<version>-<fingerprint>`), so a
-crash leaves a distinctly-named partial dir (GC'd as orphan), and a retry either **adopts** an
-already-complete matching generation (after full validation, §3.3) or builds a fresh one —
-never mutates a live generation.
+### 3.2 Base interpreter + generation identity
 
-### 3.2 Base interpreter selection + fingerprint (D3)
+Resolve one base interpreter validated `>=3.10,<3.15` to its **real executable**
+(`/opt/homebrew`→`/usr/local`→`pyenv which`→validated `PATH`), fingerprint =
+{real exe, Python x.y.z, implementation/ABI, arch}. Each provision creates a **nonce-unique**
+generation dir `<version>-<fingerprint>-<nonce>` (Codex R3-4) so a same-version rebuild,
+source/lock change, or a tampered dir never collides with the destination; `desired.json`/
+`current` reference the specific generation by name.
 
-Resolve one base interpreter validated `>=3.10,<3.15`, to its **real executable**: probe
-`/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, then `pyenv which python3` (real
-`~/.pyenv/versions/<x>/bin/python3`, not the shim), then a validated `PATH` `python3`. Probe
-each with `python -c '...'` capturing version + `sys.implementation` + `platform.machine()`.
-The venv is created from the winner; its own `bin/python` is used thereafter. The
-**fingerprint** (real exe path, Python x.y.z, implementation/ABI tag, arch) is part of the
-generation name and the marker; a changed fingerprint yields a new generation.
+### 3.3 Locks, verification, crash-safe activation, quiescence
 
-### 3.3 Cross-process lock, verification, crash-safe activation
+**Two locks (Codex R3-2), both = atomic lock-directory (`mkdir`; usable by Node, `/bin/sh`,
+CLI):**
+- **Root execution lock** `~/.repo-radar/.exec.lock.d` — held by ANY sync child (manual/
+  scheduled/CLI, either channel) for its full lifetime; serializes the shared data plane
+  (config/status/cache/pristine).
+- **Per-channel activation lock** `~/.repo-radar/<channel>/.activation.lock.d` — held by
+  provisioning through activation.
 
-**Lock protocol (Codex R2-3).** One mechanism usable by Electron (Node), `/bin/sh`, and the
-CLI: **atomic lock-directory** `~/.repo-radar/<channel>/.lock.d` acquired via `mkdir` (atomic
-create; `EEXIST` = held), containing `owner.pid`+`started_at` for **stale-owner recovery**
-(dead PID or age > threshold → reclaim). Held for the **entire child lifetime** by any runner
-(manual/scheduled/CLI) and **through activation** by provisioning. A generic runner acquires
-the lock, resolves interpreter **and** launcher from `current` **once** under the lock,
-verifies (below), execs the child **without releasing**, and cleans up on child exit — no
-resolve→exec cutover window.
+Global order (deadlock-free): if both are ever needed, acquire **root before channel**. Normal
+flow holds only one (a sync holds root; provisioning holds channel), so they don't contend.
 
-**Healthy predicate (Codex R2-4) — validates the ACTIVE payload, not just inputs.** A build's
-`current` is valid iff, under the lock:
-- `realpath(current)` is inside `~/.repo-radar/<channel>/generations/`;
-- channel identity corroborated by build metadata **and** `app.getVersion()` (authoritative;
-  fictitious fallback removed); missing/conflicting → fail closed;
-- live `hashTree(current/repo_radar)` + launcher hash **equal** the marker **and** the bundled
-  payload hash;
-- the venv's **normalized installed distribution set exactly equals** the locked set
-  (name==version for every dist; no extras, no substitutions — stronger than `pip check`);
-- interpreter fingerprint of `current/venv/bin/python` matches the marker.
-A **channel-level desired-state** (target = current build's identity) means an old healthy
-`current` is **not** treated as valid after the new build's provisioning fails — it fails
-closed (§6), never silently serves the previous generation to the new app.
+**Lock ownership + staleness (Codex R3-1).** The lock dir contains an owner record:
+`{boot_session_token, pid, proc_start_token, nonce}` (boot session from `kern.boottime`;
+`proc_start_token` from the process start time). Reclaim **only** when the owner is *provably
+gone*: different boot session, or PID dead, or PID alive but `proc_start_token` mismatched
+(PID reuse). **Age is diagnostic only — never a reclaim trigger** (a long sync keeps its lock).
+A just-created dir without a complete owner record gets a short grace window; reclaim removes a
+dir **only** by matching its nonce (never blindly `rmdir` a dir another process just recreated).
 
-**Crash-safe activation ordering (Codex R2-2).** Commit point = one atomic pointer flip, done
-last:
-1. Install/refresh **generic** self-verifying dispatchers: the CLI dispatcher(s) and
-   `run-sync.sh`. They resolve `current` at run time and **fail closed** whenever the healthy
-   predicate fails — so they are safe even before any valid `current` exists, and need no
-   per-version rewrite.
-2. **Migrate the legacy schedule:** `launchctl unload` the old `com.user.repo-radar` and
-   repoint its plist at the new generic `run-sync.sh` (which fails closed until activation).
-   This removes the **non-self-checking 1.0.26 wrapper** before a new generation exists.
-3. **Provision** into `generations/<version>-<fingerprint>/` (adopt-if-complete-and-valid,
-   else build fresh): create venv, `pip install --require-hashes -r <lock>`, copy source +
-   launcher, smoke (import + exact-version asserts + installed-set capture), write
-   `.runtime.json`.
-4. **Flip `current`** atomically (temp symlink + `rename(2)` in the same dir — atomic on
-   macOS) to the new generation. **This is the sole commit point.**
-Install the stable `repo-radar` CLI dispatcher (generic, step 1) before retiring the legacy
-launcher (§3.5). A crash after any step is safe: dispatchers fail closed until `current` is a
-validated generation; orphan/partial generations are GC'd; retry adopts a complete-valid
-generation or rebuilds.
+**Shell runner cleanup (Codex R3-1, verified).** `/bin/sh` `exec` replaces the shell, so a
+post-`exec` EXIT trap never runs and would orphan the lock. Runners therefore **spawn + wait**
+(not `exec`): start the child, forward signals (`TERM`/`INT`) to it, `wait`, release the lock
+(nonce-matched), and return the child's exit status. (Alternatively a token-aware child helper
+owns cleanup; the spec picks spawn+wait.)
 
-**Reconcile entry:** `ensureRuntime()` runs early at startup and after
-`update-downloaded`→relaunch; when the predicate already holds it is a fast no-op (no pip).
+**Expected-distribution verification (Codex R3-5).** "Installed set == locked set" is defined
+against a **precomputed expected manifest** for the *selected environment*: evaluate the lock's
+PEP 508 markers for the venv's (Python-minor, arch), yielding a canonical
+`{name==version}` manifest, **plus an explicit bootstrap allow-list** (`pip`/`setuptools`/
+`wheel` with recorded versions). Verification compares the venv's normalized installed set to
+that expected manifest (not to a marker captured from the same install). Per-(Python-minor,
+arch) locks + manifests are used when the graph differs (§3.6).
 
-### 3.4 Manual / scheduled / CLI parity (one generic runner)
+**Healthy predicate** (under the relevant lock): `realpath(current)` inside the channel
+generations tree; `current` + its marker match **`desired.json`**; live
+`hashTree(current/repo_radar)` + launcher hash == marker == bundle; venv installed set ==
+expected manifest; interpreter fingerprint matches. Any miss → fail closed.
 
-All three paths use the same runner contract (§3.3 lock + resolve-once + verify + exec-holding-
-lock):
-- **Manual** (`main.js`): acquire lock; resolve `current`; verify; `spawn(pythonBin,[launcher,
-  'sync','--status-server'],{env:{…,PYTHONPATH:sourceDir}})`; release on exit.
-- **Scheduled** (`run-sync.sh`, written atomically, generic): `#!/bin/sh` acquires the same
-  lock-dir, resolves+verifies `current`, `exec`s the absolute venv python + launcher, traps to
-  release. Fails closed (exit non-zero, logs) on any predicate failure — including the first
-  upgrade before activation.
-- **CLI** (`repo-radar` dispatcher): identical acquire→verify→exec-holding-lock.
-Because provisioning holds the lock through the `current` flip, a runner sees either the old
-generation fully or the new one fully — never a torn state. Concurrent runs serialize on the
-lock (one sync at a time across the shared data plane).
+**Legacy quiescence (Codex R3-6) — a checked phase, not a request.** Before provisioning a new
+build: synchronously `launchctl bootout`/unload the legacy `com.user.repo-radar`, then **verify
+the job label is absent and its child has exited**; also detect a running legacy *manual* sync
+(process scan for the legacy launcher/interpreter + legacy statusfile) and wait with timeout.
+If quiescence cannot be proven, **fail closed without flipping `current`.**
 
-### 3.5 Legacy migration + CLI continuity (Codex R2-1/R1-4)
+**Crash-safe activation ordering** (single commit point = the atomic `current` flip):
+1. Quiesce legacy (above); fail closed if not quiescent.
+2. Install/refresh **generic** self-verifying dispatchers (CLI + `run-sync.sh`) and the
+   stable LaunchAgent plist pointing at the generic `run-sync.sh` (fails closed until valid).
+3. **Publish `desired.json`** (atomic) — the explicit fail-closed *intent* transition: after
+   publish, until the flip, generic runners see `current`≠`desired` and fail closed.
+4. **Provision** into the nonce-unique generation (adopt an already-complete generation only if
+   its marker matches the *entire* desired identity, else build fresh): venv,
+   `pip install --require-hashes -r <lock>`, copy source+launcher, smoke (import + exact-version
+   asserts + installed-set == expected manifest), write `.runtime.json`.
+5. **Flip `current`** atomically (temp symlink + `rename(2)`, same dir). Commit point.
+Crash at any step is safe: dispatchers fail closed until `current`==`desired`==a validated
+generation; a crash before publish leaves old `desired` (old runtime still valid for the old
+build); a crash between publish and flip fails closed (no runtime served); nonce-unique dirs
+avoid destination collisions; retry adopts a complete-matching generation or rebuilds.
+`ensureRuntime()` runs at startup + after `update-downloaded`→relaunch; a no-op when healthy.
 
-- Stable installs the generic `repo-radar` dispatcher into `~/.local/bin` (atomic
-  write) **before** retiring any legacy launcher; dev installs only `repo-radar-dev`.
-- Retire a legacy top-level `~/.repo-radar/repo-radar` to `~/.repo-radar/legacy-<ts>/` only
-  after the stable dispatcher is in place and the first activation succeeds.
-- CLI invocation is in the acceptance matrix (§7).
+### 3.4 Manual / scheduled / CLI parity (generic runner)
 
-### 3.6 Dependency lock — checked-in, hash-pinned, portable (Codex R2-5)
+All three use one runner: acquire **root execution lock** (own-record + stale recovery) →
+resolve `current` + validate against `desired.json` and the healthy predicate **once** under
+the lock → **spawn+wait** the child (`current/venv/bin/python current/repo-radar sync
+--status-server`, `PYTHONPATH=current/repo_radar`) forwarding signals → release lock (nonce
+match) → return child status. No `exec`; no resolve→run window; concurrent runs (any channel)
+serialize on the root lock. The scheduled `run-sync.sh` is generic (no per-version rewrite) and
+fails closed whenever the predicate fails — including the first upgrade before activation.
 
-- The resolved lock is **checked into source control**, generated with `pip-compile
-  --generate-hashes` (or `uv pip compile --generate-hashes`) — real `--require-hashes` input,
-  covering direct + transitive deps. `pip freeze` is insufficient (no hashes).
-- **Dependency updates regenerate the lock explicitly** (a documented make/skill step); the
-  **build only verifies freshness** (lock resolves from current `requirements.txt`) and bundles
-  it. No per-build re-resolution (reproducibility).
-- **Portability decision (tested, not assumed):** target matrix = CPython 3.10–3.14 × {x86_64,
-  arm64}. Produce **one universal lock** with environment markers + all-platform wheel hashes
-  **iff** it installs cleanly (`--require-hashes`) across the full matrix in test; **otherwise
-  per-Python-minor locks** (arch covered by multi-hash wheels), selected at provision by the
-  resolved interpreter's fingerprint. If neither is clean, **narrow the supported interpreter
-  matrix** and state it. The matrix install test (§7) decides and guards this.
+### 3.5 Legacy migration + CLI continuity
+
+Stable installs the generic `repo-radar` dispatcher (atomic) **before** retiring any legacy
+launcher; dev installs only `repo-radar-dev` and never writes `repo-radar`. Retire legacy
+`~/.repo-radar/repo-radar` → `~/.repo-radar/legacy-<ts>/` only after the stable dispatcher is in
+place and the first activation succeeds. CLI invocation is in §7.
+
+### 3.6 Dependency lock(s) — checked-in, hash-pinned, per-environment
+
+- Checked-in, `--generate-hashes` lock(s) (`pip freeze` insufficient). Dependency updates
+  regenerate explicitly (documented step); the **build only verifies freshness** and bundles.
+- **Environment matrix:** CPython 3.10–3.14 × {x86_64, arm64}. Produce **per-(Python-minor,
+  arch)** locks **and** their precomputed expected-distribution manifests when the resolved
+  graph differs across the matrix; a single universal lock+manifest is used only if it is proven
+  clean across the whole matrix by the §7 test. Provision selects the lock/manifest by the
+  resolved interpreter fingerprint. Bootstrap tooling (`pip`/`setuptools`/`wheel`) is pinned or
+  allow-listed with recorded versions. The matrix install test runs on **native (or equivalent)
+  arm64 and x86_64** and compares the installed set to the **expected manifest**, not a
+  self-captured marker.
 
 ---
 
 ## 4. Components / files (implementation preview)
 
-- **New** `menubar/runtime-manager.js`: `ensureRuntime()`, generic-runner (`runSync`/dispatcher
-  emit), `resolveBaseInterpreter()`, `authoritativeIdentity()`, lock-dir acquire/release +
-  stale recovery, `provision()` (staging gen + hashed install + source copy + smoke + installed-
-  set capture), payload+dist-set validation, atomic activation, legacy migration + CLI
-  dispatcher, redacted logging, orphan-generation GC. Argument-array `spawn` only.
-- `menubar/main.js`: call `ensureRuntime()`; replace `getSyncScriptPath()`/manual spawn with the
-  runner; channel-namespace + stable-sole-owner the LaunchAgent; emit generic `run-sync.sh`;
-  remove fictitious `getVersion()` fallback (fail closed); wire failure surface.
-- **Repo:** checked-in `requirements.lock` (or per-minor locks) + a lock-freshness check;
-  bundle the lock + `resources/repo_radar` via `extraResources`.
-- `menubar/resources/setup.sh`: retired as an app dependency.
-- **New tests** (§7).
+**New** `menubar/runtime-manager.js`: `ensureRuntime()`, generic-runner emit + Node runner,
+`resolveBaseInterpreter()`, `authoritativeIdentity()` + `publishDesired()`, lock-dir
+acquire/release with owner-tuple + stale recovery, `quiesceLegacy()`, `provision()` (nonce gen +
+hashed install + source copy + smoke + installed-set vs expected manifest), atomic activation,
+legacy migration + CLI dispatcher, redacted logging, orphan/invalid-generation GC. `menubar/
+main.js`: call `ensureRuntime()`; replace spawn with the runner; channel-namespace + stable-sole-
+own the schedule; emit generic `run-sync.sh` (spawn+wait); drop fictitious `getVersion()`
+fallback. **Repo:** checked-in per-env lock(s) + expected manifests + freshness check; bundle via
+`extraResources`. `setup.sh` retired as an app dependency.
 
 ## 5. Data flow
 
-Fresh install / upgrade / crash-retry all funnel through §3.3's ordering: generic dispatchers +
-migrated schedule first (fail-closed), provision an immutable generation, then the single
-`current` flip. Upgrade from 1.0.26: the legacy non-self-checking wrapper is unloaded/repointed
-(step 2) before a new generation is committed, so it cannot run the new bundle against the old
-runtime. dev + stable each own their `<channel>/` tree; stable alone owns the persistent
-schedule and `repo-radar`. Steady state: predicate holds → no pip → sync.
+Fresh/upgrade/crash-retry funnel through §3.3: quiesce legacy → generic dispatchers + migrated
+schedule → publish `desired.json` → provision nonce generation → single `current` flip. The
+1.0.26 wrapper/manual sync is proven quiescent before a new generation is committed. dev+stable
+each own their `<channel>/` tree; stable alone owns the schedule + `repo-radar`; every sync
+child (either channel) serializes on the root execution lock. Steady state: predicate holds →
+no pip → sync.
 
 ## 6. Failure / offline
 
-Hard-block (D6): on any provisioning/validation failure the **new build's** sync/CLI fail closed
-(never serve the old generation to the new app, per §3.3 desired-state); visible + actionable
-(notification + error window, cause, **redacted** pip-log tail, Retry, remediation). All
-`~/.repo-radar/**` created user-only (`0700`/`0600`); credentials in index URLs redacted before
-storing/displaying (Codex R1-6).
+Hard-block (D6): on any provisioning/validation/quiescence failure the **new build's** sync/CLI
+fail closed (never serve the old generation to the new build, per `desired.json`); visible +
+actionable (notification + error window, cause, **redacted** pip-log tail, Retry, remediation).
+Perms (Codex minor): directories and executables (`run-sync.sh`, dispatchers) `0700`; data files
+(`desired.json`, `.runtime.json`, logs) `0600`; all under `~/.repo-radar`.
 
-## 7. Acceptance (sign-off bar)
+## 7. Acceptance
 
-**7a. Scripted logic harness** (temp `$HOME`, fast): interpreter resolution + gating;
-authoritative-identity + channel fail-closed; lock-dir acquire/stale-recovery + hold-for-child-
-lifetime (paused sync vs concurrent provisioning, both directions, Codex R2-3); healthy predicate
-(active-payload hash, exact installed-set, desired-state); crash injection after **each** step of
-§3.3 (including the verbatim 1.0.26 wrapper/bootstrap state) → recovery; adopt-vs-rebuild of an
-existing generation; redaction.
+**7a. Scripted logic harness** (temp `$HOME`): interpreter resolution/gating; authoritative
+identity + `desired.json` publish/atomicity + channel fail-closed; **lock owner-tuple + stale
+recovery** (dead PID, PID reuse via start-token, reboot via boot session, long-running owner NOT
+reclaimed, grace for ownerless new dir, nonce-matched removal); **shell runner releases the lock
+after the child exits** (regression for the `exec`/trap bug) + signal forwarding; root-exec vs
+per-channel-activation ordering; healthy predicate incl. **installed-set == expected manifest**
+and bootstrap allow-list; **desired-state ordering** crash cases (before/after publish, between
+publish and flip); nonce-unique **generation collision** (same-version/different-source,
+tampered generation → quarantine+rebuild); redaction.
 
 **7b. Built-artifact packaged upgrade smoke** (locally built `.app`; resourcesPath, launchd,
 signed paths with spaces, real identity):
-1. Seed 1.0.26 state (legacy `~/.repo-radar/repo-radar`, the **verbatim 1.0.26 wrapper**, global
-   `litellm==1.83.4`, no generations); install/run built 1.0.27.
-2. Manual **and** `launchctl`-driven scheduled sync import `repo_radar` from
-   `current/repo_radar`; `llm.DEFAULT_MODEL=='claude-sonnet-5'`.
-3. Both envs: `sys.executable==current/venv/bin/python`, `litellm==1.93.0` (despite seeded 1.83.4).
-4. `migrate_model('gpt-5.2-codex')=='gpt-5.3-codex'`, `get_fallback_model('o3') is None`,
-   `KNOWN_LIMITS['gpt-5.4-mini']==1050000`.
-5. **CLI continuity:** `repo-radar` on `PATH` runs the new runtime; dev build does **not** replace
-   it and installs no duplicate production schedule.
-6. **Crash recovery** after each cutover boundary → consistent state, sync works after relaunch.
-7. **Tamper:** mutate `current/repo_radar` or the venv's installed set → next reconcile forces
-   reprovision (fails the active-payload/installed-set check).
-8. **Lock lifetime:** a sync holds the lock across its complete lifetime (concurrent provision
-   waits; no torn cutover).
-9. **Offline** provisioning → hard-block + Retry recovery; **partial/interrupted** provision →
-   prior runtime intact, only orphan staging to GC.
-10. **Clean hashed install across the declared matrix** (CPython 3.10–3.14 × x86_64/arm64) per the
-    §3.6 decision.
+1. Seed 1.0.26 state incl. the **verbatim 1.0.26 wrapper** and **an already-running legacy
+   scheduled child AND an already-running legacy manual child** (Codex R3-6); install/run built
+   1.0.27 → quiescence proven before activation.
+2–4. Manual + `launchctl` scheduled sync import `repo_radar` from `current/repo_radar`;
+   `DEFAULT_MODEL=='claude-sonnet-5'`; both envs `sys.executable==current/venv/bin/python` +
+   `litellm==1.93.0`; `migrate_model('gpt-5.2-codex')=='gpt-5.3-codex'`, `get_fallback_model('o3')
+   is None`, `KNOWN_LIMITS['gpt-5.4-mini']==1050000`.
+5. **CLI:** `repo-radar` runs the new runtime; **dev build never replaces `repo-radar` nor
+   installs a persistent schedule**; a deliberately-installed transient `com.user.repo-radar-dev`
+   agent, once removed, is proven to have never changed stable's plist/config.
+6. **Crash recovery** after each cutover boundary → consistent state; sync works after relaunch.
+7. **Tamper** `current/repo_radar` or the venv set → next reconcile reprovisions.
+8. **Lock lifetime + cross-channel serialization:** a stable-scheduled sync and a dev-manual sync
+   contend on the root execution lock (both directions); no concurrent data-plane access; no torn
+   cutover.
+9. **Offline** → hard-block + Retry recovery; **partial/interrupted** provision → prior runtime
+   intact, only orphan generation to GC.
+10. **Matrix hashed install** across CPython 3.10–3.14 × native arm64/x86_64, installed set
+    compared to the **expected manifest** per §3.6.
 
 SIP/quarantine + per-user `$HOME` isolation covered by 7b.
 
-## 8. Resolved mechanics / decisions
+## 8. Resolved mechanics
 
-- **Activation:** a single atomic `current` flip is the only commit point; generic self-verifying
-  dispatchers + legacy-schedule migration precede it.
-- **Lock:** atomic lock-directory with PID/stale recovery, held for child lifetime and through
-  activation; used identically by Electron, `/bin/sh`, CLI.
-- **Ownership:** stable is sole owner of `repo-radar` + the persistent schedule; dev fully
-  namespaced (`repo-radar-dev`, no auto persistent schedule); missing channel identity fails closed.
-- **Lock artifact:** checked-in, `--generate-hashes`, portable-by-test (universal or per-minor);
-  build verifies freshness only.
-- D1 (JS provisioning, retire setup.sh), D3 (Homebrew→real pyenv exe→PATH, fingerprinted),
-  D4 (async provision + central gate + fail-closed runner), D6 (hard-block), D7 (2A GCs only
-  orphan/staging generations) — resolved.
+Activation = single atomic `current` flip after `desired.json` publication (the fail-closed
+intent transition), generic dispatchers, and proven legacy quiescence. Locks = two atomic
+lock-directories (root execution + per-channel activation) with a boot-session/PID/start-token/
+nonce owner tuple, provable-death staleness, and spawn+wait shell cleanup. Verification =
+active-payload hashing + installed-set vs precomputed expected manifest. Ownership = stable sole
+owner of `repo-radar` + schedule (+ config); dev namespaced; channel-missing fails closed.
+Generations = nonce-unique immutable dirs. **GC (Codex minor): 2A deletes only incomplete/invalid
+never-activated generations while holding the channel activation lock, and retains every complete
+previously-activated generation; with that + a correctly-held lock, no refcount/grace is needed —
+successful-runtime GC is 2B.** D1/D3/D4/D6/D7 resolved.
 
-## 9. Definition of done (production unblock)
+## 9. Definition of done
 
-`v1.0.27` is unblocked when §7b passes on a real 1.0.26 upgrade: manual, scheduled, and CLI runs
-provably use the bundled 1.0.27 `repo_radar` + `litellm==1.93.0` from the channel+version
-generation; the single-pointer activation is crash-safe at every boundary (incl. the verbatim
-1.0.26 wrapper); the one cross-process lock serializes runs and provisioning; the CLI keeps
-working; stable/dev coexist with no shared-CLI or duplicate-schedule mutation; tampered payloads
-force reprovision; and the hashed lock installs cleanly across the declared matrix. Spec 2B
-deferred.
+`v1.0.27` is unblocked when §7b passes on a real 1.0.26 upgrade (incl. running legacy children):
+manual, scheduled, and CLI runs provably use the bundled 1.0.27 `repo_radar` + `litellm==1.93.0`
+from the channel+version generation; activation is crash-safe at every boundary; the two locks
+serialize provisioning and all data-plane syncs with safe ownership/recovery and correct shell
+cleanup; the CLI keeps working; stable/dev coexist with no shared-CLI/schedule mutation; tampered
+payloads force reprovision; and the hashed lock installs clean across the declared matrix against
+the expected manifest. Spec 2B deferred.
