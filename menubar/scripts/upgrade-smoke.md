@@ -11,14 +11,20 @@ upgraded user's Python runtime.
 - Native **arm64** and **x86_64** Macs (or an equivalent) — the matrix item (10) must run on both.
 - Do every step against an **isolated `HOME`** (the script uses `mktemp -d`) so your real `~/.repo-radar`, `~/.local/bin/repo-radar`, and `com.user.repo-radar` LaunchAgent are never touched.
 
-## Run
+## Run (two-mode: seed → launch → verify)
 ```
 cd menubar
-CHANNEL=stable REPO_RADAR_CHANNEL=stable npm run build:version
-npx electron-builder --mac dir          # signed .app in menubar/dist/mac*/
-CHANNEL=stable bash scripts/upgrade-smoke.sh
+REPO_RADAR_CHANNEL=stable npm run build:version
+npx electron-builder --mac dir                     # signed .app in menubar/dist/mac*/
+APP="$(find dist -maxdepth 2 -name 'Repo Radar*.app' | head -1)"
+H="$(mktemp -d /tmp/rr-smoke.XXXXXX)"              # isolated HOME — never your real ~
+
+bash scripts/upgrade-smoke.sh --seed --home "$H"   # create the v1.0.26 starting state
+# then complete the seed detail below (global litellm 1.83.4, legacy agent + running children),
+HOME="$H" open -n "$APP"                            # launch 1.0.27; let ensureRuntime finish
+bash scripts/upgrade-smoke.sh --verify --home "$H" --app "$APP"   # automated assertions
 ```
-Repeat with `CHANNEL=dev` on a separate isolated HOME for the coexistence item.
+Repeat with `--channel dev` on a separate isolated HOME for the coexistence item.
 
 ## Seed detail (step 2) — the 1.0.26 starting state
 1. `~/.repo-radar/repo-radar` — the verbatim 1.0.26 launcher (the script writes it).
