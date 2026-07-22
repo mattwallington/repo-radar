@@ -1,6 +1,17 @@
 #!/bin/bash
 
 # Setup script for Repo Radar
+#
+# NOT used by the app. Repo Radar self-provisions its own Python runtime on
+# launch — it builds a per-channel, per-version virtualenv under
+# ~/.repo-radar/<channel>/ from a checked-in, hash-pinned dependency lock, and
+# every sync (manual, scheduled, or CLI) runs through that runtime. The app
+# never invokes this script.
+#
+# This file is kept only as an optional manual aid (e.g. if you want a
+# standalone `repo-radar` CLI outside of the app's own managed runtime). See
+# menubar/SETUP.md for how the real, self-provisioning runtime works.
+#
 # This script installs the Python dependencies and sets up the sync script
 
 set -e

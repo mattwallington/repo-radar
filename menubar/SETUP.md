@@ -19,6 +19,18 @@ xattr -cr "/Applications/Repo Radar.app"
 ```
 Then open it normally.
 
+### First Launch: Automatic Python Runtime Setup
+
+You don't need to install Python or run `pip install` yourself. The first time Repo Radar opens, it self-provisions its own Python runtime — a private, versioned virtual environment under `~/.repo-radar/<channel>/` (stable builds use `~/.repo-radar/stable/`, dev builds use `~/.repo-radar/dev/`) — from a checked-in, hash-pinned dependency lock. Every sync (manual, scheduled, or CLI) runs through that managed runtime.
+
+The bundled runtime supports **CPython 3.10 through 3.14**. The app scans your machine for a compatible interpreter and picks one automatically; it fails closed (refuses to guess) if none is available.
+
+> **Known pre-release limitation:** hash-pinned dependency locks are currently checked in for only a subset of the supported (Python version, CPU architecture) matrix — see [`resources/pydeps/README.md`](../resources/pydeps/README.md) for exact coverage. If the only Python your machine offers lands on an uncovered cell (for example, a 3.11 or 3.14 interpreter, or any Intel/x86_64 Mac), provisioning fails closed with a clear error until that cell is generated or the supported matrix is narrowed. This is a known item being tracked ahead of general release, not a bug in your setup.
+
+If runtime setup fails for any reason (most commonly: no network connection on first launch, so the provisioner can't install dependencies), sync is disabled and the app surfaces the reason — a red tray icon, a notification, and details under **View Errors** / Settings' error log. Resolve the underlying issue (reconnect to the network, install a supported Python) and relaunch the app to retry; setup runs fresh on every launch until it succeeds.
+
+Once provisioned, the app also installs a `repo-radar` (stable) or `repo-radar-dev` (dev builds) command onto your `PATH` so you can run syncs directly from the terminal — see [CLI Usage](../README.md#cli-usage) in the main README.
+
 ### 2. Get Your API Keys
 
 You'll need a GitHub token and at least one AI provider key:
@@ -125,10 +137,16 @@ Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown h
 
 ## Troubleshooting
 
-**"Command not found" or Python errors:**
+**Sync disabled with a runtime/Python error:**
+Repo Radar provisions its own Python runtime automatically — you should not need to run `pip install` yourself. If sync is disabled:
+1. Check Settings -> View the error logs for the specific reason (most commonly: no network connection on first launch, or no supported Python 3.10-3.14 interpreter found on the machine).
+2. Resolve the underlying cause (reconnect to the network, install a supported Python) and relaunch the app — runtime setup retries on every launch.
+
+As a last-resort manual fallback only, `menubar/resources/setup.sh` can install the pinned dependencies (`requirements.txt`) into a Python already on your `PATH`:
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+This is not run by the app and is not required for normal use.
 
 **App doesn't appear in menu bar:**
 - Check Applications -> Repo Radar is running
