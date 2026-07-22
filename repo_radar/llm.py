@@ -193,11 +193,13 @@ def _needs_responses_api(model):
     except Exception:
         pass
 
-    # Fallback heuristic — only for models that look like OpenAI ones
-    lower = model.lower()
-    bare = lower.split('/', 1)[-1] if lower.startswith('openai/') else lower
-    if '/' in bare and not bare.startswith('openai'):
-        return False  # Anthropic / Gemini / etc. never use Responses API
+    # Fallback heuristic — only OpenAI models ever use the Responses API.
+    # Gate on the centralized provider classifier first, so a non-OpenAI id
+    # whose name merely contains "-pro"/"-codex" (e.g. gemini-*-pro,
+    # claude-*-pro) can never be misrouted to /v1/responses.
+    if provider_for_model(model) != 'openai':
+        return False
+    bare = model.lower().split('/', 1)[-1]
     return any(marker in bare for marker in ('-codex', '-pro', '-deep-research', 'codex-mini'))
 
 

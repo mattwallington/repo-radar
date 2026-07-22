@@ -4,7 +4,7 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.27] - 2026-07-21
+## [1.0.27] - Unreleased
 
 ### Changed
 - Model catalog refreshed to the current Anthropic, Google, and OpenAI lineups. Default model is now **Claude Sonnet 5** (was Claude Sonnet 4.6). The Settings dropdown now has 18 models across 5 groups: ⭐ Recommended (Claude Sonnet 5, Claude Opus 4.8, Claude Haiku 4.5, Gemini 3.5 Flash, Gemini 3.1 Flash Lite, GPT-5.6 Terra, GPT-5.6 Luna), Anthropic (other), Google (other), OpenAI (other), and Advanced — Responses API (GPT-5.3 Codex, GPT-5.5 Pro).

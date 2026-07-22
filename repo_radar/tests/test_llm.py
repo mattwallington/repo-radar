@@ -114,3 +114,15 @@ def test_get_ai_model_migrates(monkeypatch):
     assert llm.get_ai_model() == 'gpt-5.3-codex'
     monkeypatch.delenv('AI_MODEL', raising=False)
     assert llm.get_ai_model() == llm.DEFAULT_MODEL
+
+
+def test_needs_responses_api_gated_on_openai_provider():
+    # An unknown OpenAI codex/pro variant still routes through the Responses API.
+    assert llm.provider_for_model('gpt-6-codex') == 'openai'
+    assert llm._needs_responses_api('gpt-6-codex') is True
+    # A non-OpenAI id whose NAME merely contains "-pro"/"-codex" must never be
+    # misrouted to OpenAI's Responses API — the route must agree with the
+    # centralized provider classifier (Codex Finding 2, provider/route invariant).
+    for m in ('gemini-future-pro', 'claude-future-pro', 'gemini/gemini-9-pro'):
+        assert llm.provider_for_model(m) != 'openai', m
+        assert llm._needs_responses_api(m) is False, m
