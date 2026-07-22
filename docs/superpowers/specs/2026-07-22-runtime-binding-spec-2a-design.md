@@ -1,9 +1,10 @@
 # Spec 2A — Packaged Python Runtime Binding (Repo Radar v1.0.27)
 
-**Status:** rev 5 — addresses Codex R4 blockers 1–3 + minors. Locking, desired-state
-ordering, and dev/legacy interaction are the last-touched sections; the dependency-lock
-design is settled (Codex R4). For Codex Round 5. Do NOT implement or merge into `dev`
-before the Spec 1 (`feature/model-refresh-2026`) dev-prerelease smoke completes.
+**Status:** rev 6 — addresses Codex R5 blockers 1–3 + minors (fd-mode `lockf`,
+lock-first-then-resolve, managed-only dev coexistence). Architecture is converged per Codex R5;
+remaining changes are the runner lock/resolution contract and the dev-detection predicate. For
+Codex Round 6. Do NOT implement or merge into `dev` before the Spec 1
+(`feature/model-refresh-2026`) dev-prerelease smoke completes.
 
 **Branch:** `feature/runtime-binding-v1.0.27` (cut from `dev` @ `6621882`).
 
@@ -21,7 +22,7 @@ into a channel+build-bound venv; interpreter binding (real executable, fingerpri
 binding (copy into a nonce-unique immutable generation); ownership (one activation pointer per
 channel; **stable** solely owns the `repo-radar` CLI, the persistent schedule, schedule config,
 and legacy migration; **dev** fully namespaced); kernel-backed locking (a root **execution**
-lock across channels + a per-channel **activation** lock, via `/usr/bin/lockf -k`); crash-safe
+lock across channels + a per-channel **activation** lock, via `/usr/bin/lockf` in fd mode); crash-safe
 activation via a published intent record (`desired.json`) whose publication is the first
 fallible mutation, plus one atomic pointer flip; verifiable identity against a real-install
 expected-distribution manifest; CLI continuity; failure/offline hard-block; scripted logic
@@ -57,10 +58,10 @@ scheduled sync = a deliberately-installed transient `com.user.repo-radar-dev` ag
 
 ```
 ~/.repo-radar/
-  .exec.lock                          # ROOT execution lock file (lockf -k); all sync children
+  .exec.lock                          # ROOT execution lock file (lockf, fd mode); all sync children
   <channel>/
-    .activation.lock                  # per-channel provisioning/activation lock file (lockf -k)
-    desired.json                      # published INTENT (atomic; first fallible mutation)
+    .activation.lock                  # per-channel provisioning/activation lock file (lockf, fd mode)
+    desired.json                      # published INTENT (atomic; first managed-update/activation-intent mutation)
     generations/<version>-<fingerprint>-<nonce>/   # IMMUTABLE, unique; venv/ repo_radar/ repo-radar .runtime.json
     current -> generations/<...>      # single ACTIVATION POINTER (commit point)
     run-sync.sh                       # generic self-verifying runner (0700)
@@ -83,23 +84,34 @@ dirs never collide the destination; `desired.json`/`current` reference the gener
 
 ### 3.3 Locking, activation transitions, verification, quiescence
 
-**Locks — kernel-backed `lockf -k` (Codex R4-1).** macOS `/usr/bin/lockf -k <lockfile> <command>`
-takes an exclusive advisory lock for the command's lifetime and the **kernel auto-releases it if
-the holder dies** — eliminating owner records, stale-owner recovery, the ownerless-init window,
-and the `exec`/trap problem entirely. Two persistent lock files:
+**Locks — kernel-backed `lockf` in file-descriptor mode (Codex R5-1).** Plain
+`lockf <file> <command>` couples the lock to the *lockf* process, not the worker: killing the
+lockf parent releases the lock while its child keeps running (Codex verified) — a cancelled
+sync could then run unprotected against the shared data plane. So the lock is held on an
+**inherited file descriptor** that rides the eventual worker across `exec`, so the lock lifetime
+== the worker's lifetime and the kernel releases it only when the worker dies:
+```sh
+exec 9>"$lock_path"           # open the persistent lock file on fd 9
+/usr/bin/lockf -t "$policy" 9 || exit $?   # lock fd 9 (or exit 75 = EX_TEMPFAIL on timeout)
+# … resolve + verify current INSIDE the lock (below) …
+exec "$python" "$launcher" "$@"            # inherits locked fd 9; lock == python's lifetime
+```
+The Node provisioning helper uses the same fd-mode shape. Two persistent lock files:
 - **Root execution lock** `~/.repo-radar/.exec.lock` — every sync child (manual/scheduled/CLI,
-  either channel) runs *through* `lockf -k -t <timeout>`, serializing the shared data plane.
-- **Per-channel activation lock** `~/.repo-radar/<channel>/.activation.lock` — provisioning runs
-  its critical section through `lockf -k`.
-Disjoint in normal flow (a sync holds root; provisioning holds channel) → no deadlock; if both
-are ever required, order **root before channel**. A sync child that needs provisioning **must
-not wait on it while holding root** — it queues the request and the provisioner runs after the
-child exits (Codex R4 pt c). `bin/sh`/CLI acquire the same way (`lockf -k … <python> <launcher>
-…`); Electron runs helpers under `lockf`. (Diagnostics-only metadata, if any, uses
-`kern.bootsessionuuid`, not formatted `kern.boottime`.)
+  either channel) runs under it, serializing the shared data plane.
+- **Per-channel activation lock** `~/.repo-radar/<channel>/.activation.lock` — provisioning holds
+  it through activation.
+Disjoint in normal flow → no deadlock; if both are ever required, order **root before channel**.
+A sync child that needs provisioning **must not wait on it while holding root** — it queues the
+request and the provisioner runs after the child exits. **Lock policy (Codex R5 minor):** sync
+entry points acquire with `-t 0` (non-blocking); exit `75` = "another sync is running" (scheduled
+runs log a benign skip; manual/CLI surface a "busy" notice). Managed activation waits on the root
+lock **asynchronously with visible status/cancellation**, never a silent hang. (Diagnostics-only
+metadata, if any, uses `kern.bootsessionuuid`.)
 
-**Two activation transitions (Codex R4-2).** Publication of `desired.json` is the **first
-fallible state mutation** so a newly-installed build can never keep serving the previous runtime:
+**Two activation transitions (Codex R4-2).** `desired.json` publication is the **first
+managed-update mutation** (and, after a legacy bootstrap, the **first activation-intent
+mutation**) so a newly-installed build can never keep serving the previous runtime:
 - **Legacy 1.0.26 bootstrap** (no `desired.json`, non-cooperating legacy jobs): stable quiesces
   the legacy jobs (below) → installs generic dispatchers + repoints the schedule → **publishes the
   first `desired.json`**. Before publication there is no `desired.json`, so generic dispatchers
@@ -113,7 +125,8 @@ fallible state mutation** so a newly-installed build can never keep serving the 
 
 **Crash-safe ordering** (commit point = the atomic `current` flip, last):
 1. (legacy bootstrap only) quiesce legacy; install generic dispatchers + repoint schedule.
-2. **Publish `desired.json`** (atomic) — fail-closed intent transition; first fallible mutation.
+2. **Publish `desired.json`** (atomic) — fail-closed intent transition; first managed-update /
+   activation-intent mutation.
 3. **Provision** the nonce-unique generation (adopt an already-complete generation only if its
    marker matches the *entire* desired identity, else build fresh): venv,
    `pip install --require-hashes -r <lock>`, copy source+launcher, smoke (import + exact-version
@@ -135,20 +148,30 @@ never accepted for a *new* build whose provisioning failed.
 migrates/quiesces the installed 1.0.26 stable jobs: synchronously `launchctl bootout`, verify the
 label is absent **and** the child has exited, detect a running legacy *manual* sync (process scan
 + legacy statusfile), wait with timeout, else **fail closed without flipping `current`**. A **dev**
-build must never touch the stable legacy agent; while an unmanaged 1.0.26 stable agent is loaded
-(and thus ignores the root lock), **dev hard-blocks shared-data-plane sync with actionable
-guidance** (upgrade stable first, or run dev in an isolated `HOME`).
+build must never touch the stable legacy agent. **Dev may share the real data plane only when
+stable is provably *managed*** — i.e. stable has a compatible managed runtime/dispatcher that
+demonstrably honors the root lock (Codex R5-3). Proving "no LaunchAgent is currently loaded" is
+insufficient: an unloaded-but-installed 1.0.26 stable app, or a legacy manual sync, can start after
+the check and ignores the root lock. Dev's detection is **read-only** — inspect stable's
+`desired.json`/dispatcher identity, the plist, `launchctl print gui/$UID/com.user.repo-radar`, the
+installed stable `VERSION`, and running legacy processes — and **any legacy stable install/state or
+detection ambiguity means "unmanaged" → dev fails closed** with actionable guidance (upgrade stable
+first, or run dev in an isolated `HOME`/test user).
 
 ### 3.4 Manual / scheduled / CLI parity (generic runner)
 
-One runner for all three: resolve `realpath(current)` once; validate against `desired.json` +
-the healthy predicate (fail closed otherwise); then run the child **through** `lockf -k -t <T>
-~/.repo-radar/.exec.lock`: `<current>/venv/bin/python <current>/repo-radar sync --status-server`
-with `PYTHONPATH=<current>/repo_radar`. `lockf` holds the root lock for the child's lifetime and
-the kernel releases it on exit/death — no `exec`/trap hazard, no manual release. A generation a
-running sync resolved stays retained (2A GC never removes activated generations), so a concurrent
-`current` flip cannot pull it out from under an in-flight sync. Concurrent runs (any channel)
-serialize on the root lock. The scheduled `run-sync.sh` is generic (no per-version rewrite).
+One generic runner for all three, in strict **lock-first-then-resolve** order (Codex R5-2): it
+**acquires the root execution lock first** (fd-mode, §3.3), and **only after acquisition** does it
+resolve `realpath(current)`, read `desired.json`, and validate the marker/payload against the
+healthy predicate — failing closed on any mismatch. **No `current` path is interpolated into the
+command before the lock is held**, so a managed update that publishes+flips while the runner was
+blocked on the lock is seen *after* acquisition: the runner then resolves the new generation, not a
+stale pre-lock one. It then `exec`s `<current>/venv/bin/python <current>/repo-radar sync
+--status-server` with `PYTHONPATH=<current>/repo_radar`, inheriting the locked fd so the lock ==
+the worker's lifetime. A generation a running sync resolved stays retained (2A GC never removes
+activated generations), so a concurrent flip cannot pull it out from under an in-flight sync.
+Concurrent runs (any channel) serialize on the root lock. The scheduled `run-sync.sh` is generic
+(no per-version rewrite).
 
 ### 3.5 Legacy migration + CLI continuity
 
@@ -185,8 +208,8 @@ retired as an app dependency.
 
 ## 5. Data flow
 
-Legacy bootstrap and managed update/rollback both make `desired.json` publication the first fallible
-mutation, then provision the nonce generation, then flip `current`. Stable alone migrates the legacy
+Legacy bootstrap and managed update/rollback both make `desired.json` publication the first
+managed-update / activation-intent mutation, then provision the nonce generation, then flip `current`. Stable alone migrates the legacy
 1.0.26 jobs and owns the schedule + `repo-radar`; dev is namespaced and hard-blocks while an unmanaged
 legacy stable agent is loaded. Every sync child (either channel) serializes on the root `lockf` lock.
 Steady state: predicate holds → no pip → sync.
@@ -201,9 +224,13 @@ error window, cause, **redacted** pip-log tail, Retry, remediation). Perms: dire
 ## 7. Acceptance
 
 **7a. Scripted logic harness** (temp `$HOME`): interpreter resolution/gating; authoritative identity +
-`desired.json` publish/atomicity/schema-fail-closed; **`lockf` mutual exclusion incl. auto-release when
-the holder is killed** (regresses the exec/trap orphan and the long-sync-not-reclaimed case) + root-vs-
-activation ordering + sync-triggered-provision-stays-async; healthy predicate incl. installed-set ==
+`desired.json` publish/atomicity/schema-fail-closed; **`lockf` fd-mode mutual exclusion** — lock rides
+the worker's inherited descriptor: killing the **outer runner** leaves **no** Python descendant active
+while another acquisition succeeds (Codex R5-1), `-t 0` returns `75` when busy, long-running holder not
+reclaimed; **lock-first-then-resolve** — pause a runner immediately before lock acquisition, complete a
+managed update (publish B → flip), then prove the runner resolves generation **B, not A**, after
+acquiring (Codex R5-2); root-vs-activation ordering + sync-triggered-provision-stays-async; healthy
+predicate incl. installed-set ==
 expected manifest + bootstrap allow-list; **transition ordering** crash cases — before publish, between
 publish and flip, **crash-before-dispatcher-refresh**, and **downgrade/rollback**; nonce generation
 collision (same-version/different-source; **tampered active generation → build replacement, flip, then
@@ -228,18 +255,21 @@ environment; resourcesPath, launchd, signed paths with spaces, real identity):
    orphan generation to GC.
 10. **Matrix hashed install** across CPython 3.10–3.14 × **native** arm64/x86_64, installed set == the
     checked-in expected manifest (§3.6).
-11. **dev/stable coexistence:** run the dev transient-agent test **only after both runtimes honor the
-    root lock**; a deliberately-installed transient `com.user.repo-radar-dev` agent, once removed, is
-    proven to have never changed stable's plist/config; verify dev **hard-blocks** while an unmanaged
-    legacy stable agent is loaded.
+11. **dev/stable coexistence:** run the dev transient-agent test **only after stable is provably
+    managed** (both runtimes honor the root lock); a deliberately-installed transient
+    `com.user.repo-radar-dev` agent, once removed, is proven to have never changed stable's
+    plist/config. Verify dev **fails closed** not only when a legacy stable agent is *loaded* but also
+    when it is **unloaded-but-installed** or detection is **ambiguous** (Codex R5-3) — dev requires an
+    isolated `HOME` in those cases.
 
 SIP/quarantine + per-user `$HOME` isolation covered by 7b.
 
 ## 8. Resolved mechanics
 
-Locks = kernel-backed `lockf -k` (root execution + per-channel activation), auto-released on death —
-no owner records or stale recovery. Activation = publish `desired.json` (first fallible mutation) →
-provision nonce generation → single atomic `current` flip; two transition flavors (legacy bootstrap,
+Locks = kernel-backed `lockf` in **fd mode** (root execution + per-channel activation), the lock
+riding the worker's inherited descriptor so its lifetime == the worker's and the kernel releases on
+death — no owner records or stale recovery; runners acquire **before** resolving `current`. Activation = publish `desired.json` (first managed-update /
+activation-intent mutation) → provision nonce generation → single atomic `current` flip; two transition flavors (legacy bootstrap,
 managed update/rollback), direction-agnostic on compatible schemas, else fail closed. Verification =
 active-payload hashing + installed-set vs a real-install expected manifest. Ownership = stable sole
 owner of `repo-radar` + schedule + config + legacy migration; dev namespaced and hard-blocks vs an
