@@ -22,21 +22,13 @@ exec 9>"$ROOT/.exec.lock"
 # --- only AFTER the lock do we resolve + verify current ---
 [ -L "$CUR" ] || { echo "repo-radar: no active runtime" >&2; exit 1; }
 GEN="$(cd "$CUR" && pwd -P)"
-[ -f "$DES" ] && [ -f "$GEN/.runtime.json" ] || { echo "repo-radar: runtime not managed" >&2; exit 1; }
-"$GEN/venv/bin/python" - "$GEN" "$DES" <<'PY' || { echo "repo-radar: runtime failed verification" >&2; exit 1; }
-import json, sys, hashlib, os
-gen, des = sys.argv[1], sys.argv[2]
-m = json.load(open(os.path.join(gen, '.runtime.json')))
-d = json.load(open(des))
-def sh(p):
-    with open(p, 'rb') as f:
-        return hashlib.sha256(f.read()).hexdigest()
-ok = (m.get('genId') == d.get('genId')
-      and m.get('versionSha') == d.get('versionSha')
-      and sh(os.path.join(gen, 'VERSION')) == m.get('versionSha')
-      and sh(os.path.join(gen, 'repo-radar')) == m.get('launcherSha'))
-sys.exit(0 if ok else 1)
-PY
+# containment: the resolved generation must live under this channel's generations tree
+case "$GEN" in "$ROOT/$CH/generations/"*) : ;; *) echo "repo-radar: runtime outside tree" >&2; exit 1 ;; esac
+[ -f "$DES" ] && [ -f "$GEN/.runtime.json" ] && [ -f "$GEN/verify.py" ] && [ -f "$GEN/manifest.json" ] \\
+  || { echo "repo-radar: runtime not managed" >&2; exit 1; }
+# full healthy predicate (desired ACTIVE, identity, live payload hashes, fingerprint, installed set)
+"$GEN/venv/bin/python" "$GEN/verify.py" "$GEN" "$DES" "$GEN/manifest.json" \\
+  || { echo "repo-radar: runtime failed verification" >&2; exit 1; }
 exec "$GEN/venv/bin/python" "$GEN/repo-radar"${tail} "$@"
 `;
 }

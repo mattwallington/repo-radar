@@ -10,7 +10,6 @@ const { layout } = require('../paths');
 const { readDesired } = require('../desired');
 
 const WT = path.join(__dirname, '..', '..', '..');
-const stubQuiesce = async () => ({ quiesced: true, reason: 'stub' });
 function bundleFor(version) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-bundle-'));
   fs.writeFileSync(path.join(d, 'VERSION'), `${version}\n`);
@@ -21,11 +20,11 @@ const activeVersion = (L) => fs.readFileSync(path.join(fs.realpathSync(L.current
 test('downgrade/rollback: ensureRuntime to an older managed version reports+runs it', { timeout: 360000 }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-rollback-'));
   const L = layout(home, 'stable');
-  assert.strictEqual((await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), quiesceFn: stubQuiesce })).status, 'ok');
-  assert.strictEqual((await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.28', bundle: bundleFor('1.0.28'), quiesceFn: stubQuiesce })).status, 'ok');
+  assert.strictEqual((await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true })).status, 'ok');
+  assert.strictEqual((await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.28', bundle: bundleFor('1.0.28'), _skipQuiesce: true })).status, 'ok');
   assert.strictEqual(activeVersion(L), '1.0.28');
   // roll BACK to 1.0.27 (direction-agnostic managed update)
-  const back = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), quiesceFn: stubQuiesce });
+  const back = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true });
   assert.strictEqual(back.status, 'ok', back.reason);
   assert.strictEqual(readDesired(L.desired).version, '1.0.27');
   assert.strictEqual(activeVersion(L), '1.0.27');
@@ -34,7 +33,7 @@ test('downgrade/rollback: ensureRuntime to an older managed version reports+runs
 test('tamper -> next ensureRuntime builds a replacement generation and flips (no pre-flip mutation)', { timeout: 360000 }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-tamper-'));
   const L = layout(home, 'stable');
-  const r1 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), quiesceFn: stubQuiesce });
+  const r1 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true });
   assert.strictEqual(r1.status, 'ok');
   const tamperedGen = fs.realpathSync(L.current);
 
@@ -42,7 +41,7 @@ test('tamper -> next ensureRuntime builds a replacement generation and flips (no
   fs.writeFileSync(path.join(tamperedGen, 'VERSION'), '6.6.6\n');
 
   // next reconcile: fast-path verify fails -> rebuild -> flip to a fresh healthy gen
-  const r2 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), quiesceFn: stubQuiesce });
+  const r2 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true });
   assert.strictEqual(r2.status, 'ok', r2.reason);
   const newGen = fs.realpathSync(L.current);
   assert.notStrictEqual(newGen, tamperedGen, 'current flipped to a new generation');

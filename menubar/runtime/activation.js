@@ -73,11 +73,14 @@ function verifyRuntime({ home, channel, genDir, desired }) {
 // GC never removes it.
 function flipCurrent(home, channel, genDir) {
   const L = layout(home, channel);
+  // Journal retention BEFORE the flip (Codex I4): a crash in the gap must leave an
+  // extra never-activated record (harmless — GC retains it) rather than a genuinely
+  // activated generation that is unrecorded (which a later GC could then delete).
+  _recordActivated(home, channel, path.basename(genDir));
   const tmp = `${L.current}.tmp-${process.pid}`;
   try { fs.unlinkSync(tmp); } catch (_) { /* no prior temp */ }
   fs.symlinkSync(genDir, tmp);
   fs.renameSync(tmp, L.current);
-  _recordActivated(home, channel, path.basename(genDir));
 }
 
 // Find a complete generation whose marker matches the ENTIRE desired identity and

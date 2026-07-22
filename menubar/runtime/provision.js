@@ -60,6 +60,10 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
     fs.copyFileSync(bundle.launcher, path.join(staging, 'repo-radar'));
     fs.chmodSync(path.join(staging, 'repo-radar'), 0o755);
     fs.copyFileSync(bundle.versionFile, path.join(staging, 'VERSION'));
+    // Ship the verifier + this env's expected manifest INTO the generation so the
+    // shell/CLI dispatchers can enforce the full predicate standalone (Codex I5).
+    fs.copyFileSync(bundle.verifyPy || path.join(__dirname, 'verify.py'), path.join(staging, 'verify.py'));
+    fs.copyFileSync(manifestPath, path.join(staging, 'manifest.json'));
     // smoke: import + exact-version + installed-set
     // NOTE: litellm's module uses PEP 562 __getattr__ lazy-loading and does not expose
     // `__version__` (confirmed against the real litellm==1.93.0 wheel: accessing it raises
