@@ -40,10 +40,16 @@ function resolveBaseInterpreter(opts = {}) {
   for (const exe of candidates) {
     const info = probe(exe);
     if (info && info.version[0] === 3 && info.version[1] >= 10 && info.version[1] < 15) {
+      // opts.accept lets a caller further constrain the accepted set — e.g. require a
+      // checked-in dependency lock for the interpreter's env (spec §3.6). Skip to the
+      // next candidate when rejected, so a covered interpreter later in the list wins.
+      if (opts.accept && !opts.accept(exe, info)) continue;
       return { exe, ...info };
     }
   }
-  throw new NoInterpreterError('no CPython 3.10-3.14 interpreter found');
+  throw new NoInterpreterError(
+    'no CPython 3.10-3.14 interpreter found' + (opts.accept ? ' with a checked-in dependency lock' : '')
+  );
 }
 
 module.exports = { NoInterpreterError, probe, resolveBaseInterpreter };

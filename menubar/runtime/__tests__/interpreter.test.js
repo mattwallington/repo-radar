@@ -25,3 +25,9 @@ test('resolveBaseInterpreter picks a valid 3.10-3.14 real exe from candidates', 
 test('resolveBaseInterpreter fails closed when nothing valid', () => {
   assert.throws(() => resolveBaseInterpreter({ candidates: ['/no/such/py'] }), NoInterpreterError);
 });
+
+test('resolveBaseInterpreter honors opts.accept (coverage gate)', () => {
+  const PY310 = '/opt/homebrew/opt/python@3.10/bin/python3.10';
+  assert.strictEqual(resolveBaseInterpreter({ candidates: [PY310], accept: () => true }).exe, PY310);
+  assert.throws(() => resolveBaseInterpreter({ candidates: [PY310], accept: () => false }), NoInterpreterError);
+});

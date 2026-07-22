@@ -1,4 +1,5 @@
 'use strict';
+const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
@@ -35,4 +36,16 @@ function verifyInstalledSet(venvPython, manifest) {
   return { ok: !extra.length && !missing.length && !mismatched.length, extra, missing, mismatched };
 }
 
-module.exports = { selectFor, verifyInstalledSet };
+// True iff a checked-in hash-pinned lock AND expected manifest exist for `fingerprint`.
+// The supported interpreter matrix == the set of envs we have locks for (spec §3.6);
+// an interpreter without a lock cannot be provisioned and must be skipped/fail-closed.
+function isCovered(fingerprint) {
+  try {
+    const { lockPath, manifestPath } = selectFor(fingerprint);
+    return fs.existsSync(lockPath) && fs.existsSync(manifestPath);
+  } catch (_) {
+    return false;
+  }
+}
+
+module.exports = { selectFor, verifyInstalledSet, isCovered };

@@ -63,3 +63,10 @@ test(
     assert.ok(withMissing.missing.includes('certifi'));
   }
 );
+
+test('isCovered reflects checked-in lock+manifest presence', () => {
+  const { isCovered } = require('../deps');
+  assert.strictEqual(isCovered('cpython-3.10.20-arm64'), true);   // cp310-arm64 checked in
+  assert.strictEqual(isCovered('cpython-3.14.4-arm64'), false);   // no cp314 lock
+  assert.strictEqual(isCovered('garbage'), false);
+});
