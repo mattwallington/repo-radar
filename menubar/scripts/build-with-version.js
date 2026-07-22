@@ -40,7 +40,12 @@ const buildDate = new Date().toISOString();
 const buildInfo = {
     version: newVersion,
     buildDate: buildDate,
-    buildTimestamp: Date.now()
+    buildTimestamp: Date.now(),
+    // Runtime channel (consumed by runtime/paths.resolveChannel, which fails closed
+    // on a missing/invalid channel -> no runtime -> no sync). Default 'stable';
+    // release.sh overrides to 'dev' for dev-channel builds. REPO_RADAR_CHANNEL lets a
+    // local `npm run build:version` produce a dev build-info when needed.
+    channel: process.env.REPO_RADAR_CHANNEL === 'dev' ? 'dev' : 'stable'
 };
 
 const buildInfoPath = path.join(__dirname, '..', 'build-info.json');
