@@ -1,308 +1,321 @@
 # Spec 2A — Packaged Python Runtime Binding (Repo Radar v1.0.27)
 
-**Status:** Draft (rev 1) — for Codex review. Do NOT implement or merge into `dev`
-before the Spec 1 (`feature/model-refresh-2026`) dev-prerelease smoke completes.
+**Status:** rev 2 — addresses Codex R1 blockers 1–6 and resolves open decisions
+D1/D3/D4/D6/D7. For Codex Round 2. Do NOT implement or merge into `dev` before the
+Spec 1 (`feature/model-refresh-2026`) dev-prerelease smoke completes.
 
 **Branch:** `feature/runtime-binding-v1.0.27` (cut from `dev` @ `6621882`).
 
-**Goal:** Guarantee that a given installed Repo Radar app version always runs its
-*own* bundled Python package against its *own* pinned dependencies — on both fresh
-installs and upgrades, and for both manual ("Sync Now") and scheduled (LaunchAgent)
-syncs — so that the Spec 1 model refresh (and every future Python-side change)
-actually reaches users. This is the sole production blocker for `v1.0.27`.
+**Goal:** Guarantee that a given installed Repo Radar app *build* (channel + version)
+always runs its *own* bundled Python package against its *own* fully-resolved,
+version-bound dependencies — on fresh installs, upgrades, and dev/stable coexistence,
+for both manual ("Sync Now") and scheduled (LaunchAgent) syncs — so the Spec 1 model
+refresh (and every future Python-side change) actually reaches users. Sole production
+blocker for `v1.0.27`.
 
-**Why this is a separate spec (2A):** Spec 1 refreshed the Python *code* and pinned
-`litellm==1.93.0`, but the app has no mechanism that binds the running Python
-interpreter + installed dependencies to the installed app version. Codex's
-whole-branch review flagged this as an Important, production-blocking defect. It is
-a pre-existing updater-architecture gap, deliberately split out from the model
-refresh.
+**Why a separate spec (2A):** Spec 1 refreshed the Python code and pinned
+`litellm==1.93.0`, but nothing binds the running interpreter + installed deps to the
+installed build. Codex flagged this as production-blocking. Pre-existing
+updater-architecture gap, deliberately split from the model refresh.
 
 ---
 
 ## 1. Scope
 
 ### In scope (2A)
-- **Dependency binding:** provision the app's pinned dependencies (`requirements.txt`,
-  `litellm==1.93.0`, …) into an **app-version-bound, app-managed location**, on fresh
-  install and on every version change.
-- **Interpreter binding:** select and record ONE base Python 3 interpreter
-  (validated `>=3.10,<3.15`), and always run syncs through the app-managed runtime's
-  interpreter — never a bare `python3` whose resolution depends on ambient `PATH`.
-- **Source binding:** always import the bundled `repo_radar` package that ships with
-  the installed `.app`, never a stale copy.
-- **Legacy `~/.repo-radar` migration:** stop preferring a manually-installed
-  `~/.repo-radar/repo-radar` launcher that can shadow the version-matched runtime;
-  migrate/retire it cleanly.
-- **Manual/scheduled parity:** both the Electron `spawn` path and the LaunchAgent
-  `run-sync.sh` wrapper must use the **same** interpreter, same package, same deps.
-- **Reconcile lifecycle:** detect a stale/missing runtime (via a persisted marker)
-  and (re)provision — on launch and after auto-update.
-- **Failure/offline behavior:** when provisioning cannot complete (offline, pip
-  failure, no valid interpreter), fail **visibly and actionably**; never silently run
-  stale or missing dependencies.
-- **Upgrade-from-v1.0.26 acceptance matrix** (Section 7) proving all of the above.
+- **Dependency binding:** provision the app's dependencies from a **fully-resolved lock**
+  into a **channel+version-bound, app-managed venv**, on fresh install and every build change.
+- **Interpreter binding:** resolve ONE base Python 3 (`>=3.10,<3.15`) to its **real
+  executable** (not a shim), fingerprint it, and always run syncs through the
+  app-managed venv interpreter — never a `PATH`-resolved bare `python3`.
+- **Source binding:** copy the shipped `repo_radar` package into the versioned runtime
+  (version/hash-bound), so it stays coherent while the `.app` is swapped; always import
+  that copy.
+- **Channel isolation:** namespace runtime pointers, wrappers, and LaunchAgent identity
+  by channel (stable vs dev) so the two builds never fight over one runtime/schedule.
+- **Manual/scheduled parity + fail-closed scheduling:** both sync paths use the same
+  interpreter/package/deps; the scheduled wrapper self-verifies build+runtime identity
+  before running and fails closed on mismatch (launchd cannot be stopped by Electron state).
+- **Transactional reconcile:** stage → smoke → atomic cutover under a cross-process lock,
+  on launch and after auto-update; verifiable runtime identity (not just an input-file hash).
+- **Legacy `~/.repo-radar` migration with CLI continuity:** retire a manually-installed
+  launcher without breaking the `repo-radar` command on `PATH`.
+- **Failure/offline behavior:** fail visibly + actionably (hard-block, redacted logs,
+  restrictive perms); never silently run stale/missing deps.
+- **Acceptance:** a scripted logic harness AND a **built-artifact packaged upgrade smoke**
+  (Section 7).
 
-### Out of scope (deferred to Spec 2B)
-- Broader auto-updater UX (channels, progress UI, rollback UX beyond runtime).
-- Code signing / notarization changes.
-- Electron version upgrade.
-- `release.sh` / CI release hardening, and the dev-vs-prod gate channel semantics.
-- Vendoring dependency wheels for fully offline first-run (noted as a 2B option;
-  2A uses pip-at-provision).
+### Out of scope (Spec 2B)
+- Broader updater UX (channels UI, progress, rollback UX beyond runtime safety).
+- Code signing / notarization changes; Electron version upgrade.
+- `release.sh` / CI release hardening; dev-vs-prod gate channel semantics.
+- Dependency **wheel vendoring** for fully-offline first-run (2A uses pip-at-provision
+  against a resolved lock; locking does **not** require vendoring).
+- Complete old-runtime garbage collection (2A deletes only abandoned staging dirs).
 
 ---
 
-## 2. Current architecture (as-is) — the gaps this spec closes
+## 2. Current architecture (as-is) — gaps this spec closes
 
-(From the architecture map; file:line refer to `dev` @ `6621882`.)
+(file:line on `dev` @ `6621882`.)
 
-1. **`setup.sh` is orphaned.** Bundled (`menubar/package.json:84-85`) but never invoked
-   by the app, installer, or build. It copies only the thin launcher to
-   `~/.repo-radar/repo-radar`, does **not** copy the `repo_radar/` package, and
-   `pip install`s deps **globally** (no venv, no `--target`) — `setup.sh:33-57`.
-2. **Deps are not app-version-bound.** `litellm==1.93.0` reaches a machine only if a
-   user manually runs setup.sh or the Troubleshooting `pip install`. Nothing
-   re-installs on update — `main.js` auto-updater has **no post-update hook**
-   (`main.js:1851-1918`). The `.app` swap updates bundled `resources/repo_radar` +
-   `VERSION`, but site-packages `litellm` is untouched.
-3. **`getSyncScriptPath()` prefers stale `~/.repo-radar/repo-radar`** over the bundled,
-   version-matched copy (`main.js:88-91`).
-4. **Manual vs scheduled interpreter divergence.** Manual spawns `/usr/bin/env python3`
-   with pyenv shims first (`main.js:963-969,1028`); the LaunchAgent wrapper prepends
-   `/usr/local/bin:/opt/homebrew/bin` *after* pyenv (`main.js:1547-1548`), so a
-   different `python3` (different site-packages) can win. → "Sync Now" and scheduled
-   syncs can use different litellm versions.
-5. **No runtime version marker** (`main.js` / `setup.sh` write none) → staleness is
-   undetectable.
+1. **`setup.sh` orphaned** — bundled (`menubar/package.json:84-85`), never invoked; copies
+   only the launcher; `pip install`s deps **globally** (no venv/`--target`) — `setup.sh:33-57`.
+2. **Deps not build-bound** — `litellm==1.93.0` reaches a machine only via manual setup.sh
+   or Troubleshooting pip; nothing re-installs on update (auto-updater has **no post-update
+   hook**, `main.js:1851-1918`). `.app` swap updates bundled source + `VERSION`; site-packages
+   untouched.
+3. **`getSyncScriptPath()` prefers stale `~/.repo-radar/repo-radar`** (`main.js:88-91`).
+4. **Manual vs scheduled interpreter divergence** — manual `/usr/bin/env python3`, pyenv-first
+   (`main.js:963-969,1028`); wrapper prepends `/usr/local/bin:/opt/homebrew/bin` *after* pyenv
+   (`main.js:1547-1548`) → different `python3` possible.
+5. **No runtime marker** — staleness undetectable.
+6. **No channel namespacing** — `~/.repo-radar`, `run-sync.sh`, LaunchAgent
+   `com.user.repo-radar` are shared across stable and dev builds.
+7. **Unsafe version identity** — `getVersion()` falls back to a fictitious default
+   (`main.js:11-26`); unusable as authoritative runtime identity.
+8. **`repo-radar` CLI is a public interface** — `~/.local/bin/repo-radar` symlink created by
+   setup.sh (`setup.sh:37`); silently removing it breaks existing users.
 
 ---
 
 ## 3. Design
 
-### 3.1 App-managed versioned runtime (chosen approach)
+### 3.1 Channel + version namespaced, self-contained runtime
 
-On launch, the app ensures a **versioned runtime** exists for the current app version
-and provisions it if missing/stale. Layout under the existing `~/.repo-radar/`
-convention (already removed on uninstall, `main.js:620-629`):
+`channel` ∈ {`stable`,`dev`} derived from build metadata (`build-info.json` CHANNEL,
+`main.js:33-38,130-153`). Everything runtime-related is namespaced by channel and version;
+the versioned runtime **contains its own copy of the source** so it cannot skew against the
+`.app` being replaced (Codex R1-2 strong rec):
 
 ```
 ~/.repo-radar/
-  runtimes/
-    <app-version>/                 e.g. 1.0.27
-      venv/                        python venv created from the chosen base python3
-      .provisioned.json            marker: {app_version, requirements_sha256,
-                                             python_version, base_interpreter,
-                                             provisioned_at, status}
-  current -> runtimes/<app-version>   (symlink to the active runtime)
+  <channel>/                         # "stable" | "dev"
+    runtimes/
+      <app-version>/                 # e.g. 1.0.27
+        venv/                        # venv from the resolved base interpreter
+        repo_radar/                  # COPY of bundled resources/repo_radar (hash-bound)
+        repo-radar                   # copy of the launcher
+        .runtime.json                # fingerprint marker (§3.3)
+    current -> runtimes/<app-version>
+    run-sync.sh                      # scheduled wrapper (self-verifying, §3.4)
+    provision.log                    # redacted (§6)
 ```
 
-- The **package** imported at runtime is always the bundled `resources/repo_radar`
-  (ships with the `.app`, so it is inherently version-matched). `PYTHONPATH` points at
-  the bundled `resources/` directory, exactly as today for the bundled case — we do
-  **not** copy the package into `~/.repo-radar` (avoids a second stale-source path).
-- The **interpreter** is always `~/.repo-radar/runtimes/<version>/venv/bin/python`.
-- The **dependencies** live in that venv, installed from the bundled
-  `resources/requirements.txt` (`litellm==1.93.0`, …).
+LaunchAgent identity is per channel: label `com.user.repo-radar` (stable) /
+`com.user.repo-radar-dev` (dev); plist
+`~/Library/LaunchAgents/com.user.repo-radar[-dev].plist`; wrapper
+`~/.repo-radar/<channel>/run-sync.sh`. Stable and dev thus never mutate each other's
+runtime, pointer, wrapper, or schedule. `~/.config/repo-radar/config.json` (credentials)
+stays shared and unchanged.
 
-**Why a versioned venv (not vendored wheels, not global pip):** it binds deps to the
-app version, isolates from ambient site-packages, is rollback-friendly (old version's
-venv remains until GC), and is far cheaper to build than vendoring litellm's transitive
-tree. The cost — pip needs network at provision time — is handled by Section 6.
+### 3.2 Base interpreter selection + fingerprint (D3)
 
-### 3.2 Interpreter selection (base python for the venv)
+Resolve ONE base interpreter, validated `>=3.10,<3.15`, and **resolve it to its real
+executable** (follow shims): probe order —
+1. `/opt/homebrew/bin/python3`, then `/usr/local/bin/python3` (explicit, stable)
+2. a pyenv interpreter resolved via `pyenv which python3` to the real
+   `~/.pyenv/versions/<x>/bin/python3` (**not** the shim)
+3. validated `python3` on the app launch `PATH`
 
-Provisioning resolves ONE base interpreter, validates `>=3.10,<3.15` (reusing
-setup.sh's guard logic), records its absolute path in the marker, and creates the venv
-from it. Resolution order (first valid wins), each probed by running
-`python -c 'sys.version_info'`:
-1. `~/.pyenv/shims/python3`
-2. `/opt/homebrew/bin/python3`
-3. `/usr/local/bin/python3`
-4. `python3` on the app's launch `PATH`
+Each candidate is probed with `python -c 'print(sys.version_info, sys.implementation.name,
+platform.machine())'`. The venv is created from the winner; thereafter the venv's own
+`bin/python` is used forever (immune to `PATH`/shim retargeting). The marker records an
+**interpreter fingerprint**: real executable path, Python version, implementation/ABI tag,
+architecture. On each launch the base+venv interpreter is revalidated (still exists,
+same fingerprint); a changed fingerprint forces reprovision.
 
-The venv's own `bin/python` is then used forever after — immune to later `PATH`
-changes. This single resolved interpreter is what BOTH sync paths use (§3.4), closing
-the manual/scheduled divergence.
+### 3.3 Transactional reconcile (lock → stage → smoke → atomic cutover)
 
-**Open decision D3 (for review):** whether to prefer a Homebrew/system python over a
-pyenv shim (pyenv shims can retarget under the user's feet). Draft prefers pyenv first
-to match today's manual-sync behavior; Codex may argue for a stabler base.
-
-### 3.3 Reconcile lifecycle
-
-A `ensureRuntime()` step runs early in app startup (before sync is enabled) and is the
-single reconciliation point (covers upgrades too, since `quitAndInstall` restarts the
-app into the new version):
+`ensureRuntime()` runs early in startup and after `update-downloaded`→relaunch. It is the
+single reconciliation point and is **cross-process-safe**:
 
 ```
-appVersion = getVersion()
-marker = read(~/.repo-radar/runtimes/<appVersion>/.provisioned.json)
-reqHash = sha256(bundled resources/requirements.txt)
-if marker.status == "ok"
-   and marker.app_version == appVersion
-   and marker.requirements_sha256 == reqHash
-   and venv python still runnable:
-       → up-to-date; point `current` symlink at it; done
+identity = authoritativeIdentity()          # app.getVersion(); REQUIRE bundled VERSION match
+                                             # (Codex R1-3); missing/conflicting → fail closed
+lock = acquireExclusive(~/.repo-radar/<channel>/.lock)   # flock; scheduled wrapper honors it too
+marker = read(current/.runtime.json)
+if marker.ok
+   and marker.identity == identity
+   and marker.lock_sha256 == sha256(resources/requirements.lock)
+   and marker.source_sha256 == hashTree(resources/repo_radar)
+   and marker.interp_fingerprint == probe(venv python)
+   and `pip check` clean:
+       → up-to-date; ensure `current`/wrapper/CLI point here; release lock; done
 else:
-       → provision(appVersion): create/refresh venv, pip install -r bundled
-         requirements.txt, run a smoke import, write marker{status:ok}, repoint
-         `current`, regenerate run-sync.sh (§3.4).
-       → on failure: write marker{status:failed, error}, surface actionable error (§6).
+       stage = runtimes/<version>.staging-<pid>/
+       create venv (from §3.2 base); pip install --require-hashes -r resources/requirements.lock
+       copy resources/repo_radar -> stage/repo_radar ; copy launcher
+       SMOKE: import repo_radar; assert exact critical versions
+              (litellm==1.93.0, …) via importlib.metadata; run `pip check`;
+              record installed distribution set (name==version list)
+       write stage/.runtime.json{ ok, identity, lock_sha256, source_sha256,
+                                  interp_fingerprint, dist_set, provisioned_at }
+       ATOMIC CUTOVER: rename(stage -> runtimes/<version>); atomically repoint `current`;
+              atomically (tmp+rename) write run-sync.sh (§3.4); update CLI dispatcher (§3.5)
+       on any failure: leave prior runtime intact; write failure state; surface (§6)
+       release lock
 ```
 
-- Provisioning is **idempotent** and **fast when up-to-date** (marker + hash compare, no
-  pip). It only pip-installs on a version/requirements change or a missing/broken venv.
-- After a successful (re)provision, the app **regenerates the LaunchAgent wrapper**
-  (`run-sync.sh`) so scheduled syncs pick up the new interpreter/runtime immediately.
+- **Idempotent + fast when healthy** (marker + hashes + `pip check`; no pip).
+- **Identity is authoritative** (app.getVersion() ∧ bundled VERSION match); the fictitious
+  `getVersion()` fallback is removed and made fail-closed.
+- **Dependency identity is real:** installs from a resolved, hash-pinned lock (§3.6);
+  the marker records the installed distribution set, not just an input-file hash.
+- All state files/dirs created with user-only perms (§6).
 
-**Open decision D4 (for review):** run provisioning synchronously on the first launch
-after an update (blocking sync until done, with a visible "Setting up…" state) vs. in
-the background with sync disabled until ready. Draft: background provision, sync
-disabled with a clear status until the marker flips to `ok`.
+### 3.4 Manual/scheduled parity + fail-closed scheduled wrapper
 
-### 3.4 Manual/scheduled parity
+A single `getRuntime(channel)` returns `{ pythonBin, sourceDir, launcher }` resolved
+through `current`, used by BOTH paths:
 
-Introduce a single `getRuntime()` that returns
-`{ pythonBin, syncScript, pythonPath }` from the active runtime, used by BOTH paths:
+- **Manual** (`main.js`): `spawn(runtime.pythonBin, [runtime.launcher, 'sync',
+  '--status-server'], { env:{…, PYTHONPATH: runtime.sourceDir}, … })`. Absolute interpreter,
+  no `/usr/bin/env python3`.
+- **Scheduled wrapper** (`run-sync.sh`, written atomically): runs an **absolute** interpreter
+  and, before exec, **self-verifies and fails closed** (Codex R1-2) — launchd cannot be
+  gated by Electron state:
+  ```sh
+  #!/bin/sh
+  # honor the reconcile lock; skip if a provision or sync holds it
+  # read current/.runtime.json; require identity.app_version == installed VERSION
+  #   and source_sha256 == hashTree(current/repo_radar); else log + exit non-zero (no sync)
+  exec '<current>/venv/bin/python' '<current>/repo-radar' sync --status-server
+  ```
+  A stale wrapper left by a half-finished update thus refuses to run the wrong runtime
+  against the new bundle. Manual entry points are centrally gated the same way (D4).
+- **In-flight sync:** the exclusive lock serializes provision vs. sync; a sync already
+  running keeps its own resolved runtime for its lifetime; a new run re-resolves `current`.
 
-- **Manual** (`main.js` sync spawn): replace `spawn('/usr/bin/env', ['python3', …])`
-  with `spawn(runtime.pythonBin, [runtime.syncScript, 'sync', '--status-server'], …)`,
-  `PYTHONPATH = runtime.pythonPath` (bundled `resources/`).
-- **Scheduled** (`run-sync.sh` generation): emit
-  `exec '<runtime.pythonBin>' '<runtime.syncScript>' sync --status-server` — an
-  **absolute interpreter path**, no `PATH`-based `python3` resolution, no pyenv/Homebrew
-  prepend logic. Same `PYTHONPATH`.
+### 3.5 Legacy migration WITH CLI continuity (Codex R1-4)
 
-Both now provably use the identical interpreter + deps. (Credential-freshness divergence
-— scheduled bakes a snapshot, `main.js:1523-1538` — is a **separate** pre-existing issue;
-noted, but only in-scope here to the extent the regenerated wrapper keeps working.)
+The `repo-radar` command on `PATH` is a public interface and must not break:
 
-### 3.5 Legacy `~/.repo-radar/repo-radar` migration
+- After a **successful** provision, atomically replace `~/.local/bin/repo-radar` with a
+  small **stable dispatcher** that execs the active runtime:
+  `exec "$HOME/.repo-radar/<channel>/current/venv/bin/python"
+   "$HOME/.repo-radar/<channel>/current/repo-radar" "$@"`.
+- Only then retire a legacy top-level `~/.repo-radar/repo-radar` to
+  `~/.repo-radar/legacy-<ts>/` (recoverable), never before the replacement is healthy.
+- CLI invocation is part of the acceptance matrix (§7).
 
-- `getSyncScriptPath()` no longer prefers a bare `~/.repo-radar/repo-radar` launcher.
-  Resolution becomes: bundled `resources/repo-radar` (version-matched) → dev fallback.
-  The app-managed runtime supersedes any manual install.
-- If a legacy top-level `~/.repo-radar/repo-radar` (and PATH symlink
-  `~/.local/bin/repo-radar`) exists from a prior manual setup.sh run, `ensureRuntime()`
-  retires it (move to `~/.repo-radar/legacy-<timestamp>/` rather than delete, so a
-  user's manual customization is recoverable) and logs the migration. The new
-  `runtimes/` tree coexists under the same `~/.repo-radar/` root.
+### 3.6 Resolved dependency lock (build-time)
+
+To make "pinned" a real guarantee (Codex R1-3), the build produces a fully-resolved,
+hash-pinned lock `resources/requirements.lock` (e.g. `pip-compile`/`pip freeze` of
+`requirements.txt` on the target Python), covering direct **and** transitive deps.
+Provisioning installs with `--require-hashes -r requirements.lock`. The loose
+`requirements.txt` remains the human-edited source; the lock is the provisioning input and
+is bundled via `extraResources`. Regenerating the lock is a build step (a Spec 2A task),
+not manual.
 
 ---
 
-## 4. Components / files to touch (implementation preview — not part of review sign-off)
+## 4. Components / files (implementation preview — not the review sign-off)
 
-- **New** `menubar/runtime-manager.js` (CommonJS): `ensureRuntime()`, `getRuntime()`,
-  `provision()`, `resolveBaseInterpreter()`, marker read/write, requirements hashing,
-  legacy migration. Pure-ish logic + `child_process` for venv/pip.
-- `menubar/main.js`: call `ensureRuntime()` in startup; replace `getSyncScriptPath()`
-  preference + the manual spawn to use `getRuntime()`; regenerate `run-sync.sh` via
-  `getRuntime()`; wire the failure state to a notification/error surface.
-- `menubar/resources/setup.sh`: repurpose as the provisioning primitive the app invokes
-  (create venv + pip install into a target dir), OR retire it in favor of in-JS
-  provisioning. **Open decision D1.**
-- `menubar/package.json`: ensure `resources/requirements.txt` + `resources/repo_radar`
-  bundling stays correct (already present, `:82-108`).
+- **New** `menubar/runtime-manager.js` (CommonJS, D1 — JS orchestration, retire setup.sh):
+  `ensureRuntime()`, `getRuntime()`, `authoritativeIdentity()`, `resolveBaseInterpreter()`,
+  `provision()` (staging + venv + hashed pip + source copy + smoke + `pip check`),
+  atomic cutover, lock (`flock`), marker read/write, hashing, legacy migration + CLI dispatcher,
+  redacted logging. Argument-array `spawn` only.
+- `menubar/main.js`: call `ensureRuntime()` in startup + after update; replace
+  `getSyncScriptPath()`/manual spawn with `getRuntime()`; channel-namespace the LaunchAgent
+  (label/plist/wrapper); emit the self-verifying wrapper; remove the fictitious `getVersion()`
+  fallback (fail closed); wire failure → notification/error surface.
+- **Build:** generate + bundle `resources/requirements.lock`; keep `resources/repo_radar`,
+  `resources/requirements.txt` bundling (`menubar/package.json:82-108`).
+- `menubar/resources/setup.sh`: retired as an app dependency (kept only as an optional manual
+  aid, or removed).
 - **New tests** (Section 7).
 
 ---
 
 ## 5. Data flow
 
-- **Fresh install (no `~/.repo-radar`):** launch → `ensureRuntime()` finds no marker →
-  provision `runtimes/1.0.27/venv` → pip install `litellm==1.93.0` … → smoke import →
-  marker ok → syncs use the venv.
-- **Upgrade from 1.0.26:** old `.app` replaced by 1.0.27 (deps untouched, possibly
-  litellm 1.83.4 global / none) → relaunch → `ensureRuntime()` sees no
-  `runtimes/1.0.27` marker (or a 1.0.26 marker) → provisions 1.0.27 venv →
-  regenerates `run-sync.sh` → both sync paths now import bundled 1.0.27 `repo_radar`
-  against `litellm==1.93.0`.
-- **Steady state:** launch → marker matches version + reqs hash + venv healthy → no
-  pip, instant → sync.
+- **Fresh install:** launch → `ensureRuntime()` no marker → stage+provision
+  `stable/runtimes/1.0.27` (venv, hashed deps, source copy, smoke) → atomic cutover →
+  CLI dispatcher installed → syncs use it.
+- **Upgrade 1.0.26→1.0.27:** `.app` replaced → relaunch → new VERSION ≠ marker → stage new
+  runtime → atomic cutover → wrapper regenerated → both sync paths import bundled 1.0.27
+  `repo_radar` against `litellm==1.93.0`. If the old LaunchAgent fires mid-update, the stale
+  wrapper **fails closed** (identity mismatch).
+- **dev + stable coexistence:** each channel provisions under `~/.repo-radar/<channel>/…`
+  and owns `com.user.repo-radar[-dev]`; neither repoints or reschedules the other.
+- **Steady state:** marker + hashes + `pip check` pass → no pip → sync.
 
 ---
 
 ## 6. Failure / offline behavior
 
-Provisioning can fail: offline (pip can't reach PyPI), pip resolution/build error, or
-no interpreter in `[3.10,3.15)`.
-
-- **Never silently run stale/missing deps.** On failure, the marker is written
-  `status:failed` with the captured error, and sync is **disabled**.
-- **Visible + actionable:** a menubar notification + the existing error window surface
-  the failure with (a) the cause (offline / pip error / no valid python), (b) the
-  captured pip log tail, (c) a **Retry setup** action, and (d) remediation text
-  (check network; install a supported Python 3.10–3.14).
-- **Last-good fallback — Open decision D6:** if a previous version's runtime venv exists
-  and imports cleanly, do we (i) hard-block until 1.0.27 provisions, or (ii) allow
-  continuing on the previous runtime with a persistent "running previous version's
-  Python runtime" warning? Draft leans (i) block-and-notify for correctness (the whole
-  point is version binding), with the previous venv retained only for quick rollback.
+- **Hard-block (D6):** on provisioning failure (offline, pip/build error, hash mismatch, no
+  valid interpreter, identity conflict), the prior runtime is left intact but the **new**
+  build's sync is **disabled**; never run stale/missing deps. A previous runtime cannot
+  satisfy version binding, so it is retained only for rollback — not used as a fallback.
+- **Visible + actionable:** menubar notification + error window with cause, redacted log tail,
+  a **Retry setup** action, and remediation (check network; install Python 3.10–3.14).
+- **Security (Codex R1-6):** redact credentials in index URLs from any stored/displayed pip
+  output; create all `~/.repo-radar/**` state with user-only perms (dirs `0700`, files `0600`).
 
 ---
 
-## 7. Acceptance matrix — upgrade from v1.0.26 (the review sign-off bar)
+## 7. Acceptance (sign-off bar)
 
-A scripted integration harness simulates a v1.0.26 install and an upgrade to 1.0.27,
-then proves each item. The harness seeds a fake `$HOME` with: a legacy
-`~/.repo-radar/repo-radar` launcher, a global/site python with `litellm==1.83.4`, and no
-`runtimes/` tree; then runs `ensureRuntime()` for app version 1.0.27 against the bundled
-1.0.27 resources.
+### 7a. Scripted logic harness (fast, no packaging)
+Unit-tests the pure logic in a temp `$HOME`: `resolveBaseInterpreter()` version gating +
+real-exe resolution; authoritative-identity fail-closed; marker read/write + staleness
+decision (identity, lock hash, source hash, interp fingerprint, `pip check`); lock/atomic
+cutover ordering; legacy detection + CLI-dispatcher generation; redaction. An integration
+variant actually stages a venv + hashed install and asserts idempotence (second run = no pip)
+and the offline failure path.
 
-1. **Bundled package import.** Both the manual-spawn env and the scheduled
-   `run-sync.sh` env import `repo_radar` from the bundled `resources/repo_radar`
-   (assert `repo_radar.__file__` under the app resources, and a 1.0.27-only symbol,
-   e.g. `repo_radar.llm.DEFAULT_MODEL == 'claude-sonnet-5'`).
-2. **Interpreter + litellm parity.** In BOTH sync environments,
-   `sys.executable == ~/.repo-radar/runtimes/1.0.27/venv/bin/python` and
-   `importlib.metadata.version('litellm') == '1.93.0'` — despite the seeded global
-   `litellm==1.83.4`.
-3. **New Python behavior executes.** From the provisioned runtime,
-   `repo_radar.llm.migrate_model('gpt-5.2-codex') == 'gpt-5.3-codex'`,
-   `get_fallback_model('o3') is None` (non-Gemini guard), and a context-window value
-   corrected in Spec 1 (`gpt-5.4-mini == 1050000`) all resolve from the new package.
-4. **Failure/offline is visible + actionable.** With PyPI unreachable (simulated),
-   provisioning fails → marker `status:failed`, sync disabled, an error surface with the
-   cause + Retry is produced; no sync runs against missing/stale deps.
+### 7b. Built-artifact packaged upgrade smoke (production sign-off, Codex R1-5)
+Against the **locally built** `.app` (exercises `process.resourcesPath`, signed paths with
+spaces, launchd, real identity):
+1. Seed a v1.0.26 state (`~/.repo-radar/repo-radar` legacy launcher, a global/site
+   `litellm==1.83.4`, no `runtimes/`), install/run the built **1.0.27** app.
+2. **Bundled import:** manual AND `launchctl`-driven scheduled sync both import
+   `repo_radar` from the versioned runtime copy (assert `repo_radar.__file__` under
+   `~/.repo-radar/<channel>/current/repo_radar`, and `llm.DEFAULT_MODEL=='claude-sonnet-5'`).
+3. **Interpreter + litellm parity:** in BOTH envs `sys.executable ==
+   .../current/venv/bin/python` and `importlib.metadata.version('litellm')=='1.93.0'`
+   despite the seeded 1.83.4.
+4. **New behavior:** from the runtime, `migrate_model('gpt-5.2-codex')=='gpt-5.3-codex'`,
+   `get_fallback_model('o3') is None`, `KNOWN_LIMITS['gpt-5.4-mini']==1050000`.
+5. **CLI continuity:** `repo-radar --version`/a no-op subcommand on `PATH` runs the new
+   runtime (dispatcher), not a dangling path.
+6. **Fail-closed under update race:** with a stale wrapper + mismatched identity, the
+   scheduled wrapper exits non-zero and runs no sync.
+7. **Offline provisioning:** PyPI unreachable → provisioning fails → sync disabled, error
+   surface + Retry; retry after "network restored" recovers.
+8. **Partial/interrupted provision:** killing mid-provision leaves the prior runtime intact
+   and only a `*.staging-*` dir to GC; next launch recovers cleanly.
+9. **dev + stable coexistence:** both installed; each syncs its own runtime; neither
+   repoints/reschedules the other.
 
-Additional required checks:
-- **Legacy migration:** the pre-existing `~/.repo-radar/repo-radar` is retired to
-  `legacy-<ts>/` and no longer shadows the runtime; `getSyncScriptPath()` resolves to the
-  bundled launcher.
-- **Idempotence:** a second `ensureRuntime()` with an unchanged version/reqs performs no
-  pip install (marker+hash short-circuit).
-
-### Testing strategy
-- **Unit (Node):** `resolveBaseInterpreter()` version gating, marker read/write,
-  requirements hashing, staleness decision, legacy-path detection — pure logic, fast.
-- **Integration (scripted):** the upgrade harness above, driving `ensureRuntime()` in a
-  temp `$HOME`; asserts items 1–4 + migration + idempotence by actually creating a venv
-  and pip-installing (network-gated; a `--offline` variant asserts item 4).
-- **Manual smoke checklist:** the Electron UI surfaces (notification, error window,
-  Retry) exercised once on a real upgrade over an installed 1.0.26.
+SIP/quarantine and per-user `$HOME` isolation are covered by 7b (real packaged app).
 
 ---
 
-## 8. Open decisions (for Codex + Matt)
+## 8. Resolved decisions (were open in rev 1)
 
-- **D1 — provisioning primitive:** repurpose `setup.sh` as the venv+pip primitive the app
-  invokes, vs. do provisioning entirely in JS (`child_process`). Trade-off: reuse vs. one
-  less shell dependency + easier error capture.
-- **D3 — base interpreter preference:** pyenv-shim-first (matches today) vs. Homebrew/
-  system-first (stabler base).
-- **D4 — provision timing:** background (sync disabled until ready) vs. blocking
-  "Setting up…" on first launch after update.
-- **D6 — failure fallback:** hard-block-and-notify vs. continue-on-previous-runtime-with-
-  warning.
-- **D7 — old-runtime GC:** when/whether to delete `runtimes/<old-version>` (keep N-1 for
-  rollback? delete on successful new provision?).
+- **D1 — provisioning primitive:** provision in JS via argument-array `spawn`; retire
+  `setup.sh`. One orchestrator owns state, errors, and cutover.
+- **D3 — base interpreter:** explicit Homebrew/`/usr/local` first, then a pyenv interpreter
+  resolved to its **real executable** (not the shim), then validated `PATH` fallback;
+  fingerprint + revalidate.
+- **D4 — provision timing:** provision **asynchronously** (Electron stays responsive) but
+  centrally gate every manual/missed-sync entry point and make the scheduled wrapper
+  fail-closed until the marker is `ok`.
+- **D6 — failure fallback:** hard-block + notify. No continuing on a previous runtime.
+- **D7 — GC:** in 2A delete only abandoned `*.staging-*` dirs; retain successful old runtimes
+  (rollback). Full runtime GC → Spec 2B.
 
 ---
 
 ## 9. Definition of done (production unblock)
 
-`v1.0.27` production release is unblocked when: the acceptance matrix (Section 7) passes
-on a real upgrade from an installed 1.0.26, manual and scheduled syncs both provably run
-the bundled 1.0.27 `repo_radar` against `litellm==1.93.0` from the app-managed venv, and
-provisioning failures are visible + actionable. Spec 2B items remain deferred.
+`v1.0.27` is unblocked when §7b passes on a real upgrade from an installed 1.0.26: manual and
+scheduled syncs provably run the bundled 1.0.27 `repo_radar` against `litellm==1.93.0` from
+the channel+version runtime; the scheduled wrapper fails closed on identity mismatch; the
+`repo-radar` CLI keeps working; dev/stable coexist without interference; and provisioning
+failures are visible, redacted, and actionable. Spec 2B items remain deferred.
