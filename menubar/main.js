@@ -11,7 +11,7 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 // provisioning + the lockf-serialized sync runner. See app.whenReady() and
 // triggerSync() below for how these are wired in.
 const runtime = require('./runtime');
-const { resolveChannel, layout } = require('./runtime/paths');
+const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
 
 // Read version from VERSION file
@@ -38,28 +38,53 @@ function getVersion() {
 
 const APP_VERSION = getVersion();
 
-// Detect dev build early (before versionInfo is initialized)
-const IS_DEV_BUILD = (() => {
-  try {
-    const buildInfoPath = path.join(__dirname, 'build-info.json');
-    if (fs.existsSync(buildInfoPath)) {
-      return JSON.parse(fs.readFileSync(buildInfoPath, 'utf8')).channel === 'dev';
-    }
-  } catch (e) {}
-  return false;
-})();
+// Channel-first, fail-closed (spec 2A maintainer addition). Resolve the build
+// channel via resolveChannel() ONCE, synchronously, here at the true top of
+// the file — BEFORE any channel-dependent behavior (the LaunchAgent
+// label/plist path, the status port, cleanupOrphans(), uninstallApp(), the
+// single-instance lock's appId) derives anything from it. Every one of those
+// consumers below reads `runtimeChannel`/`IS_DEV_BUILD` — there is no second,
+// independent build-info.json read anymore.
+//
+// Fail closed: if resolveChannel() throws ChannelError (missing/malformed
+// build-info.json — always true for a dev-from-source run, e.g. `electron .`
+// with no packaged build-info.json), `runtimeChannel` stays null and
+// `runtimeDisabled` is set. That must NEVER be silently treated as "stable" —
+// see IS_DEV_BUILD/STATUS_PORT/AGENT_LABEL below, all of which go null/absent
+// rather than guessing, and the null-channel guards in cleanupOrphans(),
+// uninstallApp(), updateLaunchAgent(), and triggerSync(). The user-facing
+// surfacing (tray icon/dialog/notification via surfaceRuntimeError()) happens
+// later in app.whenReady() once the tray exists — this block only resolves
+// state.
+let runtimeChannel = null;
+let runtimeDisabled = false;
+let runtimeDisabledReason = '';
+try {
+  runtimeChannel = resolveChannel(path.join(__dirname, 'build-info.json'));
+} catch (e) {
+  runtimeDisabled = true;
+  runtimeDisabledReason = `build channel: ${e.message}`;
+}
 
-// Dev builds use a different port so they don't conflict with production
-const STATUS_PORT = IS_DEV_BUILD ? 3848 : 3847;
+const IS_DEV_BUILD = runtimeChannel === 'dev';
+
+// Dev builds use a different port so they don't conflict with production.
+// Null (not 3847) when the channel is unresolved: startStatusServer() skips
+// listening in that case rather than guessing stable's fixed port.
+const STATUS_PORT = runtimeChannel === 'dev' ? 3848 : runtimeChannel === 'stable' ? 3847 : null;
 
 // Channel-namespaced LaunchAgent identity (spec 2A). Stable and dev must never
 // share a schedule label/plist file: uninstallApp(), cleanupOrphans(),
 // detectExistingSchedule(), and updateLaunchAgent() all previously hardcoded
 // the single stable label, which meant e.g. uninstalling Repo Radar Dev would
 // unload/delete *stable's* real persistent schedule. All four now go through
-// this helper.
-const AGENT_LABEL = IS_DEV_BUILD ? 'com.user.repo-radar-dev' : 'com.user.repo-radar';
+// this helper. AGENT_LABEL/getPlistFile() are null when the channel is
+// unresolved — callers must guard rather than fall through to stable's label.
+const AGENT_LABEL = runtimeChannel === 'dev' ? 'com.user.repo-radar-dev'
+  : runtimeChannel === 'stable' ? 'com.user.repo-radar'
+  : null;
 function getPlistFile() {
+  if (!AGENT_LABEL) return null;
   return path.join(process.env.HOME, 'Library', 'LaunchAgents', `${AGENT_LABEL}.plist`);
 }
 
@@ -130,14 +155,14 @@ let animationFrame = 0;
 let successTimeout = null;
 let versionInfo = null;
 
-// Runtime bootstrap state (spec 2A `menubar/runtime/`). `runtimeChannel` is
-// resolved synchronously in app.whenReady() (before the async ensureRuntime()
-// provisioning below it); `runtimeDisabled` is set true — and sync/schedule
-// operations refuse to run — after a fail-closed channel-resolution or
-// ensureRuntime() failure. See surfaceRuntimeError() and app.whenReady().
-let runtimeChannel = null;
-let runtimeDisabled = false;
-let runtimeDisabledReason = '';
+// Runtime bootstrap state (spec 2A `menubar/runtime/`). `runtimeChannel` /
+// `runtimeDisabled` / `runtimeDisabledReason` are declared and resolved
+// synchronously at the true top of this file (channel-first, fail-closed —
+// see the block above APP_VERSION) so every channel-dependent consumer,
+// including ones that run before app.whenReady(), sees the same resolved
+// state. `runtimeDisabled` is also set true — and sync/schedule operations
+// refuse to run — after an ensureRuntime() failure inside app.whenReady().
+// See surfaceRuntimeError() and app.whenReady().
 
 // Load version info
 function loadVersionInfo() {
@@ -585,65 +610,121 @@ function updateTrayMenu() {
   tray.setContextMenu(menu);
 }
 
-// Uninstall app - remove all persistent files and quit
+// Uninstall app - remove all persistent files and quit.
+//
+// Scoped by resolved build channel (Codex I3, spec 2A §3.3): ~/.repo-radar/
+// is now a SHARED root holding one subdirectory per channel (stable/, dev/)
+// plus a shared root exec lock; ~/.config/repo-radar/ and
+// ~/Library/Logs/repo-radar/ are shared config/log locations too. A dev build
+// must remove ONLY its own dispatcher (~/.local/bin/repo-radar-dev), its own
+// plist (com.user.repo-radar-dev), and its own channel dir
+// (~/.repo-radar/dev/) — never the shared root, stable's channel dir, the
+// shared config, or shared logs. (Stable's uninstall keeps the previous,
+// broader "full app removal" behavior — config/logs/legacy launcher — since
+// nothing here asked to change that side.) If the channel couldn't be
+// resolved at all we don't know which state is safe to touch, so refuse
+// rather than guess — the same fail-closed contract as triggerSync()/
+// updateLaunchAgent().
 function uninstallApp() {
   const appName = getAppDisplayName();
+
+  if (!runtimeChannel) {
+    dialog.showErrorBox(
+      'Uninstall Unavailable',
+      `Cannot uninstall ${appName}: the build channel could not be determined (${runtimeDisabledReason || 'unknown error'}). Remove files manually, or reinstall from a proper build.`
+    );
+    return;
+  }
+
+  const isDevChannel = runtimeChannel === 'dev';
 
   dialog.showMessageBox({
     type: 'warning',
     title: `Uninstall ${appName}`,
     message: `Are you sure you want to uninstall ${appName}?`,
-    detail: 'This will remove:\n• Scheduled sync (LaunchAgent)\n• Configuration and status files\n• Log files\n• Wrapper scripts\n\nYour synced repositories will NOT be deleted.',
+    detail: isDevChannel
+      ? 'This will remove:\n• Dev scheduled sync (LaunchAgent), if any\n• Dev CLI dispatcher (~/.local/bin/repo-radar-dev)\n• Dev runtime (~/.repo-radar/dev/)\n\nShared configuration, logs, and any stable installation will NOT be touched.\nYour synced repositories will NOT be deleted.'
+      : 'This will remove:\n• Scheduled sync (LaunchAgent)\n• Configuration and status files\n• Log files\n• Runtime files\n\nYour synced repositories will NOT be deleted.',
     buttons: ['Cancel', 'Uninstall'],
     defaultId: 0,
     cancelId: 0
   }).then((result) => {
     if (result.response !== 1) return;
 
-    console.log('Uninstalling...');
+    console.log(`Uninstalling (channel: ${runtimeChannel})...`);
 
-    // 1. Unload and remove LaunchAgent
+    // 1. Unload and remove THIS channel's LaunchAgent only (AGENT_LABEL is
+    // already channel-namespaced: com.user.repo-radar vs com.user.repo-radar-dev).
     const plistFile = getPlistFile();
     try {
-      if (fs.existsSync(plistFile)) {
+      if (plistFile && fs.existsSync(plistFile)) {
         spawn('launchctl', ['unload', plistFile], { stdio: 'ignore' });
         fs.unlinkSync(plistFile);
-        console.log('Removed LaunchAgent');
+        console.log('Removed LaunchAgent:', plistFile);
       }
     } catch (e) {
       console.error('Error removing LaunchAgent:', e);
     }
 
-    // 2. Remove config directory (~/.config/repo-radar/)
+    // 2. Remove THIS channel's CLI dispatcher only (~/.local/bin/repo-radar[-dev]).
     try {
-      if (fs.existsSync(CONFIG_DIR)) {
-        fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
-        console.log('Removed config directory');
+      const dispatcher = cliPath(os.homedir(), runtimeChannel);
+      if (fs.existsSync(dispatcher)) {
+        fs.unlinkSync(dispatcher);
+        console.log('Removed CLI dispatcher:', dispatcher);
       }
     } catch (e) {
-      console.error('Error removing config:', e);
+      console.error('Error removing CLI dispatcher:', e);
     }
 
-    // 3. Remove log directory (~/Library/Logs/repo-radar/)
-    const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
-    try {
-      if (fs.existsSync(logDir)) {
-        fs.rmSync(logDir, { recursive: true, force: true });
-        console.log('Removed log directory');
+    if (!isDevChannel) {
+      // Stable only: remove shared config + logs + any pre-spec-2A legacy
+      // launcher. Dev must never touch these (Codex I3) — they're shared
+      // across channels and dev is meant to be a disposable, isolated overlay
+      // on top of a managed stable install.
+      try {
+        if (fs.existsSync(CONFIG_DIR)) {
+          fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
+          console.log('Removed config directory');
+        }
+      } catch (e) {
+        console.error('Error removing config:', e);
       }
-    } catch (e) {
-      console.error('Error removing logs:', e);
+
+      const logDir = path.join(process.env.HOME, 'Library', 'Logs', 'repo-radar');
+      try {
+        if (fs.existsSync(logDir)) {
+          fs.rmSync(logDir, { recursive: true, force: true });
+          console.log('Removed log directory');
+        }
+      } catch (e) {
+        console.error('Error removing logs:', e);
+      }
+
+      // Legacy pre-spec-2A install: the ~/.repo-radar/repo-radar launcher sat
+      // directly in the shared root. Only stable ever had a legacy install.
+      const legacyLauncher = path.join(os.homedir(), '.repo-radar', 'repo-radar');
+      try {
+        if (fs.existsSync(legacyLauncher)) {
+          fs.unlinkSync(legacyLauncher);
+          console.log('Removed legacy launcher');
+        }
+      } catch (e) {
+        console.error('Error removing legacy launcher:', e);
+      }
     }
 
-    // 4. Remove installed script (~/.repo-radar/)
-    const installedDir = path.join(process.env.HOME, '.repo-radar');
+    // 3. Remove only THIS channel's runtime dir (~/.repo-radar/<channel>/) —
+    // never the shared ~/.repo-radar/ root, which the other channel (and the
+    // shared root exec lock) may still be using.
     try {
-      if (fs.existsSync(installedDir)) {
-        fs.rmSync(installedDir, { recursive: true, force: true });
-        console.log('Removed installed scripts');
+      const channelDir = layout(os.homedir(), runtimeChannel).channelDir;
+      if (fs.existsSync(channelDir)) {
+        fs.rmSync(channelDir, { recursive: true, force: true });
+        console.log('Removed channel runtime directory:', channelDir);
       }
     } catch (e) {
-      console.error('Error removing installed scripts:', e);
+      console.error('Error removing channel runtime directory:', e);
     }
 
     // Show confirmation
@@ -661,10 +742,15 @@ function uninstallApp() {
 
 // Clean up orphaned files from a previous uninstalled version
 function cleanupOrphans() {
+  // Fail-closed (Codex I3/maintainer channel-first addition): if the build
+  // channel is unresolved we don't reliably know which plist (if any) belongs
+  // to this build, so don't touch any LaunchAgent — never guess stable's.
+  if (!runtimeChannel) return;
+
   // Check if a LaunchAgent exists but points to an app that no longer exists
   const plistFile = getPlistFile();
   try {
-    if (fs.existsSync(plistFile)) {
+    if (plistFile && fs.existsSync(plistFile)) {
       const content = fs.readFileSync(plistFile, 'utf8');
       // Extract the script path from the plist
       const scriptMatch = content.match(/<string>(\/[^<]*run-sync\.sh)<\/string>/);
@@ -904,6 +990,32 @@ function startStatusServer() {
 function triggerSync({ showWindow = true } = {}) {
   if (currentSyncProcess) {
     return; // Already syncing
+  }
+
+  // Dev ownership isolation (Codex I3, spec 2A §3.3): dev must not run sync
+  // against the shared data plane unless stable is provably managed AND
+  // healthy (detectStableManaged) — an unmigrated/legacy/ambiguous stable
+  // install means dev has no safe, isolated place to write. This is the
+  // single central gate for BOTH dev sync entry points: manual "Sync Now"
+  // (the tray menu click handler) and the missed-sync auto-trigger
+  // (checkMissedSync()) — the only two callers of triggerSync() — since both
+  // funnel through here before any state is touched.
+  if (runtimeChannel === 'dev') {
+    const managed = detectStableManaged({ home: os.homedir() });
+    if (!managed.managed) {
+      const reason = `Dev sync blocked: stable is not provably managed (${managed.reason}). Upgrade/run stable at least once to migrate it first, or run this dev build against an isolated HOME.`;
+      console.error(reason);
+      const blockedStatus = loadStatus();
+      blockedStatus.hasErrors = true;
+      blockedStatus.errorLog = (blockedStatus.errorLog || '') + `\n⚠️ ${reason}\n`;
+      saveStatus(blockedStatus);
+      showErrorIcon();
+      updateTrayMenu();
+      if (logWindow && !logWindow.isDestroyed()) {
+        logWindow.webContents.send('terminal-output', `\n⚠️ ${reason}\n`);
+      }
+      return;
+    }
   }
 
   syncCancelledByUser = false;
@@ -1490,8 +1602,11 @@ function loadConfigAndSend() {
 function detectExistingSchedule() {
   try {
     const plistFile = getPlistFile();
-    
-    if (!fs.existsSync(plistFile)) {
+
+    // getPlistFile() is null when the build channel is unresolved (fail
+    // closed) — fs.existsSync(null) is safely false, but bail explicitly so
+    // it reads the same way as the other channel-dependent guards.
+    if (!plistFile || !fs.existsSync(plistFile)) {
       return null;
     }
     
@@ -1548,14 +1663,35 @@ function detectExistingSchedule() {
 // Save config
 function saveConfigToFile(config) {
   const configFile = path.join(CONFIG_DIR, 'config.json');
-  
+
   try {
     // Ensure directory exists
     if (!fs.existsSync(CONFIG_DIR)) {
       fs.mkdirSync(CONFIG_DIR, { recursive: true });
     }
-    
-    fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+
+    // Dev ownership isolation (Codex I3, spec 2A §3.3): config.json is shared
+    // across channels (repos/API keys/model are meant to be shared), but its
+    // `schedule` field drives a persistent LaunchAgent, which dev must never
+    // install or mutate (see updateLaunchAgent()'s unconditional dev block
+    // below). Preserve whatever schedule is already on disk instead of
+    // persisting whatever a dev build's settings window sent — the renderer
+    // has no way to know it shouldn't be touching the shared schedule, so
+    // main.js protects it here regardless of what's in the incoming payload.
+    let toWrite = config;
+    if (runtimeChannel === 'dev') {
+      let onDiskSchedule;
+      try {
+        if (fs.existsSync(configFile)) {
+          onDiskSchedule = JSON.parse(fs.readFileSync(configFile, 'utf8')).schedule;
+        }
+      } catch (_) {
+        // No readable on-disk schedule to preserve — fall through with none.
+      }
+      toWrite = { ...config, schedule: onDiskSchedule };
+    }
+
+    fs.writeFileSync(configFile, JSON.stringify(toWrite, null, 2));
     return { success: true };
   } catch (e) {
     console.error('Error saving config:', e);
@@ -1573,6 +1709,16 @@ function saveConfigToFile(config) {
 // scheduling isn't enabled) this is a no-op, exactly like a fresh install.
 function updateLaunchAgent(config) {
   try {
+    // Fail-closed (channel-first, spec 2A maintainer addition): with no
+    // resolved channel we don't know which plist/label is safe to touch, so
+    // refuse before computing plistFile/AGENT_LABEL at all — never fall
+    // through to a guessed (stable) label. Checked first, before even loading
+    // config, so it applies to every call path including the schedule-disable
+    // branch below.
+    if (!runtimeChannel) {
+      return { success: false, error: 'Cannot configure the sync schedule: build channel could not be determined (see runtime setup error).' };
+    }
+
     if (!config) {
       const configFile = path.join(CONFIG_DIR, 'config.json');
       config = fs.existsSync(configFile) ? JSON.parse(fs.readFileSync(configFile, 'utf8')) : {};
@@ -1588,7 +1734,8 @@ function updateLaunchAgent(config) {
     }
 
     if (!schedule.enabled) {
-      // Disable by unloading
+      // Disable by unloading (harmless/good hygiene for either channel — e.g.
+      // unloading a dev plist a previous app version may have installed).
       if (fs.existsSync(plistFile)) {
         try {
           spawn('launchctl', ['unload', plistFile], { stdio: 'ignore' });
@@ -1599,22 +1746,19 @@ function updateLaunchAgent(config) {
       return { success: true };
     }
 
-    if (!runtimeChannel) {
-      return { success: false, error: 'Cannot configure the sync schedule: build channel could not be determined (see runtime setup error).' };
-    }
-
-    // Dev must not install a persistent schedule unless stable is provably
-    // managed by the new runtime (spec 2A §3.3) — otherwise a dev schedule
-    // could be the only thing keeping syncs running against an unmigrated or
-    // ambiguous stable install, which the design explicitly forbids.
+    // Dev ownership isolation (Codex I3, spec 2A §3.3): dev must NEVER
+    // install a persistent LaunchAgent or write schedule fields into the
+    // shared config.json (see saveConfigToFile()'s schedule-preserving
+    // guard) — a dev transient smoke agent is a separate, deliberate
+    // operator action outside this app, not something Sync Now/Settings
+    // auto-installs. This is unconditional: unlike the old behavior, even a
+    // healthy/managed stable install does not make it safe for THIS app to
+    // persist a *dev* schedule into the shared plist/config namespace.
     if (runtimeChannel === 'dev') {
-      const managed = detectStableManaged({ home: os.homedir() });
-      if (!managed.managed) {
-        return {
-          success: false,
-          error: `Dev channel cannot install a persistent sync schedule: stable is not provably managed (${managed.reason}). Use "Sync Now" for on-demand dev syncs, or run stable at least once to migrate it first.`
-        };
-      }
+      return {
+        success: false,
+        error: 'Dev builds cannot install a persistent sync schedule. Use "Sync Now" for on-demand dev syncs — a scheduled dev smoke agent must be set up manually, outside this app.'
+      };
     }
 
     // Point at the generic, self-verifying runner ensureRuntime() emits
@@ -1715,9 +1859,21 @@ ${calendarInterval}
 </plist>
 `;
 
-    // Write plist. Mode 0600: this file now carries API keys directly (see
-    // above), same class of data as the runtime module's own desired.json.
-    fs.writeFileSync(plistFile, plistContent, { mode: 0o600 });
+    // Write plist atomically with 0600 enforced even when REWRITING an
+    // existing file (Codex I8): fs.writeFileSync's `mode` option only applies
+    // when the file is being CREATED (open() O_CREAT) — rewriting an existing
+    // plist (e.g. a 0644 one left over from before schedules carried API
+    // keys, or one restored by some other tool) would silently keep it
+    // world-readable, same class of data as the runtime module's own
+    // desired.json. Write a fresh temp file (created fresh, so `mode` does
+    // apply), rename it over the target (atomic on the same volume, so
+    // launchd/other readers never observe a partial write), then chmod
+    // explicitly as a belt-and-braces guarantee independent of whatever mode
+    // the temp file actually landed with.
+    const plistTmp = `${plistFile}.${process.pid}.tmp`;
+    fs.writeFileSync(plistTmp, plistContent, { mode: 0o600 });
+    fs.renameSync(plistTmp, plistFile);
+    fs.chmodSync(plistFile, 0o600);
 
     // Reload LaunchAgent
     spawn('launchctl', ['unload', plistFile], { stdio: 'ignore' });
@@ -2060,22 +2216,15 @@ function setupAutoUpdater() {
 
 // App ready
 app.whenReady().then(async () => {
-  // Kill any orphaned sync processes from previous app crash
-  // This handles the case where app crashed while Python was running
-  try {
-    const { execSync } = require('child_process');
-    const result = execSync('pgrep -f "repo-radar sync --status-server"', 
-      { encoding: 'utf8', stdio: 'pipe' }).trim();
-    
-    if (result) {
-      console.log('Found orphaned sync process(es), killing:', result);
-      execSync(`kill -9 ${result}`, { stdio: 'ignore' });
-      console.log('Killed orphaned processes');
-    }
-  } catch (e) {
-    // No orphans found (pgrep returns error if no matches) - this is normal
-  }
-  
+  // NOTE (Codex I6): this used to `pgrep -f "repo-radar sync --status-server"`
+  // and `kill -9` every match on every launch, to clean up a sync left behind
+  // by a prior app crash. Under the root-lock contract (runtime/lock.js,
+  // runtime.runSync()) a surviving sync worker OWNS the inherited lock fd and
+  // is a legitimate, still-serializing process — not an orphan — so killing
+  // it out from under the lock was actively unsafe. Removed entirely; the
+  // lock (acquired by the worker itself, released by the kernel on its death)
+  // handles serialization without any app-side process hunting.
+
   // Create tray
   const icon = createTrayIcon('white', 0);
   if (!icon) {
@@ -2105,9 +2254,17 @@ app.whenReady().then(async () => {
     updateTrayMenu();
   });
   
-  // Start status server
-  startStatusServer();
-  
+  // Start status server. Skipped when the build channel is unresolved: sync
+  // is disabled in that state (see triggerSync()'s runtimeDisabled/!runtimeChannel
+  // gate below), so there's nothing to serve, and binding stable's fixed port
+  // (STATUS_PORT is null here, not 3847) under a guessed identity is exactly
+  // what channel-first fail-closed forbids.
+  if (STATUS_PORT) {
+    startStatusServer();
+  } else {
+    console.warn('[runtime] status server not started: build channel unresolved');
+  }
+
   // Load initial status
   const status = loadStatus();
   
@@ -2130,22 +2287,17 @@ app.whenReady().then(async () => {
   // Clean up orphaned files from previous installs
   cleanupOrphans();
 
-  // Reconcile the per-channel Python runtime to this build (spec 2A). Resolve
-  // the channel synchronously first — triggerSync()/updateLaunchAgent() need
-  // it even if the async provisioning below fails or is still running — then
-  // await ensureRuntime(), which may provision a fresh venv on first run or
-  // after an update. Awaiting here does NOT block the event loop: this is an
-  // `async` callback, so other Electron events (tray clicks, IPC, timers)
-  // still run while ensureRuntime() is in flight.
-  try {
-    runtimeChannel = resolveChannel(path.join(__dirname, 'build-info.json'));
-  } catch (e) {
-    // ChannelError (missing/malformed build-info.json channel) — fail closed:
-    // never guess stable vs dev. Dev-from-source (no build-info.json, e.g.
-    // `electron .`) always lands here; only packaged builds produced via
-    // release.sh carry a channel.
-    runtimeChannel = null;
-    surfaceRuntimeError(`build channel: ${e.message}`);
+  // Reconcile the per-channel Python runtime to this build (spec 2A).
+  // `runtimeChannel` was already resolved synchronously at the true top of
+  // this file (channel-first, fail-closed — see the block above APP_VERSION),
+  // before cleanupOrphans() above and before the status port/LaunchAgent
+  // label were even computed. If that resolution failed, surface it now that
+  // the tray exists (surfaceRuntimeError() needs `tray`/`Notification`, which
+  // aren't available until app.whenReady()). Awaiting ensureRuntime() below
+  // does NOT block the event loop: this is an `async` callback, so other
+  // Electron events (tray clicks, IPC, timers) still run while it's in flight.
+  if (runtimeDisabled && !runtimeChannel) {
+    surfaceRuntimeError(runtimeDisabledReason);
   }
 
   if (runtimeChannel) {
@@ -2166,10 +2318,17 @@ app.whenReady().then(async () => {
         };
 
     try {
+      // Codex I7a: pass Electron's own app.getVersion() (from package.json),
+      // NOT APP_VERSION (the custom VERSION-file reader) — authoritativeIdentity()
+      // corroborates appVersion against the bundled VERSION file, and passing
+      // APP_VERSION here made that comparison tautological (VERSION file
+      // compared against itself). app.getVersion() is a genuinely independent
+      // second source. getVersion()/APP_VERSION's cosmetic dialog use (version
+      // display strings) is unaffected.
       const res = await runtime.ensureRuntime({
         home: os.homedir(),
         channel: runtimeChannel,
-        appVersion: APP_VERSION,
+        appVersion: app.getVersion(),
         bundle,
         hooks: { onFailure: surfaceRuntimeError, repointSchedule: updateLaunchAgent }
       });
