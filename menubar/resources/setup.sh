@@ -36,15 +36,15 @@ chmod +x "$INSTALL_DIR/repo-radar"
 # Create symlink in user's bin directory
 ln -sf "$INSTALL_DIR/repo-radar" "$BIN_DIR/repo-radar"
 
-# Check for Python 3
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}Error: Python 3 is required but not found${RESET}"
-    echo "Please install Python 3.8 or higher"
-    exit 1
+# Check for a supported Python 3 version
+PYV=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")
+PYMAJ=${PYV%%.*}; PYMIN=${PYV#*.}
+if [ "$PYMAJ" -ne 3 ] || [ "$PYMIN" -lt 10 ] || [ "$PYMIN" -ge 15 ]; then
+  echo "Repo Radar requires Python >=3.10,<3.15 (found $PYV). Install a supported Python 3 and retry." >&2
+  exit 1
 fi
 
-PYTHON_VERSION=$(python3 --version | awk '{print $2}')
-echo -e "${GREEN}✓ Found Python ${PYTHON_VERSION}${RESET}"
+echo -e "${GREEN}✓ Found Python ${PYV}${RESET}"
 
 # Install Python dependencies
 echo
@@ -52,12 +52,12 @@ echo -e "${BLUE}Installing Python dependencies...${RESET}"
 echo "This may take a few minutes on first install."
 echo
 
-if command -v pip3 &> /dev/null; then
-    pip3 install -q -r "$SCRIPT_DIR/requirements.txt"
+if python3 -m pip --version &> /dev/null; then
+    python3 -m pip install -q -r "$SCRIPT_DIR/requirements.txt"
     echo -e "${GREEN}✓ Python dependencies installed${RESET}"
 else
-    echo -e "${RED}Error: pip3 not found${RESET}"
-    echo "Please install pip3 or use a Python virtual environment"
+    echo -e "${RED}Error: pip not found${RESET}"
+    echo "Please install pip or use a Python virtual environment"
     exit 1
 fi
 
@@ -80,7 +80,7 @@ echo
 echo -e "${BLUE}Next steps:${RESET}"
 echo "1. The menubar app will guide you through initial configuration"
 echo "2. You'll need to provide your GitHub token"
-echo "3. You'll need to provide your Gemini API key (for metadata generation)"
+echo "3. You'll need to provide your Anthropic API key (for metadata generation)"
 echo "4. Configure which repositories to sync"
 echo
 echo -e "${BLUE}The sync script is now available at:${RESET}"

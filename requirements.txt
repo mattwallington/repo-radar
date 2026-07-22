@@ -1,4 +1,4 @@
-litellm==1.83.4
+litellm==1.93.0
 requests>=2.32.0
 inquirer>=3.4.0
 rich>=14.2.0
