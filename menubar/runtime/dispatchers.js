@@ -26,12 +26,29 @@ if [ -f "$SPLIST" ]; then
   [ "$SPROG" = "$ROOT/stable/run-sync.sh" ] \\
     || { echo "repo-radar-dev: stable LaunchAgent does not launch the managed runner; run dev in an isolated HOME" >&2; exit 1; }
 fi
-LP="$(launchctl print "gui/$(id -u)/com.user.repo-radar" 2>&1)"; LPRC=$?
+# capture inside an if-condition so set -e does NOT abort on a nonzero launchctl (a missing
+# service exits 113) before we can classify it (Codex round-7 finding 3).
+if LP="$(launchctl print "gui/$(id -u)/com.user.repo-radar" 2>&1)"; then LPRC=0; else LPRC=$?; fi
 if [ "$LPRC" -eq 0 ]; then
-  printf '%s\\n' "$LP" | awk '/arguments = \\{/{f=1} f&&/=>/{sub(/^[^>]*=> */,"");print;exit}' | grep -qxF "$ROOT/stable/run-sync.sh" \\
+  # REAL macOS launchctl print has a "program = <path>" line and an "arguments = { <path> }"
+  # block with NO "0 =>" index — parse the program field, which is ProgramArguments[0].
+  LPROG="$(printf '%s\\n' "$LP" | awk -F' = ' '/^[[:space:]]*program[[:space:]]*=/{print $2; exit}')"
+  [ "$LPROG" = "$ROOT/stable/run-sync.sh" ] \\
     || { echo "repo-radar-dev: a stale stable job is loaded; run dev in an isolated HOME" >&2; exit 1; }
 elif ! printf '%s' "$LP" | grep -qi 'could not find'; then
   echo "repo-radar-dev: cannot verify stable launchd state; run dev in an isolated HOME" >&2; exit 1
+fi
+# a legacy 1.0.26 stable sync (home launcher, ~/.config wrapper, or the app's BUNDLED launcher)
+# IGNORES the root lock and can corrupt the shared data plane even while we hold it — refuse if
+# one is running, and FAIL CLOSED if ps itself fails (Codex round-7 §2). This guards the CLI /
+# transient-launchd path, which never runs Electron's detectStableManaged().
+if ! SPS="$(ps -axo command 2>/dev/null)"; then
+  echo "repo-radar-dev: cannot scan for legacy processes; run dev in an isolated HOME" >&2; exit 1
+fi
+if printf '%s\\n' "$SPS" | awk -v L="$HOME/.repo-radar/repo-radar" -v W="$HOME/.config/repo-radar/run-sync.sh" '
+    index($0, L" ") || substr($0, length($0)-length(L)+1)==L || index($0, W) || /\\/Contents\\/Resources\\/resources\\/repo-radar([ \\t]|$)/ {f=1}
+    END { exit(f?0:1) }'; then
+  echo "repo-radar-dev: a legacy stable sync is running; run dev in an isolated HOME" >&2; exit 1
 fi
 SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
 { [ -L "$SCUR" ] && [ -f "$SDES" ] && [ -f "$ROOT/stable/run-sync.sh" ] && grep -q '"status": *"active"' "$SDES"; } \\

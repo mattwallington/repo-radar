@@ -49,3 +49,43 @@ test('run-sync exits 75 (busy) when the root exec lock is held', async () => {
     assert.match(r.stderr, /another sync is running/);
   });
 });
+
+// Shadow `ps`/`launchctl` on PATH and spawn the REAL generated dev dispatcher, so the shell
+// dev guard is exercised directly (Codex round-7 §2 wanted the CLI/transient path tested, not
+// only Electron's JS detectStableManaged). The dev guard runs AFTER the root lock is acquired.
+function fakeBin(psScript, launchctlScript) {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-bin-'));
+  fs.writeFileSync(path.join(bin, 'ps'), psScript); fs.chmodSync(path.join(bin, 'ps'), 0o755);
+  fs.writeFileSync(path.join(bin, 'launchctl'), launchctlScript); fs.chmodSync(path.join(bin, 'launchctl'), 0o755);
+  return bin;
+}
+const NO_JOB = '#!/bin/sh\necho "Could not find service" >&2\nexit 113\n'; // launchctl print: absent
+
+test('dev CLI refuses (under the lock) when a legacy stable sync is running (round-7 §2)', () => {
+  const home = tmpHome();
+  const p = emitCliDispatcher(home, 'dev');
+  const bin = fakeBin('#!/bin/sh\nprintf "%s\\n" "python3 $HOME/.repo-radar/repo-radar sync --status-server"\n', NO_JOB);
+  const r = cp.spawnSync('/bin/sh', [p], { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } });
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /a legacy stable sync is running/);
+});
+
+test('dev CLI fails closed when the process scan itself fails (round-7 §2)', () => {
+  const home = tmpHome();
+  const p = emitCliDispatcher(home, 'dev');
+  const bin = fakeBin('#!/bin/sh\nexit 1\n', NO_JOB); // ps cannot be run -> not proof of "no legacy"
+  const r = cp.spawnSync('/bin/sh', [p], { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } });
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /cannot scan for legacy processes/);
+});
+
+test('dev CLI does not abort early on a missing stable service (set -e fix, round-7 §3)', () => {
+  const home = tmpHome();
+  const p = emitCliDispatcher(home, 'dev');
+  // ps clean (no legacy), launchctl reports the service absent (rc=113). The OLD code aborted at
+  // the launchctl assignment under set -e; the fix must REACH the later stable-managed check.
+  const bin = fakeBin('#!/bin/sh\nprintf "%s\\n" "/usr/sbin/some-daemon"\n', NO_JOB);
+  const r = cp.spawnSync('/bin/sh', [p], { encoding: 'utf8', env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` } });
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /stable is not managed/, 'reached the stable-managed check past launchctl (set -e did not abort)');
+});

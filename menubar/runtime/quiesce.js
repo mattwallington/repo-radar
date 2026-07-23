@@ -11,26 +11,51 @@ function _defaultExec(cmd, args) {
   catch (e) { return { status: e.status == null ? 1 : e.status, out: (e.stdout || '') + (e.stderr || '') }; }
 }
 
-// Extract the loaded job's first program argument from `launchctl print` output:
-//   arguments = {\n\t\t0 => /path/to/run-sync.sh\n ...
-function _loadedJobArg0(out) {
-  const m = String(out || '').match(/arguments\s*=\s*\{[\s\S]*?\b0\s*=>\s*([^\n]+)/);
+// Extract the loaded job's executable from `launchctl print` output. REAL macOS output is:
+//   program = /path/to/run-sync.sh
+//   arguments = {
+//       /path/to/run-sync.sh
+//   }
+// There is NO `0 =>` index inside the arguments block — an earlier parser assumed one and so
+// false-rejected every real loaded job (Codex round-7 §3). We compare the `program =` line,
+// which launchd sets to ProgramArguments[0] for our plist.
+function _loadedJobProgram(out) {
+  const m = String(out || '').match(/^\s*program\s*=\s*(.+)$/m);
   return m ? m[1].trim() : null;
 }
 
-// A 1.0.26 sync may run the home launcher, the app's BUNDLED launcher, or the legacy
-// wrapper — all must be detected (Codex round-7 Crit1), while the managed runtime (which
-// runs .../.repo-radar/<channel>/current/repo-radar) must NOT match.
-function _legacyProcessRunning(exec, home) {
+// TRI-STATE process scan (Codex round-7 Crit1/§1). A 1.0.26 sync may run the home launcher,
+// the app's BUNDLED launcher, or the legacy wrapper — all must be detected, while the managed
+// runtime (.../.repo-radar/<channel>/current/repo-radar) must NOT match. A FAILED `ps` is NOT
+// proof of "no legacy process": return {ok:false} so callers fail CLOSED instead of open.
+function _legacyProcessScan(exec, home) {
   const ps = exec('ps', ['-axo', 'command']);
-  if (ps.status !== 0) return false;
+  if (ps.status !== 0) return { ok: false, running: false };
   const legacyLauncher = path.join(home, '.repo-radar', 'repo-radar'); // exactly this, not .../current/...
   const legacyWrapper = path.join(home, '.config', 'repo-radar', 'run-sync.sh');
-  return ps.out.split('\n').some((l) =>
+  const running = ps.out.split('\n').some((l) =>
     l.includes(`${legacyLauncher} `) || l.endsWith(legacyLauncher) ||
     l.includes(legacyWrapper) ||
     /\/Contents\/Resources\/resources\/repo-radar(\s|$)/.test(l)
   );
+  return { ok: true, running };
+}
+
+// Corroborating signal for a running legacy MANUAL sync (spec §3.3 "process scan + legacy
+// statusfile"): the legacy ~/.config/repo-radar/status.json is being written by an in-flight
+// sync — recent mtime AND at least one repo not yet at 100%. Recency-bounded so a status.json
+// left behind by a crashed/old sync can't block quiescence forever. This never PROVES safety;
+// it only ADDS a reason to fail closed alongside the authoritative process scan.
+const STATUSFILE_ACTIVE_MS = 90 * 1000;
+function _legacyStatusfileActive(home, now = Date.now()) {
+  const sf = path.join(home, '.config', 'repo-radar', 'status.json');
+  let st;
+  try { st = fs.statSync(sf); } catch (_) { return false; }   // absent -> not active
+  if (now - st.mtimeMs > STATUSFILE_ACTIVE_MS) return false;  // stale -> not active
+  try {
+    const j = JSON.parse(fs.readFileSync(sf, 'utf8'));
+    return Array.isArray(j.repos) && j.repos.some((r) => typeof r.percent === 'number' && r.percent < 100);
+  } catch (_) { return true; }                                // recent + torn write -> fail closed
 }
 
 // STABLE-ONLY (spec §3.3): boot out the legacy 1.0.26 LaunchAgent, then verify the
@@ -38,19 +63,32 @@ function _legacyProcessRunning(exec, home) {
 // the caller must NOT flip `current` if this returns {quiesced:false}.
 async function quiesceLegacyStable({
   home, exec = _defaultExec, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  uid = process.getuid(), timeoutMs = 10000,
+  uid = process.getuid(), timeoutMs = 10000, now = () => Date.now(),
 } = {}) {
   const label = 'com.user.repo-radar';
   exec('launchctl', ['bootout', `gui/${uid}/${label}`]); // idempotent; may already be gone
   const deadline = Date.now() + timeoutMs;
+  // TRI-STATE proof (Codex round-7 §1): quiescence requires the label PROVABLY absent
+  // (`print` fails with "could not find") AND a SUCCESSFUL process scan showing none AND an
+  // idle legacy statusfile. Any ambiguous launchctl/ps failure (permission/transport) is NOT
+  // proof of safety — it blocks and eventually fails closed WITHOUT flipping `current`.
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const printed = exec('launchctl', ['print', `gui/${uid}/${label}`]);
-    const labelGone = printed.status !== 0; // `print` fails when the label is absent
-    if (labelGone && !_legacyProcessRunning(exec, home)) {
-      return { quiesced: true, reason: 'label absent + no legacy process' };
+    const labelGone = printed.status !== 0 && /could not find/i.test(printed.out || '');
+    const scan = _legacyProcessScan(exec, home);
+    const statusfileActive = _legacyStatusfileActive(home, now());
+    if (labelGone && scan.ok && !scan.running && !statusfileActive) {
+      return { quiesced: true, reason: 'label absent + no legacy process + statusfile idle' };
     }
-    if (Date.now() >= deadline) return { quiesced: false, reason: 'legacy job/process did not quiesce within timeout' };
+    if (Date.now() >= deadline) {
+      const why = printed.status === 0 ? 'legacy label still loaded'
+        : !labelGone ? 'launchctl print ambiguous (fail closed)'
+        : !scan.ok ? 'process scan failed (fail closed)'
+        : scan.running ? 'legacy process still running'
+        : 'legacy statusfile still active';
+      return { quiesced: false, reason: `legacy job/process did not quiesce within timeout: ${why}` };
+    }
     await sleep(200);
   }
 }
@@ -62,7 +100,10 @@ async function quiesceLegacyStable({
 function detectStableManaged({ home, exec = _defaultExec, appVersionPath = '/Applications/Repo Radar.app/Contents/Resources/VERSION' } = {}) {
   const legacyLauncher = path.join(home, '.repo-radar', 'repo-radar');
   if (fs.existsSync(legacyLauncher)) return { managed: false, reason: 'legacy ~/.repo-radar/repo-radar present' };
-  if (_legacyProcessRunning(exec, home)) return { managed: false, reason: 'a legacy stable process is running' };
+  const scan = _legacyProcessScan(exec, home);
+  if (!scan.ok) return { managed: false, reason: 'cannot scan for legacy processes (fail closed)' };
+  if (scan.running) return { managed: false, reason: 'a legacy stable process is running' };
+  if (_legacyStatusfileActive(home)) return { managed: false, reason: 'a legacy sync statusfile is active' };
   const L = layout(home, 'stable');
   // an unloaded-but-installed old stable can reload its own plist outside the root lock.
   // Inspect the EXACT ProgramArguments[0] (raw, so the plutil `/`->`\/` json escaping can't
@@ -75,7 +116,7 @@ function detectStableManaged({ home, exec = _defaultExec, appVersionPath = '/App
   }
   const printed = exec('launchctl', ['print', `gui/${process.getuid()}/com.user.repo-radar`]);
   if (printed.status === 0) {
-    if (_loadedJobArg0(printed.out) !== L.runSync) return { managed: false, reason: 'a stale stable job is loaded' };
+    if (_loadedJobProgram(printed.out) !== L.runSync) return { managed: false, reason: 'a stale stable job is loaded' };
   } else if (!/could not find/i.test(printed.out || '')) {
     return { managed: false, reason: 'cannot verify stable launchd state' }; // fail closed on ambiguous errors
   }
