@@ -121,6 +121,13 @@ python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
   exit 1
 }
 
+# Spec 2A runtime-binding: the full dependency-lock matrix must be present (the app
+# fails closed on an uncovered interpreter, so a partial matrix ships a broken runtime).
+node menubar/scripts/pydeps.js --assert-matrix || {
+  echo "Release blocked: dependency-lock matrix incomplete (see resources/pydeps/). Generate the missing cells or narrow the supported Python matrix." >&2
+  exit 1
+}
+
 # ── Version calculation ───────────────────────────────────────────────────────
 
 step "Version calculation"

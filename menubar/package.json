@@ -89,6 +89,10 @@
         "to": "resources/repo-radar"
       },
       {
+        "from": "runtime/verify.py",
+        "to": "resources/verify.py"
+      },
+      {
         "from": "../repo_radar",
         "to": "resources/repo_radar",
         "filter": [
@@ -104,6 +108,10 @@
       {
         "from": "../VERSION",
         "to": "VERSION"
+      },
+      {
+        "from": "../resources/pydeps",
+        "to": "resources/pydeps"
       }
     ],
     "directories": {

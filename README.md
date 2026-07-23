@@ -30,7 +30,7 @@ Download the latest release from [GitHub Releases](https://github.com/mattwallin
 
 1. Unzip and drag **Repo Radar.app** to `/Applications`
 2. Open it from Applications
-3. The app runs first-time setup automatically (installs Python dependencies)
+3. The app self-provisions its own Python runtime automatically on first launch — no manual `pip install` needed (see [Python Runtime](#python-runtime) below)
 4. Configure via the menubar icon -> Settings
 
 See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
@@ -63,32 +63,45 @@ Also available: Claude Fable 5, Claude Opus 4.7, Claude Sonnet 4.6 (Anthropic); 
 
 To make your AI assistant (Claude Code, etc.) aware of your pristine repos, click the menubar icon -> **Copy LLM Config**. This copies a markdown snippet to your clipboard — paste it into your `CLAUDE.md`, `AGENTS.md`, or `.claude/rules/` file.
 
+## Python Runtime
+
+Repo Radar self-provisions its own Python runtime — no manual `pip install` required. On first launch, the app builds a private, versioned virtual environment under `~/.repo-radar/<channel>/` (`~/.repo-radar/stable/` for release builds, `~/.repo-radar/dev/` for dev builds) from a checked-in, hash-pinned dependency lock, and runs every sync — manual, scheduled, or CLI — through it.
+
+- **Supported interpreters:** CPython **3.10 through 3.14**. The app auto-selects a compatible interpreter already on your machine; it fails closed (no sync) if none is found.
+- **Known pre-release limitation:** hash-pinned locks are currently checked in for only a subset of the (Python version, architecture) matrix — see [`resources/pydeps/README.md`](resources/pydeps/README.md). A host whose only available Python lands on an uncovered cell (e.g. Python 3.11 or 3.14, or any x86_64/Intel Mac) will fail provisioning closed until that cell is generated or the supported matrix is narrowed.
+- **On-PATH CLI:** once provisioned, the app installs a `repo-radar` (stable) or `repo-radar-dev` (dev builds) command onto your `PATH` (via `~/.local/bin`) so you can run syncs directly from a terminal — see [CLI Usage](#cli-usage).
+- **If runtime setup fails** (e.g. offline on first launch, or no supported Python found), sync is disabled and the app surfaces the reason via the tray icon, a notification, and Settings' error log. Relaunching the app retries setup.
+
+See [Setup Guide: First Launch](menubar/SETUP.md#first-launch-automatic-python-runtime-setup) for more detail.
+
 ## CLI Usage
+
+Once the app has provisioned the runtime at least once, `repo-radar` (stable) / `repo-radar-dev` (dev builds) is available on your `PATH`:
 
 ```bash
 # Interactive configuration (discover repos from GitHub)
-./repo-radar configure
+repo-radar configure
 
 # Sync all configured repos
-./repo-radar sync
+repo-radar sync
 
 # Sync without metadata generation
-./repo-radar sync --skip-metadata
+repo-radar sync --skip-metadata
 
 # Force regenerate all metadata
-./repo-radar sync --regenerate-metadata
+repo-radar sync --regenerate-metadata
 
 # Dry run (show what would happen)
-./repo-radar sync --dry-run
+repo-radar sync --dry-run
 
 # View status of all repos
-./repo-radar analyze
+repo-radar analyze
 
 # Clean up repos and/or metadata
-./repo-radar clean
+repo-radar clean
 
 # Show version
-./repo-radar --version
+repo-radar --version
 ```
 
 ## Uninstall
@@ -106,8 +119,10 @@ Your synced repositories are **not** deleted.
 |------|------|
 | App config | `~/.config/repo-radar/config.json` |
 | Sync status | `~/.config/repo-radar/status.json` |
-| Scheduled sync wrapper | `~/.config/repo-radar/run-sync.sh` |
-| LaunchAgent | `~/Library/LaunchAgents/com.user.repo-radar.plist` |
+| Python runtime (self-provisioned) | `~/.repo-radar/<channel>/` (e.g. `~/.repo-radar/stable/`) |
+| Scheduled sync wrapper | `~/.repo-radar/<channel>/run-sync.sh` |
+| CLI on PATH | `~/.local/bin/repo-radar` (stable) / `~/.local/bin/repo-radar-dev` (dev) |
+| LaunchAgent | `~/Library/LaunchAgents/com.user.repo-radar.plist` (stable) / `com.user.repo-radar-dev.plist` (dev; only installable once stable is already managed — otherwise use "Sync Now" for dev) |
 | Synced repos | `~/repos-pristine/` (default) |
 | Logs | `~/Library/Logs/repo-radar/` |
 
