@@ -49,6 +49,14 @@ function detectStableManaged({ home, exec = _defaultExec } = {}) {
   if (fs.existsSync(legacyLauncher)) return { managed: false, reason: 'legacy ~/.repo-radar/repo-radar present' };
   if (_legacyProcessRunning(exec, home)) return { managed: false, reason: 'a legacy stable process is running' };
   const L = layout(home, 'stable');
+  // an unloaded-but-installed old stable can reload its own plist outside the root lock:
+  // any stable LaunchAgent must point at the managed run-sync.sh (Codex round-4 §7b).
+  const plist = path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+  if (fs.existsSync(plist)) {
+    let content = '';
+    try { content = fs.readFileSync(plist, 'utf8'); } catch (_) { /* */ }
+    if (!content.includes(L.runSync)) return { managed: false, reason: 'an unmanaged stable LaunchAgent is installed' };
+  }
   if (!fs.existsSync(cliPath(home, 'stable'))) return { managed: false, reason: 'no stable CLI dispatcher' };
   if (!fs.existsSync(L.runSync)) return { managed: false, reason: 'no stable run-sync dispatcher' };
   const desired = readDesired(L.desired);

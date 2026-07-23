@@ -27,4 +27,27 @@ function retireLegacyLauncher(home, { now = Date.now() } = {}) {
   return movedTo;
 }
 
-module.exports = { installDispatcher, retireLegacyLauncher };
+// Durably neutralize the legacy 1.0.26 stable SCHEDULE (Codex round-4 Crit1): move the
+// LaunchAgent plist + its wrapper aside so launchd can't reload them at next login,
+// regardless of what path they embed (home launcher OR the app's bundled resources path).
+// fs-only (no launchctl), so it runs even when the launchctl bootout is skipped/absent.
+// On a successful activation the managed plist is (re)created by Electron; on failure the
+// legacy schedule stays disabled -> fail closed.
+function disableLegacySchedule(home) {
+  const moved = [];
+  const targets = [
+    path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist'),
+    path.join(home, '.config', 'repo-radar', 'run-sync.sh'),
+  ];
+  for (const p of targets) {
+    if (fs.existsSync(p)) {
+      const dst = `${p}.legacy-disabled`;
+      try { fs.rmSync(dst, { force: true }); } catch (_) { /* */ }
+      fs.renameSync(p, dst);
+      moved.push(dst);
+    }
+  }
+  return moved;
+}
+
+module.exports = { installDispatcher, retireLegacyLauncher, disableLegacySchedule };

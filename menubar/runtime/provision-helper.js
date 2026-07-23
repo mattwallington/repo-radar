@@ -11,7 +11,7 @@ const { planGeneration, provision } = require('./provision');
 const { SCHEMA, ACTIVE, publishDesired } = require('./desired');
 const { verifyRuntime, flipCurrent, adopt, gcOrphans } = require('./activation');
 const { emitRunSync } = require('./dispatchers');
-const { installDispatcher, retireLegacyLauncher } = require('./migrate');
+const { installDispatcher, retireLegacyLauncher, disableLegacySchedule } = require('./migrate');
 const { quiesceLegacyStable } = require('./quiesce');
 const { redact } = require('./hashing');
 
@@ -27,9 +27,13 @@ async function main() {
     // identity check (Codex Crit1): quiesce the legacy job, install the fail-closed generic
     // dispatchers (which overwrite the legacy PATH CLI), and retire the legacy launcher.
     // A subsequent identity failure then leaves NOTHING runnable (desired stays PROVISIONING).
-    if (legacyBootstrap && channel === 'stable' && !skipQuiesce) {
-      const q = await quiesceLegacyStable({ home });
-      if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
+    if (legacyBootstrap && channel === 'stable') {
+      if (!skipQuiesce) {
+        const q = await quiesceLegacyStable({ home });
+        if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
+      }
+      // durably disable the legacy plist + wrapper (fs-only) so they can't reload at login
+      disableLegacySchedule(home);
     }
     // (Re)install the generic dispatchers on EVERY activation (Codex I2) so an app update
     // redeploys dispatcher fixes / schema changes, not only on first bootstrap.

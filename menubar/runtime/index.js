@@ -39,6 +39,15 @@ function _fullVerifyCurrent(home, channel) {
   return new Promise((resolve) => {
     let genDir;
     try { genDir = fs.realpathSync(L.current); } catch (_) { return resolve(false); }
+    const desired = readDesired(L.desired);
+    if (!isActive(desired)) return resolve(false);
+    // ANCHOR the generation-controlled verify.py + manifest against the app-published
+    // desired.json (trusted Node hashFile) BEFORE executing verify.py (Codex round-4 I2) —
+    // a swapped verifier hashes differently and fails here, forcing reconcile.
+    try {
+      if (hashFile(path.join(genDir, 'verify.py')) !== desired.verifySha) return resolve(false);
+      if (hashFile(path.join(genDir, 'manifest.json')) !== desired.manifestSha) return resolve(false);
+    } catch (_) { return resolve(false); }
     const py = path.join(genDir, 'venv', 'bin', 'python');
     const child = spawn(py, [path.join(genDir, 'verify.py'), genDir, L.desired, path.join(genDir, 'manifest.json')], { stdio: 'ignore' });
     child.on('error', () => resolve(false)); // e.g. python missing

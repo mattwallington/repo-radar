@@ -43,6 +43,12 @@ test('Crit1 bootstrap: identity failure with a seeded legacy launcher leaves not
   fs.writeFileSync(path.join(home, '.repo-radar', 'repo-radar'), '#!/bin/sh\necho legacy\n');
   fs.chmodSync(path.join(home, '.repo-radar', 'repo-radar'), 0o755);
   fs.symlinkSync(path.join(home, '.repo-radar', 'repo-radar'), path.join(home, '.local', 'bin', 'repo-radar'));
+  // ...and the legacy LaunchAgent + wrapper (the plist here embeds the bundled resources path variant)
+  fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.config', 'repo-radar'), { recursive: true });
+  const legacyPlist = path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+  fs.writeFileSync(legacyPlist, '<plist><string>/Applications/Repo Radar.app/Contents/Resources/resources/repo-radar</string></plist>');
+  fs.writeFileSync(path.join(home, '.config', 'repo-radar', 'run-sync.sh'), '#!/bin/sh\n# legacy wrapper\n');
 
   // reconcile with a MISMATCHED bundled VERSION -> authoritative identity fails, but quiesce/
   // dispatcher-install/legacy-retire happen FIRST, so nothing legacy remains runnable.
@@ -56,6 +62,21 @@ test('Crit1 bootstrap: identity failure with a seeded legacy launcher leaves not
   assert.ok(!fs.existsSync(L.current), 'no active runtime');
   const cli = fs.readFileSync(path.join(home, '.local', 'bin', 'repo-radar'), 'utf8');
   assert.match(cli, /lockf|verify\.py|another sync/, 'PATH CLI is now the generic fail-closed dispatcher');
+  // the legacy LaunchAgent + wrapper are durably disabled (can't reload at login)
+  assert.ok(!fs.existsSync(legacyPlist), 'legacy plist disabled');
+  assert.ok(fs.existsSync(`${legacyPlist}.legacy-disabled`), 'legacy plist moved aside');
+  assert.ok(!fs.existsSync(path.join(home, '.config', 'repo-radar', 'run-sync.sh')), 'legacy wrapper disabled');
+});
+
+test('Imp2 round4: swapping a healthy generation verify.py forces replacement on reconcile', { timeout: 180000 }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-vtamper-'));
+  const L = layout(home, 'stable');
+  assert.strictEqual((await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true })).status, 'ok');
+  const gen1 = fs.realpathSync(L.current);
+  fs.writeFileSync(path.join(gen1, 'verify.py'), 'import sys; sys.exit(0)\n'); // swap the verifier, same bundle
+  const r = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true });
+  assert.strictEqual(r.status, 'ok', r.reason);
+  assert.notStrictEqual(fs.realpathSync(L.current), gen1, 'anchored full verify rejected the swap -> replacement generation');
 });
 
 test('Imp2: a corrupt venv on reconcile triggers a replacement generation', { timeout: 180000 }, async () => {

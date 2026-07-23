@@ -17,10 +17,23 @@ function _script(channel, tail) {
 if [ -e "$ROOT/repo-radar" ]; then
   echo "repo-radar-dev: legacy stable install present; run dev in an isolated HOME" >&2; exit 1
 fi
+# unloaded-but-installed old stable can reload its own plist outside the root lock: any
+# stable LaunchAgent MUST point at the managed run-sync.sh (Codex round-4 §7b).
+SPLIST="$HOME/Library/LaunchAgents/com.user.repo-radar.plist"
+if [ -f "$SPLIST" ] && ! grep -q "$ROOT/stable/run-sync.sh" "$SPLIST"; then
+  echo "repo-radar-dev: an unmanaged stable LaunchAgent is installed; run dev in an isolated HOME" >&2; exit 1
+fi
 SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
 { [ -L "$SCUR" ] && [ -f "$SDES" ] && [ -f "$ROOT/stable/run-sync.sh" ] && grep -q '"status": *"active"' "$SDES"; } \\
   || { echo "repo-radar-dev: stable is not managed; run dev in an isolated HOME" >&2; exit 1; }
 SGEN="$(cd "$SCUR" && pwd -P)"
+SGENS="$(cd "$ROOT/stable/generations" 2>/dev/null && pwd -P || echo /nonexistent)"
+case "$SGEN" in "$SGENS/"*) : ;; *) echo "repo-radar-dev: stable runtime outside tree" >&2; exit 1 ;; esac
+# anchor stable's verify.py + manifest against stable's desired BEFORE executing it
+SVSHA="$(/usr/bin/shasum -a 256 "$SGEN/verify.py" | awk '{print $1}')"
+SMSHA="$(/usr/bin/shasum -a 256 "$SGEN/manifest.json" | awk '{print $1}')"
+grep -q "\\"verifySha\\": *\\"$SVSHA\\"" "$SDES" || { echo "repo-radar-dev: stable verifier hash mismatch" >&2; exit 1; }
+grep -q "\\"manifestSha\\": *\\"$SMSHA\\"" "$SDES" || { echo "repo-radar-dev: stable manifest hash mismatch" >&2; exit 1; }
 "$SGEN/venv/bin/python" "$SGEN/verify.py" "$SGEN" "$SDES" "$SGEN/manifest.json" \\
   || { echo "repo-radar-dev: stable runtime is not healthy; run dev in an isolated HOME" >&2; exit 1; }
 ` : '';
