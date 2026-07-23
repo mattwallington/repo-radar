@@ -17,11 +17,16 @@ function _script(channel, tail) {
 if [ -e "$ROOT/repo-radar" ]; then
   echo "repo-radar-dev: legacy stable install present; run dev in an isolated HOME" >&2; exit 1
 fi
-# unloaded-but-installed old stable can reload its own plist outside the root lock: any
-# stable LaunchAgent MUST point at the managed run-sync.sh (Codex round-4 §7b).
+# unloaded-but-installed old stable can reload its own plist outside the root lock. Inspect
+# the ACTUAL ProgramArguments (not text elsewhere) + any LOADED job (Codex round-5 §3.3).
 SPLIST="$HOME/Library/LaunchAgents/com.user.repo-radar.plist"
-if [ -f "$SPLIST" ] && ! grep -q "$ROOT/stable/run-sync.sh" "$SPLIST"; then
-  echo "repo-radar-dev: an unmanaged stable LaunchAgent is installed; run dev in an isolated HOME" >&2; exit 1
+if [ -f "$SPLIST" ]; then
+  /usr/bin/plutil -extract ProgramArguments json -o - "$SPLIST" 2>/dev/null | grep -q "$ROOT/stable/run-sync.sh" \\
+    || { echo "repo-radar-dev: stable LaunchAgent does not launch the managed runner; run dev in an isolated HOME" >&2; exit 1; }
+fi
+if launchctl print "gui/$(id -u)/com.user.repo-radar" >/dev/null 2>&1; then
+  launchctl print "gui/$(id -u)/com.user.repo-radar" 2>/dev/null | grep -q "$ROOT/stable/run-sync.sh" \\
+    || { echo "repo-radar-dev: a stale stable job is loaded; run dev in an isolated HOME" >&2; exit 1; }
 fi
 SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
 { [ -L "$SCUR" ] && [ -f "$SDES" ] && [ -f "$ROOT/stable/run-sync.sh" ] && grep -q '"status": *"active"' "$SDES"; } \\

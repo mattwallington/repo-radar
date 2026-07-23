@@ -49,13 +49,17 @@ function detectStableManaged({ home, exec = _defaultExec } = {}) {
   if (fs.existsSync(legacyLauncher)) return { managed: false, reason: 'legacy ~/.repo-radar/repo-radar present' };
   if (_legacyProcessRunning(exec, home)) return { managed: false, reason: 'a legacy stable process is running' };
   const L = layout(home, 'stable');
-  // an unloaded-but-installed old stable can reload its own plist outside the root lock:
-  // any stable LaunchAgent must point at the managed run-sync.sh (Codex round-4 §7b).
+  // an unloaded-but-installed old stable can reload its own plist outside the root lock.
+  // Inspect the ACTUAL ProgramArguments (via plutil) + any LOADED job (Codex round-5 §3.3).
   const plist = path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
   if (fs.existsSync(plist)) {
-    let content = '';
-    try { content = fs.readFileSync(plist, 'utf8'); } catch (_) { /* */ }
-    if (!content.includes(L.runSync)) return { managed: false, reason: 'an unmanaged stable LaunchAgent is installed' };
+    let pa = '';
+    try { pa = cp.execFileSync('/usr/bin/plutil', ['-extract', 'ProgramArguments', 'json', '-o', '-', plist], { encoding: 'utf8' }); } catch (_) { /* no ProgramArguments -> pa stays '' -> fail closed */ }
+    if (!pa.includes(L.runSync)) return { managed: false, reason: 'stable LaunchAgent does not launch the managed runner' };
+  }
+  const printed = exec('launchctl', ['print', `gui/${process.getuid()}/com.user.repo-radar`]);
+  if (printed.status === 0 && !printed.out.includes(L.runSync)) {
+    return { managed: false, reason: 'a stale stable job is loaded' };
   }
   if (!fs.existsSync(cliPath(home, 'stable'))) return { managed: false, reason: 'no stable CLI dispatcher' };
   if (!fs.existsSync(L.runSync)) return { managed: false, reason: 'no stable run-sync dispatcher' };

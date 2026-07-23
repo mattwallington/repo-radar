@@ -89,3 +89,15 @@ test('Imp2: a corrupt venv on reconcile triggers a replacement generation', { ti
   assert.strictEqual(r.status, 'ok', r.reason);
   assert.notStrictEqual(fs.realpathSync(L.current), gen1, 'reconcile flipped to a replacement generation');
 });
+
+test('Imp2 round5: stable schedule reconciled on the healthy fast path too (crash-recovery)', { timeout: 180000 }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-sched-'));
+  let repoints = 0;
+  const hooks = { repointSchedule: () => { repoints += 1; return { success: true }; } };
+  const r1 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), hooks, _skipQuiesce: true });
+  assert.strictEqual(r1.status, 'ok', r1.reason);
+  assert.strictEqual(repoints, 1, 'repointed on the activation path');
+  const r2 = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), hooks, _skipQuiesce: true });
+  assert.strictEqual(r2.status, 'ok');
+  assert.strictEqual(repoints, 2, 'the healthy FAST PATH also repoints (self-heals a crash-after-flip)');
+});

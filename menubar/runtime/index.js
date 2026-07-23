@@ -90,19 +90,38 @@ function _runActivationHelper({ home, channel, appVersion, bundle, skipQuiesce }
 // validation (Codex Crit1) — so an identity/interpreter failure on the new build can
 // never leave the previous ACTIVE runtime servable. Authoritative identity + the whole
 // activation run inside the lock-owning helper. `_skipQuiesce` is test-only.
+// Reconcile the stable persistent schedule to the managed runner. Idempotent, and run on
+// EVERY healthy outcome (Codex round-5 I2) — incl. the fast path — so a crash after the
+// current-flip but before the schedule repoint self-heals on the next launch. Returns a
+// warning string on failure (non-fatal: the runtime is healthy, only scheduling is off).
+function _reconcileSchedule(channel, hooks) {
+  if (channel !== 'stable' || !hooks.repointSchedule) return null;
+  try {
+    const r = hooks.repointSchedule();
+    if (r && r.success === false) return `schedule repoint failed: ${r.error || 'unknown'}`;
+    return null;
+  } catch (e) { return `schedule repoint threw: ${e.message}`; }
+}
+
 async function ensureRuntime({ home, channel, appVersion, bundle, hooks = {}, _skipQuiesce = false }) {
   const L = layout(home, channel);
   // cheap candidate filter, then confirm with the FULL predicate (async) before no-op'ing
   if (_fastCandidate(home, channel, appVersion, bundle) && (await _fullVerifyCurrent(home, channel))) {
-    return { status: 'ok' };
+    const warn = _reconcileSchedule(channel, hooks); // crash-recovery even on the healthy path
+    if (warn && hooks.onScheduleWarning) hooks.onScheduleWarning(warn);
+    return warn ? { status: 'ok', scheduleWarning: warn } : { status: 'ok' };
   }
 
   fs.mkdirSync(L.channelDir, { recursive: true, mode: 0o700 });
   publishDesired(L.desired, { channel, version: appVersion, status: PROVISIONING });
 
   const res = await _runActivationHelper({ home, channel, appVersion, bundle, skipQuiesce: _skipQuiesce });
-  if (res.status === 'ok') { if (channel === 'stable' && hooks.repointSchedule) hooks.repointSchedule(); }
-  else if (hooks.onFailure) hooks.onFailure(redact(String(res.reason || 'provision failed')));
+  if (res.status === 'ok') {
+    const warn = _reconcileSchedule(channel, hooks);
+    if (warn) { res.scheduleWarning = warn; if (hooks.onScheduleWarning) hooks.onScheduleWarning(warn); }
+  } else if (hooks.onFailure) {
+    hooks.onFailure(redact(String(res.reason || 'provision failed')));
+  }
   return res;
 }
 

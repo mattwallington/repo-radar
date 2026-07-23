@@ -28,12 +28,14 @@ async function main() {
     // dispatchers (which overwrite the legacy PATH CLI), and retire the legacy launcher.
     // A subsequent identity failure then leaves NOTHING runnable (desired stays PROVISIONING).
     if (legacyBootstrap && channel === 'stable') {
+      // durably disable the legacy plist + wrapper (fs move) FIRST (Codex round-5 Crit1) so a
+      // crash between this and bootout can't leave a plist that reloads at the next login.
+      disableLegacySchedule(home);
+      // then quiesce the already-loaded job.
       if (!skipQuiesce) {
         const q = await quiesceLegacyStable({ home });
         if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
       }
-      // durably disable the legacy plist + wrapper (fs-only) so they can't reload at login
-      disableLegacySchedule(home);
     }
     // (Re)install the generic dispatchers on EVERY activation (Codex I2) so an app update
     // redeploys dispatcher fixes / schema changes, not only on first bootstrap.
