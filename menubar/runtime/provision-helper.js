@@ -15,6 +15,29 @@ const { installDispatcher, retireLegacyLauncher, disableLegacySchedule } = requi
 const { quiesceLegacyStable } = require('./quiesce');
 const { redact } = require('./hashing');
 
+// STABLE legacy-bootstrap neutralization (Codex round-8 Crit). Neutralize EVERY future legacy
+// entry point BEFORE proving already-running children have exited, so a new 1.0.26 sync cannot
+// start from ~/.local/bin/repo-radar or ~/.repo-radar/repo-radar in the window between the final
+// scan and the retire (that child ignores the root lock and could overlap the current-flip).
+// Ordering is load-bearing:
+//   1. disableLegacySchedule  — move the plist + wrapper aside (fs, crash-safe): kills the SCHEDULE
+//   2. installDispatchers()   — generic CLI overwrites the legacy PATH CLI + generic run-sync
+//   3. retireLegacyLauncher   — move ~/.repo-radar/repo-radar aside: kills the HOME launcher
+//   4. quiesce                — ONLY now prove already-running legacy children have exited
+// Moving an entry point doesn't hide an already-running child from ps (its argv keeps the old
+// path), so step 4's scan is still authoritative for existing children while steps 1-3 prevent
+// new ones. `installDispatchers` is passed in so the shared every-activation install runs at the
+// exact same point in production and in tests. Throws if not quiescent (caller fails closed).
+async function neutralizeLegacyStableThenQuiesce({ home, installDispatchers, skipQuiesce, quiesce = quiesceLegacyStable }) {
+  disableLegacySchedule(home);
+  installDispatchers();
+  retireLegacyLauncher(home);
+  if (!skipQuiesce) {
+    const q = await quiesce({ home });
+    if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
+  }
+}
+
 async function main() {
   const args = JSON.parse(fs.readFileSync(0, 'utf8')); // stdin
   const { home, channel, appVersion, bundle, resultPath, skipQuiesce } = args;
@@ -23,25 +46,18 @@ async function main() {
   try {
     // legacy bootstrap: no managed runtime has ever been activated for this channel.
     const legacyBootstrap = !fs.existsSync(L.current);
-    // On the 1.0.26 bootstrap path, neutralize the legacy runtime BEFORE the fallible
-    // identity check (Codex Crit1): quiesce the legacy job, install the fail-closed generic
-    // dispatchers (which overwrite the legacy PATH CLI), and retire the legacy launcher.
-    // A subsequent identity failure then leaves NOTHING runnable (desired stays PROVISIONING).
-    if (legacyBootstrap && channel === 'stable') {
-      // durably disable the legacy plist + wrapper (fs move) FIRST (Codex round-5 Crit1) so a
-      // crash between this and bootout can't leave a plist that reloads at the next login.
-      disableLegacySchedule(home);
-      // then quiesce the already-loaded job.
-      if (!skipQuiesce) {
-        const q = await quiesceLegacyStable({ home });
-        if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
-      }
-    }
     // (Re)install the generic dispatchers on EVERY activation (Codex I2) so an app update
     // redeploys dispatcher fixes / schema changes, not only on first bootstrap.
-    installDispatcher(home, channel);
-    emitRunSync(home, channel);
-    if (legacyBootstrap && channel === 'stable') retireLegacyLauncher(home);
+    const installDispatchers = () => { installDispatcher(home, channel); emitRunSync(home, channel); };
+    // On the 1.0.26 bootstrap path, neutralize the legacy runtime BEFORE the fallible identity
+    // check (Codex Crit1) AND before proving children exited (Codex round-8 Crit): all future
+    // entry points closed first, then quiesce. A subsequent identity failure leaves NOTHING
+    // legacy runnable (desired stays PROVISIONING).
+    if (legacyBootstrap && channel === 'stable') {
+      await neutralizeLegacyStableThenQuiesce({ home, installDispatchers, skipQuiesce });
+    } else {
+      installDispatchers();
+    }
 
     // NOW the fallible identity validation — legacy is already neutralized.
     const identity = authoritativeIdentity({ appVersion, bundledVersionPath: bundle.versionFile });
@@ -74,4 +90,8 @@ async function main() {
   }
 }
 
-main();
+// Spawned as `node provision-helper.js` in production (require.main === module); require()d by
+// tests to exercise neutralizeLegacyStableThenQuiesce without running main()/reading stdin.
+if (require.main === module) main();
+
+module.exports = { neutralizeLegacyStableThenQuiesce };

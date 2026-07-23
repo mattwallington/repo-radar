@@ -5,6 +5,9 @@ const os = require('os'); const fs = require('fs'); const path = require('path')
 const { ensureRuntime } = require('../index');
 const { layout } = require('../paths');
 const { readDesired } = require('../desired');
+const { neutralizeLegacyStableThenQuiesce } = require('../provision-helper');
+const { installDispatcher } = require('../migrate');
+const { emitRunSync } = require('../dispatchers');
 
 const WT = path.join(__dirname, '..', '..', '..');
 function bundleFor(version) {
@@ -88,6 +91,48 @@ test('Imp2: a corrupt venv on reconcile triggers a replacement generation', { ti
   const r = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle: bundleFor('1.0.27'), _skipQuiesce: true });
   assert.strictEqual(r.status, 'ok', r.reason);
   assert.notStrictEqual(fs.realpathSync(L.current), gen1, 'reconcile flipped to a replacement generation');
+});
+
+test('Crit round8: every legacy entry point is neutralized BEFORE the quiescence scan', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-toctou-'));
+  // seed a full 1.0.26 stable footprint: home launcher, legacy PATH CLI symlink, plist, wrapper
+  fs.mkdirSync(path.join(home, '.repo-radar'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.local', 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.config', 'repo-radar'), { recursive: true });
+  const legacyLauncher = path.join(home, '.repo-radar', 'repo-radar');
+  fs.writeFileSync(legacyLauncher, '#!/bin/sh\necho legacy\n'); fs.chmodSync(legacyLauncher, 0o755);
+  const pathCli = path.join(home, '.local', 'bin', 'repo-radar');
+  fs.symlinkSync(legacyLauncher, pathCli); // legacy PATH CLI -> legacy launcher
+  const plist = path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+  fs.writeFileSync(plist, '<plist/>');
+  const wrapper = path.join(home, '.config', 'repo-radar', 'run-sync.sh');
+  fs.writeFileSync(wrapper, '#!/bin/sh\n# legacy wrapper\n');
+
+  // Inject a quiesce that captures the filesystem state AT the scan boundary — i.e. exactly what a
+  // legacy CLI start attempted right then would reach. This is the TOCTOU that round-8 closes.
+  let atScan = null;
+  const quiesce = async ({ home: h }) => {
+    atScan = {
+      pathCli: fs.readFileSync(path.join(h, '.local', 'bin', 'repo-radar'), 'utf8'),
+      legacyLauncherExists: fs.existsSync(path.join(h, '.repo-radar', 'repo-radar')),
+      plistDisabled: fs.existsSync(`${plist}.legacy-disabled`),
+      wrapperDisabled: !fs.existsSync(wrapper),
+    };
+    return { quiesced: true, reason: 'test scan' };
+  };
+  await neutralizeLegacyStableThenQuiesce({
+    home,
+    installDispatchers: () => { installDispatcher(home, 'stable'); emitRunSync(home, 'stable'); },
+    skipQuiesce: false,
+    quiesce,
+  });
+  // At the scan boundary every future legacy entry point is already closed, so an attempted legacy
+  // CLI start reaches only the generic fail-closed dispatcher, never the old launcher.
+  assert.match(atScan.pathCli, /lockf|verify\.py|another sync/, 'PATH CLI is the generic dispatcher at scan time');
+  assert.strictEqual(atScan.legacyLauncherExists, false, 'legacy home launcher already retired at scan time');
+  assert.ok(atScan.plistDisabled, 'legacy schedule plist already disabled at scan time');
+  assert.ok(atScan.wrapperDisabled, 'legacy wrapper already disabled at scan time');
 });
 
 test('Imp2 round5: stable schedule reconciled on the healthy fast path too (crash-recovery)', { timeout: 180000 }, async () => {

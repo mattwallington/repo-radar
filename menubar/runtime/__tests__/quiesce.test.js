@@ -148,23 +148,31 @@ test('quiesceLegacyStable fails closed on an ambiguous launchctl print error (no
   assert.match(r.reason, /ambiguous/);
 });
 
-test('quiesceLegacyStable: an active legacy statusfile blocks quiescence, a stale one does not', async () => {
+test('quiesceLegacyStable statusfile leg: in-flight blocks; a completed snapshot and a stale file do not', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-sf-'));
   const sfDir = path.join(home, '.config', 'repo-radar'); fs.mkdirSync(sfDir, { recursive: true });
   const sf = path.join(sfDir, 'status.json');
-  fs.writeFileSync(sf, JSON.stringify({ repos: [{ name: 'a/b', percent: 42 }] })); // in-flight, fresh mtime
   const exec = (cmd, args) => {
     if (cmd === 'launchctl' && args[0] === 'print') return { status: 113, out: 'Could not find service' }; // label gone
     if (cmd === 'ps') return { status: 0, out: '' }; // no legacy process
     return { status: 0, out: '' };
   };
+  // IN-FLIGHT: fresh mtime, an unfinished repo, and lastSync is from a PRIOR run (far from mtime).
+  fs.writeFileSync(sf, JSON.stringify({ lastSync: new Date(Date.now() - 10 * 60 * 1000).toISOString(), repos: [{ name: 'a/b', percent: 42 }] }));
   const active = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 300 });
-  assert.strictEqual(active.quiesced, false, 'active statusfile blocks quiescence');
+  assert.strictEqual(active.quiesced, false, 'in-flight statusfile blocks quiescence');
   assert.match(active.reason, /statusfile/);
-  const old = Date.now() / 1000 - 3600; // backdate mtime past the recency window
-  fs.utimesSync(sf, old, old);
+  // COMPLETED snapshot: the metadata "no files" path legitimately leaves a repo at 10%, and the
+  // final 'complete' write set lastSync ~= mtime. This must NOT be read as in-flight (Codex round-8:
+  // otherwise a normal completion fails an upgrade launched within 90s of it).
+  fs.writeFileSync(sf, JSON.stringify({ lastSync: new Date().toISOString(), repos: [{ name: 'a/b', percent: 10 }] }));
+  const completed = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 2000 });
+  assert.strictEqual(completed.quiesced, true, 'a normally-completed sub-100 snapshot does not block quiescence');
+  // STALE: fresh-looking content but mtime backdated past the recency window.
+  fs.writeFileSync(sf, JSON.stringify({ lastSync: new Date(Date.now() - 10 * 60 * 1000).toISOString(), repos: [{ name: 'a/b', percent: 42 }] }));
+  const old = Date.now() / 1000 - 3600; fs.utimesSync(sf, old, old);
   const stale = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 2000 });
-  assert.strictEqual(stale.quiesced, true, 'stale statusfile does not block quiescence forever');
+  assert.strictEqual(stale.quiesced, true, 'a stale statusfile does not block quiescence forever');
 });
 
 test('detectStableManaged fails closed when the process scan fails', () => {
@@ -175,17 +183,16 @@ test('detectStableManaged fails closed when the process scan fails', () => {
   assert.match(r.reason, /cannot scan/);
 });
 
-test('detectStableManaged: an active legacy statusfile means unmanaged; a stale one is not the gate', () => {
+// detectStableManaged deliberately has NO statusfile leg (Codex round-8): status.json is a results
+// snapshot, not a lifecycle marker, and a completed sub-100 snapshot would false-flag a healthy
+// managed runtime. A recent, actively-written statusfile must NOT change the verdict here — the
+// tri-state process scan + full-runtime checks are the safety contract.
+test('detectStableManaged ignores the legacy statusfile (no false-positive from a recent status.json)', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-sfd-'));
   const sfDir = path.join(home, '.config', 'repo-radar'); fs.mkdirSync(sfDir, { recursive: true });
-  const sf = path.join(sfDir, 'status.json');
-  fs.writeFileSync(sf, JSON.stringify({ repos: [{ name: 'a/b', percent: 10 }] }));
+  fs.writeFileSync(path.join(sfDir, 'status.json'), JSON.stringify({ repos: [{ name: 'a/b', percent: 10 }] })); // fresh, sub-100
   const exec = (cmd) => (cmd === 'ps' ? { status: 0, out: '' } : { status: 113, out: 'Could not find service' });
-  const active = detectStableManaged({ home, exec, appVersionPath: '/nonexistent/VERSION' });
-  assert.strictEqual(active.managed, false);
-  assert.match(active.reason, /statusfile/);
-  const old = Date.now() / 1000 - 3600; fs.utimesSync(sf, old, old);
-  const stale = detectStableManaged({ home, exec, appVersionPath: '/nonexistent/VERSION' });
-  assert.strictEqual(stale.managed, false, 'still unmanaged (no dispatcher), but for a LATER reason');
-  assert.doesNotMatch(stale.reason, /statusfile/, 'stale statusfile no longer the gating reason');
+  const r = detectStableManaged({ home, exec, appVersionPath: '/nonexistent/VERSION' });
+  assert.strictEqual(r.managed, false, 'unmanaged (no dispatcher)');
+  assert.doesNotMatch(r.reason, /statusfile/, 'the reason is never the statusfile — that leg was removed');
 });

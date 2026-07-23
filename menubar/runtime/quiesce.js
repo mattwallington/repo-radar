@@ -41,21 +41,31 @@ function _legacyProcessScan(exec, home) {
   return { ok: true, running };
 }
 
-// Corroborating signal for a running legacy MANUAL sync (spec §3.3 "process scan + legacy
-// statusfile"): the legacy ~/.config/repo-radar/status.json is being written by an in-flight
-// sync — recent mtime AND at least one repo not yet at 100%. Recency-bounded so a status.json
-// left behind by a crashed/old sync can't block quiescence forever. This never PROVES safety;
-// it only ADDS a reason to fail closed alongside the authoritative process scan.
+// Corroborating signal for an IN-FLIGHT legacy MANUAL sync (spec §3.3 "process scan + legacy
+// statusfile"), used ONLY by quiescence — NOT by detectStableManaged, where the root lock +
+// tri-state process scan + full-runtime checks are the safety contract (Codex round-8). The
+// legacy ~/.config/repo-radar/status.json is written by the Electron status server as a RESULTS
+// snapshot, so a COMPLETED sync also has a fresh mtime — and its metadata "no files" path can
+// legitimately leave a repo < 100%. So recent+sub-100 ALONE would false-flag a normal
+// completion as in-flight and (with quiescence's 10s timeout) fail an upgrade. We treat the file
+// as in-flight only when it is being written well AFTER the last recorded completion (lastSync
+// far from the final mtime, or no lastSync yet) AND still shows an unfinished repo. This never
+// PROVES safety — it only ADDS a reason to fail closed alongside the authoritative process scan.
 const STATUSFILE_ACTIVE_MS = 90 * 1000;
+const STATUSFILE_COMPLETE_TOL_MS = 5 * 1000; // a 'complete' write sets lastSync ~= the final mtime
 function _legacyStatusfileActive(home, now = Date.now()) {
   const sf = path.join(home, '.config', 'repo-radar', 'status.json');
   let st;
-  try { st = fs.statSync(sf); } catch (_) { return false; }   // absent -> not active
+  try { st = fs.statSync(sf); }
+  catch (e) { return !(e && e.code === 'ENOENT'); }           // ENOENT -> absent; other stat error -> fail closed
   if (now - st.mtimeMs > STATUSFILE_ACTIVE_MS) return false;  // stale -> not active
-  try {
-    const j = JSON.parse(fs.readFileSync(sf, 'utf8'));
-    return Array.isArray(j.repos) && j.repos.some((r) => typeof r.percent === 'number' && r.percent < 100);
-  } catch (_) { return true; }                                // recent + torn write -> fail closed
+  let j;
+  try { j = JSON.parse(fs.readFileSync(sf, 'utf8')); }
+  catch (_) { return true; }                                  // recent + torn/unreadable write -> fail closed
+  const lastSyncMs = j && typeof j.lastSync === 'string' ? Date.parse(j.lastSync) : NaN;
+  // a COMPLETED snapshot: the last write IS (about) the completion write -> not in flight.
+  if (Number.isFinite(lastSyncMs) && (st.mtimeMs - lastSyncMs) <= STATUSFILE_COMPLETE_TOL_MS) return false;
+  return Array.isArray(j.repos) && j.repos.some((r) => typeof r.percent === 'number' && r.percent < 100);
 }
 
 // STABLE-ONLY (spec §3.3): boot out the legacy 1.0.26 LaunchAgent, then verify the
@@ -103,7 +113,10 @@ function detectStableManaged({ home, exec = _defaultExec, appVersionPath = '/App
   const scan = _legacyProcessScan(exec, home);
   if (!scan.ok) return { managed: false, reason: 'cannot scan for legacy processes (fail closed)' };
   if (scan.running) return { managed: false, reason: 'a legacy stable process is running' };
-  if (_legacyStatusfileActive(home)) return { managed: false, reason: 'a legacy sync statusfile is active' };
+  // NOTE: no statusfile leg here (Codex round-8). status.json is a results snapshot, not a
+  // lifecycle marker; the tri-state process scan above + the full-runtime checks below (under
+  // the root lock) are the safety contract for "is stable managed". The statusfile's completed-
+  // snapshot ambiguity belongs only in quiescence, where it corroborates the process scan.
   const L = layout(home, 'stable');
   // an unloaded-but-installed old stable can reload its own plist outside the root lock.
   // Inspect the EXACT ProgramArguments[0] (raw, so the plutil `/`->`\/` json escaping can't
