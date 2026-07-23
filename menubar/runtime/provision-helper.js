@@ -25,20 +25,21 @@ async function main() {
 
     // legacy bootstrap: no managed runtime has ever been activated for this channel.
     const legacyBootstrap = !fs.existsSync(L.current);
-    if (legacyBootstrap) {
-      if (channel === 'stable' && !skipQuiesce) {
-        const q = await quiesceLegacyStable({ home });
-        if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
-      }
-      installDispatcher(home, channel);
-      emitRunSync(home, channel);
+    if (legacyBootstrap && channel === 'stable' && !skipQuiesce) {
+      const q = await quiesceLegacyStable({ home });
+      if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
     }
+    // (Re)install the generic dispatchers on EVERY activation (Codex I2) so an app update
+    // redeploys dispatcher fixes / schema changes, not only on first bootstrap.
+    installDispatcher(home, channel);
+    emitRunSync(home, channel);
 
     const plan = planGeneration({ identity, bundle });
     const active = {
       schema: SCHEMA, channel, version: identity.version, status: ACTIVE, genId: plan.genId,
       sourceSha: plan.expected.sourceSha, launcherSha: plan.expected.launcherSha,
       versionSha: plan.expected.versionSha, lockSha: plan.expected.lockSha,
+      verifySha: plan.expected.verifySha, manifestSha: plan.expected.manifestSha,
     };
 
     let genDir = adopt({ home, channel, desired: active });

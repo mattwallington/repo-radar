@@ -107,7 +107,8 @@ def main():
     if marker.get("schema") != 1:
         fail("marker schema")
     # identity: marker matches desired across channel/version/genId + all hashes
-    for k in ("channel", "version", "genId", "sourceSha", "launcherSha", "versionSha", "lockSha"):
+    for k in ("channel", "version", "genId", "sourceSha", "launcherSha", "versionSha",
+              "lockSha", "verifySha", "manifestSha"):
         if marker.get(k) != desired.get(k):
             fail("marker.%s != desired" % k)
     # generation name matches the genId (containment is enforced by the caller resolving current)

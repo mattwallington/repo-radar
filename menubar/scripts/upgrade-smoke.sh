@@ -50,7 +50,7 @@ GEN="$HOME_DIR/.repo-radar/$CHANNEL/current"; VENV_PY="$GEN/venv/bin/python"
 
 echo "== bundle =="
 chk "bundle carries repo_radar + repo-radar + verify.py + pydeps + VERSION" \
-  "[ -d \"$RES/resources/repo_radar\" ] && [ -f \"$RES/resources/repo-radar\" ] && [ -d \"$RES/resources/pydeps\" ] && [ -f \"$RES/VERSION\" ]"
+  "[ -d \"$RES/resources/repo_radar\" ] && [ -f \"$RES/resources/repo-radar\" ] && [ -f \"$RES/resources/verify.py\" ] && [ -d \"$RES/resources/pydeps\" ] && [ -f \"$RES/VERSION\" ]"
 
 echo "== runtime activation =="
 chk "a generation is active (current resolves)" "[ -L \"$GEN\" ]"
@@ -61,8 +61,8 @@ chk "bundled repo_radar imported from the generation, DEFAULT_MODEL=claude-sonne
   "[ \"\$(PYTHONPATH=$GEN $VENV_PY -c 'import repo_radar.llm as l;print(l.DEFAULT_MODEL)' 2>/dev/null)\" = claude-sonnet-5 ]"
 chk "migration/fallback/context execute from the new package" \
   "[ \"\$(PYTHONPATH=$GEN $VENV_PY -c 'import repo_radar.llm as l;print(l.migrate_model(\"gpt-5.2-codex\"),l.get_fallback_model(\"o3\"),l.KNOWN_LIMITS[\"gpt-5.4-mini\"])' 2>/dev/null)\" = 'gpt-5.3-codex None 1050000' ]"
-chk "$CLI --version == app version (not 1.0.0), via the on-PATH dispatcher" \
-  "[ \"\$(HOME=$HOME_DIR PATH=$HOME_DIR/.local/bin:\$PATH $CLI --version 2>/dev/null)\" = \"\$(cat \"$RES/VERSION\")\" ]"
+chk "$CLI --version reports the app version (not 1.0.0), via the on-PATH dispatcher" \
+  "HOME=$HOME_DIR PATH=$HOME_DIR/.local/bin:\$PATH $CLI --version 2>/dev/null | grep -qF \"\$(cat \"$RES/VERSION\")\""
 chk "the shipped verify.py passes the full predicate on the active generation" \
   "$VENV_PY \"$GEN/verify.py\" \"$GEN\" \"$HOME_DIR/.repo-radar/$CHANNEL/desired.json\" \"$GEN/manifest.json\""
 

@@ -198,24 +198,37 @@ function check() {
 // real checked-in lock+manifest pairs — documentation is insufficient. Fails closed if
 // any of the 10 (CPython 3.10-3.14 x {arm64, x86_64}) cells is missing.
 function assertMatrix() {
+  const crypto = require('crypto');
   const arches = ['arm64', 'x86_64'];
   const minors = [10, 11, 12, 13, 14];
-  const missing = [];
+  const problems = [];
   for (const arch of arches) {
     for (const m of minors) {
       const tag = `cp3${m}-${arch}`;
-      for (const ext of ['lock', 'manifest.json']) {
-        const p = path.join(PYDEPS_DIR, `${tag}.${ext}`);
-        if (!fs.existsSync(p)) missing.push(`${tag}.${ext}`);
-      }
+      const lockPath = path.join(PYDEPS_DIR, `${tag}.lock`);
+      const manifestPath = path.join(PYDEPS_DIR, `${tag}.manifest.json`);
+      if (!fs.existsSync(lockPath)) { problems.push(`${tag}.lock missing`); continue; }
+      if (!fs.existsSync(manifestPath)) { problems.push(`${tag}.manifest.json missing`); continue; }
+      // lock must be a non-empty hashed lock
+      const lockBuf = fs.readFileSync(lockPath);
+      if (!/--hash=sha256:/.test(lockBuf.toString())) { problems.push(`${tag}.lock has no --hash= pins`); }
+      // manifest must be valid JSON with matching env fields, non-empty dists, and lockSha256 == sha256(lock)
+      let man;
+      try { man = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+      catch (e) { problems.push(`${tag}.manifest.json is not valid JSON`); continue; }
+      if (Number(man.pyMinor) !== m) problems.push(`${tag}: manifest.pyMinor=${man.pyMinor} != ${m}`);
+      if (man.arch !== arch) problems.push(`${tag}: manifest.arch=${man.arch} != ${arch}`);
+      if (!man.dists || Object.keys(man.dists).length === 0) problems.push(`${tag}: manifest has no dists`);
+      const lockSha = crypto.createHash('sha256').update(lockBuf).digest('hex');
+      if (man.lockSha256 !== lockSha) problems.push(`${tag}: manifest.lockSha256 != sha256(${tag}.lock)`);
     }
   }
-  if (missing.length) {
-    console.error(`MATRIX INCOMPLETE — missing ${missing.length} artifact(s):\n  ${missing.join('\n  ')}`);
-    console.error('Generate them with pydeps.js/--emit-manifest or narrow the supported matrix (spec §3.6).');
+  if (problems.length) {
+    console.error(`MATRIX INVALID (${problems.length} problem(s)):\n  ${problems.join('\n  ')}`);
+    console.error('Regenerate the affected cells (pydeps.js) or narrow the supported matrix (spec §3.6).');
     return 1;
   }
-  console.log('matrix OK: all 10 (CPython 3.10-3.14 x arm64/x86_64) lock+manifest cells present');
+  console.log('matrix OK: all 10 (CPython 3.10-3.14 x arm64/x86_64) cells present + content-validated');
   return 0;
 }
 

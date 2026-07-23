@@ -2307,14 +2307,18 @@ app.whenReady().then(async () => {
       ? {
           repoRadarDir: path.join(process.resourcesPath, 'resources', 'repo_radar'),
           launcher: path.join(process.resourcesPath, 'resources', 'repo-radar'),
-          versionFile: path.join(process.resourcesPath, 'VERSION')
+          versionFile: path.join(process.resourcesPath, 'VERSION'),
+          // verify.py must be a REAL file (the node-mode provisioning helper has no asar
+          // access), so it is bundled as an extraResource, not read from inside app.asar.
+          verifyPy: path.join(process.resourcesPath, 'resources', 'verify.py')
         }
       : {
           // Dev-from-source fallback: no resourcesPath payload (electron .
           // points resourcesPath at Electron's own resources, not ours).
           repoRadarDir: path.join(__dirname, '..', 'repo_radar'),
           launcher: path.join(__dirname, '..', 'repo-radar'),
-          versionFile: path.join(__dirname, '..', 'VERSION')
+          versionFile: path.join(__dirname, '..', 'VERSION'),
+          verifyPy: path.join(__dirname, 'runtime', 'verify.py')
         };
 
     try {

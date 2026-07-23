@@ -9,6 +9,18 @@ const { layout, cliPath } = require('./paths');
 // `channel` is baked in; everything else resolves at run time. `tail` is the args
 // appended to the launcher invocation (sync mode adds `sync --status-server`).
 function _script(channel, tail) {
+  // dev must not touch the shared data plane unless stable is provably managed
+  // (Codex I3, dispatcher-boundary enforcement — defense in depth with main.js). Simple
+  // presence checks here (no node dependency for launchd); the full predicate is Node-side.
+  const devGuard = channel === 'dev' ? `
+if [ -e "$ROOT/repo-radar" ] || [ -e "$HOME/.local/bin/repo-radar" ]; then
+  echo "repo-radar-dev: a stable/legacy install is present; run dev in an isolated HOME" >&2; exit 1
+fi
+if [ ! -f "$ROOT/stable/run-sync.sh" ] || [ ! -f "$ROOT/stable/desired.json" ] \\
+   || ! grep -q '"status": *"active"' "$ROOT/stable/desired.json" 2>/dev/null; then
+  echo "repo-radar-dev: stable is not managed; run dev in an isolated HOME" >&2; exit 1
+fi
+` : '';
   return `#!/bin/sh
 set -eu
 ROOT="$HOME/.repo-radar"
@@ -16,17 +28,28 @@ CH="${channel}"
 CUR="$ROOT/$CH/current"
 DES="$ROOT/$CH/desired.json"
 mkdir -p "$ROOT" 2>/dev/null || true
-# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
+${devGuard}# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
 exec 9>"$ROOT/.exec.lock"
 /usr/bin/lockf -t 0 9 || { echo "repo-radar: another sync is running" >&2; exit 75; }
+# handshake: signal a Node parent (runSync) that the lock is ACQUIRED, via fd 3. The
+# group + 2>/dev/null makes it a clean no-op when fd 3 isn't open (launchd/CLI/direct).
+# The worker may inherit fd 3 harmlessly; runSync only needs the one byte, not the close.
+{ printf 'L' >&3; } 2>/dev/null || true
 # --- only AFTER the lock do we resolve + verify current ---
 [ -L "$CUR" ] || { echo "repo-radar: no active runtime" >&2; exit 1; }
 GEN="$(cd "$CUR" && pwd -P)"
-# containment: the resolved generation must live under this channel's generations tree
-case "$GEN" in "$ROOT/$CH/generations/"*) : ;; *) echo "repo-radar: runtime outside tree" >&2; exit 1 ;; esac
+# containment against the CANONICALIZED generations dir (HOME may have symlinked ancestors)
+GENS="$(cd "$ROOT/$CH/generations" 2>/dev/null && pwd -P || echo /nonexistent)"
+case "$GEN" in "$GENS/"*) : ;; *) echo "repo-radar: runtime outside tree" >&2; exit 1 ;; esac
 [ -f "$DES" ] && [ -f "$GEN/.runtime.json" ] && [ -f "$GEN/verify.py" ] && [ -f "$GEN/manifest.json" ] \\
   || { echo "repo-radar: runtime not managed" >&2; exit 1; }
-# full healthy predicate (desired ACTIVE, identity, live payload hashes, fingerprint, installed set)
+# ANCHOR the verifier + manifest: trusted shasum vs the app-published desired.json BEFORE
+# executing the verifier, so a swapped verify.py/manifest can't bypass tamper detection.
+VSHA="$(/usr/bin/shasum -a 256 "$GEN/verify.py" | awk '{print $1}')"
+MSHA="$(/usr/bin/shasum -a 256 "$GEN/manifest.json" | awk '{print $1}')"
+grep -q "\\"verifySha\\": *\\"$VSHA\\"" "$DES" || { echo "repo-radar: verifier hash mismatch" >&2; exit 1; }
+grep -q "\\"manifestSha\\": *\\"$MSHA\\"" "$DES" || { echo "repo-radar: manifest hash mismatch" >&2; exit 1; }
+# full healthy predicate (desired ACTIVE, identity, live payload hashes, fingerprint, installed set, pip check)
 "$GEN/venv/bin/python" "$GEN/verify.py" "$GEN" "$DES" "$GEN/manifest.json" \\
   || { echo "repo-radar: runtime failed verification" >&2; exit 1; }
 exec "$GEN/venv/bin/python" "$GEN/repo-radar"${tail} "$@"

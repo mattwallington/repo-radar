@@ -30,13 +30,16 @@ function planGeneration({ identity, bundle }) {
   if (!fs.existsSync(lockPath)) throw new ProvisionError(`no dependency lock for env ${fp}`);
   const nonce = newNonce();
   const genId = generationId(identity.version, fp, nonce);
+  const verifyPySrc = bundle.verifyPy || path.join(__dirname, 'verify.py');
   const expected = {
     sourceSha: hashTree(bundle.repoRadarDir),
     launcherSha: hashFile(bundle.launcher),
     versionSha: hashFile(bundle.versionFile),
     lockSha: hashFile(lockPath),
+    verifySha: hashFile(verifyPySrc), // anchor: dispatcher checks the shipped verify.py against this
+    manifestSha: hashFile(manifestPath),
   };
-  return { base, fp, nonce, genId, lockPath, manifestPath, expected };
+  return { base, fp, nonce, genId, lockPath, manifestPath, verifyPySrc, expected };
 }
 
 function provision({ home, channel, identity, bundle, logPath, plan }) {
@@ -46,7 +49,7 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
   let genId = null;
   try {
     const p = plan || planGeneration({ identity, bundle });
-    const { base, fp, lockPath, manifestPath } = p;
+    const { base, fp, lockPath, manifestPath, verifyPySrc } = p;
     genId = p.genId;
     staging = path.join(L.generations, `${genId}.staging-${process.pid}`);
     const genDir = path.join(L.generations, genId);
@@ -62,7 +65,7 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
     fs.copyFileSync(bundle.versionFile, path.join(staging, 'VERSION'));
     // Ship the verifier + this env's expected manifest INTO the generation so the
     // shell/CLI dispatchers can enforce the full predicate standalone (Codex I5).
-    fs.copyFileSync(bundle.verifyPy || path.join(__dirname, 'verify.py'), path.join(staging, 'verify.py'));
+    fs.copyFileSync(verifyPySrc || path.join(__dirname, 'verify.py'), path.join(staging, 'verify.py'));
     fs.copyFileSync(manifestPath, path.join(staging, 'manifest.json'));
     // smoke: import + exact-version + installed-set
     // NOTE: litellm's module uses PEP 562 __getattr__ lazy-loading and does not expose
@@ -86,11 +89,13 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
       channel,
       genId,
       fingerprint: fp,
-      baseExe: base.exe, // provenance: which interpreter built this generation (Codex I7)
+      baseExe: (() => { try { return fs.realpathSync(base.exe); } catch (_) { return base.exe; } })(), // Codex I7: real path
       abi: base.abi,     // SOABI, verified against the venv python at run time
       sourceSha: hashTree(path.join(staging, 'repo_radar')),
       launcherSha: hashFile(path.join(staging, 'repo-radar')),
       versionSha: hashFile(path.join(staging, 'VERSION')),
+      verifySha: hashFile(path.join(staging, 'verify.py')),   // anchored by the dispatcher pre-exec
+      manifestSha: hashFile(path.join(staging, 'manifest.json')),
       versionValue: identity.version,
       lockSha: hashFile(lockPath),
       installedSetOk: true,
