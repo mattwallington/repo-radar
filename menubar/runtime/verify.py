@@ -133,7 +133,9 @@ def main():
     # lock identity: the manifest and the marker agree on the lock they came from
     if manifest.get("lockSha256") is not None and manifest.get("lockSha256") != marker.get("lockSha"):
         fail("manifest lockSha256 != marker lockSha")
-    # installed distribution set (incl. bootstrap versions) exactly equals the manifest
+    # the hash-locked dependency set exactly equals the manifest; bootstrap tooling
+    # (pip/setuptools/wheel) is allow-listed by name (versions not enforced — they are
+    # not part of the hash-pinned lock; pip check below guards the resolved graph)
     if not installed_set_ok(manifest):
         fail("installed set != manifest")
     # no broken/conflicting dependency graph

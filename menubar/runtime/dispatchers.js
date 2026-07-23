@@ -9,17 +9,20 @@ const { layout, cliPath } = require('./paths');
 // `channel` is baked in; everything else resolves at run time. `tail` is the args
 // appended to the launcher invocation (sync mode adds `sync --status-server`).
 function _script(channel, tail) {
-  // dev must not touch the shared data plane unless stable is provably managed
-  // (Codex I3, dispatcher-boundary enforcement — defense in depth with main.js). Simple
-  // presence checks here (no node dependency for launchd); the full predicate is Node-side.
+  // dev must not touch the shared data plane unless stable is provably managed AND healthy
+  // (Codex I3). Runs UNDER the root lock (no TOCTOU) and validates stable via its OWN
+  // anchored verify.py — NOT ~/.local/bin/repo-radar presence (that IS the managed stable
+  // dispatcher). Only the legacy launcher ~/.repo-radar/repo-radar signals an unmanaged stable.
   const devGuard = channel === 'dev' ? `
-if [ -e "$ROOT/repo-radar" ] || [ -e "$HOME/.local/bin/repo-radar" ]; then
-  echo "repo-radar-dev: a stable/legacy install is present; run dev in an isolated HOME" >&2; exit 1
+if [ -e "$ROOT/repo-radar" ]; then
+  echo "repo-radar-dev: legacy stable install present; run dev in an isolated HOME" >&2; exit 1
 fi
-if [ ! -f "$ROOT/stable/run-sync.sh" ] || [ ! -f "$ROOT/stable/desired.json" ] \\
-   || ! grep -q '"status": *"active"' "$ROOT/stable/desired.json" 2>/dev/null; then
-  echo "repo-radar-dev: stable is not managed; run dev in an isolated HOME" >&2; exit 1
-fi
+SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
+{ [ -L "$SCUR" ] && [ -f "$SDES" ] && [ -f "$ROOT/stable/run-sync.sh" ] && grep -q '"status": *"active"' "$SDES"; } \\
+  || { echo "repo-radar-dev: stable is not managed; run dev in an isolated HOME" >&2; exit 1; }
+SGEN="$(cd "$SCUR" && pwd -P)"
+"$SGEN/venv/bin/python" "$SGEN/verify.py" "$SGEN" "$SDES" "$SGEN/manifest.json" \\
+  || { echo "repo-radar-dev: stable runtime is not healthy; run dev in an isolated HOME" >&2; exit 1; }
 ` : '';
   return `#!/bin/sh
 set -eu
@@ -28,14 +31,14 @@ CH="${channel}"
 CUR="$ROOT/$CH/current"
 DES="$ROOT/$CH/desired.json"
 mkdir -p "$ROOT" 2>/dev/null || true
-${devGuard}# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
+# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
 exec 9>"$ROOT/.exec.lock"
 /usr/bin/lockf -t 0 9 || { echo "repo-radar: another sync is running" >&2; exit 75; }
 # handshake: signal a Node parent (runSync) that the lock is ACQUIRED, via fd 3. The
 # group + 2>/dev/null makes it a clean no-op when fd 3 isn't open (launchd/CLI/direct).
 # The worker may inherit fd 3 harmlessly; runSync only needs the one byte, not the close.
 { printf 'L' >&3; } 2>/dev/null || true
-# --- only AFTER the lock do we resolve + verify current ---
+${devGuard}# --- only AFTER the lock do we resolve + verify current ---
 [ -L "$CUR" ] || { echo "repo-radar: no active runtime" >&2; exit 1; }
 GEN="$(cd "$CUR" && pwd -P)"
 # containment against the CANONICALIZED generations dir (HOME may have symlinked ancestors)

@@ -21,10 +21,12 @@ async function main() {
   const L = layout(home, channel);
   const writeResult = (r) => { try { fs.writeFileSync(resultPath, JSON.stringify(r), { mode: 0o600 }); } catch (_) { /* */ } };
   try {
-    const identity = authoritativeIdentity({ appVersion, bundledVersionPath: bundle.versionFile });
-
     // legacy bootstrap: no managed runtime has ever been activated for this channel.
     const legacyBootstrap = !fs.existsSync(L.current);
+    // On the 1.0.26 bootstrap path, neutralize the legacy runtime BEFORE the fallible
+    // identity check (Codex Crit1): quiesce the legacy job, install the fail-closed generic
+    // dispatchers (which overwrite the legacy PATH CLI), and retire the legacy launcher.
+    // A subsequent identity failure then leaves NOTHING runnable (desired stays PROVISIONING).
     if (legacyBootstrap && channel === 'stable' && !skipQuiesce) {
       const q = await quiesceLegacyStable({ home });
       if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
@@ -33,7 +35,10 @@ async function main() {
     // redeploys dispatcher fixes / schema changes, not only on first bootstrap.
     installDispatcher(home, channel);
     emitRunSync(home, channel);
+    if (legacyBootstrap && channel === 'stable') retireLegacyLauncher(home);
 
+    // NOW the fallible identity validation — legacy is already neutralized.
+    const identity = authoritativeIdentity({ appVersion, bundledVersionPath: bundle.versionFile });
     const plan = planGeneration({ identity, bundle });
     const active = {
       schema: SCHEMA, channel, version: identity.version, status: ACTIVE, genId: plan.genId,
@@ -51,8 +56,7 @@ async function main() {
     // publish the complete ACTIVE identity BEFORE the atomic flip; until the flip,
     // current.marker.genId != active.genId, so dispatchers stay fail-closed.
     publishDesired(L.desired, active);
-    flipCurrent(home, channel, genDir); // commit point
-    if (legacyBootstrap && channel === 'stable') retireLegacyLauncher(home);
+    flipCurrent(home, channel, genDir); // commit point (legacy already retired pre-identity)
     gcOrphans(home, channel);
     writeResult({ status: 'ok', genDir });
     process.exit(0);

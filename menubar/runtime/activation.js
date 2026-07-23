@@ -40,15 +40,17 @@ function verifyRuntime({ home, channel, genDir, desired }) {
   if (!marker || !schemaCompatible(marker)) return { ok: false, reasons: [...reasons, 'marker missing/incompatible'] };
   if (!desired || !schemaCompatible(desired)) return { ok: false, reasons: [...reasons, 'desired missing/incompatible'] };
 
-  // current + marker must match desired intent
-  for (const k of ['genId', 'versionSha', 'sourceSha', 'launcherSha', 'lockSha']) {
+  // current + marker must match desired intent (incl. the anchored verifier/manifest, Codex I4)
+  for (const k of ['genId', 'versionSha', 'sourceSha', 'launcherSha', 'lockSha', 'verifySha', 'manifestSha']) {
     if (marker[k] !== desired[k]) reasons.push(`marker.${k} != desired.${k}`);
   }
-  // live payload must match the marker (catches post-provision tampering)
+  // live payload must match the marker (catches post-provision tampering, incl. verify.py/manifest)
   try {
     if (hashTree(path.join(genDir, 'repo_radar')) !== marker.sourceSha) reasons.push('live sourceSha != marker');
     if (hashFile(path.join(genDir, 'repo-radar')) !== marker.launcherSha) reasons.push('live launcherSha != marker');
     if (hashFile(path.join(genDir, 'VERSION')) !== marker.versionSha) reasons.push('live versionSha != marker');
+    if (marker.verifySha != null && hashFile(path.join(genDir, 'verify.py')) !== marker.verifySha) reasons.push('live verifySha != marker');
+    if (marker.manifestSha != null && hashFile(path.join(genDir, 'manifest.json')) !== marker.manifestSha) reasons.push('live manifestSha != marker');
   } catch (e) { reasons.push(`payload hash error: ${e.message}`); }
 
   // interpreter fingerprint + ABI of the venv python match the marker

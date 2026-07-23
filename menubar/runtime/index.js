@@ -9,11 +9,10 @@ const { hashTree, hashFile, redact } = require('./hashing');
 
 const HELPER = path.join(__dirname, 'provision-helper.js');
 
-// Fast path: is `current` a compatible ACTIVE runtime for THIS bundle AND untampered?
-// CHEAP + non-blocking (Codex I6): file hashes only — NO interpreter probe / pip list
-// (those run in the async helper at provision, and per-sync in the dispatcher's
-// verify.py). Catches source/launcher/VERSION tamper so reconcile rebuilds.
-function _fastHealthy(home, channel, appVersion, bundle) {
+// Cheap CANDIDATE filter (Codex I6): does `current` even claim to be this bundle's ACTIVE
+// runtime? File hashes only — NO interpreter probe / pip list (non-blocking on the Electron
+// main loop). A pass here does NOT mean healthy; it just avoids a needless full verify.
+function _fastCandidate(home, channel, appVersion, bundle) {
   const L = layout(home, channel);
   const desired = readDesired(L.desired);
   if (!isActive(desired) || desired.version !== appVersion) return false;
@@ -22,18 +21,29 @@ function _fastHealthy(home, channel, appVersion, bundle) {
   let marker;
   try { marker = JSON.parse(fs.readFileSync(path.join(genDir, '.runtime.json'), 'utf8')); } catch (_) { return false; }
   try {
-    // marker matches this bundle (right build)
     if (marker.sourceSha !== hashTree(bundle.repoRadarDir)) return false;
     if (marker.launcherSha !== hashFile(bundle.launcher)) return false;
     if (marker.versionSha !== hashFile(bundle.versionFile)) return false;
     const { lockPath } = selectFor(marker.fingerprint);
     if (marker.lockSha !== hashFile(lockPath)) return false;
-    // live payload untampered (matches the marker)
-    if (hashTree(path.join(genDir, 'repo_radar')) !== marker.sourceSha) return false;
-    if (hashFile(path.join(genDir, 'repo-radar')) !== marker.launcherSha) return false;
-    if (hashFile(path.join(genDir, 'VERSION')) !== marker.versionSha) return false;
   } catch (_) { return false; }
   return true;
+}
+
+// Run the FULL healthy predicate on `current` asynchronously via the shipped verify.py
+// (Codex I6/I2): live payload + fingerprint + ABI + installed-set + pip check. Catches a
+// corrupt/deleted venv, tampered payload, etc. — anything the cheap filter can't. Async
+// spawn keeps the Electron main loop responsive.
+function _fullVerifyCurrent(home, channel) {
+  const L = layout(home, channel);
+  return new Promise((resolve) => {
+    let genDir;
+    try { genDir = fs.realpathSync(L.current); } catch (_) { return resolve(false); }
+    const py = path.join(genDir, 'venv', 'bin', 'python');
+    const child = spawn(py, [path.join(genDir, 'verify.py'), genDir, L.desired, path.join(genDir, 'manifest.json')], { stdio: 'ignore' });
+    child.on('error', () => resolve(false)); // e.g. python missing
+    child.on('exit', (code) => resolve(code === 0));
+  });
 }
 
 // Spawn the lock-owning activation helper. A wrapping /bin/sh acquires the ROOT then
@@ -73,7 +83,10 @@ function _runActivationHelper({ home, channel, appVersion, bundle, skipQuiesce }
 // activation run inside the lock-owning helper. `_skipQuiesce` is test-only.
 async function ensureRuntime({ home, channel, appVersion, bundle, hooks = {}, _skipQuiesce = false }) {
   const L = layout(home, channel);
-  if (_fastHealthy(home, channel, appVersion, bundle)) return { status: 'ok' };
+  // cheap candidate filter, then confirm with the FULL predicate (async) before no-op'ing
+  if (_fastCandidate(home, channel, appVersion, bundle) && (await _fullVerifyCurrent(home, channel))) {
+    return { status: 'ok' };
+  }
 
   fs.mkdirSync(L.channelDir, { recursive: true, mode: 0o700 });
   publishDesired(L.desired, { channel, version: appVersion, status: PROVISIONING });

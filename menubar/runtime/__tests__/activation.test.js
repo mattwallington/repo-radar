@@ -17,7 +17,8 @@ function realGen(home) {
 }
 function desiredFromMarker(m) {
   return { schema: 1, channel: m.channel, version: m.version, genId: m.genId,
-    sourceSha: m.sourceSha, launcherSha: m.launcherSha, versionSha: m.versionSha, lockSha: m.lockSha };
+    sourceSha: m.sourceSha, launcherSha: m.launcherSha, versionSha: m.versionSha, lockSha: m.lockSha,
+    verifySha: m.verifySha, manifestSha: m.manifestSha };
 }
 
 test('verify + adopt + flip on a real generation, then tamper fails closed', { timeout: 180000 }, () => {

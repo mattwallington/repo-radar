@@ -4,15 +4,17 @@ const { execFileSync } = require('child_process');
 class NoInterpreterError extends Error {}
 
 const PROBE =
-  'import sys,platform,sysconfig;' +
-  "print(sys.version_info[0],sys.version_info[1],sys.version_info[2],sys.implementation.name,platform.machine(),(sysconfig.get_config_var('SOABI') or 'none'))";
+  'import sys,platform,sysconfig,os;' +
+  "print(sys.version_info[0],sys.version_info[1],sys.version_info[2],sys.implementation.name,platform.machine(),(sysconfig.get_config_var('SOABI') or 'none'));" +
+  'print(os.path.realpath(sys.executable))';
 
 function probe(exe) {
   try {
-    const out = execFileSync(exe, ['-c', PROBE], { encoding: 'utf8', timeout: 8000 })
-      .trim()
-      .split(/\s+/);
-    return { version: [+out[0], +out[1], +out[2]], impl: out[3], arch: out[4], abi: out[5] };
+    // line 1: version/impl/arch/abi (whitespace-split); line 2: the REAL executable path
+    const lines = execFileSync(exe, ['-c', PROBE], { encoding: 'utf8', timeout: 8000 }).trim().split('\n');
+    const out = lines[0].trim().split(/\s+/);
+    const realExe = lines[1] ? lines[1].trim() : exe;
+    return { exe: realExe, version: [+out[0], +out[1], +out[2]], impl: out[3], arch: out[4], abi: out[5] };
   } catch (e) {
     return null;
   }
@@ -45,7 +47,7 @@ function resolveBaseInterpreter(opts = {}) {
       // checked-in dependency lock for the interpreter's env (spec §3.6). Skip to the
       // next candidate when rejected, so a covered interpreter later in the list wins.
       if (opts.accept && !opts.accept(exe, info)) continue;
-      return { exe, ...info };
+      return { ...info }; // info.exe is the resolved real executable (Codex minor)
     }
   }
   throw new NoInterpreterError(
