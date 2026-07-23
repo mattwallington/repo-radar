@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; padding: 20px; }
+    #title { font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+    #body { font-size: 13px; line-height: 1.5; margin-bottom: 18px; }
+    #buttons { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    button { padding: 6px 14px; font-size: 13px; cursor: pointer; }
+    #close { margin-left: auto; background: transparent; border: none; opacity: 0.6; }
+  </style>
+</head>
+<body>
+  <div id="title"></div>
+  <div id="body"></div>
+  <div id="buttons"><button id="close" type="button">Close</button></div>
+  <script src="model-update.js"></script>
+</body>
+</html>
