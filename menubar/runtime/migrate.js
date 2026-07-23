@@ -10,9 +10,11 @@ function installDispatcher(home, channel) {
 }
 
 // STABLE-ONLY: move the legacy 1.0.26 ~/.repo-radar/repo-radar launcher aside
-// (non-destructive) ONLY after the stable dispatcher is in place AND a current
-// activation exists (Codex R1-4 / R2-1). Returns the moved-to path, or null if
-// there is nothing to retire or the guards aren't satisfied yet.
+// (non-destructive). By default this requires the generic stable dispatcher to already
+// own the PATH CLI (so `repo-radar` still resolves to a runnable dispatcher, Codex
+// R1-4/R2-1); it does NOT require a current activation. `failClosed` retires even before
+// the dispatcher exists (Codex round-9). Returns the moved-to path, or null if there is
+// nothing to retire or (default only) the dispatcher guard isn't met.
 function retireLegacyLauncher(home, { now = Date.now(), failClosed = false } = {}) {
   const legacy = path.join(home, '.repo-radar', 'repo-radar');
   if (!fs.existsSync(legacy)) return null;
