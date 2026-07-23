@@ -1,5 +1,5 @@
 'use strict';
-const { migrateModel, suggestUpgrade } = require('./model-policy');
+const { migrateModel, suggestUpgrade, KNOWN_MODEL_IDS } = require('./model-policy');
 
 // Compound-aware notice: migration and suggestion are NOT mutually exclusive (several retired
 // ids migrate onto a suggestion key). suggestUpgrade is evaluated on the EFFECTIVE model.
@@ -69,4 +69,50 @@ function renderNoticeText(notice, labelMap) {
   };
 }
 
-module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText };
+// Per-kind allow-list + conservative 'close' mapping. Returns null for a disallowed action.
+function resolveNoticeAction(action, notice) {
+  const eff = notice.effective, sug = notice.suggested;
+  if (notice.kind === 'migration') {
+    if (action === 'acknowledge' || action === 'close') return { finalModel: eff, openSettings: false };
+    if (action === 'review') return { finalModel: eff, openSettings: true };
+    return null;
+  }
+  if (notice.kind === 'suggestion') {
+    if (action === 'switch') return { finalModel: sug, openSettings: false };
+    if (action === 'keep' || action === 'close') return { finalModel: null, openSettings: false };
+    if (action === 'review') return { finalModel: null, openSettings: true };
+    return null;
+  }
+  if (notice.kind === 'compound') {
+    if (action === 'switch') return { finalModel: sug, openSettings: false };
+    if (action === 'keep' || action === 'close') return { finalModel: eff, openSettings: false };
+    if (action === 'review') return { finalModel: eff, openSettings: true };
+    return null;
+  }
+  return null;
+}
+
+// Pure finalize plan. `expectedSig` is the signature the window displayed (staleness guard).
+function planFinalize(action, diskConfig, expectedSig) {
+  const cur = computeModelNotice(diskConfig.ai_model);
+  if (!cur || noticeSignature(cur) !== expectedSig) return { staleOrGone: true, valid: false };
+  const resolved = resolveNoticeAction(action, cur);
+  if (!resolved) return { staleOrGone: false, valid: false };
+  if (resolved.finalModel && !KNOWN_MODEL_IDS.has(resolved.finalModel)) return { staleOrGone: false, valid: false, invalidTarget: true };
+  const original = diskConfig.ai_model;
+  const nextConfig = { ...diskConfig };
+  if (resolved.finalModel) nextConfig.ai_model = resolved.finalModel;
+  nextConfig.model_notice_ack = noticeSignature(computeModelNotice(nextConfig.ai_model)) || '';
+  return { staleOrGone: false, valid: true, nextConfig, reconcileSchedule: nextConfig.ai_model !== original, openSettings: resolved.openSettings };
+}
+
+// Save first; stop on save failure; reconcile the schedule ONLY after a successful save.
+function persistConfig(config, { reconcileSchedule, save, reconcile }) {
+  const saved = save(config);
+  if (!saved || saved.success === false) return { ok: false, stage: 'save', error: saved && saved.error };
+  if (!reconcileSchedule) return { ok: true, schedule: { ok: true, skipped: true } };
+  const s = reconcile(config);
+  return { ok: true, schedule: { ok: !(!s || s.success === false), error: s && s.error } };
+}
+
+module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig };
