@@ -1146,9 +1146,9 @@ function triggerSync({ showWindow = true } = {}) {
   setTimeout(sendSyncStartedWhenReady, 300);
   
   // Build the environment for the sync child exactly as before. runtime.runSync()
-  // (spec 2A) merges this over process.env and sets its own PYTHONPATH to the
-  // resolved generation dir, so PYTHONPATH/getSyncScriptPath() are no longer
-  // needed here — the runner resolves + verifies `current` itself.
+  // (spec 2A) merges this over process.env; the runner resolves + verifies `current`
+  // itself and execs the generation's launcher, whose own dir is sys.path[0] — so no
+  // PYTHONPATH/getSyncScriptPath() is needed here (runSync sets no PYTHONPATH).
   const shellEnv = { ...process.env };
 
   // Ensure pyenv shims are in PATH (still useful for anything the sync shells
@@ -1242,9 +1242,9 @@ function triggerSync({ showWindow = true } = {}) {
   // and spawns `<gen>/venv/bin/python <gen>/repo-radar sync --status-server`
   // itself, handing the child back via onChild() so we can wire the same
   // cancellation / output-capture / status-window integration as before.
-  // IMPORTANT: runSync's default `stdio` is 'inherit' (child.stdout/stderr
-  // would be null); we explicitly request piped stdio here so the capture
-  // below keeps working exactly as it did with the old direct spawn().
+  // NOTE: runSync() always pipes stdout/stderr internally (it does not read a `stdio`
+  // option — the key passed below is inert), so child.stdout/stderr are available for
+  // the capture wiring below exactly as with the old direct spawn().
   runtime.runSync({
     home: os.homedir(),
     channel: runtimeChannel,
@@ -2334,8 +2334,10 @@ app.whenReady().then(async () => {
           repoRadarDir: path.join(process.resourcesPath, 'resources', 'repo_radar'),
           launcher: path.join(process.resourcesPath, 'resources', 'repo-radar'),
           versionFile: path.join(process.resourcesPath, 'VERSION'),
-          // verify.py must be a REAL file (the node-mode provisioning helper has no asar
-          // access), so it is bundled as an extraResource, not read from inside app.asar.
+          // verify.py is an extraResource (a real on-disk file) because provisioning must COPY
+          // it verbatim into each generation dir and hash it — the inputs must be real files.
+          // (Not an asar-access limitation: ELECTRON_RUN_AS_NODE can require() from app.asar,
+          // which is exactly how the provisioning helper + its runtime/ siblings load.)
           verifyPy: path.join(process.resourcesPath, 'resources', 'verify.py')
         }
       : {

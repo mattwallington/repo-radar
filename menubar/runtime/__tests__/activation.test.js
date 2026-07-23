@@ -57,3 +57,53 @@ test('gcOrphans removes staging + never-activated, retains activated + current',
   assert.ok(fs.existsSync(path.join(L.generations, 'g-old-activated')));
   assert.ok(!fs.existsSync(path.join(L.generations, 'g-orphan')));
 });
+
+test('gcOrphans caps retention: keeps current + the single most-recent inactive, prunes older activated + compacts the journal', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-gc-cap-'));
+  const L = layout(home, 'stable'); fs.mkdirSync(L.generations, { recursive: true });
+  // activation order oldest->newest: g1, g2, g3(current)
+  for (const n of ['g1', 'g2', 'g3']) fs.mkdirSync(path.join(L.generations, n));
+  fs.symlinkSync(path.join(L.generations, 'g3'), L.current);
+  fs.writeFileSync(path.join(L.channelDir, 'activated.json'), JSON.stringify(['g1', 'g2', 'g3']));
+
+  const removed = gcOrphans(home, 'stable');
+  assert.ok(removed.includes('g1'), 'oldest activated pruned');
+  assert.ok(!removed.includes('g2') && !removed.includes('g3'), 'current + most-recent inactive kept');
+  assert.ok(fs.existsSync(path.join(L.generations, 'g2')) && fs.existsSync(path.join(L.generations, 'g3')));
+  assert.ok(!fs.existsSync(path.join(L.generations, 'g1')));
+  // journal compacted to retained genIds, activation order preserved
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(L.channelDir, 'activated.json'), 'utf8')), ['g2', 'g3']);
+});
+
+test('gcOrphans protects current even when absent from the journal', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-gc-cur-'));
+  const L = layout(home, 'stable'); fs.mkdirSync(L.generations, { recursive: true });
+  for (const n of ['gc', 'ga']) fs.mkdirSync(path.join(L.generations, n));
+  fs.symlinkSync(path.join(L.generations, 'gc'), L.current);
+  fs.writeFileSync(path.join(L.channelDir, 'activated.json'), JSON.stringify(['ga'])); // current 'gc' not journaled
+  const removed = gcOrphans(home, 'stable');
+  assert.ok(!removed.includes('gc'), 'current never removed');
+  assert.ok(fs.existsSync(path.join(L.generations, 'gc')), 'current retained');
+  assert.ok(fs.existsSync(path.join(L.generations, 'ga')), 'most-recent inactive retained');
+  assert.ok(JSON.parse(fs.readFileSync(path.join(L.channelDir, 'activated.json'), 'utf8')).includes('gc'), 'current added to compacted journal');
+});
+
+test('gcOrphans keeps generations bounded (<=2) across repeated upgrades', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-gc-bound-'));
+  const L = layout(home, 'stable'); fs.mkdirSync(L.generations, { recursive: true });
+  const jp = path.join(L.channelDir, 'activated.json');
+  for (let i = 1; i <= 6; i++) {
+    const g = `gen${i}`;
+    fs.mkdirSync(path.join(L.generations, g));
+    // mirror flipCurrent journaling order: record THEN flip
+    const cur = (() => { try { return JSON.parse(fs.readFileSync(jp, 'utf8')); } catch (_) { return []; } })();
+    cur.push(g); fs.writeFileSync(jp, JSON.stringify(cur));
+    try { fs.unlinkSync(L.current); } catch (_) { /* first iter */ }
+    fs.symlinkSync(path.join(L.generations, g), L.current);
+    gcOrphans(home, 'stable');
+    const gens = fs.readdirSync(L.generations).filter((n) => !n.includes('.staging-'));
+    assert.ok(gens.length <= 2, `after activation ${i}: ${gens.length} generations (must stay <= 2)`);
+  }
+  assert.deepStrictEqual(fs.readdirSync(L.generations).sort(), ['gen5', 'gen6']);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(jp, 'utf8')), ['gen5', 'gen6']);
+});
