@@ -32,8 +32,10 @@
 - `menubar/__tests__/drift-check.js` — **modify**: `MODEL_SUGGESTIONS` invariants (incl. dropdown membership + provider parity).
 - `menubar/__tests__/model-notice.test.js` — **create**: full matrix for the pure logic.
 - `menubar/renderer/model-update.html`, `menubar/renderer/model-update.js`, `menubar/renderer/model-update-preload.js` — **create**: thin display window.
-- `menubar/main.js` — **modify**: `maybeShowModelNotice`, `finalizeModelNotice`, window creation, IPC (sender-bound), `before-quit`, and refactor `save-config` onto `persistConfig`.
-- `menubar/__tests__/model-notice-wiring.test.js` — **create**: static assertions over `main.js` wiring.
+- `menubar/model-notice-controller.js` — **create**: dependency-injected coordinator (`createModelNoticeController(deps)`) holding all notice behavior (stable-only, dedup, sender rejection, finalize idempotency, save-failure, close/quit rules) so it is unit-testable with fakes.
+- `menubar/__tests__/model-notice-controller.test.js` — **create**: behavioral tests with fake windows/senders/persistence/config.
+- `menubar/main.js` — **modify**: thin glue — build the controller with real deps (config read, `saveConfigToFile`, `updateLaunchAgent`, real `BrowserWindow`), call `.maybe()` at stable startup, wire sender-bound IPC + `close` handler + `before-quit`, and refactor `save-config` onto `persistConfig`.
+- `menubar/__tests__/model-notice-wiring.test.js` — **create**: a small static landmark (require + trigger + before-quit present); the behavior is proven by the controller test, not this one.
 
 ---
 
@@ -43,10 +45,16 @@
 
 This branch (`feature/model-update-notice-v1.0.27`) was cut from the canonical `menubar/` structure that only reaches `dev` when Spec 2A merges. Do not start Task 1 until this gate passes.
 
-- [ ] **Step 1: Confirm Spec 2A merged to `dev`**
+- [ ] **Step 1: Confirm Spec 2A merged to `dev` (ancestry + structure, not a message grep)**
 
-Run: `git -C ~/.claude-worktrees/repo-radar-model-notice fetch origin && git log --oneline origin/dev | grep -i "runtime.binding\|spec 2a\|runtime-binding" | head`
-Expected: at least one commit line for the Spec 2A runtime-binding merge. If empty, STOP — the gate is not met.
+Run:
+```bash
+cd ~/.claude-worktrees/repo-radar-model-notice && git fetch origin
+# The runtime-binding work only reaches dev via Spec 2A. Prove it two ways:
+git merge-base --is-ancestor 5874973 origin/dev && echo "spec2a-ancestor: yes" || echo "spec2a-ancestor: NO"
+git cat-file -e origin/dev:menubar/runtime/quiesce.js 2>/dev/null && echo "menubar/runtime present on dev: yes" || echo "menubar/runtime present on dev: NO"
+```
+Expected: both print `yes`. `5874973` is the final Spec 2A round-9 commit; if review added later commits, substitute the actual merged Spec 2A head. If either prints `NO`, STOP — the gate is not met, stay parked.
 
 - [ ] **Step 2: Rebase the notice branch onto fresh `dev`**
 
@@ -55,7 +63,7 @@ Run:
 cd ~/.claude-worktrees/repo-radar-model-notice
 git rebase origin/dev
 ```
-Expected: rebase completes clean (only the four spec-doc commits `851d055..2981472` replay). Resolve any doc conflict by keeping the spec.
+Expected: rebase completes clean. Only this branch's own doc commits (the spec revs `851d055..2981472` **and** this plan commit `14bfc25`, plus any later plan edits) replay onto `dev`; there is no `menubar/` code on this branch yet, so there is nothing to conflict with the merged Spec 2A code. Resolve any doc conflict by keeping this branch's version.
 
 - [ ] **Step 3: Revalidate referenced functions + tests still exist with the referenced shapes**
 
@@ -585,60 +593,236 @@ git commit -m "feat(model-notice): thin branded modal window (restricted preload
 
 ---
 
-## Task 6: Main-process wiring
+## Task 6: `model-notice-controller.js` — dependency-injected coordinator
+
+**Files:**
+- Create: `menubar/model-notice-controller.js`
+- Test: `menubar/__tests__/model-notice-controller.test.js`
+
+**Interfaces:**
+- Consumes: `computeModelNotice`, `noticeSignature`, `renderNoticeText`, `planFinalize`, `persistConfig` from `./model-notice`.
+- Produces: `createModelNoticeController(deps) -> { maybe, getView, onAction, closeDecision, finalize, isFinalized }`.
+  - `deps = { channel, readConfig, save, reconcile, labels, openWindow, showError, showScheduleWarning, isQuitting, openSettings }`.
+  - `openWindow(notice, sig)` returns a window handle exposing `{ webContents, destroy() }`.
+  - `maybe() -> windowHandle|null`; `getView(sender) -> renderNoticeText output|null`; `onAction(sender, action) -> void`; `closeDecision() -> 'allow'|'handle'` (pure); `finalize(action) -> void`; `isFinalized() -> boolean`.
+
+All Electron/IO is injected, so behavior (stable-only, dedup, sender rejection, finalize idempotency, save-failure, quit escape) is unit-tested with fakes. `main.js` (Task 7) supplies the real deps.
+
+- [ ] **Step 1: Write the failing behavioral test** — create `menubar/__tests__/model-notice-controller.test.js`:
+
+```js
+const test = require('node:test'); const assert = require('node:assert');
+const { createModelNoticeController } = require('../model-notice-controller');
+
+function harness(over = {}) {
+  const state = {
+    channel: 'stable', config: { ai_model: 'claude-sonnet-4-6' }, saved: [], reconciled: 0,
+    errors: [], scheduleWarnings: [], settingsOpened: 0, quitting: false, windows: [],
+    saveResult: { success: true }, reconcileResult: { success: true }, ...over,
+  };
+  const deps = {
+    channel: state.channel,
+    readConfig: () => ({ ...state.config }),
+    save: (c) => { state.saved.push({ ...c }); state.config = { ...c }; return state.saveResult; },
+    reconcile: () => { state.reconciled++; return state.reconcileResult; },
+    labels: {},
+    openWindow: () => { const w = { webContents: { id: state.windows.length + 1 }, destroyed: false, destroy() { this.destroyed = true; } }; state.windows.push(w); return w; },
+    showError: (e) => state.errors.push(e),
+    showScheduleWarning: (e) => state.scheduleWarnings.push(e),
+    isQuitting: () => state.quitting,
+    openSettings: () => { state.settingsOpened++; },
+  };
+  return { ctl: createModelNoticeController(deps), state };
+}
+
+test('maybe: dev build shows nothing (stable-only)', () => {
+  const { ctl, state } = harness({ channel: 'dev' });
+  assert.strictEqual(ctl.maybe(), null);
+  assert.strictEqual(state.windows.length, 0);
+});
+test('maybe: dedup — a matching ack shows nothing', () => {
+  const { ctl, state } = harness();
+  state.config.model_notice_ack = 'suggestion:claude-sonnet-4-6>claude-sonnet-5';
+  assert.strictEqual(ctl.maybe(), null);
+  assert.strictEqual(state.windows.length, 0);
+});
+test('maybe: opens a window for an actionable notice', () => {
+  const { ctl, state } = harness();
+  assert.ok(ctl.maybe());
+  assert.strictEqual(state.windows.length, 1);
+});
+test('onAction: foreign sender is rejected (no persist, not finalized)', () => {
+  const { ctl, state } = harness();
+  ctl.maybe();
+  ctl.onAction({ id: 999 }, 'switch');
+  assert.strictEqual(state.saved.length, 0);
+  assert.strictEqual(ctl.isFinalized(), false);
+});
+test('onAction switch: persists suggested, reconciles, destroys, finalized', () => {
+  const { ctl, state } = harness();
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'switch');
+  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5');
+  assert.strictEqual(state.reconciled, 1);
+  assert.strictEqual(w.destroyed, true);
+  assert.strictEqual(ctl.isFinalized(), true);
+});
+test('save failure: not finalized, error surfaced, window kept, never reconciled', () => {
+  const { ctl, state } = harness({ saveResult: { success: false, error: 'disk full' } });
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'switch');
+  assert.strictEqual(ctl.isFinalized(), false);
+  assert.deepStrictEqual(state.errors, ['disk full']);
+  assert.strictEqual(w.destroyed, false);
+  assert.strictEqual(state.reconciled, 0);
+});
+test('idempotent: a second action after finalize does nothing', () => {
+  const { ctl, state } = harness();
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'switch');
+  ctl.onAction(w.webContents, 'switch');
+  assert.strictEqual(state.saved.length, 1);
+});
+test('compound Keep: persists effective + acks resulting suggestion; re-run dedups', () => {
+  const { ctl, state } = harness({ config: { ai_model: 'gemini/gemini-2.0-flash' } });
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'keep');
+  assert.strictEqual(state.saved[0].ai_model, 'gemini/gemini-2.5-flash');
+  assert.strictEqual(state.saved[0].model_notice_ack, 'suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash');
+  assert.strictEqual(ctl.maybe(), null, 'resulting config dedups the follow-on suggestion');
+});
+test('closeDecision is pure: handle normally, allow when finalized', () => {
+  const { ctl } = harness();
+  const w = ctl.maybe();
+  assert.strictEqual(ctl.closeDecision(), 'handle');
+  ctl.finalize('keep'); // suggestion close/keep is ack-only -> finalized
+  assert.strictEqual(ctl.isFinalized(), true);
+  assert.strictEqual(ctl.closeDecision(), 'allow');
+});
+test('quit escape: closeDecision allows close even when a failing save left it un-finalized', () => {
+  const { ctl, state } = harness({ saveResult: { success: false, error: 'x' } });
+  const w = ctl.maybe();
+  ctl.finalize('switch');
+  assert.strictEqual(ctl.isFinalized(), false);
+  assert.strictEqual(ctl.closeDecision(), 'handle');
+  state.quitting = true;
+  assert.strictEqual(ctl.closeDecision(), 'allow');
+});
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `node --test menubar/__tests__/model-notice-controller.test.js`
+Expected: FAIL — cannot find module `../model-notice-controller`.
+
+- [ ] **Step 3: Implement** — create `menubar/model-notice-controller.js`:
+
+```js
+'use strict';
+const { computeModelNotice, noticeSignature, renderNoticeText, planFinalize, persistConfig } = require('./model-notice');
+
+// Dependency-injected coordinator. All Electron/IO is injected so behavior is unit-testable.
+function createModelNoticeController(deps) {
+  let win = null;
+  let finalized = false;
+
+  function maybe() {
+    if (deps.channel !== 'stable') return null;
+    const config = deps.readConfig();
+    const notice = computeModelNotice(config.ai_model);
+    if (!notice) return null;
+    const sig = noticeSignature(notice);
+    if (config.model_notice_ack === sig) return null;
+    finalized = false;
+    win = deps.openWindow(notice, sig);
+    win.sig = sig; win.notice = notice;
+    return win;
+  }
+
+  function getView(sender) {
+    if (!win || sender !== win.webContents) return null;
+    return renderNoticeText(win.notice, deps.labels);
+  }
+
+  function finalize(action) {
+    if (finalized || !win) return;
+    const plan = planFinalize(action, deps.readConfig(), win.sig);
+    if (plan.staleOrGone) { finalized = true; win.destroy(); win = null; return; }
+    if (!plan.valid) return; // disallowed/invalid target: ignore, do NOT finalize
+    const res = persistConfig(plan.nextConfig, { reconcileSchedule: plan.reconcileSchedule, save: deps.save, reconcile: deps.reconcile });
+    if (!res.ok) { deps.showError(res.error); return; } // benign; keep window, ack unchanged, re-shows next launch
+    if (res.schedule && res.schedule.ok === false) deps.showScheduleWarning(res.schedule.error);
+    finalized = true; win.destroy(); win = null;
+    if (plan.openSettings) deps.openSettings();
+  }
+
+  function onAction(sender, action) {
+    if (!win || sender !== win.webContents) return; // foreign sender rejected
+    if (typeof action !== 'string') return;
+    finalize(action);
+  }
+
+  // Pure decision for main's `close` handler: 'handle' -> preventDefault + finalize('close').
+  function closeDecision() {
+    if (finalized || deps.isQuitting()) return 'allow'; // done, or quitting (never trap app.quit)
+    return 'handle';
+  }
+
+  return { maybe, getView, onAction, closeDecision, finalize, isFinalized: () => finalized };
+}
+
+module.exports = { createModelNoticeController };
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `node --test menubar/__tests__/model-notice-controller.test.js`
+Expected: all tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add menubar/model-notice-controller.js menubar/__tests__/model-notice-controller.test.js
+git commit -m "feat(model-notice): DI notice controller with behavioral tests"
+```
+
+---
+
+## Task 7: Main-process glue
 
 **Files:**
 - Modify: `menubar/main.js`
-- Test: `menubar/__tests__/model-notice-wiring.test.js` (create)
+- Test: `menubar/__tests__/model-notice-wiring.test.js` (create — static landmark only)
 
 **Interfaces:**
-- Consumes: `computeModelNotice`, `noticeSignature`, `renderNoticeText`, `parseModelLabels`, `planFinalize`, `persistConfig` from `./model-notice`; existing `saveConfigToFile` (`main.js:1690`), `updateLaunchAgent` (`:1736`), `surfaceScheduleWarning`, `runtimeChannel`, `CONFIG_DIR` (`:118`), `dialog`, `BrowserWindow`, `ipcMain`, `app`, `showSettingsWindow` (`:1514`), and `fs`/`path` (already required).
+- Consumes: `createModelNoticeController` (Task 6); `parseModelLabels` (Task 3); `persistConfig` (Task 4); existing `saveConfigToFile` (`main.js:1690`), `updateLaunchAgent` (`:1736`), `surfaceScheduleWarning`, `runtimeChannel`, `CONFIG_DIR` (`:118`), `dialog`, `BrowserWindow`, `ipcMain`, `app`, `showSettingsWindow` (`:1514`), `fs`/`path`.
 - Produces: the running feature.
 
-- [ ] **Step 1: Add requires + module state** near the top of `menubar/main.js` (with the other requires):
+- [ ] **Step 1: Add requires + module state** near the top requires of `menubar/main.js`:
 
 ```js
-const { computeModelNotice, noticeSignature, renderNoticeText, parseModelLabels, planFinalize, persistConfig } = require('./model-notice');
-let modelUpdateWindow = null;
-let _noticeFinalized = false;
+const { createModelNoticeController } = require('./model-notice-controller');
+const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
+let modelNoticeController = null;
 const MODEL_LABELS = parseModelLabels(fs.readFileSync(path.join(__dirname, 'renderer', 'settings.html'), 'utf8'));
 ```
 
-- [ ] **Step 2: Add the quit flag** — register in the existing app lifecycle wiring (near the other `app.on(...)` handlers):
+- [ ] **Step 2: Add the quit flag** — with the other `app.on(...)` handlers:
 
 ```js
 app.on('before-quit', () => { appIsQuitting = true; });
 ```
 
-- [ ] **Step 3: Add the finalizer + trigger + window** — add these functions in `menubar/main.js` (near `surfaceScheduleWarning`):
+- [ ] **Step 3: Add the disk read + window opener + controller builder** near `surfaceScheduleWarning`:
 
 ```js
-function _readConfigFromDisk() {
+function _readModelConfig() {
   try { return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'config.json'), 'utf8')); }
   catch (e) { return {}; }
 }
 
-// The ONE authoritative, idempotent finalizer (renderer owns no finalize state).
-function finalizeModelNotice(action) {
-  if (_noticeFinalized || !modelUpdateWindow) return;
-  const win = modelUpdateWindow;
-  const plan = planFinalize(action, _readConfigFromDisk(), win._sig);
-  if (plan.staleOrGone) { _noticeFinalized = true; win.destroy(); return; }
-  if (!plan.valid) return; // disallowed/invalid: ignore, do NOT finalize
-  const res = persistConfig(plan.nextConfig, { reconcileSchedule: plan.reconcileSchedule, save: saveConfigToFile, reconcile: updateLaunchAgent });
-  if (!res.ok) { // benign error; keep window open, ack unchanged, re-shows next launch. NOT surfaceRuntimeError.
-    dialog.showErrorBox('Repo Radar', `Could not save model change: ${res.error || 'unknown error'}`);
-    return;
-  }
-  if (res.schedule && res.schedule.ok === false) surfaceScheduleWarning(res.schedule.error);
-  _noticeFinalized = true;
-  win.destroy();
-  if (plan.openSettings) showSettingsWindow(); // existing opener at menubar/main.js:1514
-}
-
-function openModelUpdateWindow(notice, sig) {
-  _noticeFinalized = false;
+function _openModelUpdateWindow(notice, sig) {
   const win = new BrowserWindow({
     width: 460, height: 220, resizable: false, minimizable: false, maximizable: false,
     fullscreenable: false, title: 'Repo Radar — Models', show: false,
@@ -647,58 +831,58 @@ function openModelUpdateWindow(notice, sig) {
       preload: path.join(__dirname, 'renderer', 'model-update-preload.js'),
     },
   });
-  win._sig = sig; win._notice = notice;
-  win.on('close', (e) => { if (_noticeFinalized || appIsQuitting) return; e.preventDefault(); finalizeModelNotice('close'); });
-  win.on('closed', () => { if (modelUpdateWindow === win) modelUpdateWindow = null; });
+  win.on('close', (e) => {
+    if (!modelNoticeController || modelNoticeController.closeDecision() === 'allow') return;
+    e.preventDefault();
+    modelNoticeController.finalize('close');
+  });
   win.loadFile(path.join(__dirname, 'renderer', 'model-update.html'));
   win.once('ready-to-show', () => win.show());
-  modelUpdateWindow = win;
+  return win;
 }
 
-// Stable-only, actionable-only, once per notice content.
-function maybeShowModelNotice() {
-  if (runtimeChannel !== 'stable') return;
-  const config = _readConfigFromDisk();
-  const notice = computeModelNotice(config.ai_model);
-  if (!notice) return;
-  const sig = noticeSignature(notice);
-  if (config.model_notice_ack === sig) return;
-  openModelUpdateWindow(notice, sig);
+function buildModelNoticeController() {
+  modelNoticeController = createModelNoticeController({
+    channel: runtimeChannel,
+    readConfig: _readModelConfig,
+    save: saveConfigToFile,
+    reconcile: updateLaunchAgent,
+    labels: MODEL_LABELS,
+    openWindow: _openModelUpdateWindow,
+    showError: (err) => dialog.showErrorBox('Repo Radar', `Could not save model change: ${err || 'unknown error'}`),
+    showScheduleWarning: (err) => surfaceScheduleWarning(err),
+    isQuitting: () => appIsQuitting,
+    openSettings: () => showSettingsWindow(),
+  });
+  return modelNoticeController;
 }
 ```
 
-- [ ] **Step 4: Add the sender-bound IPC handlers** — near the other `ipcMain` registrations:
+- [ ] **Step 4: Add the sender-bound IPC handlers** — with the other `ipcMain` registrations:
 
 ```js
-ipcMain.handle('model-notice:get', (event) => {
-  if (!modelUpdateWindow || event.sender !== modelUpdateWindow.webContents) return null;
-  return renderNoticeText(modelUpdateWindow._notice, MODEL_LABELS);
-});
-ipcMain.on('model-notice:action', (event, action) => {
-  if (!modelUpdateWindow || event.sender !== modelUpdateWindow.webContents) return;
-  if (typeof action !== 'string') return;
-  finalizeModelNotice(action);
-});
+ipcMain.handle('model-notice:get', (event) => modelNoticeController ? modelNoticeController.getView(event.sender) : null);
+ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController) modelNoticeController.onAction(event.sender, action); });
 ```
 
-- [ ] **Step 5: Call the trigger at stable startup** — inside the existing `app.whenReady().then(async () => { ... })`, AFTER the runtime bootstrap + tray are set up, add:
+- [ ] **Step 5: Trigger at stable startup** — inside `app.whenReady().then(async () => { ... })`, AFTER runtime bootstrap + tray setup:
 
 ```js
-  maybeShowModelNotice();
+  buildModelNoticeController();
+  modelNoticeController.maybe();
 ```
 
-- [ ] **Step 6: Route Settings' save through the shared primitive** — in the `ipcMain.on('save-config', ...)` handler, replace the direct `saveConfigToFile(config)` + `updateLaunchAgent(config)` sequence with:
+- [ ] **Step 6: Route Settings' save through the shared primitive** — in the `ipcMain.on('save-config', ...)` handler, replace the `saveConfigToFile(config)` + `updateLaunchAgent(config)` sequence with:
 
 ```js
   const res = persistConfig(config, { reconcileSchedule: true, save: saveConfigToFile, reconcile: updateLaunchAgent });
   const result = res.ok ? { success: true } : { success: false, error: res.error };
-  // preserve the existing reply + schedule-warning behavior:
   if (res.ok && res.schedule && res.schedule.ok === false) surfaceScheduleWarning(res.schedule.error);
 ```
 
-(Keep the handler's existing `event.reply('config-saved', ...)` semantics; only the save+reconcile call changes so both paths share one primitive.)
+Keep the handler's existing `event.reply('config-saved', result.success, result.error)` behavior; only the save+reconcile call changes so both paths share one primitive.
 
-- [ ] **Step 7: Write the wiring assertions** — create `menubar/__tests__/model-notice-wiring.test.js`:
+- [ ] **Step 7: Write the static landmark test** — create `menubar/__tests__/model-notice-wiring.test.js`:
 
 ```js
 const assert = require('assert');
@@ -706,63 +890,97 @@ const fs = require('fs');
 const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
-assert.ok(/require\(['"]\.\/model-notice['"]\)/.test(src), 'main.js requires ./model-notice');
-assert.ok(/runtimeChannel !== 'stable'/.test(src), 'maybeShowModelNotice is stable-only');
-assert.ok(/appIsQuitting/.test(src) && /before-quit/.test(src), 'before-quit sets appIsQuitting');
-assert.ok(/event\.sender !== modelUpdateWindow\.webContents/.test(src), 'IPC handlers are sender-bound');
-assert.ok(/e\.preventDefault\(\);\s*finalizeModelNotice\('close'\)/.test(src), 'close handler finalizes via main');
-assert.ok(/persistConfig\(config, \{ reconcileSchedule: true/.test(src), 'save-config routes through persistConfig');
-assert.ok(/maybeShowModelNotice\(\)/.test(src), 'trigger is called at startup');
-console.log('model-notice wiring OK');
+// Landmark only — the BEHAVIOR is proven by model-notice-controller.test.js.
+assert.ok(/require\(['"]\.\/model-notice-controller['"]\)/.test(src), 'requires the controller');
+assert.ok(/before-quit['"]\s*,\s*\(\)\s*=>\s*\{\s*appIsQuitting = true/.test(src), 'before-quit sets appIsQuitting');
+assert.ok(/modelNoticeController\.maybe\(\)/.test(src), 'trigger is called at startup');
+assert.ok(/persistConfig\(config, \{ reconcileSchedule: true/.test(src), 'save-config uses persistConfig');
+assert.ok(/event\.sender/.test(src) === false || /getView\(event\.sender\)/.test(src), 'IPC forwards sender to the controller for binding');
+console.log('model-notice wiring landmark OK');
 ```
 
-- [ ] **Step 8: Run the wiring test + parse check**
+- [ ] **Step 8: Run the landmark + parse check**
 
 Run: `node menubar/__tests__/model-notice-wiring.test.js && node --check menubar/main.js`
-Expected: `model-notice wiring OK` and a clean parse.
+Expected: `model-notice wiring landmark OK` and a clean parse.
 
 - [ ] **Step 9: Commit**
 
 ```bash
 git add menubar/main.js menubar/__tests__/model-notice-wiring.test.js
-git commit -m "feat(model-notice): stable startup trigger, hardened modal + IPC, shared persistConfig save path"
+git commit -m "feat(model-notice): wire DI controller into main (startup trigger, IPC, close/quit, shared save)"
 ```
 
 ---
 
-## Task 7: Full-suite verification + manual smoke
+## Task 8: Full release-gate verification + isolated smoke
 
 **Files:** none (verification).
 
-- [ ] **Step 1: Run the whole menubar test set**
+- [ ] **Step 1: Parse-check every changed/created JS file**
 
 Run:
 ```bash
 cd ~/.claude-worktrees/repo-radar-model-notice
+for f in menubar/model-policy.js menubar/model-notice.js menubar/model-notice-controller.js menubar/main.js \
+         menubar/renderer/model-update.js menubar/renderer/model-update-preload.js; do node --check "$f" || exit 1; done
+echo "parse OK"
+```
+Expected: `parse OK`.
+
+- [ ] **Step 2: Run the model-notice unit + landmark suites**
+
+Run:
+```bash
 node menubar/__tests__/model-policy.test.js
 node menubar/__tests__/dropdown.test.js
 node menubar/__tests__/drift-check.js
 node menubar/__tests__/model-notice-wiring.test.js
-node --test menubar/__tests__/model-notice.test.js
+node --test menubar/__tests__/model-notice.test.js menubar/__tests__/model-notice-controller.test.js
 ```
-Expected: every script prints its `OK` line and `node --test` reports `pass` with `fail 0`.
+Expected: each script prints its `OK` line; `node --test` reports `pass` with `fail 0`.
 
-- [ ] **Step 2: Manual smoke on a stable-channel dev run** — seed a saved model, confirm the notice, each action, and dedup:
+- [ ] **Step 3: Run the inherited Spec 2A + release gates (must stay green after this feature)**
 
+Run:
 ```bash
-# migration+suggestion (compound):
-mkdir -p ~/.config/repo-radar && printf '{"ai_model":"gemini/gemini-2.0-flash"}' > ~/.config/repo-radar/config.json
+# Spec 2A runtime suite + its main wiring
+node --test menubar/runtime/__tests__/*.test.js
+node menubar/__tests__/main-runtime-wiring.test.js
+# dependency matrix preflight (Spec 2A release gate)
+node menubar/scripts/pydeps.js --assert-matrix
+# Python package tests (repo_radar is untouched, but prove no regression)
+python3 -m pytest repo_radar/tests -q
 ```
-Launch the app on the **stable** channel. Verify: the modal shows the compound copy; **Keep** persists `ai_model=gemini/gemini-2.5-flash` and `model_notice_ack=suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash` in `~/.config/repo-radar/config.json`; relaunch shows **no** notice (dedup); the LaunchAgent plist env `AI_MODEL` matches the new model (`plutil -p ~/Library/LaunchAgents/com.user.repo-radar.plist | grep AI_MODEL` or the channel's plist). Repeat with `ai_model` set to `claude-sonnet-4-6` (pure suggestion → Switch) and `claude-3-5-sonnet-20241022` (pure migration → OK).
+Expected: runtime suite `fail 0`; `main-runtime-wiring` prints OK; `--assert-matrix` validates all 10 cells; pytest passes. If `pydeps.js`/the lifecycle gate has a different invocation on merged `dev`, use the one the Spec 2A release checklist documents (Task 0 revalidation surfaces the exact commands).
 
-- [ ] **Step 3: Confirm dev suppression** — on a **dev** build with a compound `ai_model`, launch and verify **no** notice appears and `model_notice_ack` is NOT written.
+- [ ] **Step 4: Run the release lifecycle gate**
 
-- [ ] **Step 4: Final commit (if the smoke required any fix)** — otherwise nothing to commit; the feature is complete.
+Run the Spec 2A/release lifecycle gate exactly as the merged `dev` release checklist specifies (the vendor-date + model-lifecycle preflight referenced by `release.sh`). Expected: passes for the current date. Do not hand-wave — run the documented command and confirm green output.
+
+- [ ] **Step 5: Isolated, non-destructive manual smoke — NEVER against your own account**
+
+The app resolves config, LaunchAgents, and the launchctl gui domain from the running user. A temp `$HOME` isolates files but NOT the launchctl gui domain, so a real run would rewrite your config and load the production `com.user.repo-radar` label. Run the smoke in a **dedicated macOS test user account** (separate gui domain) — or a VM — with the packaged **stable** artifact. Do not run it as Matt's user.
+
+In the test account:
+```bash
+# compound (migration + suggestion):
+mkdir -p ~/.config/repo-radar && printf '{"ai_model":"gemini/gemini-2.0-flash"}' > ~/.config/repo-radar/config.json
+# launch the packaged STABLE Repo Radar.app in this account
+```
+Verify: the modal shows the compound copy; **Keep** writes `ai_model=gemini/gemini-2.5-flash` and `model_notice_ack=suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash` to `~/.config/repo-radar/config.json`; the plist **file** reflects the new model — `plutil -p ~/Library/LaunchAgents/com.user.repo-radar.plist | grep AI_MODEL`; a relaunch shows **no** notice (dedup). Repeat with `ai_model=claude-sonnet-4-6` (pure suggestion → **Switch** → `claude-sonnet-5`) and `ai_model=claude-3-5-sonnet-20241022` (pure migration → **OK** persists `claude-sonnet-5`). Tear down by deleting the test account (or its `~/.config/repo-radar` + `~/Library/LaunchAgents/com.user.repo-radar.plist`).
+
+- [ ] **Step 6: Dev-suppression smoke** — in the test account with a packaged **dev** build and a compound `ai_model`, launch and confirm **no** notice appears and `model_notice_ack` is NOT written.
+
+- [ ] **Step 7: Final** — no commit unless a smoke surfaced a fix. The feature is complete; hand off to the final whole-branch review (superpowers:requesting-code-review) + a Codex code-review brief before merging to `dev`.
 
 ---
 
 ## Self-review notes (already applied)
 
-- **Spec coverage:** §5 map+invariants → Tasks 1–2; §6 compute/signature/ack → Tasks 3–4; §7 trigger/persistConfig/finalizer/IPC/quit-escape → Tasks 4,6; §8 modal → Task 5; §11 tests → Tasks 3,4,6,7. Stable-only, sender-binding, provider-parity, dropdown membership, label fallback, compound-Keep-next-launch all have explicit tests.
-- **Type consistency:** `computeModelNotice`/`noticeSignature`/`resolveNoticeAction`/`planFinalize`/`persistConfig`/`renderNoticeText` signatures are identical across the task that defines them and Task 6's wiring.
-- **Sequencing:** Task 0 enforces Spec-2A-merged → rebase → revalidate before any code.
+- **Spec coverage:** §5 map+invariants → Tasks 1–2; §6 compute/signature/ack → Tasks 3–4; §7 trigger/persistConfig/finalizer/IPC/quit-escape → Tasks 4,6,7; §8 modal → Task 5; §11 tests → Tasks 3,4,6,8. Stable-only, sender-binding, provider-parity, dropdown membership, label fallback, compound-Keep-next-launch, save-failure, quit-escape, dedup all have explicit tests (pure or DI-controller behavioral).
+- **Testability (Codex):** all main-process behavior lives in the DI `model-notice-controller` and is tested with fakes; `main.js` is thin glue with only a static landmark test.
+- **Non-destructive verification (Codex):** the manual smoke runs in a dedicated macOS test account (not Matt's), reads the plist file rather than loading the production label, and never writes the real `~/.config/repo-radar/config.json`.
+- **Full gate (Codex):** Task 8 runs the runtime suite, `main-runtime-wiring`, Python tests, `pydeps.js --assert-matrix`, the lifecycle gate, and per-file parse checks — not just the model-notice tests.
+- **Type consistency:** controller/`planFinalize`/`persistConfig`/`renderNoticeText`/`computeModelNotice` signatures match across Tasks 3–7.
+- **Sequencing:** Task 0 gates on Spec-2A-merged (ancestry + file check) → rebase → revalidate before any code.
