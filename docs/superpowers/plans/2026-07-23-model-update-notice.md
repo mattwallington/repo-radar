@@ -708,6 +708,26 @@ test('quit escape: closeDecision allows close even when a failing save left it u
   state.quitting = true;
   assert.strictEqual(ctl.closeDecision(), 'allow');
 });
+test('getView: foreign sender gets null; the real sender gets the view', () => {
+  const { ctl } = harness();
+  const w = ctl.maybe();
+  assert.strictEqual(ctl.getView({ id: 999 }), null);
+  assert.ok(ctl.getView(w.webContents));
+});
+test('schedule-warning surfaced when reconcile fails (save still ok -> finalized)', () => {
+  const { ctl, state } = harness({ reconcileResult: { success: false, error: 'no launchctl' } });
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'switch');
+  assert.strictEqual(ctl.isFinalized(), true, 'schedule failure is non-fatal');
+  assert.deepStrictEqual(state.scheduleWarnings, ['no launchctl']);
+});
+test('migration Review: persists effective (heals retired id) and opens Settings', () => {
+  const { ctl, state } = harness({ config: { ai_model: 'claude-3-5-sonnet-20241022' } });
+  const w = ctl.maybe();
+  ctl.onAction(w.webContents, 'review');
+  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5');
+  assert.strictEqual(state.settingsOpened, 1);
+});
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -880,7 +900,7 @@ ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController
   if (res.ok && res.schedule && res.schedule.ok === false) surfaceScheduleWarning(res.schedule.error);
 ```
 
-Keep the handler's existing `event.reply('config-saved', result.success, result.error)` behavior; only the save+reconcile call changes so both paths share one primitive.
+Keep the handler's existing reply — `settingsWindow.webContents.send('config-saved', result.success, result.error)` (main.js:1983), NOT `event.reply`; only the save+reconcile call changes so both paths share one primitive.
 
 - [ ] **Step 7: Write the static landmark test** — create `menubar/__tests__/model-notice-wiring.test.js`:
 
@@ -949,26 +969,33 @@ node --test menubar/runtime/__tests__/*.test.js
 node menubar/__tests__/main-runtime-wiring.test.js
 # dependency matrix preflight (Spec 2A release gate)
 node menubar/scripts/pydeps.js --assert-matrix
-# Python package tests (repo_radar is untouched, but prove no regression)
-python3 -m pytest repo_radar/tests -q
+# Python package tests via the PROJECT venv (the suite includes the litellm 1.93.0 assertion,
+# so the system python3 is wrong here) — repo_radar is untouched, but prove no regression
+.venv/bin/python -m pytest repo_radar/tests -q
 ```
 Expected: runtime suite `fail 0`; `main-runtime-wiring` prints OK; `--assert-matrix` validates all 10 cells; pytest passes. If `pydeps.js`/the lifecycle gate has a different invocation on merged `dev`, use the one the Spec 2A release checklist documents (Task 0 revalidation surfaces the exact commands).
 
 - [ ] **Step 4: Run the release lifecycle gate**
 
-Run the Spec 2A/release lifecycle gate exactly as the merged `dev` release checklist specifies (the vendor-date + model-lifecycle preflight referenced by `release.sh`). Expected: passes for the current date. Do not hand-wave — run the documented command and confirm green output.
+Run the model-lifecycle gate explicitly:
+
+```bash
+python3 scripts/check_model_lifecycle.py --target-date 2026-07-23
+```
+Expected: green output (no retired/expired model in the shipped catalog for the target date). Update `--target-date` to the actual release date if it differs.
 
 - [ ] **Step 5: Isolated, non-destructive manual smoke — NEVER against your own account**
 
-The app resolves config, LaunchAgents, and the launchctl gui domain from the running user. A temp `$HOME` isolates files but NOT the launchctl gui domain, so a real run would rewrite your config and load the production `com.user.repo-radar` label. Run the smoke in a **dedicated macOS test user account** (separate gui domain) — or a VM — with the packaged **stable** artifact. Do not run it as Matt's user.
+The app resolves config, LaunchAgents, and the launchctl gui domain from the running user. A temp `$HOME` isolates files but NOT the launchctl gui domain, so a real run would rewrite your config and load the production `com.user.repo-radar` label. Run the smoke in a **dedicated macOS test user account** (separate gui domain) — or a VM — with the packaged **stable** artifact. Do not run it as Matt's user. **Creating and deleting that test account is an explicit operator action — the plan does not script it.**
 
-In the test account:
+In the test account, seed a config with an **enabled schedule** (otherwise `updateLaunchAgent` writes no plist, so the plist assertion below would inspect a file that never gets created):
 ```bash
-# compound (migration + suggestion):
-mkdir -p ~/.config/repo-radar && printf '{"ai_model":"gemini/gemini-2.0-flash"}' > ~/.config/repo-radar/config.json
+# compound (migration + suggestion), WITH a schedule so the LaunchAgent plist is generated:
+mkdir -p ~/.config/repo-radar
+printf '{"ai_model":"gemini/gemini-2.0-flash","schedule":{"enabled":true,"type":"daily","hour":9,"minute":0}}' > ~/.config/repo-radar/config.json
 # launch the packaged STABLE Repo Radar.app in this account
 ```
-Verify: the modal shows the compound copy; **Keep** writes `ai_model=gemini/gemini-2.5-flash` and `model_notice_ack=suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash` to `~/.config/repo-radar/config.json`; the plist **file** reflects the new model — `plutil -p ~/Library/LaunchAgents/com.user.repo-radar.plist | grep AI_MODEL`; a relaunch shows **no** notice (dedup). Repeat with `ai_model=claude-sonnet-4-6` (pure suggestion → **Switch** → `claude-sonnet-5`) and `ai_model=claude-3-5-sonnet-20241022` (pure migration → **OK** persists `claude-sonnet-5`). Tear down by deleting the test account (or its `~/.config/repo-radar` + `~/Library/LaunchAgents/com.user.repo-radar.plist`).
+Verify: the modal shows the compound copy; **Keep** writes `ai_model=gemini/gemini-2.5-flash` and `model_notice_ack=suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash` to `~/.config/repo-radar/config.json`; because the schedule is enabled, the plist **file** reflects the new model — `plutil -p ~/Library/LaunchAgents/com.user.repo-radar.plist | grep AI_MODEL`; a relaunch shows **no** notice (dedup). Repeat with `ai_model=claude-sonnet-4-6` (pure suggestion → **Switch** → `claude-sonnet-5`) and `ai_model=claude-3-5-sonnet-20241022` (pure migration → **OK** persists `claude-sonnet-5`), keeping the schedule block. (If you test without an enabled schedule, skip the plist assertion — no plist is written by design.) Tear down by removing the test account's `~/.config/repo-radar` + `~/Library/LaunchAgents/com.user.repo-radar.plist`; deleting the account itself is a manual operator step.
 
 - [ ] **Step 6: Dev-suppression smoke** — in the test account with a packaged **dev** build and a compound `ai_model`, launch and confirm **no** notice appears and `model_notice_ack` is NOT written.
 
