@@ -67,7 +67,7 @@ test('detectStableManaged: true only after a real managed+healthy stable bootstr
   const r = await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle, _skipQuiesce: true });
   assert.strictEqual(r.status, 'ok', r.reason);
   // inject a no-loaded-job launchctl stub so the check doesn't consult the real machine
-  assert.strictEqual(detectStableManaged({ home, exec: () => ({ status: 1, out: '' }) }).managed, true);
+  assert.strictEqual(detectStableManaged({ home, exec: () => ({ status: 1, out: 'Could not find service' }), appVersionPath: '/nonexistent/VERSION' }).managed, true);
 });
 
 test('detectStableManaged: false on a misleading plist or a stale loaded job (round-5 §3.3)', { timeout: 180000 }, async () => {
@@ -79,22 +79,41 @@ test('detectStableManaged: false on a misleading plist or a stale loaded job (ro
   const bundle = { repoRadarDir: path.join(WT, 'repo_radar'), launcher: path.join(WT, 'repo-radar'), versionFile: path.join(bd, 'VERSION') };
   await ensureRuntime({ home, channel: 'stable', appVersion: '1.0.27', bundle, _skipQuiesce: true });
   const L = layout(home, 'stable');
-  const noJob = () => ({ status: 1, out: '' }); // launchctl print: no loaded job
-  assert.strictEqual(detectStableManaged({ home, exec: noJob }).managed, true, 'managed baseline');
+  const noJob = () => ({ status: 1, out: 'Could not find service' }); // launchctl print: no loaded job
+  assert.strictEqual(detectStableManaged({ home, exec: noJob, appVersionPath: '/nonexistent/VERSION' }).managed, true, 'managed baseline');
 
-  // a MISLEADING plist: ProgramArguments launches a legacy binary, but the managed path is
-  // mentioned only in an env var. plutil -extract must reject it (text search would pass).
   const plistDir = path.join(home, 'Library', 'LaunchAgents'); fs.mkdirSync(plistDir, { recursive: true });
   const plist = path.join(plistDir, 'com.user.repo-radar.plist');
-  fs.writeFileSync(plist,
-    '<?xml version="1.0"?><!DOCTYPE plist><plist version="1.0"><dict>' +
+  const plistHdr = '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>';
+  // a VALID managed plist (ProgramArguments[0] == the managed runner) must be ACCEPTED —
+  // regression for plutil's `/`->`\/` json escaping that had been false-rejecting it.
+  fs.writeFileSync(plist, `${plistHdr}<key>ProgramArguments</key><array><string>${L.runSync}</string></array></dict></plist>`);
+  assert.strictEqual(detectStableManaged({ home, exec: noJob, appVersionPath: '/nonexistent/VERSION' }).managed, true, 'valid managed plist accepted');
+
+  // a MISLEADING plist: ProgramArguments launches a legacy binary, but the managed path is
+  // mentioned only in an env var. plutil ProgramArguments.0 must reject it (text search would pass).
+  fs.writeFileSync(plist, `${plistHdr}` +
     '<key>ProgramArguments</key><array><string>/tmp/legacy-1.0.26</string></array>' +
     `<key>EnvironmentVariables</key><dict><key>NOTE</key><string>${L.runSync}</string></dict>` +
     '</dict></plist>');
-  assert.strictEqual(detectStableManaged({ home, exec: noJob }).managed, false, 'misleading plist rejected');
+  assert.strictEqual(detectStableManaged({ home, exec: noJob, appVersionPath: '/nonexistent/VERSION' }).managed, false, 'misleading plist rejected');
   fs.rmSync(plist);
 
-  // a STALE loaded job whose program is not the managed runner -> unmanaged
-  const staleJob = () => ({ status: 0, out: 'program = /tmp/legacy-1.0.26\n' });
-  assert.strictEqual(detectStableManaged({ home, exec: staleJob }).managed, false, 'stale loaded job rejected');
+  // a STALE loaded job whose first argument is not the managed runner -> unmanaged
+  const staleJob = () => ({ status: 0, out: 'arguments = {\n\t\t0 => /tmp/legacy-1.0.26\n\t}\n' });
+  assert.strictEqual(detectStableManaged({ home, exec: staleJob, appVersionPath: '/nonexistent/VERSION' }).managed, false, 'stale loaded job rejected');
+  // an ambiguous launchctl error (not "could not find") -> fail closed
+  const ambiguous = () => ({ status: 5, out: 'Operation not permitted' });
+  assert.strictEqual(detectStableManaged({ home, exec: ambiguous, appVersionPath: '/nonexistent/VERSION' }).managed, false, 'ambiguous launchctl error fails closed');
+});
+
+test('quiesceLegacyStable fails closed when a BUNDLED-path legacy sync is running (round-7 Crit1)', async () => {
+  const home = '/tmp/rr-home-bundled';
+  const exec = (cmd, args) => {
+    if (cmd === 'launchctl' && args[0] === 'print') return { status: 1, out: 'Could not find' }; // label gone
+    if (cmd === 'ps') return { status: 0, out: 'python3 /Applications/Repo Radar.app/Contents/Resources/resources/repo-radar sync --status-server\n' };
+    return { status: 0, out: '' };
+  };
+  const r = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 300 });
+  assert.strictEqual(r.quiesced, false, 'bundled-path legacy sync detected -> not quiescent');
 });

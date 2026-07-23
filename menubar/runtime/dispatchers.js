@@ -18,15 +18,20 @@ if [ -e "$ROOT/repo-radar" ]; then
   echo "repo-radar-dev: legacy stable install present; run dev in an isolated HOME" >&2; exit 1
 fi
 # unloaded-but-installed old stable can reload its own plist outside the root lock. Inspect
-# the ACTUAL ProgramArguments (not text elsewhere) + any LOADED job (Codex round-5 §3.3).
+# the EXACT ProgramArguments[0] (raw, not json — avoids plutil's / -> \\/ escaping) + the
+# LOADED job's actual first argument, and fail closed on ambiguous launchctl errors (round-7).
 SPLIST="$HOME/Library/LaunchAgents/com.user.repo-radar.plist"
 if [ -f "$SPLIST" ]; then
-  /usr/bin/plutil -extract ProgramArguments json -o - "$SPLIST" 2>/dev/null | grep -q "$ROOT/stable/run-sync.sh" \\
+  SPROG="$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$SPLIST" 2>/dev/null || true)"
+  [ "$SPROG" = "$ROOT/stable/run-sync.sh" ] \\
     || { echo "repo-radar-dev: stable LaunchAgent does not launch the managed runner; run dev in an isolated HOME" >&2; exit 1; }
 fi
-if launchctl print "gui/$(id -u)/com.user.repo-radar" >/dev/null 2>&1; then
-  launchctl print "gui/$(id -u)/com.user.repo-radar" 2>/dev/null | grep -q "$ROOT/stable/run-sync.sh" \\
+LP="$(launchctl print "gui/$(id -u)/com.user.repo-radar" 2>&1)"; LPRC=$?
+if [ "$LPRC" -eq 0 ]; then
+  printf '%s\\n' "$LP" | awk '/arguments = \\{/{f=1} f&&/=>/{sub(/^[^>]*=> */,"");print;exit}' | grep -qxF "$ROOT/stable/run-sync.sh" \\
     || { echo "repo-radar-dev: a stale stable job is loaded; run dev in an isolated HOME" >&2; exit 1; }
+elif ! printf '%s' "$LP" | grep -qi 'could not find'; then
+  echo "repo-radar-dev: cannot verify stable launchd state; run dev in an isolated HOME" >&2; exit 1
 fi
 SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
 { [ -L "$SCUR" ] && [ -f "$SDES" ] && [ -f "$ROOT/stable/run-sync.sh" ] && grep -q '"status": *"active"' "$SDES"; } \\
@@ -34,6 +39,10 @@ SCUR="$ROOT/stable/current"; SDES="$ROOT/stable/desired.json"
 SGEN="$(cd "$SCUR" && pwd -P)"
 SGENS="$(cd "$ROOT/stable/generations" 2>/dev/null && pwd -P || echo /nonexistent)"
 case "$SGEN" in "$SGENS/"*) : ;; *) echo "repo-radar-dev: stable runtime outside tree" >&2; exit 1 ;; esac
+SAPP="/Applications/Repo Radar.app/Contents/Resources/VERSION"
+if [ -f "$SAPP" ] && [ -f "$SGEN/VERSION" ] && [ "$(cat "$SAPP" 2>/dev/null)" != "$(cat "$SGEN/VERSION" 2>/dev/null)" ]; then
+  echo "repo-radar-dev: installed stable app version != managed runtime; run dev in an isolated HOME" >&2; exit 1
+fi
 # anchor stable's verify.py + manifest against stable's desired BEFORE executing it
 SVSHA="$(/usr/bin/shasum -a 256 "$SGEN/verify.py" | awk '{print $1}')"
 SMSHA="$(/usr/bin/shasum -a 256 "$SGEN/manifest.json" | awk '{print $1}')"

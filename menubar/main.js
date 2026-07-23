@@ -802,6 +802,32 @@ function surfaceRuntimeError(msg) {
   }
 }
 
+// Non-fatal: the runtime + manual "Sync Now" are healthy, but the SCHEDULED sync could
+// not be (re)installed. Surface it to the user (status log + tray + a notification with
+// relaunch guidance) instead of leaving it silent in the console (Codex round-7 I3).
+function surfaceScheduleWarning(msg) {
+  console.warn('[runtime] schedule warning:', msg);
+  try {
+    const status = loadStatus();
+    if (!status.errorList) status.errorList = [];
+    status.errorList.unshift({
+      timestamp: new Date().toISOString(),
+      repo: 'Schedule',
+      message: 'Scheduled sync setup failed — manual sync still works; relaunch to retry',
+      fullError: msg
+    });
+    status.errorLog = (status.errorLog || '') + `\n⚠️ Scheduled sync setup failed (manual sync still works): ${msg}\n`;
+    saveStatus(status);
+  } catch (e) { /* best effort */ }
+  if (tray && !tray.isDestroyed()) updateTrayMenu();
+  if (Notification.isSupported()) {
+    new Notification({
+      title: getAppDisplayName(),
+      body: 'Scheduled sync couldn’t be set up — manual sync still works. Relaunch to retry.'
+    }).show();
+  }
+}
+
 // Start status server
 function startStatusServer() {
   const expressApp = express();
@@ -2334,7 +2360,15 @@ app.whenReady().then(async () => {
         channel: runtimeChannel,
         appVersion: app.getVersion(),
         bundle,
-        hooks: { onFailure: surfaceRuntimeError, repointSchedule: updateLaunchAgent }
+        hooks: {
+          onFailure: surfaceRuntimeError,
+          repointSchedule: updateLaunchAgent,
+          // non-fatal: the runtime + manual sync are healthy, only the scheduled sync
+          // may be off. Surface it (Codex round-7 I3) so it isn't silent to the user.
+          // This hook fires on EVERY warning path (fast + activated), so it is the single
+          // surfacing point — do NOT also read res.scheduleWarning or it double-notifies.
+          onScheduleWarning: (msg) => surfaceScheduleWarning(msg)
+        }
       });
       if (res.status === 'failed') {
         // ensureRuntime() already invoked hooks.onFailure(redacted reason)
