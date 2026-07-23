@@ -82,6 +82,9 @@ Rules, asserted by `menubar/__tests__/drift-check.js` (JS-internal — no Python
   (so a switch lands on a model the user can also see and re-select);
 - every value is GA (does not end in `-preview`);
 - no value is itself a `MODEL_MIGRATIONS` key (targets must be current);
+- **`providerForModel(key) === providerForModel(value)`** — a suggestion never switches provider
+  (which would need a different API key the user may not have). The four rows comply; this guards
+  future rows (Codex minor);
 - no key equals its value.
 
 `suggestUpgrade` is always evaluated on the **effective** (post-migration) model (§6), covering
@@ -212,10 +215,16 @@ Any action not in the notice's list returns `null` (ignored, no write).
   modelUpdateWindow.webContents`, then `finalizeModelNotice(action)`.
 - `model-notice:get` (renderer fetches display strings): **also** verify `event.sender ===
   modelUpdateWindow.webContents` (Codex minor).
-- BrowserWindow `close`: `win.on('close', (e) => { if (_noticeFinalized) return; e.preventDefault();
-  finalizeModelNotice('close'); });` — the native close is *prevented*, the conservative action is
-  persisted by main, and the window is destroyed only after persistence succeeds. Button IPC and
-  the native close therefore share the one authoritative finalizer (race-safe, idempotent).
+- BrowserWindow `close`: `win.on('close', (e) => { if (_noticeFinalized || appIsQuitting) return;
+  e.preventDefault(); finalizeModelNotice('close'); });` — on a normal close the native close is
+  *prevented*, the conservative action is persisted by main, and the window is destroyed only after
+  persistence succeeds. Button IPC and the native close share the one authoritative finalizer
+  (race-safe, idempotent).
+- **App-quit escape (Codex Important).** A persistence failure must never trap `app.quit()`. Set
+  `appIsQuitting = true` in an `app.on('before-quit', …)` handler; while quitting, the `close`
+  handler above short-circuits (no `preventDefault`), so the window closes **without** saving and
+  the ack is left unchanged — the notice simply retries next launch. Without this, an unwritable
+  `config.json` would make every quit re-enter the finalizer and leave Repo Radar unable to quit.
 
 ### Renderer isolation
 
@@ -238,7 +247,9 @@ idempotency and persistence live in main (§7). Render shapes:
   in its tier is also available: **{effective}** → **{suggested}**."
   Buttons: **Switch to {suggested}** (`switch`) · **Keep {effective}** (`keep`) · **Review Models…** (`review`).
 
-Labels are humanized via an id→label map derived from the Settings dropdown.
+Labels are humanized via an id→label map derived from the Settings dropdown. A retired id absent
+from that map (retired ids are not dropdown options) falls back to displaying its raw id string
+(Codex minor) — so `from` always renders something meaningful.
 
 ## 9. Sequencing (Codex point 9)
 
@@ -280,6 +291,10 @@ writing-plans → subagent-driven implementation. Both features ship in **v1.0.2
   before opening Settings (retired id healed even if Settings is closed unsaved).
 - **Native-close/button race (Important 3):** a `close` and a button action resolve to a single
   finalize (idempotent `_noticeFinalized`); the native close persists via main before destroy.
+- **App-quit escape (Important):** with `saveConfigToFile` failing, a *normal* close keeps the
+  window open (finalize did not succeed), but with `appIsQuitting = true` the `close` handler
+  short-circuits and the window closes without saving — assert the quit is not blocked and the ack
+  is unchanged (re-shows next launch).
 - **IPC hardening:** a foreign `event.sender` is ignored on both `model-notice:action` and
   `model-notice:get`; a stale action (recomputed signature ≠ window `_sig`) writes nothing and
   closes; an out-of-allow-list action is ignored.
