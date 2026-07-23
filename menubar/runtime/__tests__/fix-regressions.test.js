@@ -135,6 +135,37 @@ test('Crit round8: every legacy entry point is neutralized BEFORE the quiescence
   assert.ok(atScan.wrapperDisabled, 'legacy wrapper already disabled at scan time');
 });
 
+test('Imp round9: a failing installDispatchers still retires the launcher, disables the schedule, attempts quiesce, and rejects', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-neut-fail-'));
+  fs.mkdirSync(path.join(home, '.repo-radar'), { recursive: true });
+  fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.config', 'repo-radar'), { recursive: true });
+  const legacyLauncher = path.join(home, '.repo-radar', 'repo-radar');
+  fs.writeFileSync(legacyLauncher, '#!/bin/sh\necho legacy\n');
+  const plist = path.join(home, 'Library', 'LaunchAgents', 'com.user.repo-radar.plist');
+  fs.writeFileSync(plist, '<plist/>');
+  const wrapper = path.join(home, '.config', 'repo-radar', 'run-sync.sh');
+  fs.writeFileSync(wrapper, '#!/bin/sh\n# legacy\n');
+
+  let quiesceAttempted = false;
+  const quiesce = async () => { quiesceAttempted = true; return { quiesced: true, reason: 'test' }; };
+  await assert.rejects(
+    neutralizeLegacyStableThenQuiesce({
+      home,
+      installDispatchers: () => { throw new Error('install boom'); },
+      skipQuiesce: false,
+      quiesce,
+    }),
+    /neutralization failed|install boom/,
+    'a failed neutralization step still rejects (hard-block)'
+  );
+  // Even though installDispatchers threw, EVERY other safety action ran (best-effort neutralization):
+  assert.ok(!fs.existsSync(legacyLauncher), 'legacy home launcher retired fail-closed (no live launcher)');
+  assert.ok(fs.existsSync(`${plist}.legacy-disabled`), 'legacy schedule plist disabled');
+  assert.ok(!fs.existsSync(wrapper), 'legacy wrapper disabled');
+  assert.ok(quiesceAttempted, 'quiescence/bootout was still attempted despite the earlier failure');
+});
+
 test('Imp2 round5: stable schedule reconciled on the healthy fast path too (crash-recovery)', { timeout: 180000 }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-sched-'));
   let repoints = 0;

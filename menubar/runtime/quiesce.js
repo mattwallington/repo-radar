@@ -63,8 +63,10 @@ function _legacyStatusfileActive(home, now = Date.now()) {
   try { j = JSON.parse(fs.readFileSync(sf, 'utf8')); }
   catch (_) { return true; }                                  // recent + torn/unreadable write -> fail closed
   const lastSyncMs = j && typeof j.lastSync === 'string' ? Date.parse(j.lastSync) : NaN;
-  // a COMPLETED snapshot: the last write IS (about) the completion write -> not in flight.
-  if (Number.isFinite(lastSyncMs) && (st.mtimeMs - lastSyncMs) <= STATUSFILE_COMPLETE_TOL_MS) return false;
+  // a COMPLETED snapshot: the last write IS (about) the completion write -> not in flight. Use an
+  // ABSOLUTE delta (Codex round-9) so a bogus FUTURE lastSync (mtime - lastSync is large negative)
+  // can't slip under an upper-bound-only check and be misclassified as idle; it stays in flight.
+  if (Number.isFinite(lastSyncMs) && Math.abs(st.mtimeMs - lastSyncMs) <= STATUSFILE_COMPLETE_TOL_MS) return false;
   return Array.isArray(j.repos) && j.repos.some((r) => typeof r.percent === 'number' && r.percent < 100);
 }
 

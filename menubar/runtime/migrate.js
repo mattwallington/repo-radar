@@ -13,13 +13,15 @@ function installDispatcher(home, channel) {
 // (non-destructive) ONLY after the stable dispatcher is in place AND a current
 // activation exists (Codex R1-4 / R2-1). Returns the moved-to path, or null if
 // there is nothing to retire or the guards aren't satisfied yet.
-function retireLegacyLauncher(home, { now = Date.now() } = {}) {
+function retireLegacyLauncher(home, { now = Date.now(), failClosed = false } = {}) {
   const legacy = path.join(home, '.repo-radar', 'repo-radar');
   if (!fs.existsSync(legacy)) return null;
-  // The generic stable dispatcher must already own the PATH CLI first (it overwrites the
-  // legacy ~/.local/bin/repo-radar symlink) — then retiring is safe even pre-first-activation,
-  // so a bootstrap identity failure still neutralizes the legacy launcher (Codex Crit1).
-  if (!fs.existsSync(cliPath(home, 'stable'))) return null;
+  // Normally we retire only AFTER the generic dispatcher owns the PATH CLI (it overwrites the
+  // legacy ~/.local/bin/repo-radar symlink), so `repo-radar` on PATH always resolves to a
+  // runnable dispatcher (Codex R1-4/R2-1). But on a FAIL-CLOSED bootstrap (Codex round-9) the
+  // hard-block contract prefers a temporarily-dangling PATH symlink over serving stale Python if
+  // the dispatcher install fails — so `failClosed` skips that guard and retires unconditionally.
+  if (!failClosed && !fs.existsSync(cliPath(home, 'stable'))) return null;
   const dst = path.join(home, '.repo-radar', `legacy-${now}`);
   fs.mkdirSync(dst, { recursive: true, mode: 0o700 });
   const movedTo = path.join(dst, 'repo-radar');

@@ -168,6 +168,12 @@ test('quiesceLegacyStable statusfile leg: in-flight blocks; a completed snapshot
   fs.writeFileSync(sf, JSON.stringify({ lastSync: new Date().toISOString(), repos: [{ name: 'a/b', percent: 10 }] }));
   const completed = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 2000 });
   assert.strictEqual(completed.quiesced, true, 'a normally-completed sub-100 snapshot does not block quiescence');
+  // A bogus FUTURE lastSync must NOT slip under the completion window (absolute-delta guard, round-9):
+  // a fresh sub-100 file with lastSync far in the future is still treated as in-flight -> blocks.
+  fs.writeFileSync(sf, JSON.stringify({ lastSync: '2099-01-01T00:00:00.000Z', repos: [{ name: 'a/b', percent: 30 }] }));
+  const future = await quiesceLegacyStable({ home, exec, sleep: fastSleep, uid: 501, timeoutMs: 300 });
+  assert.strictEqual(future.quiesced, false, 'a future lastSync does not count as a completed snapshot');
+  assert.match(future.reason, /statusfile/);
   // STALE: fresh-looking content but mtime backdated past the recency window.
   fs.writeFileSync(sf, JSON.stringify({ lastSync: new Date(Date.now() - 10 * 60 * 1000).toISOString(), repos: [{ name: 'a/b', percent: 42 }] }));
   const old = Date.now() / 1000 - 3600; fs.utimesSync(sf, old, old);

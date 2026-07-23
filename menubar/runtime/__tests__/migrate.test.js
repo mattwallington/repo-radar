@@ -41,3 +41,13 @@ test('retireLegacyLauncher moves (not deletes) the legacy launcher once guards p
   assert.ok(fs.existsSync(movedTo), 'moved, not deleted');
   assert.ok(!fs.existsSync(path.join(home, '.repo-radar', 'repo-radar')), 'legacy removed from original path');
 });
+
+test('retireLegacyLauncher failClosed retires WITHOUT a dispatcher (round-9 hard-block)', () => {
+  const home = tmpHome();
+  fs.mkdirSync(path.join(home, '.repo-radar'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.repo-radar', 'repo-radar'), '#legacy'); // no dispatcher, no current
+  const movedTo = retireLegacyLauncher(home, { now: 999, failClosed: true });
+  assert.strictEqual(movedTo, path.join(home, '.repo-radar', 'legacy-999', 'repo-radar'));
+  assert.ok(fs.existsSync(movedTo), 'moved, not deleted');
+  assert.ok(!fs.existsSync(path.join(home, '.repo-radar', 'repo-radar')), 'legacy retired fail-closed even without a dispatcher');
+});

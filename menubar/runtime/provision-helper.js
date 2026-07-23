@@ -15,27 +15,35 @@ const { installDispatcher, retireLegacyLauncher, disableLegacySchedule } = requi
 const { quiesceLegacyStable } = require('./quiesce');
 const { redact } = require('./hashing');
 
-// STABLE legacy-bootstrap neutralization (Codex round-8 Crit). Neutralize EVERY future legacy
-// entry point BEFORE proving already-running children have exited, so a new 1.0.26 sync cannot
-// start from ~/.local/bin/repo-radar or ~/.repo-radar/repo-radar in the window between the final
-// scan and the retire (that child ignores the root lock and could overlap the current-flip).
-// Ordering is load-bearing:
-//   1. disableLegacySchedule  — move the plist + wrapper aside (fs, crash-safe): kills the SCHEDULE
-//   2. installDispatchers()   — generic CLI overwrites the legacy PATH CLI + generic run-sync
-//   3. retireLegacyLauncher   — move ~/.repo-radar/repo-radar aside: kills the HOME launcher
-//   4. quiesce                — ONLY now prove already-running legacy children have exited
-// Moving an entry point doesn't hide an already-running child from ps (its argv keeps the old
-// path), so step 4's scan is still authoritative for existing children while steps 1-3 prevent
+// STABLE legacy-bootstrap neutralization (Codex round-8 Crit + round-9 Imp). Neutralize EVERY
+// future legacy entry point BEFORE proving already-running children have exited, so a new 1.0.26
+// sync cannot start from ~/.local/bin/repo-radar or ~/.repo-radar/repo-radar in the window between
+// the final scan and the retire (that child ignores the root lock and could overlap the flip).
+// Two properties, both load-bearing:
+//   (a) FAIL-CLOSED order: retire the HOME launcher FIRST (its PATH symlink then dangles = fail
+//       closed) so a later installDispatchers() failure can never leave a LIVE legacy launcher —
+//       the hard-block contract prefers a temporarily-dangling PATH entry over serving stale
+//       Python. installDispatchers() then overwrites that symlink with the generic dispatcher.
+//   (b) BEST EFFORT: attempt every neutralization even if one throws, so a single failed mutation
+//       never skips the remaining safety actions (esp. the bootout/scan). Errors are collected and
+//       raised AFTER, so the caller still fails closed (desired stays PROVISIONING).
+// Moving an entry point doesn't hide an already-running child from ps (argv keeps the old path),
+// so the scan stays authoritative for existing children while the retire/install/disable prevent
 // new ones. `installDispatchers` is passed in so the shared every-activation install runs at the
-// exact same point in production and in tests. Throws if not quiescent (caller fails closed).
+// exact same point in production and in tests.
 async function neutralizeLegacyStableThenQuiesce({ home, installDispatchers, skipQuiesce, quiesce = quiesceLegacyStable }) {
-  disableLegacySchedule(home);
-  installDispatchers();
-  retireLegacyLauncher(home);
+  const errors = [];
+  const attempt = (label, fn) => { try { fn(); } catch (e) { errors.push(`${label}: ${e.message}`); } };
+  attempt('disableLegacySchedule', () => disableLegacySchedule(home));
+  attempt('retireLegacyLauncher', () => retireLegacyLauncher(home, { failClosed: true }));
+  attempt('installDispatchers', () => installDispatchers());
   if (!skipQuiesce) {
-    const q = await quiesce({ home });
-    if (!q.quiesced) throw new Error(`legacy not quiescent: ${q.reason}`);
+    let q;
+    try { q = await quiesce({ home }); }
+    catch (e) { q = { quiesced: false, reason: e.message }; }
+    if (!q.quiesced) errors.push(`quiesce: ${q.reason || 'not quiescent'}`);
   }
+  if (errors.length) throw new Error(`legacy neutralization failed: ${errors.join('; ')}`);
 }
 
 async function main() {
