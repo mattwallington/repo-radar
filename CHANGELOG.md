@@ -4,7 +4,11 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.27] - Unreleased
+## [1.0.27] - 2026-07-24
+
+### Added
+- **Packaged Python runtime binding.** The app now self-provisions a per-channel, per-version Python runtime — an immutable generation (a venv plus hash-pinned dependencies installed with `--require-hashes`) under `~/.repo-radar/<channel>/generations/`, activated atomically and run through generic self-verifying dispatchers that hold an execution lock. This is what makes the refreshed model catalog and the litellm bump actually reach existing installs on upgrade, instead of being stranded on a stale system Python. Legacy 1.0.26 launchers/schedules are quiesced and neutralized fail-closed during the first upgrade.
+- **Post-upgrade model notice.** On the first launch after an update, a one-time notice appears when your saved model was retired (it is migrated to the current same-tier model and the change is made durable) and/or a newer model in your tier is available (with a one-click switch). It never changes a deliberate choice on its own, appears only when there is something to act on, and does not repeat once addressed.
 
 ### Changed
 - Model catalog refreshed to the current Anthropic, Google, and OpenAI lineups. Default model is now **Claude Sonnet 5** (was Claude Sonnet 4.6). The Settings dropdown now has 18 models across 5 groups: ⭐ Recommended (Claude Sonnet 5, Claude Opus 4.8, Claude Haiku 4.5, Gemini 3.5 Flash, Gemini 3.1 Flash Lite, GPT-5.6 Terra, GPT-5.6 Luna), Anthropic (other), Google (other), OpenAI (other), and Advanced — Responses API (GPT-5.3 Codex, GPT-5.5 Pro).
