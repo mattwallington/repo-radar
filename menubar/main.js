@@ -17,6 +17,7 @@ const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
 let modelNoticeController = null;
+let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
 const MODEL_LABELS = parseModelLabels(fs.readFileSync(path.join(__dirname, 'renderer', 'settings.html'), 'utf8'));
 
 // Read version from VERSION file
@@ -852,8 +853,10 @@ function _openModelUpdateWindow(notice, sig) {
     e.preventDefault();
     modelNoticeController.finalize('close');
   });
+  win.on('closed', () => { if (modelUpdateWindow === win) modelUpdateWindow = null; });
   win.loadFile(path.join(__dirname, 'renderer', 'model-update.html'));
   win.once('ready-to-show', () => win.show());
+  modelUpdateWindow = win; // track so showSettingsWindow can focus it instead of coexisting
   return win;
 }
 
@@ -869,6 +872,7 @@ function buildModelNoticeController() {
     showScheduleWarning: (err) => surfaceScheduleWarning(err),
     isQuitting: () => appIsQuitting,
     openSettings: () => showSettingsWindow(),
+    isSettingsOpen: () => !!(settingsWindow && !settingsWindow.isDestroyed()),
   });
   return modelNoticeController;
 }
@@ -1557,6 +1561,14 @@ function showLogWindow() {
 
 // Show settings window
 function showSettingsWindow() {
+  // Never open Settings while an unresolved model notice is up (Codex code-review): a stale
+  // Settings snapshot could clobber the notice's write. Focus the notice instead. The notice's
+  // own "Review Models" path first finalizes + destroys the notice, so this guard is already
+  // false by the time it calls showSettingsWindow, and Settings opens normally.
+  if (modelUpdateWindow && !modelUpdateWindow.isDestroyed()) {
+    modelUpdateWindow.focus();
+    return;
+  }
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.show();
     settingsWindow.focus();

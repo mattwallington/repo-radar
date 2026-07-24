@@ -8,5 +8,7 @@ assert.ok(/require\(['"]\.\/model-notice-controller['"]\)/.test(src), 'requires 
 assert.ok(/before-quit['"]\s*,\s*\(\)\s*=>\s*\{\s*appIsQuitting = true/.test(src), 'before-quit sets appIsQuitting');
 assert.ok(/modelNoticeController\.maybe\(\)/.test(src), 'trigger is called at startup');
 assert.ok(/persistConfig\(config, \{ reconcileSchedule: true/.test(src), 'save-config uses persistConfig');
-assert.ok(/event\.sender/.test(src) === false || /getView\(event\.sender\)/.test(src), 'IPC forwards sender to the controller for binding');
+// Both IPC handlers must forward event.sender to the controller so it can bind to the notice window.
+assert.ok(/getView\(event\.sender\)/.test(src), 'get handler forwards event.sender to the controller');
+assert.ok(/onAction\(event\.sender,\s*action\)/.test(src), 'action handler forwards event.sender to the controller');
 console.log('model-notice wiring landmark OK');

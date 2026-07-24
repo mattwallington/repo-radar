@@ -13,6 +13,12 @@ function createModelNoticeController(deps) {
     if (!notice) return null;
     const sig = noticeSignature(notice);
     if (config.model_notice_ack === sig) return null;
+    // Never coexist with Settings (Codex code-review): Settings holds a full-config snapshot from
+    // when it opened and submits it wholesale on save, which would clobber the notice's model write
+    // + model_notice_ack with stale values. If Settings is open, DEFER — the notice re-fires on a
+    // later launch (ack was not written). The reverse (opening Settings while the notice is open) is
+    // blocked in showSettingsWindow, which focuses the notice instead.
+    if (deps.isSettingsOpen && deps.isSettingsOpen()) return null;
     finalized = false;
     win = deps.openWindow(notice, sig);
     win.sig = sig; win.notice = notice;

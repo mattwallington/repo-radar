@@ -4,13 +4,14 @@ const { createModelNoticeController } = require('../model-notice-controller');
 function harness(over = {}) {
   const state = {
     channel: 'stable', config: { ai_model: 'claude-sonnet-4-6' }, saved: [], reconciled: 0,
-    errors: [], scheduleWarnings: [], settingsOpened: 0, quitting: false, windows: [],
+    errors: [], scheduleWarnings: [], settingsOpened: 0, quitting: false, settingsOpen: false, windows: [],
     saveResult: { success: true }, reconcileResult: { success: true }, ...over,
   };
   const deps = {
     channel: state.channel,
     readConfig: () => ({ ...state.config }),
-    save: (c) => { state.saved.push({ ...c }); state.config = { ...c }; return state.saveResult; },
+    // only a SUCCESSFUL save mutates disk state — a failed save must leave config + ack untouched
+    save: (c) => { state.saved.push({ ...c }); if (state.saveResult.success) state.config = { ...c }; return state.saveResult; },
     reconcile: () => { state.reconciled++; return state.reconcileResult; },
     labels: {},
     openWindow: () => { const w = { webContents: { id: state.windows.length + 1 }, destroyed: false, destroy() { this.destroyed = true; } }; state.windows.push(w); return w; },
@@ -18,6 +19,7 @@ function harness(over = {}) {
     showScheduleWarning: (e) => state.scheduleWarnings.push(e),
     isQuitting: () => state.quitting,
     openSettings: () => { state.settingsOpened++; },
+    isSettingsOpen: () => state.settingsOpen,
   };
   return { ctl: createModelNoticeController(deps), state };
 }
@@ -54,7 +56,7 @@ test('onAction switch: persists suggested, reconciles, destroys, finalized', () 
   assert.strictEqual(w.destroyed, true);
   assert.strictEqual(ctl.isFinalized(), true);
 });
-test('save failure: not finalized, error surfaced, window kept, never reconciled', () => {
+test('save failure: not finalized, error surfaced, window kept, never reconciled, DISK+ACK unchanged, reopens', () => {
   const { ctl, state } = harness({ saveResult: { success: false, error: 'disk full' } });
   const w = ctl.maybe();
   ctl.onAction(w.webContents, 'switch');
@@ -62,6 +64,17 @@ test('save failure: not finalized, error surfaced, window kept, never reconciled
   assert.deepStrictEqual(state.errors, ['disk full']);
   assert.strictEqual(w.destroyed, false);
   assert.strictEqual(state.reconciled, 0);
+  // a failed save must NOT mutate disk state — model + ack are untouched
+  assert.strictEqual(state.config.ai_model, 'claude-sonnet-4-6');
+  assert.strictEqual(state.config.model_notice_ack, undefined);
+  // ...so a fresh controller on the same (unchanged) config reopens the notice next launch
+  const { ctl: ctl2 } = harness({ config: { ...state.config } });
+  assert.ok(ctl2.maybe(), 'notice reopens because the ack was never written');
+});
+test('maybe: deferred when Settings is open (avoids the stale-Settings-snapshot clobber)', () => {
+  const { ctl, state } = harness({ settingsOpen: true }); // actionable notice, but Settings is open
+  assert.strictEqual(ctl.maybe(), null);
+  assert.strictEqual(state.windows.length, 0, 'no notice window while Settings is open');
 });
 test('idempotent: a second action after finalize does nothing', () => {
   const { ctl, state } = harness();
