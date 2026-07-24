@@ -14,4 +14,16 @@ for (const [oldId, newId] of Object.entries(MODEL_MIGRATIONS)) {
   assert.ok(KNOWN_MODEL_IDS.has(newId), `target ${newId} in KNOWN_MODEL_IDS`);
 }
 assert.strictEqual(migrateModel('claude-sonnet-5'), 'claude-sonnet-5');
+
+const { MODEL_SUGGESTIONS, suggestUpgrade } = require('../model-policy');
+assert.deepStrictEqual(MODEL_SUGGESTIONS, {
+  'claude-sonnet-4-6': 'claude-sonnet-5',
+  'claude-opus-4-7': 'claude-opus-4-8',
+  'gemini/gemini-2.5-flash': 'gemini/gemini-3.5-flash',
+  'gemini/gemini-2.5-flash-lite': 'gemini/gemini-3.1-flash-lite',
+}, 'MODEL_SUGGESTIONS must be exactly the four normative rows');
+assert.strictEqual(suggestUpgrade('gemini/gemini-2.5-flash'), 'gemini/gemini-3.5-flash');
+assert.strictEqual(suggestUpgrade('claude-sonnet-5'), null, 'newest-in-tier has no suggestion');
+assert.strictEqual(suggestUpgrade(null), null);
+
 console.log('model-policy OK:', Object.keys(MODEL_MIGRATIONS).length, 'migrations');

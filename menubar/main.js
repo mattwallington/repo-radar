@@ -13,6 +13,12 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
+const { createModelNoticeController } = require('./model-notice-controller');
+const { parseModelLabels, persistConfig } = require('./model-notice');
+let appIsQuitting = false;
+let modelNoticeController = null;
+let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
+const MODEL_LABELS = parseModelLabels(fs.readFileSync(path.join(__dirname, 'renderer', 'settings.html'), 'utf8'));
 
 // Read version from VERSION file
 function getVersion() {
@@ -828,6 +834,49 @@ function surfaceScheduleWarning(msg) {
   }
 }
 
+function _readModelConfig() {
+  try { return JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'config.json'), 'utf8')); }
+  catch (e) { return {}; }
+}
+
+function _openModelUpdateWindow(notice, sig) {
+  const win = new BrowserWindow({
+    width: 460, height: 220, resizable: false, minimizable: false, maximizable: false,
+    fullscreenable: false, title: 'Repo Radar — Models', show: false,
+    webPreferences: {
+      contextIsolation: true, nodeIntegration: false, sandbox: true,
+      preload: path.join(__dirname, 'renderer', 'model-update-preload.js'),
+    },
+  });
+  win.on('close', (e) => {
+    if (!modelNoticeController || modelNoticeController.closeDecision() === 'allow') return;
+    e.preventDefault();
+    modelNoticeController.finalize('close');
+  });
+  win.on('closed', () => { if (modelUpdateWindow === win) modelUpdateWindow = null; });
+  win.loadFile(path.join(__dirname, 'renderer', 'model-update.html'));
+  win.once('ready-to-show', () => win.show());
+  modelUpdateWindow = win; // track so showSettingsWindow can focus it instead of coexisting
+  return win;
+}
+
+function buildModelNoticeController() {
+  modelNoticeController = createModelNoticeController({
+    channel: runtimeChannel,
+    readConfig: _readModelConfig,
+    save: saveConfigToFile,
+    reconcile: updateLaunchAgent,
+    labels: MODEL_LABELS,
+    openWindow: _openModelUpdateWindow,
+    showError: (err) => dialog.showErrorBox('Repo Radar', `Could not save model change: ${err || 'unknown error'}`),
+    showScheduleWarning: (err) => surfaceScheduleWarning(err),
+    isQuitting: () => appIsQuitting,
+    openSettings: () => showSettingsWindow(),
+    isSettingsOpen: () => !!(settingsWindow && !settingsWindow.isDestroyed()),
+  });
+  return modelNoticeController;
+}
+
 // Start status server
 function startStatusServer() {
   const expressApp = express();
@@ -1512,6 +1561,14 @@ function showLogWindow() {
 
 // Show settings window
 function showSettingsWindow() {
+  // Never open Settings while an unresolved model notice is up (Codex code-review): a stale
+  // Settings snapshot could clobber the notice's write. Focus the notice instead. The notice's
+  // own "Review Models" path first finalizes + destroys the notice, so this guard is already
+  // false by the time it calls showSettingsWindow, and Settings opens normally.
+  if (modelUpdateWindow && !modelUpdateWindow.isDestroyed()) {
+    modelUpdateWindow.focus();
+    return;
+  }
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.show();
     settingsWindow.focus();
@@ -1964,27 +2021,24 @@ ipcMain.on('clear-errors', (event) => {
 });
 
 ipcMain.on('save-config', (event, config) => {
-  const result = saveConfigToFile(config);
-  
-  // If save successful, update LaunchAgent with new schedule
-  if (result.success) {
-    const updateResult = updateLaunchAgent(config);
-    if (!updateResult.success) {
-      console.error('Failed to update LaunchAgent:', updateResult.error);
-      if (settingsWindow && !settingsWindow.isDestroyed()) {
-        settingsWindow.webContents.send('config-saved', false, 
-          'Config saved but failed to update schedule: ' + updateResult.error);
-      }
-      return;
+  // Unified save+reconcile primitive (shared with the model-notice finalize path), but the
+  // Settings reply semantics are preserved EXACTLY as before this refactor: a schedule-only
+  // failure still surfaces INLINE in the Settings window as config-saved(false, ...) rather than
+  // flipping to success + a separate tray warning.
+  const res = persistConfig(config, { reconcileSchedule: true, save: saveConfigToFile, reconcile: updateLaunchAgent });
+  const scheduleFailed = res.ok && res.schedule && res.schedule.ok === false;
+
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (scheduleFailed) {
+      console.error('Failed to update LaunchAgent:', res.schedule.error);
+      settingsWindow.webContents.send('config-saved', false, 'Config saved but failed to update schedule: ' + (res.schedule.error || ''));
+    } else {
+      settingsWindow.webContents.send('config-saved', res.ok, res.error);
     }
   }
-  
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.webContents.send('config-saved', result.success, result.error);
-  }
-  
-  // Update tray menu to reflect new repo count
-  if (result.success) {
+
+  // Update tray menu to reflect new repo count (only on a fully-successful save, as before)
+  if (res.ok && !scheduleFailed) {
     setTimeout(() => {
       updateTrayMenu();
     }, 500);
@@ -2079,6 +2133,9 @@ ipcMain.on('stop-sync', (event) => {
     logWindow.webContents.send('terminal-output', '\n\n⏹ Sync cancelled by user\n\n');
   }
 });
+
+ipcMain.handle('model-notice:get', (event) => modelNoticeController ? modelNoticeController.getView(event.sender) : null);
+ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController) modelNoticeController.onAction(event.sender, action); });
 
 // Check if we need to catch up on a missed sync
 function checkMissedSync() {
@@ -2390,6 +2447,9 @@ app.whenReady().then(async () => {
     }
   }
 
+  buildModelNoticeController();
+  modelNoticeController.maybe();
+
   // Set up auto-updater
   setupAutoUpdater();
 
@@ -2441,6 +2501,8 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', (e) => {
   e.preventDefault(); // Prevent quit when windows close
 });
+
+app.on('before-quit', () => { appIsQuitting = true; });
 
 app.on('before-quit', () => {
   stopIconAnimation();

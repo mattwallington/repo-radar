@@ -102,4 +102,15 @@ function providerForModel(model) {
 
 function migrateModel(model) { return (model && MODEL_MIGRATIONS[model]) || model; }
 
-module.exports = { DEFAULT_MODEL, MODEL_MIGRATIONS, KNOWN_MODEL_IDS, providerForModel, migrateModel };
+// Same-tier, newer-generation upgrade suggestions for the post-upgrade notice. UI policy only,
+// JS-only (no Python consumer). Invariants enforced by menubar/__tests__/drift-check.js.
+const MODEL_SUGGESTIONS = {
+  'claude-sonnet-4-6': 'claude-sonnet-5',
+  'claude-opus-4-7': 'claude-opus-4-8',
+  'gemini/gemini-2.5-flash': 'gemini/gemini-3.5-flash',
+  'gemini/gemini-2.5-flash-lite': 'gemini/gemini-3.1-flash-lite',
+};
+
+function suggestUpgrade(model) { return (model && MODEL_SUGGESTIONS[model]) || null; }
+
+module.exports = { DEFAULT_MODEL, MODEL_MIGRATIONS, KNOWN_MODEL_IDS, MODEL_SUGGESTIONS, providerForModel, migrateModel, suggestUpgrade };

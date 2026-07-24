@@ -1,7 +1,8 @@
 const assert = require('assert');
 const path = require('path');
+const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { MODEL_MIGRATIONS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel } = require('../model-policy');
+const { MODEL_MIGRATIONS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel, MODEL_SUGGESTIONS } = require('../model-policy');
 const root = path.join(__dirname, '..', '..');
 const py = process.platform === 'win32' ? 'python' : 'python3';
 
@@ -30,3 +31,20 @@ for (const [id, pyProv] of Object.entries(p.prov)) {
   assert.strictEqual(jsProv === undefined ? null : jsProv, pyProv, `provider drift for ${JSON.stringify(id)}: js=${jsProv} py=${pyProv}`);
 }
 console.log('drift OK:', p.k.length, 'known,', Object.keys(p.m).length, 'migrations,', Object.keys(p.prov).length, 'provider fixtures');
+
+// Parse the selectable ai-model dropdown values from settings.html.
+const _html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+const _sel = _html.slice(_html.indexOf('id="ai-model"'));
+const _selBody = _sel.slice(0, _sel.indexOf('</select>'));
+const DROPDOWN = new Set([..._selBody.matchAll(/<option value="([^"]+)"/g)].map(m => m[1]));
+
+for (const [from, to] of Object.entries(MODEL_SUGGESTIONS)) {
+  assert.ok(KNOWN_MODEL_IDS.has(from), `suggestion key not in KNOWN_MODEL_IDS: ${from}`);
+  assert.ok(KNOWN_MODEL_IDS.has(to), `suggestion target not in KNOWN_MODEL_IDS: ${to}`);
+  assert.ok(DROPDOWN.has(to), `suggestion target not a settings.html dropdown option: ${to}`);
+  assert.ok(!to.endsWith('-preview'), `suggestion target must be GA (not preview): ${to}`);
+  assert.ok(!(to in MODEL_MIGRATIONS), `suggestion target must be current (not a migration key): ${to}`);
+  assert.strictEqual(providerForModel(from), providerForModel(to), `suggestion crosses provider: ${from} -> ${to}`);
+  assert.notStrictEqual(from, to, `suggestion is a self-map: ${from}`);
+}
+console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).length, 'rows');
