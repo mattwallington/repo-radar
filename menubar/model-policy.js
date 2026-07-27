@@ -47,6 +47,7 @@ const KNOWN_MODEL_IDS = new Set([
   'claude-opus-4-6-20260205',
   'claude-opus-4-7',
   'claude-opus-4-8',
+  'claude-opus-5',
   'claude-sonnet-4-5',
   'claude-sonnet-4-5-20250929',
   'claude-sonnet-4-6',
@@ -58,6 +59,7 @@ const KNOWN_MODEL_IDS = new Set([
   'gemini/gemini-3.1-flash-lite',
   'gemini/gemini-3.1-pro-preview',
   'gemini/gemini-3.5-flash',
+  'gemini/gemini-3.6-flash',
   'gemini/gemini-flash-latest',
   'gemini/gemini-flash-lite-latest',
   'gemini/gemini-pro-latest',
@@ -104,10 +106,15 @@ function migrateModel(model) { return (model && MODEL_MIGRATIONS[model]) || mode
 
 // Same-tier, newer-generation upgrade suggestions for the post-upgrade notice. UI policy only,
 // JS-only (no Python consumer). Invariants enforced by menubar/__tests__/drift-check.js.
+// Targets are always the CURRENT best in tier, never an intermediate generation — otherwise a
+// user two generations back gets walked forward one notice per launch (4.7 -> 4.8, then 4.8 -> 5).
 const MODEL_SUGGESTIONS = {
   'claude-sonnet-4-6': 'claude-sonnet-5',
-  'claude-opus-4-7': 'claude-opus-4-8',
-  'gemini/gemini-2.5-flash': 'gemini/gemini-3.5-flash',
+  'claude-opus-4-7': 'claude-opus-5',
+  'claude-opus-4-8': 'claude-opus-5',
+  // Google names 3.6 Flash as 2.5 Flash's replacement on the deprecations page.
+  'gemini/gemini-2.5-flash': 'gemini/gemini-3.6-flash',
+  'gemini/gemini-3.5-flash': 'gemini/gemini-3.6-flash',
   'gemini/gemini-2.5-flash-lite': 'gemini/gemini-3.1-flash-lite',
 };
 

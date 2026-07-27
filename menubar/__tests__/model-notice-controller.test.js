@@ -88,7 +88,7 @@ test('compound Keep: persists effective + acks resulting suggestion; re-run dedu
   const w = ctl.maybe();
   ctl.onAction(w.webContents, 'keep');
   assert.strictEqual(state.saved[0].ai_model, 'gemini/gemini-2.5-flash');
-  assert.strictEqual(state.saved[0].model_notice_ack, 'suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.5-flash');
+  assert.strictEqual(state.saved[0].model_notice_ack, 'suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.6-flash');
   assert.strictEqual(ctl.maybe(), null, 'resulting config dedups the follow-on suggestion');
 });
 test('closeDecision is pure: handle normally, allow when finalized', () => {

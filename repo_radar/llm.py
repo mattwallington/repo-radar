@@ -17,6 +17,7 @@ DEFAULT_MODEL = 'claude-sonnet-5'
 KNOWN_LIMITS = {
     # ── Anthropic Claude ──────────────────────────────────────────────
     # Claude 5.x / newest 4.x (latest)
+    "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4-7": 1000000,
@@ -38,6 +39,7 @@ KNOWN_LIMITS = {
 
     # ── Google Gemini ─────────────────────────────────────────────────
     # Gemini 3.x
+    "gemini/gemini-3.6-flash": 1048576,
     "gemini/gemini-3.5-flash": 1048576,
     "gemini/gemini-3.1-pro-preview": 1048576,
     "gemini/gemini-3.1-flash-lite": 1048576,

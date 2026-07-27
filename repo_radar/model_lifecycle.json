@@ -126,6 +126,12 @@
     "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
   },
   {
+    "id": "claude-opus-5",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  },
+  {
     "id": "claude-sonnet-4-20250514",
     "status": "retired",
     "shutdown_date": "2026-06-15",
@@ -247,6 +253,12 @@
   },
   {
     "id": "gemini/gemini-3.5-flash",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
+  },
+  {
+    "id": "gemini/gemini-3.6-flash",
     "status": "active",
     "shutdown_date": null,
     "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
