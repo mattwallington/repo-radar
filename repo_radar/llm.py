@@ -501,8 +501,138 @@ Repository files:
                 raise
 
 
-def combine_chunk_analyses(full_name, analyses):
-    """Combine multiple chunk analyses into a cohesive report."""
+# Guards for hierarchical synthesis. Coverage is the priority — every chunk reaches the final
+# report — so these bound the work rather than dropping input; hitting them degrades to an
+# explicit, warned truncation instead of silently analysing part of the repository.
+SYNTHESIS_MAX_DEPTH = 4
+SYNTHESIS_MAX_CALLS = 32
+SYNTHESIS_OUTPUT_TOKENS = 16384
+
+
+def _batch_by_budget(analyses, budget, model):
+    """Group analyses into ordered, contiguous batches that each fit the token budget.
+
+    Order is preserved: a batch is always a contiguous run, so "Analysis Part N" ordering
+    still reflects the repository's chunk order after any number of rounds. An analysis that
+    exceeds the budget on its own lands in a batch by itself, for the caller to handle.
+    """
+    batches, current, current_tokens = [], [], 0
+    for analysis in analyses:
+        tokens = count_tokens_accurate(analysis, model)
+        if current and current_tokens + tokens > budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(analysis)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _truncate_to_tokens(text, max_tokens, model):
+    """Cut text down to a token budget, marking the cut. Last resort only."""
+    if max_tokens <= 0 or count_tokens_accurate(text, model) <= max_tokens:
+        return text
+    # Start from a proportional guess, then walk down until it genuinely fits.
+    cut = max(int(len(text) * (max_tokens / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    candidate = text[:cut]
+    while cut > 1 and count_tokens_accurate(candidate, model) > max_tokens:
+        cut = int(cut * 0.9)
+        candidate = text[:cut]
+    return candidate + "\n\n[truncated by repo-radar: exceeded the synthesis budget]\n"
+
+
+def _total_tokens(analyses, model):
+    return sum(count_tokens_accurate(a, model) for a in analyses)
+
+
+def combine_chunk_analyses(full_name, analyses, model=None,
+                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS):
+    """Combine chunk analyses into one cohesive report, bounded by the model's context.
+
+    Previously every chunk analysis was concatenated into a single prompt with no bound, so a
+    large repository produced a request larger than the context window and the whole metadata
+    step failed (observed: 1,189,532 tokens against a 1,000,000 limit). Chunking bounded the
+    INPUT files but nothing bounded their combination.
+
+    This performs a hierarchical map-reduce instead: analyses are grouped into ordered batches
+    that each fit the budget, every batch is synthesised, and the results are combined again
+    until a single bounded synthesis remains. Every chunk therefore reaches the final report.
+
+    Returns (final_analysis, total_api_cost) — cost is aggregated across every round.
+    """
+    analyses = [a for a in (analyses or []) if a and str(a).strip()]
+    if not analyses:
+        return "", 0.0
+    if model is None:
+        model = get_ai_model()
+
+    # Reserve room for the template itself and for the response.
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    budget = get_chunking_threshold(model) - overhead - SYNTHESIS_OUTPUT_TOKENS
+    if budget < 1000:  # pathologically small window — leave something workable
+        budget = 1000
+
+    if len(analyses) == 1 and count_tokens_accurate(analyses[0], model) <= budget:
+        return _synthesize_once(full_name, analyses)
+
+    level = list(analyses)
+    depth = 0
+    calls = 0
+    total_cost = 0.0
+
+    while True:
+        # A single analysis larger than one whole request cannot be reduced by regrouping —
+        # nothing to combine it with. Truncation is the only remaining move, and it is loud.
+        if len(level) == 1 and count_tokens_accurate(level[0], model) > budget:
+            print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
+                  f"truncating it to fit (some detail from this section is lost){RESET}")
+            level = [_truncate_to_tokens(level[0], budget, model)]
+
+        batches = _batch_by_budget(level, budget, model)
+
+        if len(batches) == 1:
+            text, cost = _synthesize_once(full_name, batches[0])
+            return text, total_cost + cost
+
+        # Guards: stop expanding work, but never by dropping input.
+        remaining_depth = max_depth - depth
+        if remaining_depth <= 0 or calls + len(batches) > max_calls:
+            reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
+            print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
+                  f"truncating each to fit a single final pass{RESET}")
+            share = max(budget // len(level), 1)
+            trimmed = [_truncate_to_tokens(a, share, model) for a in level]
+            text, cost = _synthesize_once(full_name, trimmed)
+            return text, total_cost + cost
+
+        print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
+              f"(round {depth + 1}){RESET}")
+
+        before = _total_tokens(level, model)
+        combined = []
+        for batch in batches:
+            text, cost = _synthesize_once(full_name, batch)
+            combined.append(text)
+            total_cost += cost
+            calls += 1
+
+        # No-progress detection: if a whole round failed to shrink the material, recursing
+        # again would loop at the same size and burn the call budget for nothing.
+        if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
+            print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
+                  f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
+            share = max(budget // len(combined), 1)
+            trimmed = [_truncate_to_tokens(a, share, model) for a in combined]
+            text, cost = _synthesize_once(full_name, trimmed)
+            return text, total_cost + cost
+
+        level = combined
+        depth += 1
+
+
+def _build_synthesis_prompt(full_name, analyses):
+    """Build the synthesis prompt for a single round of combining."""
 
     combined_prompt = f"""You are reviewing multiple analyses of different parts of the repository "{full_name}".
 
@@ -547,6 +677,17 @@ Here are the analyses to combine:
 
     for i, analysis in enumerate(analyses, 1):
         combined_prompt += f"\n--- Analysis Part {i} ---\n{analysis}\n"
+
+    return combined_prompt
+
+
+def _synthesize_once(full_name, analyses):
+    """Run ONE synthesis call over the given analyses. Returns (text, api_cost).
+
+    The caller is responsible for ensuring the batch fits the model's budget; this function
+    does not bound its input.
+    """
+    combined_prompt = _build_synthesis_prompt(full_name, analyses)
 
     # Use retry logic
     max_retries = 3
