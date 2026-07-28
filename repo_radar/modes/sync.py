@@ -19,11 +19,13 @@ from repo_radar.git import run_git_command, determine_preferred_branch, get_repo
 from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model
 from repo_radar.metadata import (
+    DEGRADED_DIR_NAME,
     PARSE_STATUS_DEGRADED,
     PARSE_STATUS_OK,
     degradation_reasons,
     parse_llm_response,
     regenerate_index,
+    save_degraded_response,
 )
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
@@ -1179,11 +1181,9 @@ Repository files:
                     for problem in parse_problems:
                         print(f"    {YELLOW}- {problem}{RESET}")
                     try:
-                        raw_dir = PRISTINE_DIR / '.degraded-responses'
-                        raw_dir.mkdir(exist_ok=True)
-                        (raw_dir / f"{cache_name}.txt").write_text(analysis)
-                        print(f"    {YELLOW}raw response saved to"
-                              f" .degraded-responses/{cache_name}.txt{RESET}")
+                        saved_to = save_degraded_response(PRISTINE_DIR, cache_name, analysis)
+                        print(f"    {YELLOW}raw response saved (redacted, owner-only) to"
+                              f" {DEGRADED_DIR_NAME}/{saved_to.name}{RESET}")
                     except Exception as exc:
                         print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
 

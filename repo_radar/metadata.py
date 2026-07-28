@@ -1,6 +1,7 @@
 """Metadata parsing, response extraction, and index generation."""
 
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -164,6 +165,69 @@ def _parse_delimited_response(response_text):
         'related_repos': related_repos,
         'analysis': main_analysis
     }
+
+
+# Saved raw responses are derived from repository source and can quote secrets verbatim, so
+# they are owner-only, redacted best-effort, size-capped, and pruned to a fixed generation count.
+DEGRADED_DIR_NAME = '.degraded-responses'
+MAX_DEGRADED_BYTES = 256 * 1024
+MAX_DEGRADED_FILES = 20
+
+_REDACTIONS = (
+    (re.compile(r'-----BEGIN[^-]{0,40}PRIVATE KEY-----.*?-----END[^-]{0,40}PRIVATE KEY-----',
+                re.S), '[REDACTED private key]'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '[REDACTED aws key id]'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{20,}\b'), '[REDACTED github token]'),
+    (re.compile(r'\bsk-(?:ant-)?[A-Za-z0-9_\-]{20,}\b'), '[REDACTED api key]'),
+    (re.compile(r'\bxox[abposr]-[A-Za-z0-9-]{10,}\b'), '[REDACTED slack token]'),
+    (re.compile(r'\b(?:Bearer|Basic)\s+[A-Za-z0-9._\-+/=]{20,}'), '[REDACTED authorization]'),
+    (re.compile(r'(?i)\b((?:api[_-]?key|secret|password|passwd|token|access[_-]?key)'
+                r'\s*[:=]\s*)(["\']?)[^\s"\'<>,;]{8,}\2'), r'\1[REDACTED]'),
+)
+
+
+def redact_secrets(text):
+    """Best-effort scrub of high-confidence secret shapes. Not a guarantee — a defence in
+    depth alongside owner-only permissions, not a substitute for them."""
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def save_degraded_response(pristine_dir, cache_name, response_text):
+    """Persist a degraded raw response for diagnosis. Returns the path, or None on failure.
+
+    Without the raw response, diagnosing a bad parse after the fact is guesswork — but the
+    text is untrusted repository-derived content, so it is redacted, truncated, written
+    0600 into a 0700 directory, and old generations are pruned.
+    """
+    directory = Path(pristine_dir) / DEGRADED_DIR_NAME
+    directory.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)  # exist_ok=True skips mode on an existing directory
+
+    text = redact_secrets(response_text or '')
+    if len(text) > MAX_DEGRADED_BYTES:
+        text = (text[:MAX_DEGRADED_BYTES]
+                + f"\n\n[truncated at {MAX_DEGRADED_BYTES} bytes by repo-radar]\n")
+
+    target = directory / f"{cache_name}.txt"
+    # Create owner-only from the outset rather than chmod-ing after a 0644 write.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(text)
+    os.chmod(target, 0o600)
+
+    # Never prune the file just written: several repos degrading inside the same second get
+    # indistinguishable mtimes, and a tie could otherwise evict the one being saved right now.
+    others = [p for p in directory.glob('*.txt') if p != target]
+    others.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in others[max(MAX_DEGRADED_FILES - 1, 0):]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    return target
 
 
 def _parse_status_of(info):

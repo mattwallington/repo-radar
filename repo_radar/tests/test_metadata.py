@@ -249,3 +249,57 @@ def test_legacy_file_without_parse_status_is_inferred_degraded(tmp_path, monkeyp
 
     metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
     assert "degraded metadata" in index_file.read_text()
+
+
+# ── saved raw responses are owner-only, redacted, capped, and pruned ─────────────────
+
+
+def test_degraded_response_is_owner_only(tmp_path):
+    from repo_radar.metadata import DEGRADED_DIR_NAME, save_degraded_response
+    target = save_degraded_response(tmp_path, "demo-abc1234", "some response")
+    assert oct(target.stat().st_mode)[-3:] == "600"
+    assert oct((tmp_path / DEGRADED_DIR_NAME).stat().st_mode)[-3:] == "700"
+
+
+def test_degraded_response_tightens_a_preexisting_loose_directory(tmp_path):
+    """mkdir(exist_ok=True) skips mode on an existing dir, so it must be re-chmod'd."""
+    import os
+    from repo_radar.metadata import DEGRADED_DIR_NAME, save_degraded_response
+    loose = tmp_path / DEGRADED_DIR_NAME
+    loose.mkdir(mode=0o755)
+    save_degraded_response(tmp_path, "demo-abc1234", "x")
+    assert oct(os.stat(loose).st_mode)[-3:] == "700"
+
+
+def test_degraded_response_redacts_high_confidence_secrets(tmp_path):
+    from repo_radar.metadata import save_degraded_response
+    secrets = (
+        "AKIAIOSFODNN7EXAMPLE\n"
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456\n"
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456\n"
+        'API_KEY = "supersecretvalue123"\n'
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow==\n-----END RSA PRIVATE KEY-----\n"
+    )
+    body = save_degraded_response(tmp_path, "demo-abc1234", secrets).read_text()
+    for leaked in ("AKIAIOSFODNN7EXAMPLE", "ghp_abcdefghij", "sk-ant-api03",
+                   "supersecretvalue123", "MIIEow=="):
+        assert leaked not in body, f"{leaked} survived redaction"
+    assert "REDACTED" in body
+
+
+def test_degraded_response_is_size_capped(tmp_path):
+    from repo_radar.metadata import MAX_DEGRADED_BYTES, save_degraded_response
+    body = save_degraded_response(tmp_path, "big-abc1234", "x" * (MAX_DEGRADED_BYTES * 2)).read_text()
+    assert len(body) < MAX_DEGRADED_BYTES + 200
+    assert "truncated" in body
+
+
+def test_degraded_responses_are_pruned_to_a_bounded_count(tmp_path):
+    import os, time
+    from repo_radar.metadata import DEGRADED_DIR_NAME, MAX_DEGRADED_FILES, save_degraded_response
+    for i in range(MAX_DEGRADED_FILES + 5):
+        p = save_degraded_response(tmp_path, f"repo-{i:03d}", "body")
+        os.utime(p, (time.time() + i, time.time() + i))  # deterministic recency
+    kept = list((tmp_path / DEGRADED_DIR_NAME).glob("*.txt"))
+    assert len(kept) == MAX_DEGRADED_FILES
