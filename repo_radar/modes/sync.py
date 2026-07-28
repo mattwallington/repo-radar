@@ -18,7 +18,13 @@ from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, RE
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model
-from repo_radar.metadata import parse_llm_response, regenerate_index
+from repo_radar.metadata import (
+    PARSE_STATUS_DEGRADED,
+    PARSE_STATUS_OK,
+    degradation_reasons,
+    parse_llm_response,
+    regenerate_index,
+)
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
 
@@ -1161,6 +1167,26 @@ Repository files:
                 # Parse and save (simplified - use existing parse logic)
                 parsed = parse_llm_response(analysis)
 
+                # A failed parse used to be written to disk and indexed as if it were fine, so
+                # `type: Unknown` looked like a model that didn't know rather than a parser that
+                # gave up. Say so out loud, record it in the frontmatter, and keep the raw
+                # response — without it, diagnosing a bad parse after the fact is guesswork.
+                parse_problems = degradation_reasons(parsed)
+                parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
+                if parse_problems:
+                    print(f"  {YELLOW}Degraded metadata parse for {full_name}"
+                          f" (model: {getattr(args, 'model', 'unknown')}){RESET}")
+                    for problem in parse_problems:
+                        print(f"    {YELLOW}- {problem}{RESET}")
+                    try:
+                        raw_dir = PRISTINE_DIR / '.degraded-responses'
+                        raw_dir.mkdir(exist_ok=True)
+                        (raw_dir / f"{cache_name}.txt").write_text(analysis)
+                        print(f"    {YELLOW}raw response saved to"
+                              f" .degraded-responses/{cache_name}.txt{RESET}")
+                    except Exception as exc:
+                        print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
+
                 # Build metadata file
                 quick_ref = parsed['quick_ref']
                 brief = parsed['brief']
@@ -1200,6 +1226,7 @@ database: {quick_ref.get('database', 'None')}
 apis: {quick_ref.get('apis', 'None')}
 port: {quick_ref.get('port', 'N/A')}
 related_repos: {json.dumps(related_repos)}
+parse_status: {parse_status}
 ---
 
 # Repository: {full_name}
