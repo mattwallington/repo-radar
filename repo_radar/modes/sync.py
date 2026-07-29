@@ -14,7 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
-from repo_radar.receipts import resolve_trigger, write_receipt
+from repo_radar import VERSION as REPO_RADAR_VERSION
+from repo_radar.receipts import resolve_channel, resolve_trigger, run_mode, write_receipt
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
@@ -201,13 +202,47 @@ def sync_mode(args):
     # being shown", so a genuine LaunchAgent run recorded itself as "manual" and the logs could
     # not distinguish scheduled from manual. The window heuristic remains only as the default
     # for callers that declare nothing.
-    run_trigger = resolve_trigger(
-        default=("scheduled" if not getattr(args, 'show_window', True) else "manual"))
+    # Every invoker DECLARES its trigger via REPO_RADAR_TRIGGER (LaunchAgent=scheduled,
+    # Electron button=manual, Electron catch-up=catchup, dispatcher/CLI=cli). The previous
+    # heuristic read args.show_window, which the CLI never defines — so it silently resolved to
+    # "manual" for every run, launchd jobs included. 'cli' is the honest default for an
+    # undeclared invocation: it means "something ran this directly".
+    run_trigger = resolve_trigger(default='cli')
+    run_channel = resolve_channel()
+    run_mode_name = run_mode(
+        skip_metadata=bool(getattr(args, 'skip_metadata', False)),
+        metadata_only=bool(getattr(args, 'metadata_only', False)),
+        repos_only=bool(getattr(args, 'repos_only', False)),
+    )
     run_started_at = datetime.now(timezone.utc).isoformat()
+    def _finalize_run(stats_snapshot):
+        """Record completion once, from whichever path finished the run.
+
+        A zero-repository run returns success early; without going through here it completed
+        every day and left no receipt, so the catch-up logic kept believing a sync was overdue —
+        the very symptom this work exists to remove, surviving on one path.
+        """
+        if getattr(args, 'dry_run', False):
+            return
+        written = write_receipt(
+            CONFIG_DIR,
+            trigger=run_trigger,
+            started_at=run_started_at,
+            stats=stats_snapshot,
+            channel=run_channel,
+            mode=run_mode_name,
+            version=REPO_RADAR_VERSION,
+        )
+        if sync_logger:
+            sync_logger.event("receipt_written" if written else "receipt_failed",
+                              trigger=run_trigger, channel=run_channel, mode=run_mode_name)
+
     if sync_logger:
         sync_logger.event(
             "sync_start",
             trigger=run_trigger,
+            channel=run_channel,
+            mode=run_mode_name,
             dry_run=bool(getattr(args, 'dry_run', False)),
             skip_metadata=bool(getattr(args, 'skip_metadata', False)),
         )
@@ -247,6 +282,13 @@ def sync_mode(args):
     repos = config.get('repositories', [])
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
+        # A successful no-op is still a completed run; record it or the schedule looks missed.
+        _finalize_run({'total': 0, 'updated': 0, 'cloned': 0, 'skipped': 0,
+                       'errors': 0, 'metadata_generated': 0, 'api_cost': 0.0})
+        if sync_logger:
+            sync_logger.event("sync_complete", total=0, updated=0, cloned=0, skipped=0,
+                              errors=0, metadata=0, cost="$0.0000")
+            sync_logger.close()
         return 0
 
     # Create directories
@@ -1538,17 +1580,7 @@ Stack Trace:
     # sync. Written here regardless of trigger; Electron reconciles it into the status file on
     # next start. Never fails the run: a completed sync must not report failure because its
     # receipt could not be written.
-    if not getattr(args, 'dry_run', False):
-        written = write_receipt(
-            CONFIG_DIR,
-            trigger=run_trigger,
-            started_at=run_started_at,
-            stats=stats,
-            version=os.environ.get('REPO_RADAR_VERSION'),
-        )
-        if sync_logger:
-            sync_logger.event("receipt_written" if written else "receipt_failed",
-                              trigger=run_trigger)
+    _finalize_run(stats)
 
     if sync_logger:
         sync_logger.close()

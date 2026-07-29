@@ -72,6 +72,13 @@ grep -q "\\"manifestSha\\": *\\"$SMSHA\\"" "$SDES" || { echo "repo-radar-dev: st
 set -eu
 ROOT="$HOME/.repo-radar"
 CH="${channel}"
+# Export the channel so the Python side can scope its completion receipt: without this a dev
+# build's receipt would be written as (and could advance) the stable channel's watermark.
+export REPO_RADAR_CHANNEL="$CH"
+# Declare provenance for a direct dispatcher/CLI invocation, but never override an invoker that
+# already declared one — the LaunchAgent sets "scheduled" and that must win.
+: "\${REPO_RADAR_TRIGGER:=cli}"
+export REPO_RADAR_TRIGGER
 CUR="$ROOT/$CH/current"
 DES="$ROOT/$CH/desired.json"
 mkdir -p "$ROOT" 2>/dev/null || true

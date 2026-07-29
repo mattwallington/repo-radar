@@ -13,6 +13,7 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
+const { planReconcile } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
@@ -1062,7 +1063,8 @@ function startStatusServer() {
 }
 
 // Trigger sync
-function triggerSync({ showWindow = true } = {}) {
+function triggerSync({ showWindow = true, trigger = null } = {}) {
+  const options = { showWindow, trigger };
   if (currentSyncProcess) {
     return; // Already syncing
   }
@@ -1257,6 +1259,11 @@ function triggerSync({ showWindow = true } = {}) {
   }
 
   shellEnv.REPO_RADAR_STATUS_PORT = String(STATUS_PORT);
+  // Declare provenance rather than relying on this variable being ABSENT. If the app's own
+  // environment ever carried REPO_RADAR_TRIGGER (inherited, exported, launchd), every in-app
+  // sync would report itself as scheduled — the same mislabelling, inverted.
+  shellEnv.REPO_RADAR_TRIGGER = (options && options.trigger) || 'manual';
+  shellEnv.REPO_RADAR_CHANNEL = runtimeChannel;
 
   // Sync disabled: either the build channel couldn't be resolved, or
   // ensureRuntime() failed during startup (see app.whenReady()). Surface the
@@ -1328,6 +1335,10 @@ function triggerSync({ showWindow = true } = {}) {
       });
 
       currentSyncProcess.on('close', (code) => {
+        // The child wrote its receipt just before exiting; absorb it now so lastRunTrigger and
+        // lastRunErrors are recorded for ordinary app-launched runs too, not only for runs that
+        // happened while we were closed.
+        try { reconcileRunReceipt(); } catch (e) { /* never break sync completion */ }
         try {
           console.log('Sync process exited with code:', code);
           logSyncState('process-exited');
@@ -2158,30 +2169,83 @@ ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController
 // the sync never happened, so it could launch a redundant paid sync. Python writes the receipt
 // and never touches status.json; this reads the receipt and never has Python write status.json,
 // so there is exactly one writer per file.
+// Tighten an existing config at startup. The writers now create 0600, but an upgraded user who
+// never opens Settings and never gets an actionable notice would otherwise keep a legacy 0644
+// config — holding four API keys — indefinitely. Idempotent and silent when already correct.
+function hardenExistingConfig() {
+  try {
+    const configFile = path.join(process.env.HOME, '.config', 'repo-radar', 'config.json');
+    if (!fs.existsSync(configFile)) return false;
+    const mode = fs.statSync(configFile).mode & 0o777;
+    if (mode === 0o600) return false;
+    fs.chmodSync(configFile, 0o600);
+    console.log(`Tightened config permissions from ${mode.toString(8)} to 600`);
+    return true;
+  } catch (e) {
+    console.error('Could not tighten config permissions:', e.message);
+    return false;
+  }
+}
+
 function reconcileRunReceipt() {
   try {
-    const receiptFile = path.join(path.dirname(STATUS_FILE), 'last-run.json');
+    const receiptFile = path.join(path.dirname(STATUS_FILE), `last-run-${runtimeChannel}.json`);
     if (!fs.existsSync(receiptFile)) return null;
     const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
-    if (!receipt || receipt.schema !== 1 || !receipt.completed || !receipt.finishedAt) return null;
-
-    const finished = new Date(receipt.finishedAt);
-    if (Number.isNaN(finished.getTime()) || finished > new Date()) return null;  // ignore junk
-
-    const status = loadStatus();
-    const known = status.lastSync ? new Date(status.lastSync) : null;
-    if (known && !(finished > known)) return null;  // only ever move lastSync FORWARD
-
-    status.lastSync = receipt.finishedAt;
-    status.lastRunTrigger = receipt.trigger || null;
-    status.lastRunErrors = receipt.stats ? receipt.stats.errors : null;
-    saveStatus(status);
-    console.log(`Adopted ${receipt.trigger || 'unknown'} run completed at ${receipt.finishedAt}`
-      + ` (was ${status.lastSync === receipt.finishedAt && known ? known.toISOString() : 'unset'})`);
+    const before = loadStatus();
+    const plan = planReconcile(receipt, before, { channel: runtimeChannel });
+    if (!plan.adopt) return null;
+    saveStatus(plan.status);
+    console.log(`Adopted ${receipt.trigger} run finished ${receipt.finishedAt}`
+      + ` (${plan.reason}; lastSync ${plan.advanceLastSync ? 'advanced' : 'unchanged'})`);
     return receipt;
   } catch (e) {
     console.error('Could not reconcile run receipt:', e.message);
     return null;
+  }
+}
+
+// A catch-up decision made now can be stale by the time a delayed launch fires: the real
+// scheduled run may finish and write its receipt during the wait, and the exec lock will be free
+// again — so the callback would start a second, redundant paid sync. Re-reconcile and re-ask the
+// question immediately before launching.
+function scheduleCatchUpSync(delayMs, decide) {
+  setTimeout(() => {
+    if (currentSyncProcess) return;
+    reconcileRunReceipt();
+    if (typeof decide === 'function' && !decide(loadStatus())) {
+      console.log('Catch-up no longer needed — a run completed while we waited');
+      return;
+    }
+    triggerSync({ showWindow: false, trigger: 'catchup' });
+  }, delayMs);
+}
+
+// Would a catch-up still be warranted right now? Re-asked immediately before a delayed launch,
+// because the scheduled run may have finished during the wait — in which case launching would be
+// a second, redundant paid sync.
+function stillNeedsCatchUp() {
+  try {
+    if (currentSyncProcess) return false;
+    const status = loadStatus();
+    if (status.syncing) return false;
+    const configFile = path.join(process.env.HOME, '.config', 'repo-radar', 'config.json');
+    if (!fs.existsSync(configFile)) return false;
+    const schedule = (JSON.parse(fs.readFileSync(configFile, 'utf8')) || {}).schedule;
+    if (!schedule || !schedule.enabled) return false;
+    if (!status.lastSync) return true;
+    const lastSync = new Date(status.lastSync);
+    const now = new Date();
+    if (schedule.type === 'daily') {
+      const [h, m] = (schedule.time || '09:00').split(':').map(Number);
+      const todayScheduled = new Date(now);
+      todayScheduled.setHours(h, m, 0, 0);
+      return now > todayScheduled && lastSync < todayScheduled;
+    }
+    const interval = Number(schedule.interval) || 6;
+    return ((now - lastSync) / 3600000) >= interval;
+  } catch (e) {
+    return false;   // never launch a paid sync off a failed read
   }
 }
 
@@ -2224,7 +2288,7 @@ function checkMissedSync() {
     // If never synced before, definitely need to sync
     if (!lastSync) {
       console.log('No previous sync found, triggering initial sync...');
-      setTimeout(() => triggerSync({ showWindow: false }), 5000); // Wait 5 seconds after startup
+      scheduleCatchUpSync(5000, (st) => !st.lastSync);  // revalidates before launching
       return;
     }
     
@@ -2238,7 +2302,7 @@ function checkMissedSync() {
       // If it's past the scheduled time today and last sync was before today's scheduled time
       if (now > todayScheduled && lastSync < todayScheduled) {
         console.log(`Missed scheduled sync at ${schedule.time}, catching up now...`);
-        setTimeout(() => triggerSync({ showWindow: false }), 5000);
+        scheduleCatchUpSync(5000, () => stillNeedsCatchUp());
         return;
       }
     } else if (schedule.type === 'hourly') {
@@ -2246,7 +2310,7 @@ function checkMissedSync() {
       const interval = schedule.interval || 6;
       if (hoursSinceLastSync >= interval) {
         console.log(`Last sync was ${hoursSinceLastSync.toFixed(1)} hours ago, interval is ${interval} hours. Catching up...`);
-        setTimeout(() => triggerSync({ showWindow: false }), 5000);
+        scheduleCatchUpSync(5000, () => stillNeedsCatchUp());
         return;
       }
     } else if (schedule.type === 'weekly') {
@@ -2260,7 +2324,7 @@ function checkMissedSync() {
         
         if (now > todayScheduled && lastSync < todayScheduled) {
           console.log(`Missed scheduled sync on ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][today]} at ${schedule.time}, catching up...`);
-          setTimeout(() => triggerSync({ showWindow: false }), 5000);
+          scheduleCatchUpSync(5000, () => stillNeedsCatchUp());
           return;
         }
       }
@@ -2506,6 +2570,8 @@ app.whenReady().then(async () => {
 
   // Check for missed syncs after a short delay (let everything initialize)
   setTimeout(() => {
+    hardenExistingConfig();
+    reconcileRunReceipt();
     checkMissedSync();
   }, 2000);
   
