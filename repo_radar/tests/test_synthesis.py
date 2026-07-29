@@ -240,3 +240,96 @@ def test_batching_accounts_for_the_analysis_part_framing():
     for batch in batches:
         prompt = llm._build_synthesis_prompt("org/repo", batch)
         assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= budget
+
+
+# ── second review round ──────────────────────────────────────────────────────────────
+
+
+def test_budget_is_sized_for_the_smallest_model_in_the_fallback_chain(monkeypatch):
+    """Rebudgeting AFTER a call is too late.
+
+    The caller's retry re-sends the SAME prompt to the fallback model, so a prompt sized for
+    the larger window overflows the instant the fallback serves it. Size for the smallest
+    candidate up front.
+    """
+    windows = {"big": 400_000, "small": 60_000}
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: windows.get(m, 60_000))
+    monkeypatch.setattr(llm, "get_fallback_model",
+                        lambda m: "small" if m == "big" else None)
+
+    seen = []
+
+    def falls_back_on_the_first_call(prompt, model):
+        # Mirrors sync.py: the retry swaps the model but re-sends the same prompt.
+        seen.append(llm.count_tokens_accurate(prompt, "small"))
+        return "SUMMARY " + "word " * 100, 0.01, "small"
+
+    llm.combine_chunk_analyses("org/repo", ["word " * 4_000 for _ in range(30)],
+                               model="big", synthesize=falls_back_on_the_first_call)
+
+    small_budget = llm._synthesis_budget("org/repo", "small")
+    assert seen, "no calls made"
+    assert seen[0] <= small_budget, (
+        f"the FIRST prompt was {seen[0]} tokens, over the fallback model's {small_budget} "
+        f"budget — it was sized for the larger window")
+
+
+def test_max_calls_is_enforced_after_rebatching(monkeypatch):
+    """Re-batching per call can produce more calls than the round's estimate.
+
+    A budget that shrinks mid-round makes smaller batches, so a once-per-round check can be
+    overrun. The ceiling must hold per call.
+    """
+    calls = []
+    shrink = {"n": 0}
+
+    def shrinking(prompt, model):
+        calls.append(1)
+        shrink["n"] += 1
+        # Every call reports a smaller-window model, so batches keep getting smaller.
+        return "SUMMARY " + "word " * 500, 0.01, f"model-{shrink['n']}"
+
+    def threshold(m):
+        if m.startswith("model-"):
+            return max(40_000 - int(m.split("-")[1]) * 3_000, 20_000)
+        return 60_000
+    monkeypatch.setattr(llm, "get_chunking_threshold", threshold)
+    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
+
+    llm.combine_chunk_analyses("org/repo", ["word " * 1_500 for _ in range(80)],
+                               model="start", max_calls=5, synthesize=shrinking)
+
+    assert len(calls) <= 5, f"ceiling of 5 overrun with {len(calls)} calls"
+
+
+def test_truncation_paths_produce_a_prompt_that_actually_fits(monkeypatch):
+    """Guard/truncation shares must account for template and per-part framing.
+
+    budget // count ignores both, so the assembled prompt could exceed the budget its own
+    shares were derived from.
+    """
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: 40_000)
+    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
+
+    sent = []
+
+    def record(prompt, model):
+        sent.append(llm.count_tokens_accurate(prompt, "claude-opus-5"))
+        return " ".join(["word"] * 5_000), 0.01, model  # never shrinks -> forces the guards
+
+    llm.combine_chunk_analyses("org/repo", ["word " * 2_000 for _ in range(40)],
+                               model="claude-opus-5", max_depth=1, synthesize=record)
+
+    budget = llm._synthesis_budget("org/repo", "claude-opus-5")
+    assert sent, "no calls made"
+    for tokens in sent:
+        assert tokens <= budget, f"a truncation path produced {tokens} tokens over {budget}"
+
+
+def test_truncate_all_to_fit_is_framing_aware():
+    analyses = ["word " * 3_000 for _ in range(10)]
+    budget = 8_000
+    trimmed = llm._truncate_all_to_fit("org/repo", analyses, budget, "claude-opus-5")
+    prompt = llm._build_synthesis_prompt("org/repo", trimmed)
+    assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= budget
+    assert len(trimmed) == len(analyses), "every part must survive, truncated not dropped"

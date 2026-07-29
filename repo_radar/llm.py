@@ -566,13 +566,56 @@ def _total_tokens(analyses, model):
     return sum(count_tokens_accurate(a, model) for a in analyses)
 
 
+def _truncate_all_to_fit(full_name, analyses, budget, model):
+    """Truncate every analysis so the FINISHED prompt fits the budget.
+
+    Dividing the budget by the item count ignores the per-item "Analysis Part N" wrapper and
+    the template, so the assembled prompt can exceed the budget the shares were derived from.
+    The share is framing-aware, and the finished prompt is verified and tightened if needed.
+    """
+    if not analyses:
+        return []
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    framing = count_tokens_accurate(_framed('', 1), model)
+    share = max((budget - overhead) // len(analyses) - framing, 1)
+    trimmed = [_truncate_to_tokens(a, share, model) for a in analyses]
+
+    # Verify rather than assume: token counting is approximate, so tighten until it fits.
+    for _ in range(5):
+        if count_tokens_accurate(_build_synthesis_prompt(full_name, trimmed), model) <= budget:
+            break
+        share = max(int(share * 0.85), 1)
+        trimmed = [_truncate_to_tokens(a, share, model) for a in trimmed]
+    return trimmed
+
+
+def _fallback_chain(model, limit=6):
+    """The model plus every model a rate limit could fall back to, in order."""
+    chain, seen, current = [model], {model}, model
+    while len(chain) < limit:
+        nxt = get_fallback_model(current)
+        if not nxt or nxt in seen:
+            break
+        chain.append(nxt)
+        seen.add(nxt)
+        current = nxt
+    return chain
+
+
 def _synthesis_budget(full_name, model):
     """Total prompt-token budget for one synthesis call against `model`.
 
-    Includes the template overhead (measured, not assumed) and reserves room for the response,
-    so callers compare a FINISHED prompt against this number.
+    Budgets for the SMALLEST window in the fallback chain, not just `model`. A rate-limit
+    fallback happens inside the caller's retry, which re-sends the SAME prompt to a different
+    model — so re-budgeting after the call is too late. If the prompt was sized for a larger
+    window it overflows the moment the fallback serves it. Sizing for the smallest candidate
+    up front means whichever model answers, the prompt fits.
+
+    Includes measured template overhead and reserves room for the response, so callers compare
+    a FINISHED prompt against this number.
     """
-    budget = get_chunking_threshold(model) - SYNTHESIS_OUTPUT_TOKENS
+    budget = min(get_chunking_threshold(m) for m in _fallback_chain(model)) \
+        - SYNTHESIS_OUTPUT_TOKENS
     overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
     # Always leave workable room for content beyond the template itself.
     return max(budget, overhead + 1000)
@@ -635,8 +678,7 @@ def combine_chunk_analyses(full_name, analyses, model=None,
                 _build_synthesis_prompt(full_name, level), model) > budget:
             print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
                   f"truncating it to fit (some detail from this section is lost){RESET}")
-            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-            level = [_truncate_to_tokens(level[0], max(budget - overhead, 1), model)]
+            level = _truncate_all_to_fit(full_name, level, budget, model)
 
         batches = _batch_by_budget(full_name, level, budget, model)
 
@@ -651,10 +693,7 @@ def combine_chunk_analyses(full_name, analyses, model=None,
             reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
             print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
                   f"truncating each to fit a single final pass{RESET}")
-            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-            share = max((budget - overhead) // len(level), 1)
-            trimmed = [_truncate_to_tokens(a, share, model) for a in level]
-            text, cost = run(trimmed)
+            text, cost = run(_truncate_all_to_fit(full_name, level, budget, model))
             return text, total_cost + cost
 
         print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
@@ -664,6 +703,16 @@ def combine_chunk_analyses(full_name, analyses, model=None,
         combined = []
         pending = list(level)
         while pending:
+            # Enforce the ceiling per CALL, not per round: re-batching can yield more calls
+            # than the round's estimate (a shrunk budget makes smaller batches), so a
+            # once-per-round check can be overrun mid-round.
+            if calls + 1 >= max_calls:
+                print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
+                      f"remaining {len(combined) + len(pending)} parts to finish{RESET}")
+                text, cost = run(_truncate_all_to_fit(
+                    full_name, combined + pending, budget, model))
+                return text, total_cost + cost
+
             # Re-batch before every call rather than once per round: a mid-round fallback to a
             # smaller-window model shrinks the budget, and batches sized for the previous model
             # would overflow it. Re-deriving keeps each prompt within the CURRENT budget.
@@ -679,10 +728,7 @@ def combine_chunk_analyses(full_name, analyses, model=None,
         if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
             print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
                   f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
-            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-            share = max((budget - overhead) // len(combined), 1)
-            trimmed = [_truncate_to_tokens(a, share, model) for a in combined]
-            text, cost = run(trimmed)
+            text, cost = run(_truncate_all_to_fit(full_name, combined, budget, model))
             return text, total_cost + cost
 
         level = combined
