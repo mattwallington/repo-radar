@@ -603,15 +603,65 @@ def _truncate_all_to_fit(full_name, analyses, budget, model):
         trimmed = [_truncate_to_tokens(a, share, model) for a in trimmed]
 
     # Terminal path: the per-part floor exceeds the budget, so tightening cannot converge.
+    return _compact_every_part(full_name, analyses, budget, model)
+
+
+# Below this, an excerpt conveys nothing useful about its part, so representing every part is
+# no longer meaningful and honest local degradation is the better answer.
+MIN_EXCERPT_TOKENS = 8
+
+
+def _hard_truncate(text, max_tokens, model):
+    """Cut to a token budget with NO marker — the caller adds one global warning instead.
+
+    Marking every excerpt is what creates the per-part floor this path exists to escape.
+    """
+    if max_tokens <= 0:
+        return ''
+    if count_tokens_accurate(text, model) <= max_tokens:
+        return text
+    cut = max(int(len(text) * (max_tokens / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    candidate = text[:cut]
+    while cut > 1 and count_tokens_accurate(candidate, model) > max_tokens:
+        cut = int(cut * 0.9)
+        candidate = text[:cut]
+    return candidate
+
+
+def _compact_every_part(full_name, analyses, budget, model):
+    """One analysis holding an excerpt of EVERY part, or [] if that cannot fit.
+
+    Joining the parts and cutting the head keeps the prompt bounded but silently drops whole
+    later analyses — and the model, seeing no evidence anything is missing, returns normal
+    QUICK_REFERENCE and summary sections that parse as healthy. That is the original defect
+    this feature exists to prevent (authoritative metadata for a repository mostly unread),
+    reintroduced through the emergency path.
+
+    So every part gets an equal excerpt under one global warning. If the parts cannot each
+    carry at least MIN_EXCERPT_TOKENS, this returns [] and the caller degrades locally, which
+    is honest, rather than emitting a confident synthesis of a fraction of the repository.
+    """
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    framing = count_tokens_accurate(_framed('', 1), model)
+    warning = (f"[repo-radar: all {len(analyses)} analysis parts below are excerpted to fit "
+               f"the model's context window; detail within each part is lost]\n")
+    separators = [f"\n[{i}] " for i in range(1, len(analyses) + 1)]
+
     room = budget - overhead - framing
-    if room <= marker + 1:
+    fixed = count_tokens_accurate(warning, model) + sum(
+        count_tokens_accurate(s, model) for s in separators)
+    share = (room - fixed) // max(len(analyses), 1)
+    if share < MIN_EXCERPT_TOKENS:
         return []
-    blob = "\n\n- - -\n\n".join(analyses)  # lighter than the full per-part framing
+
     for _ in range(6):
-        collapsed = _truncate_to_tokens(blob, room, model)
-        if _fits(full_name, [collapsed], budget, model):
-            return [collapsed]
-        room = max(int(room * 0.8), 1)
+        excerpts = [_hard_truncate(a, share, model) for a in analyses]
+        compact = warning + ''.join(s + e for s, e in zip(separators, excerpts))
+        if _fits(full_name, [compact], budget, model):
+            return [compact]
+        share = int(share * 0.8)
+        if share < MIN_EXCERPT_TOKENS:
+            return []
     return []
 
 

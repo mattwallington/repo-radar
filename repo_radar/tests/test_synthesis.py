@@ -400,3 +400,64 @@ def test_local_degraded_analysis_is_returned_without_calling(monkeypatch):
     assert trimmed == []
     assert not calls
     assert "could not be completed" in llm._local_degraded_analysis("org/repo", 500)
+
+
+# ── fourth review round: the collapse must not drop parts ────────────────────────────
+
+
+@pytest.mark.parametrize("parts", [100, 150, 200, 400, 2000])
+def test_terminal_collapse_represents_every_part_or_none(parts):
+    """All markers or []; never a prefix.
+
+    The first collapse implementation joined the parts and cut the head, keeping only the
+    first ~15 while the prompt still "fit". The model, given no evidence anything was missing,
+    would return normal QUICK_REFERENCE and summary sections that parse as perfectly healthy —
+    authoritative metadata for a repository it had mostly never seen. That is the exact defect
+    this feature exists to prevent, so a partial representation is not an acceptable outcome.
+    """
+    budget = 3_616
+    analyses = [f"UNIQUE_{i} " + "word " * 300 for i in range(parts)]
+    trimmed = llm._truncate_all_to_fit("org/repo", analyses, budget, "claude-opus-5")
+
+    if not trimmed:
+        return  # honest local degradation; the caller makes no request
+
+    prompt = llm._build_synthesis_prompt("org/repo", trimmed)
+    assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= budget
+    missing = [i for i in range(parts) if f"UNIQUE_{i}" not in prompt]
+    assert not missing, (
+        f"{len(missing)} of {parts} parts absent from the emitted prompt "
+        f"(first missing: {missing[:5]}) — a prefix is not a representation")
+
+
+def test_terminal_collapse_warns_that_everything_is_excerpted():
+    """The single global warning must be present so the content is not read as complete."""
+    analyses = [f"UNIQUE_{i} " + "word " * 300 for i in range(150)]
+    trimmed = llm._truncate_all_to_fit("org/repo", analyses, 3_616, "claude-opus-5")
+    assert trimmed and "excerpted" in trimmed[0]
+    assert "150 analysis parts" in trimmed[0]
+
+
+def test_driver_never_drops_parts_silently(monkeypatch):
+    """End to end: whatever reaches the model represents every part, or nothing is sent."""
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: 20_000)
+    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
+    sent = []
+
+    def never_shrinks(prompt, model):
+        sent.append(prompt)
+        return "word " * 5_000, 0.01, model
+
+    parts = 120
+    analyses = [f"UNIQUE_{i} " + "word " * 400 for i in range(parts)]
+    llm.combine_chunk_analyses("org/repo", analyses,
+                               model="claude-opus-5", synthesize=never_shrinks)
+
+    if sent:
+        final = sent[-1]
+        represented = sum(1 for i in range(parts) if f"UNIQUE_{i}" in final)
+        # The final prompt is either a full-coverage compact form or a synthesis of summaries
+        # (which legitimately no longer carries the markers). A partial prefix of the
+        # originals is the failure mode being excluded.
+        assert represented in (0, parts), (
+            f"final prompt carried {represented} of {parts} original parts — a prefix")
