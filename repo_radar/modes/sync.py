@@ -18,7 +18,15 @@ from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, RE
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model
-from repo_radar.metadata import parse_llm_response, regenerate_index
+from repo_radar.metadata import (
+    DEGRADED_DIR_NAME,
+    PARSE_STATUS_DEGRADED,
+    PARSE_STATUS_OK,
+    degradation_reasons,
+    parse_llm_response,
+    regenerate_index,
+    save_degraded_response,
+)
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
 
@@ -957,6 +965,11 @@ Repository files:
 
                         # Note: Delay before next chunk is now at the start of the loop
 
+                    # Set by whichever path produces `analysis`; used to name the model in a
+                    # degraded-parse warning, since a rate-limit fallback means it is not
+                    # necessarily the configured one.
+                    analysis_model = None
+
                     if chunk_analyses:
                         meta_progress.update(task_id, completed=80, status=f"[{task_color}]combining analyses...[/{task_color}]")
 
@@ -1017,6 +1030,9 @@ Here are the analyses to combine:
                                 else:
                                     raise
                         total_api_cost += combine_cost
+                        # The combine step may have fallen back to a different model than the
+                        # one chunking used; this is the model that actually produced `analysis`.
+                        analysis_model = current_model_combine
                 else:
                     # Repo fits in context - single analysis
                     meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
@@ -1080,6 +1096,7 @@ Repository files:
                             analysis, single_cost, response = call_llm(
                                 current_model, prompt, max_tokens=16384
                             )
+                            analysis_model = current_model  # may be a fallback after a retry
 
                             # Update rate limit tracker
                             rate_limit_tracker.update_from_response(response)
@@ -1161,6 +1178,26 @@ Repository files:
                 # Parse and save (simplified - use existing parse logic)
                 parsed = parse_llm_response(analysis)
 
+                # A failed parse used to be written to disk and indexed as if it were fine, so
+                # `type: Unknown` looked like a model that didn't know rather than a parser that
+                # gave up. Say so out loud, record it in the frontmatter, and keep the raw
+                # response — without it, diagnosing a bad parse after the fact is guesswork.
+                parse_problems = degradation_reasons(parsed)
+                parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
+                if parse_problems:
+                    # Name the model that actually produced this response — including a
+                    # rate-limit fallback — since which model degrades is the whole diagnostic.
+                    print(f"  {YELLOW}Degraded metadata parse for {full_name}"
+                          f" (model: {analysis_model or get_ai_model()}){RESET}")
+                    for problem in parse_problems:
+                        print(f"    {YELLOW}- {problem}{RESET}")
+                    try:
+                        saved_to = save_degraded_response(PRISTINE_DIR, cache_name, analysis)
+                        print(f"    {YELLOW}raw response saved (redacted, owner-only) to"
+                              f" {DEGRADED_DIR_NAME}/{saved_to.name}{RESET}")
+                    except Exception as exc:
+                        print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
+
                 # Build metadata file
                 quick_ref = parsed['quick_ref']
                 brief = parsed['brief']
@@ -1200,6 +1237,7 @@ database: {quick_ref.get('database', 'None')}
 apis: {quick_ref.get('apis', 'None')}
 port: {quick_ref.get('port', 'N/A')}
 related_repos: {json.dumps(related_repos)}
+parse_status: {parse_status}
 ---
 
 # Repository: {full_name}
