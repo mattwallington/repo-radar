@@ -303,3 +303,74 @@ def test_degraded_responses_are_pruned_to_a_bounded_count(tmp_path):
         os.utime(p, (time.time() + i, time.time() + i))  # deterministic recency
     kept = list((tmp_path / DEGRADED_DIR_NAME).glob("*.txt"))
     assert len(kept) == MAX_DEGRADED_FILES
+
+
+# ── review follow-ups ────────────────────────────────────────────────────────────────
+
+
+def test_degraded_response_cap_counts_bytes_not_characters(tmp_path):
+    """A multibyte response must not blow past the advertised on-disk cap.
+
+    len()/slicing counts code points; a 4-byte-per-char response was ~4x the stated cap.
+    """
+    from repo_radar.metadata import MAX_DEGRADED_BYTES, save_degraded_response
+    target = save_degraded_response(tmp_path, "wide-abc1234", "😀" * MAX_DEGRADED_BYTES)
+    assert target.stat().st_size <= MAX_DEGRADED_BYTES, (
+        f"file is {target.stat().st_size} bytes against a {MAX_DEGRADED_BYTES} cap")
+    assert "truncated" in target.read_text()
+
+
+def test_degraded_response_cap_includes_the_marker(tmp_path):
+    from repo_radar.metadata import MAX_DEGRADED_BYTES, save_degraded_response
+    target = save_degraded_response(tmp_path, "big-abc1234", "a" * (MAX_DEGRADED_BYTES * 3))
+    assert target.stat().st_size <= MAX_DEGRADED_BYTES
+
+
+def test_quote_opening_summary_is_not_flagged(tmp_path):
+    """A legitimate summary that opens with a quotation mark is prose, not a fragment."""
+    response = """QUICK_REFERENCE_START
+Type: Library
+Language: Python
+QUICK_REFERENCE_END
+
+ONE_LINE_SUMMARY_START
+"Batteries included" utilities for parsing repository metadata.
+ONE_LINE_SUMMARY_END
+
+RELATED_REPOS_START
+RELATED_REPOS_END
+"""
+    result = parse_llm_response(response)
+    assert not looks_degraded(result), degradation_reasons(result)
+
+
+def test_genuinely_unknown_language_is_not_a_parse_failure():
+    """The parser succeeded; the model just could not identify the language.
+
+    Incomplete metadata is not the same defect as a parse that produced nothing, and
+    conflating them makes the degraded signal noisy enough to ignore.
+    """
+    response = """QUICK_REFERENCE_START
+Type: Infrastructure
+Language: Unknown
+QUICK_REFERENCE_END
+
+ONE_LINE_SUMMARY_START
+Terraform definitions with no dominant implementation language.
+ONE_LINE_SUMMARY_END
+
+RELATED_REPOS_START
+RELATED_REPOS_END
+"""
+    result = parse_llm_response(response)
+    assert not looks_degraded(result), degradation_reasons(result)
+
+
+def test_structural_quick_reference_keys_are_still_flagged():
+    """JSON split on ':' yields keys like '"type"', so values never reach their fields."""
+    result = parse_llm_response(
+        'QUICK_REFERENCE_START\n  "type": "Go",\n  "language": "Go",\nQUICK_REFERENCE_END\n'
+        'ONE_LINE_SUMMARY_START\nA Go toolkit.\nONE_LINE_SUMMARY_END\n'
+    )
+    assert looks_degraded(result)
+    assert any("structural" in r for r in degradation_reasons(result))

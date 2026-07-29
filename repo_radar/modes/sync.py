@@ -965,6 +965,11 @@ Repository files:
 
                         # Note: Delay before next chunk is now at the start of the loop
 
+                    # Set by whichever path produces `analysis`; used to name the model in a
+                    # degraded-parse warning, since a rate-limit fallback means it is not
+                    # necessarily the configured one.
+                    analysis_model = None
+
                     if chunk_analyses:
                         meta_progress.update(task_id, completed=80, status=f"[{task_color}]combining analyses...[/{task_color}]")
 
@@ -1025,6 +1030,9 @@ Here are the analyses to combine:
                                 else:
                                     raise
                         total_api_cost += combine_cost
+                        # The combine step may have fallen back to a different model than the
+                        # one chunking used; this is the model that actually produced `analysis`.
+                        analysis_model = current_model_combine
                 else:
                     # Repo fits in context - single analysis
                     meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
@@ -1088,6 +1096,7 @@ Repository files:
                             analysis, single_cost, response = call_llm(
                                 current_model, prompt, max_tokens=16384
                             )
+                            analysis_model = current_model  # may be a fallback after a retry
 
                             # Update rate limit tracker
                             rate_limit_tracker.update_from_response(response)
@@ -1176,8 +1185,10 @@ Repository files:
                 parse_problems = degradation_reasons(parsed)
                 parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
                 if parse_problems:
+                    # Name the model that actually produced this response — including a
+                    # rate-limit fallback — since which model degrades is the whole diagnostic.
                     print(f"  {YELLOW}Degraded metadata parse for {full_name}"
-                          f" (model: {getattr(args, 'model', 'unknown')}){RESET}")
+                          f" (model: {analysis_model or get_ai_model()}){RESET}")
                     for problem in parse_problems:
                         print(f"    {YELLOW}- {problem}{RESET}")
                     try:

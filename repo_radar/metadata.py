@@ -25,9 +25,14 @@ def extract_between(text, start_marker, end_marker):
     return text[start_idx:end_idx].strip()
 
 
-# A prose field that starts with one of these is a structural fragment that leaked through the
-# delimiter parser (e.g. a JSON response whose `"one_line_summary": "…"` landed between markers).
-_FRAGMENT_PREFIXES = ('"', '{', '[', ':', ',')
+# Structural fragments that leaked through the delimiter parser. Deliberately narrow: matching a
+# bare '"' would flag any summary that legitimately opens with a quotation mark. Every real case
+# observed begins with an orphaned key/value separator, so require the separator to be present.
+_FRAGMENT_PATTERN = re.compile(r'^\s*(?:["\']\s*:|:\s*["\']|[{\[]|,)')
+
+
+def _looks_like_fragment(text):
+    return bool(_FRAGMENT_PATTERN.match(text))
 
 # Written into metadata frontmatter so consumers can filter without re-deriving this.
 PARSE_STATUS_OK = 'ok'
@@ -50,15 +55,18 @@ def degradation_reasons(parsed):
         reasons.append('summary is empty')
     elif brief == 'Repository analysis':
         reasons.append('summary missing (fell back to the placeholder)')
-    elif brief.startswith(_FRAGMENT_PREFIXES):
+    elif _looks_like_fragment(brief):
         reasons.append('summary looks like a structural fragment, not prose')
 
+    # An empty block means the parser extracted nothing at all — a parse failure. A block that
+    # parsed but reported "Unknown" for a field is a model that genuinely could not tell, which
+    # is incomplete metadata rather than broken metadata; only the former is a defect to chase.
     if not quick_ref:
         reasons.append('quick reference empty (no "key: value" lines parsed)')
-    else:
-        for field in ('type', 'language'):
-            if quick_ref.get(field, 'Unknown') in ('', 'Unknown'):
-                reasons.append(f'quick reference has no {field}')
+    elif any(k.strip('"\' ') != k or '{' in k or '}' in k for k in quick_ref):
+        # Keys like '"type"' mean JSON was split on ':' as if it were the delimiter format,
+        # so the values never reached the fields they were meant to populate.
+        reasons.append('quick reference keys look structural, not plain field names')
 
     for entry in parsed.get('related_repos') or []:
         # Splitting a JSON array on commas yields quote-only shards like '"' or '\\": \\"None\\"'.
@@ -205,10 +213,16 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
     directory.mkdir(mode=0o700, exist_ok=True)
     os.chmod(directory, 0o700)  # exist_ok=True skips mode on an existing directory
 
+    # Cap actual BYTES on disk, not characters: len()/slicing counts code points, so a response
+    # of multibyte UTF-8 can be several times the advertised cap once encoded. The marker is
+    # counted inside the cap so the finished file never exceeds it.
     text = redact_secrets(response_text or '')
-    if len(text) > MAX_DEGRADED_BYTES:
-        text = (text[:MAX_DEGRADED_BYTES]
-                + f"\n\n[truncated at {MAX_DEGRADED_BYTES} bytes by repo-radar]\n")
+    marker = f"\n\n[truncated at {MAX_DEGRADED_BYTES} bytes by repo-radar]\n"
+    encoded = text.encode('utf-8')
+    if len(encoded) > MAX_DEGRADED_BYTES:
+        room = max(MAX_DEGRADED_BYTES - len(marker.encode('utf-8')), 0)
+        # errors='ignore' drops a partial character at the cut rather than raising.
+        text = encoded[:room].decode('utf-8', errors='ignore') + marker
 
     target = directory / f"{cache_name}.txt"
     # Create owner-only from the outset rather than chmod-ing after a 0644 write.
