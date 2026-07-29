@@ -566,27 +566,65 @@ def _total_tokens(analyses, model):
     return sum(count_tokens_accurate(a, model) for a in analyses)
 
 
+def _fits(full_name, parts, budget, model):
+    return count_tokens_accurate(_build_synthesis_prompt(full_name, parts), model) <= budget
+
+
 def _truncate_all_to_fit(full_name, analyses, budget, model):
-    """Truncate every analysis so the FINISHED prompt fits the budget.
+    """Truncate analyses so the FINISHED prompt fits the budget. NEVER returns over-budget.
 
     Dividing the budget by the item count ignores the per-item "Analysis Part N" wrapper and
-    the template, so the assembled prompt can exceed the budget the shares were derived from.
-    The share is framing-aware, and the finished prompt is verified and tightened if needed.
+    the template, so shares derived that way can assemble into an over-budget prompt.
+
+    Per-part tightening also has a floor: every part costs its framing plus a truncation
+    marker (~23 tokens here) no matter how hard its content is cut. Past roughly
+    budget/floor parts, no number of tightening passes can succeed — the previous version
+    simply gave up after five tries and returned the over-budget result anyway. So beyond
+    that point the parts are collapsed into ONE compact analysis with lightweight separators
+    and a single global marker, which pays the framing and marker cost once instead of n times.
+
+    Returns [] when even one framed, marked part cannot fit; the caller must then produce a
+    local result rather than send a request that is certain to be rejected.
     """
     if not analyses:
         return []
     overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
     framing = count_tokens_accurate(_framed('', 1), model)
+    marker = count_tokens_accurate(_TRUNCATION_MARKER, model)
+
     share = max((budget - overhead) // len(analyses) - framing, 1)
     trimmed = [_truncate_to_tokens(a, share, model) for a in analyses]
 
     # Verify rather than assume: token counting is approximate, so tighten until it fits.
     for _ in range(5):
-        if count_tokens_accurate(_build_synthesis_prompt(full_name, trimmed), model) <= budget:
-            break
+        if _fits(full_name, trimmed, budget, model):
+            return trimmed
         share = max(int(share * 0.85), 1)
         trimmed = [_truncate_to_tokens(a, share, model) for a in trimmed]
-    return trimmed
+
+    # Terminal path: the per-part floor exceeds the budget, so tightening cannot converge.
+    room = budget - overhead - framing
+    if room <= marker + 1:
+        return []
+    blob = "\n\n- - -\n\n".join(analyses)  # lighter than the full per-part framing
+    for _ in range(6):
+        collapsed = _truncate_to_tokens(blob, room, model)
+        if _fits(full_name, [collapsed], budget, model):
+            return [collapsed]
+        room = max(int(room * 0.8), 1)
+    return []
+
+
+def _local_degraded_analysis(full_name, part_count):
+    """A synthesis-failed placeholder produced WITHOUT an LLM call.
+
+    Used only when the budget cannot accommodate even a single framed part. Sending the
+    request anyway would guarantee a context-window rejection; returning this keeps the sync
+    alive and leaves a record the metadata parser will flag as degraded.
+    """
+    return (f"Synthesis for {full_name} could not be completed: {part_count} analysis parts "
+            f"could not be reduced to fit the model's context window. Re-run with a "
+            f"larger-context model, or narrow the repository's file selection.")
 
 
 def _fallback_chain(model, limit=6):
@@ -613,6 +651,14 @@ def _synthesis_budget(full_name, model):
 
     Includes measured template overhead and reserves room for the response, so callers compare
     a FINISHED prompt against this number.
+
+    Known limitation, deliberately not addressed here: this takes the smallest numeric WINDOW
+    across the chain, but batching still counts tokens with the current model's tokenizer. A
+    fallback whose tokenizer counted the same text differently could therefore be handed a
+    prompt sized by another model's count. Measured against the live chain this is a non-issue
+    — litellm counts an identical sample identically for all four Gemini fallback models — and
+    Gemini is the only provider with a fallback chain at all. A fully generic guarantee would
+    re-count each candidate with its own tokenizer and take the worst case.
     """
     budget = min(get_chunking_threshold(m) for m in _fallback_chain(model)) \
         - SYNTHESIS_OUTPUT_TOKENS
@@ -679,6 +725,10 @@ def combine_chunk_analyses(full_name, analyses, model=None,
             print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
                   f"truncating it to fit (some detail from this section is lost){RESET}")
             level = _truncate_all_to_fit(full_name, level, budget, model)
+            if not level:
+                print(f"    {YELLOW}Synthesis: budget cannot fit even one part; "
+                      f"reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, 1), total_cost
 
         batches = _batch_by_budget(full_name, level, budget, model)
 
@@ -693,7 +743,12 @@ def combine_chunk_analyses(full_name, analyses, model=None,
             reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
             print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
                   f"truncating each to fit a single final pass{RESET}")
-            text, cost = run(_truncate_all_to_fit(full_name, level, budget, model))
+            trimmed = _truncate_all_to_fit(full_name, level, budget, model)
+            if not trimmed:
+                print(f"    {YELLOW}Synthesis: {len(level)} parts cannot be reduced to fit; "
+                      f"reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, len(level)), total_cost
+            text, cost = run(trimmed)
             return text, total_cost + cost
 
         print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
@@ -709,8 +764,13 @@ def combine_chunk_analyses(full_name, analyses, model=None,
             if calls + 1 >= max_calls:
                 print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
                       f"remaining {len(combined) + len(pending)} parts to finish{RESET}")
-                text, cost = run(_truncate_all_to_fit(
-                    full_name, combined + pending, budget, model))
+                remainder = combined + pending
+                trimmed = _truncate_all_to_fit(full_name, remainder, budget, model)
+                if not trimmed:
+                    print(f"    {YELLOW}Synthesis: {len(remainder)} parts cannot be reduced "
+                          f"to fit; reporting locally without a request{RESET}")
+                    return _local_degraded_analysis(full_name, len(remainder)), total_cost
+                text, cost = run(trimmed)
                 return text, total_cost + cost
 
             # Re-batch before every call rather than once per round: a mid-round fallback to a
@@ -728,7 +788,12 @@ def combine_chunk_analyses(full_name, analyses, model=None,
         if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
             print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
                   f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
-            text, cost = run(_truncate_all_to_fit(full_name, combined, budget, model))
+            trimmed = _truncate_all_to_fit(full_name, combined, budget, model)
+            if not trimmed:
+                print(f"    {YELLOW}Synthesis: {len(combined)} parts cannot be reduced to "
+                      f"fit; reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, len(combined)), total_cost
+            text, cost = run(trimmed)
             return text, total_cost + cost
 
         level = combined

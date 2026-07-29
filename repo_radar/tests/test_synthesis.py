@@ -333,3 +333,70 @@ def test_truncate_all_to_fit_is_framing_aware():
     prompt = llm._build_synthesis_prompt("org/repo", trimmed)
     assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= budget
     assert len(trimmed) == len(analyses), "every part must survive, truncated not dropped"
+
+
+# ── third review round: terminal boundedness ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("parts", [100, 150, 200, 400, 2000])
+def test_truncate_all_to_fit_never_returns_over_budget(parts):
+    """High-cardinality input: per-part tightening has a floor it cannot get under.
+
+    Each part costs its framing plus a truncation marker (~23 tokens) no matter how hard its
+    content is cut, so past roughly budget/floor parts no number of tightening passes can
+    succeed. The previous version gave up after five attempts and returned the over-budget
+    result anyway (reported: 100 parts at a 3,616 budget assembling to 10,345 tokens).
+    """
+    budget = 3_616
+    trimmed = llm._truncate_all_to_fit("org/repo", ["word " * 500 for _ in range(parts)],
+                                       budget, "claude-opus-5")
+    if trimmed:
+        prompt = llm._build_synthesis_prompt("org/repo", trimmed)
+        got = llm.count_tokens_accurate(prompt, "claude-opus-5")
+        assert got <= budget, f"{parts} parts assembled to {got} tokens over a {budget} budget"
+    # An empty result is the explicit "cannot fit" signal; callers must not send a request.
+
+
+def test_impossible_budget_reports_locally_without_a_request():
+    """When not even one framed, marked part fits, no LLM call may be made."""
+    trimmed = llm._truncate_all_to_fit("org/repo", ["word " * 100 for _ in range(50)],
+                                       10, "claude-opus-5")
+    assert trimmed == [], "a budget of 10 tokens cannot fit a framed, marked part"
+
+
+def test_driver_never_emits_an_over_budget_prompt_under_any_guard(monkeypatch):
+    """Drive every guard at once: tiny budget, high cardinality, a model that never shrinks."""
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: 20_000)
+    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
+    sent = []
+
+    def never_shrinks(prompt, model):
+        sent.append(llm.count_tokens_accurate(prompt, "claude-opus-5"))
+        return "word " * 5_000, 0.01, model
+
+    text, _ = llm.combine_chunk_analyses(
+        "org/repo", ["word " * 400 for _ in range(300)],
+        model="claude-opus-5", synthesize=never_shrinks)
+
+    budget = llm._synthesis_budget("org/repo", "claude-opus-5")
+    assert text, "must still return something"
+    for tokens in sent:
+        assert tokens <= budget, f"emitted a {tokens}-token prompt over the {budget} budget"
+
+
+def test_local_degraded_analysis_is_returned_without_calling(monkeypatch):
+    """The no-request path returns a placeholder the metadata parser will flag as degraded."""
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: llm.SYNTHESIS_OUTPUT_TOKENS + 5)
+    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
+    calls = []
+
+    def must_not_be_called(prompt, model):
+        calls.append(1)
+        return "SUMMARY", 0.01, model
+
+    # Budget floors at overhead + 1000, so force the impossible case directly.
+    trimmed = llm._truncate_all_to_fit("org/repo", ["word " * 50 for _ in range(500)],
+                                       12, "claude-opus-5")
+    assert trimmed == []
+    assert not calls
+    assert "could not be completed" in llm._local_degraded_analysis("org/repo", 500)
