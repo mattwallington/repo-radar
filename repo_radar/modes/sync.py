@@ -9,11 +9,12 @@ import socket
 import traceback
 import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
+from repo_radar.receipts import resolve_trigger, write_receipt
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
@@ -196,10 +197,17 @@ def sync_mode(args):
     # UI's rich console output: one line per meaningful event, no progress bars,
     # no ANSI, rotated to the most recent runs.
     sync_logger = _open_sync_logger()
+    # Provenance is DECLARED by the invoker, not guessed. The old heuristic read "is a window
+    # being shown", so a genuine LaunchAgent run recorded itself as "manual" and the logs could
+    # not distinguish scheduled from manual. The window heuristic remains only as the default
+    # for callers that declare nothing.
+    run_trigger = resolve_trigger(
+        default=("scheduled" if not getattr(args, 'show_window', True) else "manual"))
+    run_started_at = datetime.now(timezone.utc).isoformat()
     if sync_logger:
         sync_logger.event(
             "sync_start",
-            trigger=("scheduled" if not getattr(args, 'show_window', True) else "manual"),
+            trigger=run_trigger,
             dry_run=bool(getattr(args, 'dry_run', False)),
             skip_metadata=bool(getattr(args, 'skip_metadata', False)),
         )
@@ -1523,6 +1531,26 @@ Stack Trace:
             metadata=stats['metadata_generated'],
             cost=f"${stats['api_cost']:.4f}",
         )
+
+    # Durable completion receipt. Progress went to a status server inside the app, so a run that
+    # finished with the app closed previously left no trace at all — the tray showed a stale
+    # time and the catch-up logic, reading that same stale value, could launch a redundant paid
+    # sync. Written here regardless of trigger; Electron reconciles it into the status file on
+    # next start. Never fails the run: a completed sync must not report failure because its
+    # receipt could not be written.
+    if not getattr(args, 'dry_run', False):
+        written = write_receipt(
+            CONFIG_DIR,
+            trigger=run_trigger,
+            started_at=run_started_at,
+            stats=stats,
+            version=os.environ.get('REPO_RADAR_VERSION'),
+        )
+        if sync_logger:
+            sync_logger.event("receipt_written" if written else "receipt_failed",
+                              trigger=run_trigger)
+
+    if sync_logger:
         sync_logger.close()
 
     return 0 if stats['errors'] == 0 else 1

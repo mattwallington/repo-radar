@@ -15,7 +15,10 @@ def test_known_model_context_window():
     assert get_model_context_window("gpt-5.4") == 1_050_000
     assert get_model_context_window("o3") == 200_000
     assert get_model_context_window("gemini/gemini-3.1-pro-preview") == 1_048_576
-    assert get_model_context_window("gpt-5.3-codex") == 400_000
+    # 272K INPUT, not the 400K total context: OpenAI documents 400K total with 128K max output,
+    # and 400_000 - 128_000 == 272_000, which is what litellm reports as max_input_tokens. This
+    # table stores input windows, so 400_000 was the total misfiled as an input limit.
+    assert get_model_context_window("gpt-5.3-codex") == 272_000
     assert get_model_context_window("claude-sonnet-5") == 1_000_000
 
 

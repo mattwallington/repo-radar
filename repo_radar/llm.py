@@ -65,7 +65,12 @@ KNOWN_LIMITS = {
     "gpt-5.4-pro": 1050000,
     "gpt-5.4-mini": 1050000,
     "gpt-5.4-nano": 1050000,
-    "gpt-5.3-codex": 400000,
+    # 272K INPUT, not the 400K total context. OpenAI documents 400K total with a 128K maximum
+    # output, and 400000 - 128000 = 272000 exactly, which is litellm's max_input_tokens. This
+    # table stores input windows (see the header), so 400K was the total misfiled as an input
+    # limit — and since the chunking threshold is 75% of this value, it produced 300K-token
+    # chunks against a 272K input ceiling. https://developers.openai.com/api/docs/models/gpt-5.3-codex
+    "gpt-5.3-codex": 272000,
     "gpt-5.2": 272000,
     "gpt-5.2-pro": 272000,
     "gpt-5.1": 272000,

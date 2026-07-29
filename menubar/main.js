@@ -1774,7 +1774,14 @@ function saveConfigToFile(config) {
       toWrite = { ...config, schedule: onDiskSchedule };
     }
 
-    fs.writeFileSync(configFile, JSON.stringify(toWrite, null, 2));
+    // This file holds the GitHub token and every provider API key, so it must be owner-only.
+    // writeFileSync's mode applies only when CREATING, so a new config would otherwise inherit
+    // the umask and land 0644; and because overwriting preserves the existing mode, a file
+    // already created 0644 by an older build would stay world-readable forever. Hence both:
+    // the mode for creation, and an explicit chmod that also tightens pre-existing files.
+    // (Same belt-and-braces treatment as the LaunchAgent writer below.)
+    fs.writeFileSync(configFile, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
+    fs.chmodSync(configFile, 0o600);
     return { success: true };
   } catch (e) {
     console.error('Error saving config:', e);
@@ -1907,6 +1914,11 @@ ${intervals}
     if (config.openai_api_key) addEnvVar('OPENAI_API_KEY', config.openai_api_key);
     addEnvVar('AI_MODEL', migrateModel(config.ai_model || DEFAULT_MODEL));
     addEnvVar('REPO_RADAR_STATUS_PORT', String(STATUS_PORT));
+    // State the provenance instead of letting the sync infer it. Runs launched by THIS plist
+    // are scheduled by definition; the old code guessed from "is a window being shown", so
+    // launchd runs logged themselves as manual and the two were indistinguishable. The same
+    // declared trigger is recorded in the completion receipt.
+    addEnvVar('REPO_RADAR_TRIGGER', 'scheduled');
 
     // Generate plist
     const plistContent = `<?xml version="1.0" encoding="UTF-8"?>
@@ -2138,13 +2150,52 @@ ipcMain.handle('model-notice:get', (event) => modelNoticeController ? modelNotic
 ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController) modelNoticeController.onAction(event.sender, action); });
 
 // Check if we need to catch up on a missed sync
+// Adopt a completion receipt written by a sync that ran while this app was closed.
+//
+// Progress is reported to an in-process status server, and only this process persists
+// lastSync — so a scheduled run at 9am with the app closed completed successfully and left
+// lastSync untouched. That made the tray show a stale time AND made checkMissedSync() believe
+// the sync never happened, so it could launch a redundant paid sync. Python writes the receipt
+// and never touches status.json; this reads the receipt and never has Python write status.json,
+// so there is exactly one writer per file.
+function reconcileRunReceipt() {
+  try {
+    const receiptFile = path.join(path.dirname(STATUS_FILE), 'last-run.json');
+    if (!fs.existsSync(receiptFile)) return null;
+    const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+    if (!receipt || receipt.schema !== 1 || !receipt.completed || !receipt.finishedAt) return null;
+
+    const finished = new Date(receipt.finishedAt);
+    if (Number.isNaN(finished.getTime()) || finished > new Date()) return null;  // ignore junk
+
+    const status = loadStatus();
+    const known = status.lastSync ? new Date(status.lastSync) : null;
+    if (known && !(finished > known)) return null;  // only ever move lastSync FORWARD
+
+    status.lastSync = receipt.finishedAt;
+    status.lastRunTrigger = receipt.trigger || null;
+    status.lastRunErrors = receipt.stats ? receipt.stats.errors : null;
+    saveStatus(status);
+    console.log(`Adopted ${receipt.trigger || 'unknown'} run completed at ${receipt.finishedAt}`
+      + ` (was ${status.lastSync === receipt.finishedAt && known ? known.toISOString() : 'unset'})`);
+    return receipt;
+  } catch (e) {
+    console.error('Could not reconcile run receipt:', e.message);
+    return null;
+  }
+}
+
 function checkMissedSync() {
   // Don't check if a sync is already running
   if (currentSyncProcess) {
     console.log('Sync already running, skipping missed sync check');
     return;
   }
-  
+
+  // Adopt any run that completed while we were closed BEFORE deciding whether one was missed,
+  // otherwise a completed scheduled sync looks like a missed one and gets needlessly repeated.
+  reconcileRunReceipt();
+
   const status = loadStatus();
   
   // Don't check if status shows syncing in progress
