@@ -6,7 +6,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { planReconcile, validateReceipt, satisfiesSchedule, SCHEMA } = require('../run-receipt');
+const { planReconcile, validateReceipt, qualifiesForSchedule, needsCatchUp, SCHEMA } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -23,9 +23,11 @@ const receipt = (over = {}) => ({
   const plan = planReconcile(r, { lastSync: stale });
   assert.ok(plan.adopt && plan.advanceLastSync, 'a qualifying newer run must advance lastSync');
   assert.strictEqual(plan.status.lastSync, r.finishedAt);
-  assert.strictEqual(plan.status.lastRunTrigger, 'scheduled');
-  assert.strictEqual(plan.status.lastRunErrors, 3, 'error count recorded');
-  assert.strictEqual(plan.status.lastRunReceiptAt, r.finishedAt, 'receipt watermark set');
+  const st = plan.status.channels.stable;
+  assert.strictEqual(st.trigger, 'scheduled');
+  assert.strictEqual(st.errors, 3, 'error count recorded');
+  assert.strictEqual(st.receiptAt, r.finishedAt, 'per-channel watermark set');
+  assert.strictEqual(st.qualifies, true, 'derived qualification recorded');
 }
 
 // per-repo errors do not stop adoption: the run COMPLETED
@@ -38,13 +40,15 @@ assert.ok(planReconcile(receipt({ stats: { errors: 3 } }), { lastSync: iso(6 * 3
 // how ordinary runs were triggered.
 {
   const newerLastSync = iso(60_000);                       // captured, so the compare is real
+  // A full manual run now qualifies (freshness), so use an older receipt to exercise the
+  // "newer lastSync already recorded" path rather than the non-qualifying path.
   const r = receipt({ trigger: 'manual', finishedAt: iso(120_000) });
   const plan = planReconcile(r, { lastSync: newerLastSync });
   assert.ok(plan.adopt, 'must still absorb the receipt for observability');
   assert.strictEqual(plan.advanceLastSync, false, 'but must not rewind lastSync');
   assert.strictEqual(plan.status.lastSync, newerLastSync, 'lastSync must be byte-identical');
-  assert.strictEqual(plan.status.lastRunTrigger, 'manual', 'provenance recorded anyway');
-  assert.strictEqual(plan.status.lastRunReceiptAt, r.finishedAt, 'watermark advanced');
+  assert.strictEqual(plan.status.channels.stable.trigger, 'manual', 'provenance recorded anyway');
+  assert.strictEqual(plan.status.channels.stable.receiptAt, r.finishedAt, 'watermark advanced');
   assert.strictEqual(plan.reason, 'observability-only');
 }
 
@@ -55,7 +59,7 @@ assert.ok(planReconcile(receipt({ stats: { errors: 3 } }), { lastSync: iso(6 * 3
   assert.ok(plan.adopt, 'still absorbed');
   assert.strictEqual(plan.advanceLastSync, false,
     'a --skip-metadata run did not do the scheduled work, so it must not satisfy the schedule');
-  assert.strictEqual(plan.status.lastRunMode, 'skip-metadata');
+  assert.strictEqual(plan.status.channels.stable.mode, 'skip-metadata');
 }
 
 // ── channel isolation: a dev run must never advance stable ───────────────────────────────
@@ -92,18 +96,80 @@ for (const [label, over] of Object.entries(rejects)) {
 assert.strictEqual(validateReceipt(null), null, 'null is rejected, not thrown on');
 assert.strictEqual(validateReceipt('a string'), null, 'a non-object is rejected');
 
-// ── schedule equivalence ────────────────────────────────────────────────────────────────
-assert.ok(satisfiesSchedule(receipt({ trigger: 'scheduled' })), 'scheduled satisfies');
-assert.ok(satisfiesSchedule(receipt({ trigger: 'catchup' })), 'catch-up stands in for a miss');
-// manual/cli mean "a user asked for a sync now", which is not the same as the scheduled
-// occurrence having happened, so they do not satisfy the schedule even when mode is full.
-assert.strictEqual(satisfiesSchedule(receipt({ trigger: 'manual' })), false,
-  'a manual run is not the scheduled occurrence');
-assert.strictEqual(satisfiesSchedule(receipt({ trigger: 'cli' })), false,
-  'a direct CLI run is not the scheduled occurrence');
-assert.strictEqual(satisfiesSchedule(receipt({ trigger: 'scheduled', qualifiesForSchedule: false })),
-  false, 'a partial scheduled run does not satisfy the schedule either');
-assert.strictEqual(satisfiesSchedule(null), false, 'null is false, not a throw');
+// ── schedule equivalence, as PRODUCTION derives it ──────────────────────────────────────
+// Derived from the run's properties, never read off receipt.qualifiesForSchedule — a receipt can
+// carry mode:'metadata-only' with qualifies:true, and trusting the flag let a partial run
+// suppress the schedule.
+assert.ok(qualifiesForSchedule(receipt({ trigger: 'scheduled' })), 'stable full scheduled');
+assert.ok(qualifiesForSchedule(receipt({ trigger: 'catchup' })), 'stable full catch-up');
+// Freshness argument: checkMissedSync is freshness-based and Electron already stamps lastSync for
+// a completed manual run, so re-running identical full work minutes later because the trigger was
+// manual just spends money.
+assert.ok(qualifiesForSchedule(receipt({ trigger: 'manual' })), 'a FULL manual run is fresh work');
+assert.ok(qualifiesForSchedule(receipt({ trigger: 'cli' })), 'a FULL cli run is fresh work');
+assert.strictEqual(qualifiesForSchedule(receipt({ mode: 'skip-metadata' })), false,
+  'a partial run did not do the scheduled work');
+assert.strictEqual(qualifiesForSchedule(receipt({ mode: 'metadata-only' })), false, 'partial');
+assert.strictEqual(qualifiesForSchedule(receipt({ channel: 'dev' })), false, 'dev owns no schedule');
+assert.strictEqual(qualifiesForSchedule(null), false, 'null is false, not a throw');
+
+// contradictory fields: the flag says yes, the mode says partial -> derived answer wins
+{
+  const plan = planReconcile(receipt({ mode: 'metadata-only', qualifiesForSchedule: true }),
+    { lastSync: iso(6 * 3600_000) });
+  assert.strictEqual(plan.advanceLastSync, false,
+    'a contradictory receipt must not advance lastSync on the strength of its own flag');
+}
+
+// ── channel isolation must survive a SHARED status object ───────────────────────────────
+// The filenames are channel-scoped but status.json is not, so the earlier version let a dev app
+// advance the shared lastSync and then block a stable receipt as already-absorbed.
+{
+  const shared = { lastSync: iso(6 * 3600_000) };
+  const dev = planReconcile(receipt({ channel: 'dev' }), shared, { channel: 'dev' });
+  assert.ok(dev.adopt, 'a dev app absorbs its own receipt');
+  assert.strictEqual(dev.advanceLastSync, false, 'but must NOT advance the stable watermark');
+  assert.strictEqual(dev.status.lastSync, shared.lastSync, 'stable lastSync byte-identical');
+
+  const stable = planReconcile(receipt({ finishedAt: iso(120_000) }), dev.status,
+    { channel: 'stable' });
+  assert.ok(stable.adopt, 'a dev receipt must not consume the stable absorption watermark');
+  assert.strictEqual(stable.reason, 'adopted', 'stable still advances after a dev run');
+  assert.notStrictEqual(stable.status.lastSync, shared.lastSync, 'stable lastSync moved');
+}
+
+// ── needsCatchUp: one predicate for the initial and delayed decisions ───────────────────
+{
+  const at = (h, m = 0) => { const d = new Date(); d.setHours(h, m, 0, 0); return d; };
+  const daily = { schedule: { enabled: true, type: 'daily', time: '09:00' } };
+  assert.ok(needsCatchUp(daily, { lastSync: at(8).toISOString() }, at(10)), 'daily missed');
+  assert.strictEqual(needsCatchUp(daily, { lastSync: at(9, 30).toISOString() }, at(10)), false,
+    'daily already satisfied today');
+
+  // weekly previously fell through to the hourly interval branch, so a 09:00 weekly schedule with
+  // lastSync at 08:00 was flagged missed and then cancelled an hour later.
+  const weekly = { schedule: { enabled: true, type: 'weekly', time: '09:00',
+    days: [new Date().getDay()] } };
+  assert.ok(needsCatchUp(weekly, { lastSync: at(8).toISOString() }, at(10)), 'weekly missed');
+  assert.strictEqual(needsCatchUp(weekly, { lastSync: at(9, 30).toISOString() }, at(10)), false,
+    'weekly satisfied — must NOT fall through to an hourly interval');
+  const otherDay = { schedule: { enabled: true, type: 'weekly', time: '09:00',
+    days: [(new Date().getDay() + 3) % 7] } };
+  assert.strictEqual(needsCatchUp(otherDay, { lastSync: at(8).toISOString() }, at(10)), false,
+    'not a scheduled weekday');
+
+  const hourly = { schedule: { enabled: true, type: 'hourly', interval: 6 } };
+  assert.ok(needsCatchUp(hourly, { lastSync: iso(7 * 3600_000) }), 'hourly overdue');
+  assert.strictEqual(needsCatchUp(hourly, { lastSync: iso(3600_000) }), false, 'hourly fresh');
+
+  // things that must never launch a paid sync
+  assert.ok(needsCatchUp(daily, {}), 'scheduling on and never synced -> yes');
+  assert.strictEqual(needsCatchUp({ schedule: { enabled: false } }, {}), false, 'disabled');
+  assert.strictEqual(needsCatchUp(null, {}), false, 'config vanished during the delay');
+  assert.strictEqual(needsCatchUp({}, {}), false, 'no schedule block');
+  assert.strictEqual(needsCatchUp(daily, { syncing: true }), false, 'already syncing');
+  assert.strictEqual(needsCatchUp(daily, { lastSync: 'not-a-date' }), false, 'unusable lastSync');
+}
 
 // ── main.js wiring landmarks ────────────────────────────────────────────────────────────
 assert.ok(/require\('\.\/run-receipt'\)/.test(MAIN), 'main.js must use the shared module');
@@ -113,6 +179,18 @@ assert.ok(/function hardenExistingConfig\(/.test(MAIN) && /hardenExistingConfig\
   'startup config hardening must exist AND be called');
 assert.ok(/function scheduleCatchUpSync\(/.test(MAIN),
   'delayed catch-up must go through the revalidating helper');
+assert.ok(/needsCatchUp\(config, loadStatus\(\)/.test(MAIN),
+  'main.js must use the SHARED predicate, not a second diverging copy');
+assert.ok(/REPO_RADAR_CATCHUP_NOT_BEFORE/.test(MAIN),
+  'catch-up must carry the watermark its decision was based on, for the lock-held re-check');
+{
+  const region = MAIN.slice(MAIN.indexOf('app.whenReady().then'));
+  const harden = region.indexOf('hardenExistingConfig()');
+  const tray = region.indexOf('updateTrayMenu()');
+  const runtime = region.indexOf('ensureRuntime');
+  assert.ok(harden >= 0 && harden < tray && harden < runtime,
+    'config must be tightened BEFORE the tray render and before async runtime provisioning');
+}
 assert.ok(!/setTimeout\(\(\) => triggerSync\(/.test(MAIN),
   'no delayed catch-up may bypass revalidation with a bare setTimeout');
 assert.ok(/shellEnv\.REPO_RADAR_TRIGGER =/.test(MAIN),

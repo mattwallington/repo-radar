@@ -205,3 +205,94 @@ def test_read_rejects_wrongly_typed_fields(tmp_path):
                         ("non-bool qualification", {"qualifiesForSchedule": "yes"})):
         receipt_path(tmp_path, "stable").write_text(_json.dumps({**good, **over}))
         assert read_receipt(tmp_path, "stable") is None, f"must reject: {label}"
+
+
+# ── executable orchestration: run sync_mode itself, not the helper it calls ───────────────
+
+
+def _args(**over):
+    import types
+    base = dict(command='sync', dry_run=False, force=False, metadata_only=False,
+                repos_only=False, regenerate_metadata=False, skip_metadata=False,
+                status_server=False, version=False)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_zero_repo_sync_mode_execution_writes_a_receipt(tmp_path, monkeypatch):
+    """Actually EXECUTE sync_mode. The previous 'end-to-end' test called write_receipt directly,
+    so the production call site stayed covered only by source-text landmarks — the same blind spot
+    that let a synthesis fix ship as dead code."""
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config',
+                        lambda: {'repositories': [], 'ai_model': 'claude-opus-5'})
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'scheduled')
+    monkeypatch.setenv(receipts_mod.CHANNEL_ENV, 'stable')
+
+    rc = sync_mod.sync_mode(_args())
+    assert rc == 0, "a zero-repository run is a success"
+
+    r = read_receipt(tmp_path, 'stable')
+    assert r is not None, "executing sync_mode must leave a receipt on disk"
+    assert r['trigger'] == 'scheduled' and r['channel'] == 'stable'
+    assert r['completed'] is True and r['qualifiesForSchedule'] is True
+    assert r['stats']['total'] == 0
+
+
+def test_dry_run_execution_writes_no_receipt(tmp_path, monkeypatch):
+    from repo_radar.modes import sync as sync_mod
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    sync_mod.sync_mode(_args(dry_run=True))
+    assert read_receipt(tmp_path, 'stable') is None, "a dry run must not claim a completed sync"
+
+
+def test_catchup_execution_skips_when_already_satisfied(tmp_path, monkeypatch):
+    """The lock-held guard: by the time sync_mode runs, the dispatcher holds the root lock, so
+    this is the first race-free moment to notice a scheduled worker already did the work."""
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+
+    # a qualifying run landed AFTER the catch-up decision was taken
+    write_receipt(tmp_path, trigger='scheduled', started_at='x', stats=STATS,
+                  channel='stable', mode='full', finished_at='2026-07-29T23:00:00+00:00')
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'catchup')
+    monkeypatch.setenv('REPO_RADAR_CATCHUP_NOT_BEFORE', '2026-07-29T22:00:00+00:00')
+
+    called = {'network': False}
+    monkeypatch.setattr(sync_mod, 'wait_for_network',
+                        lambda **kw: called.__setitem__('network', True) or True)
+    rc = sync_mod.sync_mode(_args())
+    assert rc == 0
+    assert called['network'] is False, "must bail BEFORE doing any work"
+    # the pre-existing receipt is untouched, not overwritten by the skipped run
+    assert read_receipt(tmp_path, 'stable')['finishedAt'] == '2026-07-29T23:00:00+00:00'
+
+
+def test_catchup_execution_proceeds_when_not_satisfied(tmp_path, monkeypatch):
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    # the only receipt predates the decision watermark, so it cannot satisfy this catch-up
+    write_receipt(tmp_path, trigger='scheduled', started_at='x', stats=STATS,
+                  channel='stable', mode='full', finished_at='2026-07-29T21:00:00+00:00')
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'catchup')
+    monkeypatch.setenv('REPO_RADAR_CATCHUP_NOT_BEFORE', '2026-07-29T22:00:00+00:00')
+    assert sync_mod.sync_mode(_args()) == 0
+    assert read_receipt(tmp_path, 'stable')['trigger'] == 'catchup', "the catch-up ran"

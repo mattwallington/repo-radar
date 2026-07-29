@@ -13,7 +13,7 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
-const { planReconcile } = require('./run-receipt');
+const { planReconcile, needsCatchUp } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
@@ -1063,8 +1063,8 @@ function startStatusServer() {
 }
 
 // Trigger sync
-function triggerSync({ showWindow = true, trigger = null } = {}) {
-  const options = { showWindow, trigger };
+function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {}) {
+  const options = { showWindow, trigger, notBefore };
   if (currentSyncProcess) {
     return; // Already syncing
   }
@@ -1263,6 +1263,7 @@ function triggerSync({ showWindow = true, trigger = null } = {}) {
   // environment ever carried REPO_RADAR_TRIGGER (inherited, exported, launchd), every in-app
   // sync would report itself as scheduled — the same mislabelling, inverted.
   shellEnv.REPO_RADAR_TRIGGER = (options && options.trigger) || 'manual';
+  if (options && options.notBefore) shellEnv.REPO_RADAR_CATCHUP_NOT_BEFORE = options.notBefore;
   shellEnv.REPO_RADAR_CHANNEL = runtimeChannel;
 
   // Sync disabled: either the build channel couldn't be resolved, or
@@ -2196,6 +2197,7 @@ function reconcileRunReceipt() {
     const plan = planReconcile(receipt, before, { channel: runtimeChannel });
     if (!plan.adopt) return null;
     saveStatus(plan.status);
+    try { updateTrayMenu(); } catch (e) { /* tray may not exist yet at startup */ }
     console.log(`Adopted ${receipt.trigger} run finished ${receipt.finishedAt}`
       + ` (${plan.reason}; lastSync ${plan.advanceLastSync ? 'advanced' : 'unchanged'})`);
     return receipt;
@@ -2217,7 +2219,10 @@ function scheduleCatchUpSync(delayMs, decide) {
       console.log('Catch-up no longer needed — a run completed while we waited');
       return;
     }
-    triggerSync({ showWindow: false, trigger: 'catchup' });
+    // Hand the worker the watermark this decision was based on. The lock is acquired inside the
+    // worker, so only the worker can make the final, race-free call.
+    triggerSync({ showWindow: false, trigger: 'catchup',
+                  notBefore: (loadStatus() || {}).lastSync || '' });
   }, delayMs);
 }
 
@@ -2227,25 +2232,12 @@ function scheduleCatchUpSync(delayMs, decide) {
 function stillNeedsCatchUp() {
   try {
     if (currentSyncProcess) return false;
-    const status = loadStatus();
-    if (status.syncing) return false;
     const configFile = path.join(process.env.HOME, '.config', 'repo-radar', 'config.json');
-    if (!fs.existsSync(configFile)) return false;
-    const schedule = (JSON.parse(fs.readFileSync(configFile, 'utf8')) || {}).schedule;
-    if (!schedule || !schedule.enabled) return false;
-    if (!status.lastSync) return true;
-    const lastSync = new Date(status.lastSync);
-    const now = new Date();
-    if (schedule.type === 'daily') {
-      const [h, m] = (schedule.time || '09:00').split(':').map(Number);
-      const todayScheduled = new Date(now);
-      todayScheduled.setHours(h, m, 0, 0);
-      return now > todayScheduled && lastSync < todayScheduled;
-    }
-    const interval = Number(schedule.interval) || 6;
-    return ((now - lastSync) / 3600000) >= interval;
+    if (!fs.existsSync(configFile)) return false;      // config removed during the delay
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    return needsCatchUp(config, loadStatus(), new Date());
   } catch (e) {
-    return false;   // never launch a paid sync off a failed read
+    return false;                                       // never launch a paid sync off a bad read
   }
 }
 
@@ -2288,7 +2280,7 @@ function checkMissedSync() {
     // If never synced before, definitely need to sync
     if (!lastSync) {
       console.log('No previous sync found, triggering initial sync...');
-      scheduleCatchUpSync(5000, (st) => !st.lastSync);  // revalidates before launching
+      scheduleCatchUpSync(5000, () => stillNeedsCatchUp());
       return;
     }
     
@@ -2414,6 +2406,16 @@ function setupAutoUpdater() {
 
 // App ready
 app.whenReady().then(async () => {
+  // FIRST, before any await: the config may hold four API keys at a legacy 0644. Runtime
+  // provisioning below can take minutes on a new generation, and the tray render and model notice
+  // both read config before that resolves — so deferring this left the keys exposed for the whole
+  // window. Synchronous, idempotent, cheap.
+  hardenExistingConfig();
+  // Adopt any run that completed while we were closed BEFORE the first tray render, so the
+  // Last Sync label is correct immediately rather than after the 30s refresh. Idempotent: a
+  // second call reports already-absorbed.
+  try { reconcileRunReceipt(); } catch (e) { /* never block startup */ }
+
   // NOTE (Codex I6): this used to `pgrep -f "repo-radar sync --status-server"`
   // and `kill -9` every match on every launch, to clean up a sync left behind
   // by a prior app crash. Under the root-lock contract (runtime/lock.js,
@@ -2570,7 +2572,6 @@ app.whenReady().then(async () => {
 
   // Check for missed syncs after a short delay (let everything initialize)
   setTimeout(() => {
-    hardenExistingConfig();
     reconcileRunReceipt();
     checkMissedSync();
   }, 2000);
