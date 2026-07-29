@@ -501,8 +501,357 @@ Repository files:
                 raise
 
 
-def combine_chunk_analyses(full_name, analyses):
-    """Combine multiple chunk analyses into a cohesive report."""
+# Guards for hierarchical synthesis. Coverage is the priority — every chunk reaches the final
+# report — so these bound the work rather than dropping input; hitting them degrades to an
+# explicit, warned truncation instead of silently analysing part of the repository.
+SYNTHESIS_MAX_DEPTH = 4
+SYNTHESIS_MAX_CALLS = 32
+SYNTHESIS_OUTPUT_TOKENS = 16384
+
+
+_TRUNCATION_MARKER = "\n\n[truncated by repo-radar: exceeded the synthesis budget]\n"
+
+
+def _framed(analysis, index):
+    """Exactly how _build_synthesis_prompt wraps one analysis."""
+    return f"\n--- Analysis Part {index} ---\n{analysis}\n"
+
+
+def _batch_by_budget(full_name, analyses, budget, model):
+    """Group analyses into ordered, contiguous batches whose PROMPT fits the token budget.
+
+    Budget is measured against the finished prompt — template overhead plus each
+    "Analysis Part N" wrapper — not against the bare analysis text. Counting only the text
+    understates the prompt and makes "no prompt exceeds the budget" false by the size of the
+    framing.
+
+    Order is preserved: a batch is always a contiguous run, so part ordering still reflects
+    the repository's chunk order after any number of rounds. An analysis too large even alone
+    lands in a batch by itself, for the caller to handle.
+    """
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    batches, current, current_tokens = [], [], 0
+    for analysis in analyses:
+        tokens = count_tokens_accurate(_framed(analysis, len(current) + 1), model)
+        if current and overhead + current_tokens + tokens > budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+            tokens = count_tokens_accurate(_framed(analysis, 1), model)
+        current.append(analysis)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _truncate_to_tokens(text, max_tokens, model):
+    """Cut text to a token budget INCLUDING the marker, so the result really fits.
+
+    Appending the marker after sizing overshoots by the marker's own length, which is how a
+    1,000-token request came back as 1,009 tokens. Last resort only.
+    """
+    if max_tokens <= 0 or count_tokens_accurate(text, model) <= max_tokens:
+        return text
+    room = max(max_tokens - count_tokens_accurate(_TRUNCATION_MARKER, model), 1)
+    # Start from a proportional guess, then walk down until it genuinely fits.
+    cut = max(int(len(text) * (room / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    candidate = text[:cut]
+    while cut > 1 and count_tokens_accurate(candidate, model) > room:
+        cut = int(cut * 0.9)
+        candidate = text[:cut]
+    return candidate + _TRUNCATION_MARKER
+
+
+def _total_tokens(analyses, model):
+    return sum(count_tokens_accurate(a, model) for a in analyses)
+
+
+def _fits(full_name, parts, budget, model):
+    return count_tokens_accurate(_build_synthesis_prompt(full_name, parts), model) <= budget
+
+
+def _truncate_all_to_fit(full_name, analyses, budget, model):
+    """Truncate analyses so the FINISHED prompt fits the budget. NEVER returns over-budget.
+
+    Dividing the budget by the item count ignores the per-item "Analysis Part N" wrapper and
+    the template, so shares derived that way can assemble into an over-budget prompt.
+
+    Per-part tightening also has a floor: every part costs its framing plus a truncation
+    marker (~23 tokens here) no matter how hard its content is cut. Past roughly
+    budget/floor parts, no number of tightening passes can succeed — the previous version
+    simply gave up after five tries and returned the over-budget result anyway. So beyond
+    that point the parts are collapsed into ONE compact analysis with lightweight separators
+    and a single global marker, which pays the framing and marker cost once instead of n times.
+
+    Returns [] when even one framed, marked part cannot fit; the caller must then produce a
+    local result rather than send a request that is certain to be rejected.
+    """
+    if not analyses:
+        return []
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    framing = count_tokens_accurate(_framed('', 1), model)
+    marker = count_tokens_accurate(_TRUNCATION_MARKER, model)
+
+    share = max((budget - overhead) // len(analyses) - framing, 1)
+    trimmed = [_truncate_to_tokens(a, share, model) for a in analyses]
+
+    # Verify rather than assume: token counting is approximate, so tighten until it fits.
+    for _ in range(5):
+        if _fits(full_name, trimmed, budget, model):
+            return trimmed
+        share = max(int(share * 0.85), 1)
+        trimmed = [_truncate_to_tokens(a, share, model) for a in trimmed]
+
+    # Terminal path: the per-part floor exceeds the budget, so tightening cannot converge.
+    return _compact_every_part(full_name, analyses, budget, model)
+
+
+# Below this, an excerpt conveys nothing useful about its part, so representing every part is
+# no longer meaningful and honest local degradation is the better answer.
+MIN_EXCERPT_TOKENS = 8
+
+
+def _hard_truncate(text, max_tokens, model):
+    """Cut to a token budget with NO marker — the caller adds one global warning instead.
+
+    Marking every excerpt is what creates the per-part floor this path exists to escape.
+    """
+    if max_tokens <= 0:
+        return ''
+    if count_tokens_accurate(text, model) <= max_tokens:
+        return text
+    cut = max(int(len(text) * (max_tokens / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    candidate = text[:cut]
+    while cut > 1 and count_tokens_accurate(candidate, model) > max_tokens:
+        cut = int(cut * 0.9)
+        candidate = text[:cut]
+    return candidate
+
+
+def _compact_every_part(full_name, analyses, budget, model):
+    """One analysis holding an excerpt of EVERY part, or [] if that cannot fit.
+
+    Joining the parts and cutting the head keeps the prompt bounded but silently drops whole
+    later analyses — and the model, seeing no evidence anything is missing, returns normal
+    QUICK_REFERENCE and summary sections that parse as healthy. That is the original defect
+    this feature exists to prevent (authoritative metadata for a repository mostly unread),
+    reintroduced through the emergency path.
+
+    So every part gets an equal excerpt under one global warning. If the parts cannot each
+    carry at least MIN_EXCERPT_TOKENS, this returns [] and the caller degrades locally, which
+    is honest, rather than emitting a confident synthesis of a fraction of the repository.
+    """
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    framing = count_tokens_accurate(_framed('', 1), model)
+    warning = (f"[repo-radar: all {len(analyses)} analysis parts below are excerpted to fit "
+               f"the model's context window; detail within each part is lost]\n")
+    separators = [f"\n[{i}] " for i in range(1, len(analyses) + 1)]
+
+    room = budget - overhead - framing
+    fixed = count_tokens_accurate(warning, model) + sum(
+        count_tokens_accurate(s, model) for s in separators)
+    share = (room - fixed) // max(len(analyses), 1)
+    if share < MIN_EXCERPT_TOKENS:
+        return []
+
+    for _ in range(6):
+        excerpts = [_hard_truncate(a, share, model) for a in analyses]
+        compact = warning + ''.join(s + e for s, e in zip(separators, excerpts))
+        if _fits(full_name, [compact], budget, model):
+            return [compact]
+        share = int(share * 0.8)
+        if share < MIN_EXCERPT_TOKENS:
+            return []
+    return []
+
+
+def _local_degraded_analysis(full_name, part_count):
+    """A synthesis-failed placeholder produced WITHOUT an LLM call.
+
+    Used only when the budget cannot accommodate even a single framed part. Sending the
+    request anyway would guarantee a context-window rejection; returning this keeps the sync
+    alive and leaves a record the metadata parser will flag as degraded.
+    """
+    return (f"Synthesis for {full_name} could not be completed: {part_count} analysis parts "
+            f"could not be reduced to fit the model's context window. Re-run with a "
+            f"larger-context model, or narrow the repository's file selection.")
+
+
+def _fallback_chain(model, limit=6):
+    """The model plus every model a rate limit could fall back to, in order."""
+    chain, seen, current = [model], {model}, model
+    while len(chain) < limit:
+        nxt = get_fallback_model(current)
+        if not nxt or nxt in seen:
+            break
+        chain.append(nxt)
+        seen.add(nxt)
+        current = nxt
+    return chain
+
+
+def _synthesis_budget(full_name, model):
+    """Total prompt-token budget for one synthesis call against `model`.
+
+    Budgets for the SMALLEST window in the fallback chain, not just `model`. A rate-limit
+    fallback happens inside the caller's retry, which re-sends the SAME prompt to a different
+    model — so re-budgeting after the call is too late. If the prompt was sized for a larger
+    window it overflows the moment the fallback serves it. Sizing for the smallest candidate
+    up front means whichever model answers, the prompt fits.
+
+    Includes measured template overhead and reserves room for the response, so callers compare
+    a FINISHED prompt against this number.
+
+    Known limitation, deliberately not addressed here: this takes the smallest numeric WINDOW
+    across the chain, but batching still counts tokens with the current model's tokenizer. A
+    fallback whose tokenizer counted the same text differently could therefore be handed a
+    prompt sized by another model's count. Measured against the live chain this is a non-issue
+    — litellm counts an identical sample identically for all four Gemini fallback models — and
+    Gemini is the only provider with a fallback chain at all. A fully generic guarantee would
+    re-count each candidate with its own tokenizer and take the worst case.
+    """
+    budget = min(get_chunking_threshold(m) for m in _fallback_chain(model)) \
+        - SYNTHESIS_OUTPUT_TOKENS
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    # Always leave workable room for content beyond the template itself.
+    return max(budget, overhead + 1000)
+
+
+def combine_chunk_analyses(full_name, analyses, model=None,
+                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS,
+                           synthesize=None):
+    """Combine chunk analyses into one cohesive report, bounded by the model's context.
+
+    Previously every chunk analysis was concatenated into a single prompt with no bound, so a
+    large repository produced a request larger than the context window and the whole metadata
+    step failed (observed: 1,189,532 tokens against a 1,000,000 limit). Chunking bounded the
+    INPUT files but nothing bounded their combination.
+
+    This performs a hierarchical map-reduce instead: analyses are grouped into ordered batches
+    that each fit the budget, every batch is synthesised, and the results are combined again
+    until a single bounded synthesis remains. Every chunk therefore reaches the final report.
+
+    synthesize: optional callable(prompt, model) -> (text, cost, model_used), letting a caller
+    supply its own retry, model-fallback and rate-limit accounting while this function keeps
+    ownership of bounding. model_used is fed back into the budget, because a fallback model may
+    have a smaller window than the one the budget was computed from — budgeting one model while
+    calling another is how a "bounded" prompt can still overflow.
+
+    Returns (final_analysis, total_api_cost) — cost is aggregated across every round.
+    """
+    analyses = [a for a in (analyses or []) if a and str(a).strip()]
+    if not analyses:
+        return "", 0.0
+    if model is None:
+        model = get_ai_model()
+
+    def run(batch):
+        """One synthesis call. Returns (text, cost) and re-budgets if the model changed."""
+        nonlocal model, budget
+        prompt = _build_synthesis_prompt(full_name, batch)
+        if synthesize is None:
+            text, cost, used = _synthesize_once(full_name, batch, model)
+        else:
+            text, cost, used = synthesize(prompt, model)
+        if used and used != model:
+            # Re-derive the budget from whichever model actually served the request, keeping
+            # the smaller of the two so a fallback can only tighten, never loosen.
+            model = used
+            budget = min(budget, _synthesis_budget(full_name, used))
+        return text, cost
+
+    budget = _synthesis_budget(full_name, model)
+
+    level = list(analyses)
+    depth = 0
+    calls = 0
+    total_cost = 0.0
+
+    while True:
+        # A single analysis larger than one whole request cannot be reduced by regrouping —
+        # nothing to combine it with. Truncation is the only remaining move, and it is loud.
+        if len(level) == 1 and count_tokens_accurate(
+                _build_synthesis_prompt(full_name, level), model) > budget:
+            print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
+                  f"truncating it to fit (some detail from this section is lost){RESET}")
+            level = _truncate_all_to_fit(full_name, level, budget, model)
+            if not level:
+                print(f"    {YELLOW}Synthesis: budget cannot fit even one part; "
+                      f"reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, 1), total_cost
+
+        batches = _batch_by_budget(full_name, level, budget, model)
+
+        if len(batches) == 1:
+            text, cost = run(batches[0])
+            return text, total_cost + cost
+
+        # Guards: stop expanding work, but never by dropping input. The +1 reserves the final
+        # reduction, so max_calls is a true ceiling rather than a ceiling on the map rounds.
+        remaining_depth = max_depth - depth
+        if remaining_depth <= 0 or calls + len(batches) + 1 > max_calls:
+            reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
+            print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
+                  f"truncating each to fit a single final pass{RESET}")
+            trimmed = _truncate_all_to_fit(full_name, level, budget, model)
+            if not trimmed:
+                print(f"    {YELLOW}Synthesis: {len(level)} parts cannot be reduced to fit; "
+                      f"reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, len(level)), total_cost
+            text, cost = run(trimmed)
+            return text, total_cost + cost
+
+        print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
+              f"(round {depth + 1}){RESET}")
+
+        before = _total_tokens(level, model)
+        combined = []
+        pending = list(level)
+        while pending:
+            # Enforce the ceiling per CALL, not per round: re-batching can yield more calls
+            # than the round's estimate (a shrunk budget makes smaller batches), so a
+            # once-per-round check can be overrun mid-round.
+            if calls + 1 >= max_calls:
+                print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
+                      f"remaining {len(combined) + len(pending)} parts to finish{RESET}")
+                remainder = combined + pending
+                trimmed = _truncate_all_to_fit(full_name, remainder, budget, model)
+                if not trimmed:
+                    print(f"    {YELLOW}Synthesis: {len(remainder)} parts cannot be reduced "
+                          f"to fit; reporting locally without a request{RESET}")
+                    return _local_degraded_analysis(full_name, len(remainder)), total_cost
+                text, cost = run(trimmed)
+                return text, total_cost + cost
+
+            # Re-batch before every call rather than once per round: a mid-round fallback to a
+            # smaller-window model shrinks the budget, and batches sized for the previous model
+            # would overflow it. Re-deriving keeps each prompt within the CURRENT budget.
+            batch = _batch_by_budget(full_name, pending, budget, model)[0]
+            text, cost = run(batch)
+            combined.append(text)
+            total_cost += cost
+            calls += 1
+            pending = pending[len(batch):]
+
+        # No-progress detection: if a whole round failed to shrink the material, recursing
+        # again would loop at the same size and burn the call budget for nothing.
+        if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
+            print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
+                  f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
+            trimmed = _truncate_all_to_fit(full_name, combined, budget, model)
+            if not trimmed:
+                print(f"    {YELLOW}Synthesis: {len(combined)} parts cannot be reduced to "
+                      f"fit; reporting locally without a request{RESET}")
+                return _local_degraded_analysis(full_name, len(combined)), total_cost
+            text, cost = run(trimmed)
+            return text, total_cost + cost
+
+        level = combined
+        depth += 1
+
+
+def _build_synthesis_prompt(full_name, analyses):
+    """Build the synthesis prompt for a single round of combining."""
 
     combined_prompt = f"""You are reviewing multiple analyses of different parts of the repository "{full_name}".
 
@@ -548,6 +897,20 @@ Here are the analyses to combine:
     for i, analysis in enumerate(analyses, 1):
         combined_prompt += f"\n--- Analysis Part {i} ---\n{analysis}\n"
 
+    return combined_prompt
+
+
+def _synthesize_once(full_name, analyses, model=None):
+    """Run ONE synthesis call over the given analyses. Returns (text, api_cost, model_used).
+
+    The caller is responsible for ensuring the batch fits the model's budget; this function
+    does not bound its input. `model` is threaded in explicitly — resolving it independently
+    via get_ai_model() would let the caller budget one model and this call use another.
+    """
+    if model is None:
+        model = get_ai_model()
+    combined_prompt = _build_synthesis_prompt(full_name, analyses)
+
     # Use retry logic
     max_retries = 3
     base_wait = 2
@@ -555,9 +918,9 @@ Here are the analyses to combine:
     for retry in range(max_retries):
         try:
             final_analysis, api_cost, _ = call_llm(
-                get_ai_model(), combined_prompt, max_tokens=16384
+                model, combined_prompt, max_tokens=SYNTHESIS_OUTPUT_TOKENS
             )
-            return final_analysis, api_cost
+            return final_analysis, api_cost, model
 
         except Exception as e:
             error_str = str(e)
