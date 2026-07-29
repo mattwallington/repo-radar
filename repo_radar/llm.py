@@ -509,19 +509,34 @@ SYNTHESIS_MAX_CALLS = 32
 SYNTHESIS_OUTPUT_TOKENS = 16384
 
 
-def _batch_by_budget(analyses, budget, model):
-    """Group analyses into ordered, contiguous batches that each fit the token budget.
+_TRUNCATION_MARKER = "\n\n[truncated by repo-radar: exceeded the synthesis budget]\n"
 
-    Order is preserved: a batch is always a contiguous run, so "Analysis Part N" ordering
-    still reflects the repository's chunk order after any number of rounds. An analysis that
-    exceeds the budget on its own lands in a batch by itself, for the caller to handle.
+
+def _framed(analysis, index):
+    """Exactly how _build_synthesis_prompt wraps one analysis."""
+    return f"\n--- Analysis Part {index} ---\n{analysis}\n"
+
+
+def _batch_by_budget(full_name, analyses, budget, model):
+    """Group analyses into ordered, contiguous batches whose PROMPT fits the token budget.
+
+    Budget is measured against the finished prompt — template overhead plus each
+    "Analysis Part N" wrapper — not against the bare analysis text. Counting only the text
+    understates the prompt and makes "no prompt exceeds the budget" false by the size of the
+    framing.
+
+    Order is preserved: a batch is always a contiguous run, so part ordering still reflects
+    the repository's chunk order after any number of rounds. An analysis too large even alone
+    lands in a batch by itself, for the caller to handle.
     """
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
     batches, current, current_tokens = [], [], 0
     for analysis in analyses:
-        tokens = count_tokens_accurate(analysis, model)
-        if current and current_tokens + tokens > budget:
+        tokens = count_tokens_accurate(_framed(analysis, len(current) + 1), model)
+        if current and overhead + current_tokens + tokens > budget:
             batches.append(current)
             current, current_tokens = [], 0
+            tokens = count_tokens_accurate(_framed(analysis, 1), model)
         current.append(analysis)
         current_tokens += tokens
     if current:
@@ -530,24 +545,42 @@ def _batch_by_budget(analyses, budget, model):
 
 
 def _truncate_to_tokens(text, max_tokens, model):
-    """Cut text down to a token budget, marking the cut. Last resort only."""
+    """Cut text to a token budget INCLUDING the marker, so the result really fits.
+
+    Appending the marker after sizing overshoots by the marker's own length, which is how a
+    1,000-token request came back as 1,009 tokens. Last resort only.
+    """
     if max_tokens <= 0 or count_tokens_accurate(text, model) <= max_tokens:
         return text
+    room = max(max_tokens - count_tokens_accurate(_TRUNCATION_MARKER, model), 1)
     # Start from a proportional guess, then walk down until it genuinely fits.
-    cut = max(int(len(text) * (max_tokens / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    cut = max(int(len(text) * (room / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
     candidate = text[:cut]
-    while cut > 1 and count_tokens_accurate(candidate, model) > max_tokens:
+    while cut > 1 and count_tokens_accurate(candidate, model) > room:
         cut = int(cut * 0.9)
         candidate = text[:cut]
-    return candidate + "\n\n[truncated by repo-radar: exceeded the synthesis budget]\n"
+    return candidate + _TRUNCATION_MARKER
 
 
 def _total_tokens(analyses, model):
     return sum(count_tokens_accurate(a, model) for a in analyses)
 
 
+def _synthesis_budget(full_name, model):
+    """Total prompt-token budget for one synthesis call against `model`.
+
+    Includes the template overhead (measured, not assumed) and reserves room for the response,
+    so callers compare a FINISHED prompt against this number.
+    """
+    budget = get_chunking_threshold(model) - SYNTHESIS_OUTPUT_TOKENS
+    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    # Always leave workable room for content beyond the template itself.
+    return max(budget, overhead + 1000)
+
+
 def combine_chunk_analyses(full_name, analyses, model=None,
-                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS):
+                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS,
+                           synthesize=None):
     """Combine chunk analyses into one cohesive report, bounded by the model's context.
 
     Previously every chunk analysis was concatenated into a single prompt with no bound, so a
@@ -559,6 +592,12 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     that each fit the budget, every batch is synthesised, and the results are combined again
     until a single bounded synthesis remains. Every chunk therefore reaches the final report.
 
+    synthesize: optional callable(prompt, model) -> (text, cost, model_used), letting a caller
+    supply its own retry, model-fallback and rate-limit accounting while this function keeps
+    ownership of bounding. model_used is fed back into the budget, because a fallback model may
+    have a smaller window than the one the budget was computed from — budgeting one model while
+    calling another is how a "bounded" prompt can still overflow.
+
     Returns (final_analysis, total_api_cost) — cost is aggregated across every round.
     """
     analyses = [a for a in (analyses or []) if a and str(a).strip()]
@@ -567,14 +606,22 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     if model is None:
         model = get_ai_model()
 
-    # Reserve room for the template itself and for the response.
-    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-    budget = get_chunking_threshold(model) - overhead - SYNTHESIS_OUTPUT_TOKENS
-    if budget < 1000:  # pathologically small window — leave something workable
-        budget = 1000
+    def run(batch):
+        """One synthesis call. Returns (text, cost) and re-budgets if the model changed."""
+        nonlocal model, budget
+        prompt = _build_synthesis_prompt(full_name, batch)
+        if synthesize is None:
+            text, cost, used = _synthesize_once(full_name, batch, model)
+        else:
+            text, cost, used = synthesize(prompt, model)
+        if used and used != model:
+            # Re-derive the budget from whichever model actually served the request, keeping
+            # the smaller of the two so a fallback can only tighten, never loosen.
+            model = used
+            budget = min(budget, _synthesis_budget(full_name, used))
+        return text, cost
 
-    if len(analyses) == 1 and count_tokens_accurate(analyses[0], model) <= budget:
-        return _synthesize_once(full_name, analyses)
+    budget = _synthesis_budget(full_name, model)
 
     level = list(analyses)
     depth = 0
@@ -584,26 +631,30 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     while True:
         # A single analysis larger than one whole request cannot be reduced by regrouping —
         # nothing to combine it with. Truncation is the only remaining move, and it is loud.
-        if len(level) == 1 and count_tokens_accurate(level[0], model) > budget:
+        if len(level) == 1 and count_tokens_accurate(
+                _build_synthesis_prompt(full_name, level), model) > budget:
             print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
                   f"truncating it to fit (some detail from this section is lost){RESET}")
-            level = [_truncate_to_tokens(level[0], budget, model)]
+            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+            level = [_truncate_to_tokens(level[0], max(budget - overhead, 1), model)]
 
-        batches = _batch_by_budget(level, budget, model)
+        batches = _batch_by_budget(full_name, level, budget, model)
 
         if len(batches) == 1:
-            text, cost = _synthesize_once(full_name, batches[0])
+            text, cost = run(batches[0])
             return text, total_cost + cost
 
-        # Guards: stop expanding work, but never by dropping input.
+        # Guards: stop expanding work, but never by dropping input. The +1 reserves the final
+        # reduction, so max_calls is a true ceiling rather than a ceiling on the map rounds.
         remaining_depth = max_depth - depth
-        if remaining_depth <= 0 or calls + len(batches) > max_calls:
+        if remaining_depth <= 0 or calls + len(batches) + 1 > max_calls:
             reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
             print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
                   f"truncating each to fit a single final pass{RESET}")
-            share = max(budget // len(level), 1)
+            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+            share = max((budget - overhead) // len(level), 1)
             trimmed = [_truncate_to_tokens(a, share, model) for a in level]
-            text, cost = _synthesize_once(full_name, trimmed)
+            text, cost = run(trimmed)
             return text, total_cost + cost
 
         print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
@@ -611,20 +662,27 @@ def combine_chunk_analyses(full_name, analyses, model=None,
 
         before = _total_tokens(level, model)
         combined = []
-        for batch in batches:
-            text, cost = _synthesize_once(full_name, batch)
+        pending = list(level)
+        while pending:
+            # Re-batch before every call rather than once per round: a mid-round fallback to a
+            # smaller-window model shrinks the budget, and batches sized for the previous model
+            # would overflow it. Re-deriving keeps each prompt within the CURRENT budget.
+            batch = _batch_by_budget(full_name, pending, budget, model)[0]
+            text, cost = run(batch)
             combined.append(text)
             total_cost += cost
             calls += 1
+            pending = pending[len(batch):]
 
         # No-progress detection: if a whole round failed to shrink the material, recursing
         # again would loop at the same size and burn the call budget for nothing.
         if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
             print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
                   f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
-            share = max(budget // len(combined), 1)
+            overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+            share = max((budget - overhead) // len(combined), 1)
             trimmed = [_truncate_to_tokens(a, share, model) for a in combined]
-            text, cost = _synthesize_once(full_name, trimmed)
+            text, cost = run(trimmed)
             return text, total_cost + cost
 
         level = combined
@@ -681,12 +739,15 @@ Here are the analyses to combine:
     return combined_prompt
 
 
-def _synthesize_once(full_name, analyses):
-    """Run ONE synthesis call over the given analyses. Returns (text, api_cost).
+def _synthesize_once(full_name, analyses, model=None):
+    """Run ONE synthesis call over the given analyses. Returns (text, api_cost, model_used).
 
     The caller is responsible for ensuring the batch fits the model's budget; this function
-    does not bound its input.
+    does not bound its input. `model` is threaded in explicitly — resolving it independently
+    via get_ai_model() would let the caller budget one model and this call use another.
     """
+    if model is None:
+        model = get_ai_model()
     combined_prompt = _build_synthesis_prompt(full_name, analyses)
 
     # Use retry logic
@@ -696,9 +757,9 @@ def _synthesize_once(full_name, analyses):
     for retry in range(max_retries):
         try:
             final_analysis, api_cost, _ = call_llm(
-                get_ai_model(), combined_prompt, max_tokens=16384
+                model, combined_prompt, max_tokens=SYNTHESIS_OUTPUT_TOKENS
             )
-            return final_analysis, api_cost
+            return final_analysis, api_cost, model
 
         except Exception as e:
             error_str = str(e)

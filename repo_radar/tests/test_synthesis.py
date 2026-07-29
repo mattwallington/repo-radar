@@ -13,9 +13,9 @@ def recorder(monkeypatch):
     """
     calls = []
 
-    def fake_synthesize(full_name, analyses):
+    def fake_synthesize(full_name, analyses, model=None):
         calls.append(list(analyses))
-        return f"SUMMARY[{len(analyses)} parts]", 0.01
+        return f"SUMMARY[{len(analyses)} parts]", 0.01, (model or "claude-opus-5")
 
     monkeypatch.setattr(llm, "_synthesize_once", fake_synthesize)
     monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
@@ -45,7 +45,9 @@ def test_no_prompt_ever_exceeds_the_budget(recorder, monkeypatch):
     assert recorder, "no synthesis happened"
     for batch in recorder:
         prompt = llm._build_synthesis_prompt("org/big", batch)
-        assert _tokens(prompt) <= 50_000, f"prompt of {_tokens(prompt)} tokens exceeds budget"
+        budget = llm._synthesis_budget("org/big", "claude-opus-5")
+        assert _tokens(prompt) <= budget, (
+            f"prompt of {_tokens(prompt)} tokens exceeds the {budget} budget")
 
 
 def test_every_analysis_reaches_the_synthesis(recorder, monkeypatch):
@@ -95,9 +97,9 @@ def test_single_oversized_analysis_falls_back_to_truncation(monkeypatch, capsys)
     """One analysis bigger than a whole request has nothing to be combined with."""
     calls = []
 
-    def fake_synthesize(full_name, analyses):
+    def fake_synthesize(full_name, analyses, model=None):
         calls.append(list(analyses))
-        return "SUMMARY", 0.01
+        return "SUMMARY", 0.01, (model or "claude-opus-5")
 
     monkeypatch.setattr(llm, "_synthesize_once", fake_synthesize)
     monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
@@ -119,7 +121,7 @@ def test_depth_guard_stops_runaway_recursion(monkeypatch, capsys):
         return " ".join(analyses)  # returns everything it was given — zero reduction
 
     monkeypatch.setattr(llm, "_synthesize_once",
-                        lambda fn, a: (stubborn(fn, a), 0.01))
+                        lambda fn, a, m=None: (stubborn(fn, a), 0.01, m or "claude-opus-5"))
     monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
 
@@ -134,13 +136,15 @@ def test_depth_guard_stops_runaway_recursion(monkeypatch, capsys):
 def test_call_budget_is_respected(monkeypatch):
     calls = []
     monkeypatch.setattr(llm, "_synthesize_once",
-                        lambda fn, a: (calls.append(list(a)), ("S", 0.01))[1])
+                        lambda fn, a, m=None: (calls.append(list(a)),
+                                               ("S", 0.01, m or "claude-opus-5"))[1])
     monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 30_000)
 
     llm.combine_chunk_analyses("org/big", ["word " * 3_000 for _ in range(60)], max_calls=6)
 
-    assert len(calls) <= 7, f"exceeded the call ceiling: {len(calls)} calls"
+    # A true ceiling: the final reduction is reserved, not spent on top of the map rounds.
+    assert len(calls) <= 6, f"exceeded the call ceiling: {len(calls)} calls"
 
 
 def test_empty_input_is_handled():
@@ -150,9 +154,89 @@ def test_empty_input_is_handled():
 
 def test_batching_preserves_contiguity_and_budget():
     analyses = [f"part{i} " + "word " * 500 for i in range(12)]
-    batches = llm._batch_by_budget(analyses, 2_000, "claude-opus-5")
+    batches = llm._batch_by_budget("org/repo", analyses, 4_000, "claude-opus-5")
 
     assert [a for b in batches for a in b] == analyses, "order/content must be preserved"
     for batch in batches:
         if len(batch) > 1:
-            assert llm._total_tokens(batch, "claude-opus-5") <= 2_000
+            prompt = llm._build_synthesis_prompt("org/repo", batch)
+            assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= 4_000
+
+
+# ── review follow-ups ────────────────────────────────────────────────────────────────
+
+
+def test_production_sync_uses_the_bounded_combine():
+    """Regression for the defect the helper tests could not see.
+
+    Every synthesis test passed while sync.py still built its own unbounded prompt inline and
+    called call_llm directly, so combine_chunk_analyses was dead code and the 1,189,532-token
+    failure was completely unaffected. Pin the actual production wiring.
+    """
+    import inspect
+    from repo_radar.modes import sync
+
+    src = inspect.getsource(sync)
+    assert "combine_chunk_analyses(" in src, "sync must call the bounded combine"
+    # The inline concatenation that caused the overflow must not come back.
+    assert "combined_prompt +=" not in src, (
+        "sync is building a synthesis prompt inline again — that path is unbounded")
+
+
+def test_injected_synthesize_is_used_and_receives_the_model():
+    """sync supplies its own caller for retry/fallback; the helper must use it, not its own."""
+    used = []
+
+    def injected(prompt, model):
+        used.append((prompt, model))
+        return "SUMMARY", 0.02, model
+
+    text, cost = llm.combine_chunk_analyses(
+        "org/repo", ["a short analysis"], model="claude-sonnet-5", synthesize=injected)
+
+    assert text == "SUMMARY" and cost == pytest.approx(0.02)
+    assert used and used[0][1] == "claude-sonnet-5", "the chosen model must be threaded through"
+
+
+def test_budget_follows_a_model_fallback(monkeypatch):
+    """Budgeting one model while calling another is how a 'bounded' prompt still overflows.
+
+    When the injected caller reports a fallback with a smaller window, later batches must be
+    budgeted against the smaller one.
+    """
+    windows = {"big-model": 100_000, "small-model": 60_000}
+    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: windows.get(m, 20_000))
+
+    seen = []
+
+    def falls_back(prompt, model):
+        seen.append((model, llm.count_tokens_accurate(prompt, "small-model")))
+        return "SUMMARY " + "word " * 200, 0.01, "small-model"  # served by the fallback
+
+    llm.combine_chunk_analyses(
+        "org/repo", ["word " * 3_000 for _ in range(40)],
+        model="big-model", synthesize=falls_back)
+
+    assert len(seen) > 1, "expected more than one call for this fixture"
+    later_budget = llm._synthesis_budget("org/repo", "small-model")
+    for model_used, prompt_tokens in seen[1:]:
+        assert prompt_tokens <= later_budget, (
+            f"prompt of {prompt_tokens} exceeds the fallback model's {later_budget} budget")
+
+
+def test_truncation_marker_is_inside_the_requested_budget():
+    """Appending the marker after sizing overshoots by the marker's own length."""
+    text = "word " * 20_000
+    out = llm._truncate_to_tokens(text, 1_000, "claude-opus-5")
+    assert llm.count_tokens_accurate(out, "claude-opus-5") <= 1_000
+    assert "truncated by repo-radar" in out
+
+
+def test_batching_accounts_for_the_analysis_part_framing():
+    """Counting only analysis text understates the prompt by every wrapper it omits."""
+    analyses = ["word " * 300 for _ in range(30)]
+    budget = 6_000
+    batches = llm._batch_by_budget("org/repo", analyses, budget, "claude-opus-5")
+    for batch in batches:
+        prompt = llm._build_synthesis_prompt("org/repo", batch)
+        assert llm.count_tokens_accurate(prompt, "claude-opus-5") <= budget

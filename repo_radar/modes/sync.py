@@ -17,7 +17,7 @@ from repo_radar.config import load_config, save_config, load_cache_index, save_c
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model
+from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses
 from repo_radar.metadata import parse_llm_response, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update
 
@@ -962,26 +962,58 @@ Repository files:
 
                         # Retry logic for combine step with model fallback
                         current_model_combine = current_model  # Use whatever model succeeded for chunks
+
+                        def _synthesize_bounded(prompt, synth_model):
+                            """One bounded synthesis call, with this loop's retry/fallback.
+
+                            combine_chunk_analyses owns *bounding* (how the analyses are
+                            batched so no prompt exceeds the window); this closure keeps the
+                            existing retry, model fallback and rate-limit accounting. It
+                            returns the model actually used so the caller can re-budget when a
+                            fallback has a smaller context window.
+                            """
+                            nonlocal current_model_combine
+                            for attempt in range(max_retries):
+                                try:
+                                    text, cost, resp = call_llm(
+                                        current_model_combine, prompt, max_tokens=16384
+                                    )
+                                    rate_limit_tracker.update_from_response(resp)
+                                    return text, cost, current_model_combine
+                                except Exception as exc:
+                                    err = str(exc)
+                                    is_rl = (type(exc).__name__ == 'RateLimitError'
+                                             or '429' in err or 'RESOURCE_EXHAUSTED' in err)
+                                    if not is_rl:
+                                        raise
+                                    fb = get_fallback_model(current_model_combine)
+                                    if fb and attempt < max_retries - 1:
+                                        console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fb}[/bold yellow]")
+                                        current_model_combine = fb
+                                        meta_progress.update(task_id, status=f"[yellow]combine fallback to {fb.split('/')[-1]}...[/yellow]")
+                                        time.sleep(2)
+                                    elif attempt < max_retries - 1:
+                                        wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
+                                        meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
+                                        time.sleep(wait_time)
+                                    else:
+                                        raise Exception(
+                                            f"Rate limit exceeded on combine after {max_retries} retries")
+                            raise Exception(f"Combine failed after {max_retries} retries")
+
                         for retry in range(max_retries):
                             try:
-                                # Combine analyses (simplified prompt - use existing combine_chunk_analyses function)
-                                import litellm
-                                combined_prompt = f"""You are reviewing multiple analyses of different parts of the repository "{full_name}".
-
-Please synthesize these into ONE comprehensive repository analysis in the required format with QUICK_REFERENCE, ONE_LINE_SUMMARY, and RELATED_REPOS sections followed by detailed analysis.
-
-Here are the analyses to combine:
-
-"""
-                                for part_idx, analysis_part in enumerate(chunk_analyses, 1):
-                                    combined_prompt += f"\n--- Analysis Part {part_idx} ---\n{analysis_part}\n"
-
-                                analysis, combine_cost, response = call_llm(
-                                    current_model_combine, combined_prompt, max_tokens=16384
+                                # Bounded hierarchical synthesis. The previous inline version
+                                # concatenated every chunk analysis into ONE prompt with no
+                                # bound, which is what produced
+                                #   prompt is too long: 1189532 tokens > 1000000 maximum
+                                # on large repositories. Batching happens inside; this call
+                                # may perform several LLM requests and returns their total cost.
+                                analysis, combine_cost = combine_chunk_analyses(
+                                    full_name, chunk_analyses,
+                                    model=current_model_combine,
+                                    synthesize=_synthesize_bounded,
                                 )
-
-                                # Update rate limit tracker
-                                rate_limit_tracker.update_from_response(response)
 
                                 # Success! Break out of retry loop
                                 break
