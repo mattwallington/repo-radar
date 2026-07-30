@@ -8,7 +8,7 @@ const path = require('path');
 
 const { planReconcile, validateReceipt, qualifiesForSchedule, completionQualifies,
         needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK,
-        indexDroppedOf, runSucceeded } = require('../run-receipt');
+        indexDroppedOf, runSucceeded, statsFromReceipt } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -307,6 +307,84 @@ assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
     'an older receipt without the field reconciles as zero, not undefined');
 }
 
+// ── ONE canonical latest-run outcome ─────────────────────────────────────────────────────
+// The tray reads status.stats. Receipt adoption must normalize into it, ordered by statsAt.
+// Before this, the per-channel receipt state and the live stats were two independently-stale
+// representations and readers picked "whichever is non-zero" — which cannot model last-run state,
+// because zero is exactly how a clean run says "no longer broken".
+{
+  const at = (h) => `2026-07-30T${String(h).padStart(2, '0')}:00:00.000Z`;
+  const rec = (over, finishedAt) => receipt({ finishedAt, ...over });
+
+  // 1. live index failure → newer clean receipt: the warning and the count must CLEAR.
+  {
+    const live = { stats: { total: 30, errors: 0, index_dropped: 4 }, statsAt: at(10),
+                   hasErrors: true, errorLog: 'earlier failure' };
+    const plan = planReconcile(rec({ stats: { total: 30, errors: 0, indexDropped: 0 } }, at(12)), live);
+    assert.ok(plan.adopt && plan.isLatestOutcome);
+    assert.strictEqual(plan.status.stats.index_dropped, 0,
+      'a newer clean run must clear the stale drop count, not lose to it');
+    assert.strictEqual(plan.status.hasErrors, false, 'and must clear the error state');
+    assert.strictEqual(plan.status.errorLog, 'earlier failure',
+      'history is append-only — success does not erase it');
+  }
+
+  // 2. live clean success → newer failed receipt: the current failure must APPEAR.
+  {
+    const live = { stats: { total: 30, errors: 0, index_dropped: 0 }, statsAt: at(10),
+                   hasErrors: false };
+    const plan = planReconcile(rec({ stats: { total: 30, errors: 0, indexDropped: 3 } }, at(12)), live);
+    assert.strictEqual(plan.status.stats.index_dropped, 3);
+    assert.strictEqual(plan.status.hasErrors, true);
+  }
+
+  // 3. the same two transitions for ordinary errors, not just index drops.
+  {
+    const live = { stats: { total: 30, errors: 5, index_dropped: 0 }, statsAt: at(10),
+                   hasErrors: true };
+    const cleared = planReconcile(rec({ stats: { total: 30, errors: 0, indexDropped: 0 } }, at(12)), live);
+    assert.strictEqual(cleared.status.stats.errors, 0, 'a newer clean run clears stale errors');
+    assert.strictEqual(cleared.status.hasErrors, false);
+
+    const clean = { stats: { total: 30, errors: 0, index_dropped: 0 }, statsAt: at(10),
+                    hasErrors: false };
+    const failed = planReconcile(rec({ stats: { total: 30, errors: 7, indexDropped: 0 } }, at(12)), clean);
+    assert.strictEqual(failed.status.stats.errors, 7);
+    assert.strictEqual(failed.status.hasErrors, true);
+  }
+
+  // 4. ordering, not blind overwrite: an OLDER receipt must not clobber a newer live outcome.
+  {
+    const live = { stats: { total: 30, errors: 0, index_dropped: 6 }, statsAt: at(14),
+                   hasErrors: true };
+    const plan = planReconcile(rec({ stats: { total: 30, errors: 0, indexDropped: 0 } }, at(12)), live);
+    assert.ok(plan.adopt, 'still adopted for scheduling/observability purposes');
+    assert.strictEqual(plan.isLatestOutcome, false);
+    assert.strictEqual(plan.status.stats.index_dropped, 6,
+      'the newer live outcome must survive an older receipt');
+    assert.strictEqual(plan.status.hasErrors, true);
+    assert.strictEqual(plan.status.channels.stable.indexDropped, 0,
+      'the per-channel record still tracks that receipt — it is history, not presentation');
+  }
+
+  // 5. a first receipt with no prior statsAt is the latest by default.
+  {
+    const plan = planReconcile(rec({ stats: { total: 30, errors: 0, indexDropped: 2 } }, at(12)), {});
+    assert.strictEqual(plan.isLatestOutcome, true);
+    assert.strictEqual(plan.status.stats.index_dropped, 2);
+    assert.strictEqual(plan.status.statsAt, at(12), 'adoption must stamp the freshness marker');
+  }
+
+  // statsFromReceipt translates camelCase receipt stats into the snake_case shape the live path
+  // writes, so both transports land in one representation.
+  const s = statsFromReceipt(rec({ stats: { total: 30, updated: 4, cloned: 1, skipped: 2,
+    errors: 3, metadataGenerated: 5, indexDropped: 6, apiCost: 1.25 } }, at(12)));
+  assert.deepStrictEqual(s, { total: 30, updated: 4, cloned: 1, skipped: 2, errors: 3,
+    metadata_generated: 5, index_dropped: 6, api_cost: 1.25 });
+  assert.deepStrictEqual(statsFromReceipt({}), { total: 0, updated: 0, cloned: 0, skipped: 0,
+    errors: 0, metadata_generated: 0, index_dropped: 0, api_cost: 0 }, 'missing fields read as zero');
+}
+
 // main.js wiring landmarks for the two consumers Codex found still reporting success.
 // NOTE the key difference: the live status-server payload carries Python's raw stats dict
 // (snake_case index_dropped) while the durable receipt uses camelCase indexDropped. Both
@@ -322,13 +400,25 @@ assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
 {
   const fn = MAIN.slice(MAIN.indexOf('function reconcileRunReceipt()'));
   const body = fn.slice(0, fn.indexOf('\n}'));
-  // hasErrors is LAST-RUN state, not unread history: showErrorIcon documents it as "stays until
-  // next successful sync", and the live-completion and child-exit paths both clear it on success.
-  // A receipt-driven success must behave identically or the tray can stay red indefinitely.
-  assert.ok(/adopted\.hasErrors = !ok/.test(body),
-    'reconciliation must SET hasErrors from the receipt, clearing it on a newer clean run');
+  // Presentation state now belongs to planReconcile (asserted behaviourally above) so there is
+  // one canonical outcome. main.js must not re-derive it here, and must gate its history append
+  // on the same freshness ordering — an older receipt has no business writing "current" text.
+  assert.ok(!/adopted\.hasErrors\s*=/.test(body),
+    'main.js must not set hasErrors itself — planReconcile owns the canonical outcome');
+  assert.ok(/plan\.isLatestOutcome && !ok/.test(body),
+    'the errorLog append must be gated on the receipt actually being the latest outcome');
   assert.ok(/errorLog = \(adopted\.errorLog \|\| ''\)/.test(body),
     'errorLog is history and may only be appended to, never erased on success');
+}
+
+// The live path must stamp when its outcome was produced, or adoption cannot order the two.
+assert.ok(/status\.statsAt = new Date\(\)\.toISOString\(\)/.test(MAIN),
+  'the live completion handler must stamp statsAt alongside status.stats');
+{
+  const fn = MAIN.slice(MAIN.indexOf('function trayIndexDropped(status)'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+  assert.ok(!/channels/.test(body),
+    'the tray must read ONE canonical source, not choose between live stats and channel state');
 }
 
 // The startup reset that erased the failure reconciled moments earlier. reconcileRunReceipt() runs
@@ -344,16 +434,9 @@ assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
 
 // Index-only failures must not render as "Sync failed with 0 errors".
 assert.ok(/function trayIndexDropped\(status\)/.test(MAIN),
-  'the two-transport drop lookup must live in one place');
+  'the drop lookup must live in one place');
 assert.ok(/Sync incomplete — \$\{dropped\} repositor/.test(MAIN),
   'an index-only failure needs its own tooltip, not a "0 errors" one');
-{
-  const fn = MAIN.slice(MAIN.indexOf('function trayIndexDropped(status)'));
-  const body = fn.slice(0, fn.indexOf('\n}'));
-  assert.ok(/status\.stats && status\.stats\.index_dropped/.test(body)
-    && /ch\.indexDropped/.test(body),
-    'both transports must be consulted: live snake_case stats AND the reconciled camelCase receipt');
-}
 
 console.log('run-receipt OK: production planReconcile + validation + index-drop propagation'
   + ' + main.js wiring landmarks');

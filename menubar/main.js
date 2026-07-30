@@ -360,18 +360,15 @@ function showSuccessIcon() {
   }, 5000);
 }
 
-// Repositories excluded from INDEX.md by the most recent run we know about. The count reaches us
-// by two different transports with two different spellings: a live run posts Python's raw stats
-// dict (snake_case index_dropped, copied into status.stats), while a run that finished with the
-// app closed is learned from its receipt (camelCase indexDropped, stored per channel). Reading
-// only one of them silently reports an incomplete index as a clean sync.
+// Repositories excluded from INDEX.md by the latest run. status.stats is the SINGLE presentation
+// source: the live path writes it directly, and receipt adoption normalizes into it (see
+// planReconcile), so there is nothing to choose between here. An earlier version consulted the
+// live stats and the per-channel receipt state and preferred whichever was non-zero — which
+// cannot model last-run state, because zero is how a clean run says "no longer broken". A newer
+// clean receipt then left the tray white while its own menu still read "4 missing from INDEX.md".
 function trayIndexDropped(status) {
-  if (!status) return 0;
-  const live = status.stats && status.stats.index_dropped;
-  if (Number.isInteger(live) && live > 0) return live;
-  const ch = status.channels && status.channels[runtimeChannel];
-  const reconciled = ch && ch.indexDropped;
-  return Number.isInteger(reconciled) ? reconciled : 0;
+  const n = status && status.stats && status.stats.index_dropped;
+  return Number.isInteger(n) ? n : 0;
 }
 
 // Show error icon (stays until next successful sync)
@@ -1027,7 +1024,11 @@ function startStatusServer() {
         };
       }
       status.stats = data.stats || status.stats;
-      
+      // When this outcome was produced. Receipt adoption compares against it to decide whether a
+      // receipt is newer than what the tray is already showing; without it, adoption had no way
+      // to order two representations of possibly-different runs and simply guessed.
+      status.statsAt = new Date().toISOString();
+
       console.log('Sync complete with stats:', data.stats);
       
       // Check for warnings (only from explicit warning message from Python)
@@ -2288,15 +2289,16 @@ function reconcileRunReceipt() {
     // a run that failed, or that produced an incomplete index, presented afterwards as a clean
     // sync.
     //
-    // hasErrors tracks the LAST run, not unread history: showErrorIcon documents it as "stays
-    // until next successful sync", and both the live-completion and child-exit paths clear it on
-    // success. A receipt-driven success must behave the same or the tray can stay red forever.
-    // errorLog is the history and is only ever appended to.
+    // planReconcile owns the presentation state (stats, statsAt, hasErrors) so there is exactly
+    // one canonical latest-run outcome, and it applies that only when the receipt is actually
+    // newer than what the tray is showing. hasErrors tracks the LAST run rather than unread
+    // history — showErrorIcon documents it as "stays until next successful sync", and the
+    // live-completion and child-exit paths both clear it on success. errorLog is the history and
+    // is only ever appended to.
     const adopted = { ...plan.status };
     const dropped = indexDroppedOf(receipt);
     const ok = runSucceeded(receipt);
-    adopted.hasErrors = !ok;
-    if (!ok) {
+    if (plan.isLatestOutcome && !ok) {
       const detail = dropped > 0
         ? `${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} missing from INDEX.md`
         : `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`;
@@ -2307,6 +2309,7 @@ function reconcileRunReceipt() {
     try { updateTrayMenu(); } catch (e) { /* tray may not exist yet at startup */ }
     console.log(`Adopted ${receipt.trigger} run finished ${receipt.finishedAt}`
       + ` (${plan.reason}; lastSync ${plan.advanceLastSync ? 'advanced' : 'unchanged'}`
+      + `; presentation ${plan.isLatestOutcome ? 'updated' : 'kept (newer live run)'}`
       + `; errors ${receipt.stats.errors}, indexDropped ${dropped})`);
     return receipt;
   } catch (e) {

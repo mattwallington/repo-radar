@@ -106,6 +106,30 @@ function channelState(status, channel) {
 }
 
 /**
+ * A receipt's outcome in the shape the LIVE path already writes to status.stats.
+ *
+ * Python's in-process stats dict is snake_case and its receipt is camelCase, so the same run
+ * reaches the tray under two spellings depending on whether the app was open. Translating here
+ * means presentation has exactly one source of truth instead of readers choosing between two
+ * independently-stale representations — a choice that cannot be made correctly, because zero is a
+ * meaningful clearing value and "prefer whichever is non-zero" therefore models nothing.
+ */
+function statsFromReceipt(receipt) {
+  const s = (receipt && receipt.stats) || {};
+  const int = (v) => (Number.isInteger(v) ? v : 0);
+  return {
+    total: int(s.total),
+    updated: int(s.updated),
+    cloned: int(s.cloned),
+    skipped: int(s.skipped),
+    errors: int(s.errors),
+    metadata_generated: int(s.metadataGenerated),
+    index_dropped: int(s.indexDropped),
+    api_cost: typeof s.apiCost === 'number' ? s.apiCost : 0,
+  };
+}
+
+/**
  * Decide what a receipt changes. Returns { adopt, advanceLastSync, status, reason }.
  * Pure: never mutates its inputs.
  */
@@ -137,12 +161,28 @@ function planReconcile(receipt, status, opts = {}) {
     qualifies,
   };
 
+  // Presentation state. The tray reads ONE outcome — status.stats plus hasErrors — and this is
+  // where a receipt becomes that outcome. Gated on statsAt, the timestamp the live path stamps
+  // when it writes stats: without an ordering, adoption either clobbered a newer live result with
+  // an older receipt, or (before this) left a stale live result in place while the channel state
+  // said otherwise, so the icon and the menu could disagree — white tray, "4 missing from
+  // INDEX.md" one click away. `channels[...]` above stays as the per-channel scheduling/history
+  // record; it is deliberately NOT a second presentation source.
+  const statsAt = status && status.statsAt ? new Date(status.statsAt) : null;
+  const isLatestOutcome = !statsAt || finished > statsAt;
+  if (isLatestOutcome) {
+    next.stats = statsFromReceipt(valid);
+    next.statsAt = valid.finishedAt;
+    next.hasErrors = !runSucceeded(valid);
+  }
+
   const known = status && status.lastSync ? new Date(status.lastSync) : null;
   const advance = qualifies && channel === SCHEDULING_CHANNEL && (!known || finished > known);
   if (advance) next.lastSync = valid.finishedAt;
 
   return {
     adopt: true,
+    isLatestOutcome,
     advanceLastSync: advance,
     status: next,
     reason: advance ? 'adopted' : 'observability-only',
@@ -193,5 +233,5 @@ module.exports = {
   SCHEMA, VALID_TRIGGERS, VALID_CHANNELS, VALID_MODES, SCHEDULING_CHANNEL,
   EXIT_SKIPPED_NO_WORK,
   validateReceipt, qualifiesForSchedule, completionQualifies, planReconcile, needsCatchUp,
-  channelState, indexDroppedOf, runSucceeded,
+  channelState, indexDroppedOf, runSucceeded, statsFromReceipt,
 };

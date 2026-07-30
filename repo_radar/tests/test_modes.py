@@ -8,6 +8,7 @@ import types
 import pytest
 
 import repo_radar.modes.sync as sync
+from repo_radar.config import get_cache_name
 
 
 def test_sync_all_three_clusters_use_provider_for_model():
@@ -78,6 +79,23 @@ def sync_harness(tmp_path, monkeypatch):
     monkeypatch.setattr(sync, 'save_cache_index', lambda index: None)
     monkeypatch.setattr(sync, 'wait_for_network', lambda *a, **k: True)
 
+    # No test may reach a paid API. This is not belt-and-braces: an earlier version of the
+    # steady-state test below mis-derived the metadata filename, so `needs_metadata` came out true
+    # and the suite made a real LLM call and spent real money — intermittently, which is the worst
+    # way to find out. Raising here makes spending impossible.
+    #
+    # Recording the attempt matters as much as blocking it: sync swallows exceptions from its
+    # metadata futures, so a blocked call leaves metadata_generated at 0 — indistinguishable from
+    # "there was no work to do". A test asserting the steady state would keep passing while no
+    # longer testing it.
+    llm_attempts = []
+
+    def _no_paid_calls(*a, **k):
+        llm_attempts.append(a)
+        raise AssertionError(
+            'a test attempted a live LLM call — the sync harness must never spend money')
+    monkeypatch.setattr(sync, 'call_llm', _no_paid_calls)
+
     calls = []
 
     def run(index_drops, skip_metadata=True):
@@ -94,6 +112,7 @@ def sync_harness(tmp_path, monkeypatch):
 
     run.pristine = pristine
     run.src = src
+    run.llm_attempts = llm_attempts
     return run
 
 
@@ -139,14 +158,23 @@ def test_sync_rebuilds_the_index_on_a_genuine_steady_state_run(sync_harness):
 
     head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=sync_harness.src,
                           capture_output=True, text=True, check=True).stdout.strip()
-    cache_dir = next(p for p in sync_harness.pristine.iterdir() if p.is_dir())
-    (sync_harness.pristine / f'{cache_dir.name}.md').write_text(
-        f"---\nfull_name: org/probe\ncache_dir: {cache_dir.name}\nlast_commit: {head}\n"
+    # Derive the cache name the way production does rather than scanning the directory. Sync
+    # creates a stable `probe` symlink alongside the real `probe-<hash>` directory and is_dir() is
+    # true for both, so picking "the first directory" depended on filesystem iteration order: when
+    # it returned the symlink, the metadata file was written under the wrong name, needs_metadata
+    # came out true, and the test made a live paid LLM call roughly one run in eight. That is the
+    # same symlink-vs-real-file confusion this branch fixes in regenerate_index.
+    cache_name = get_cache_name(str(sync_harness.src), 'probe')
+    assert (sync_harness.pristine / cache_name).is_dir(), 'precondition: the clone landed here'
+    (sync_harness.pristine / f'{cache_name}.md').write_text(
+        f"---\nfull_name: org/probe\ncache_dir: {cache_name}\nlast_commit: {head}\n"
         f"brief: Already analysed.\ntype: Library\nlanguage: Go\nrelated_repos: []\n---\n")
 
     rc, receipt, calls = sync_harness(index_drops=1, skip_metadata=False)
 
-    assert receipt['stats']['metadataGenerated'] == 0, (
-        "precondition: this run must have had no metadata work to do")
+    assert sync_harness.llm_attempts == [], (
+        "precondition: this run must have needed NO metadata work. A blocked call would leave "
+        "metadataGenerated at 0 too, so that alone cannot tell 'nothing to do' from 'it failed'")
+    assert receipt['stats']['metadataGenerated'] == 0
     assert len(calls) == 2, "a steady-state run must still validate the derived index"
     assert rc == 1 and receipt['stats']['indexDropped'] == 1
