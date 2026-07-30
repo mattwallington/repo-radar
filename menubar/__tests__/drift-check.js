@@ -146,7 +146,12 @@ console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).l
     "for k,(f,v) in cases.items():\n" +
     "    o=json.loads(json.dumps(base)); o[f]=v; p.write_text(json.dumps(o));" +
     " out[k]=(r.read_receipt(d) is not None, o)\n" +
-    "for k,v in [('drop_bool',True),('drop_str','3'),('drop_int',2)]:\n" +
+    "o=json.loads(json.dumps(base)); o['stats']['errors']=-1; p.write_text(json.dumps(o));" +
+    " out['errors_negative']=(r.read_receipt(d) is not None, o)\n" +
+    "o=json.loads(json.dumps(base)); del o['stats']['indexDropped']; p.write_text(json.dumps(o));" +
+    " out['drop_absent']=(r.read_receipt(d) is not None, o)\n" +
+    "for k,v in [('drop_bool',True),('drop_str','3'),('drop_int',2),('drop_null',None)," +
+    "('drop_negative',-1)]:\n" +
     "    o=json.loads(json.dumps(base)); o['stats']['indexDropped']=v; p.write_text(json.dumps(o));" +
     " out[k]=(r.read_receipt(d) is not None, o)\n" +
     "print(json.dumps(out))"], { cwd: root, encoding: 'utf8' }));
@@ -159,7 +164,21 @@ console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).l
       + `py=${pyAccepts ? 'accepts' : 'rejects'}`);
     compared2 += 1;
   }
-  assert.strictEqual(compared2, 8, 'every invalid-type case must be compared');
+  assert.strictEqual(compared2, 12, 'every invalid-type case must be compared');
+
+  // The outcome rule must agree with itself across the two shapes it is asked about. A negative
+  // counter satisfied neither "=== 0" nor "> 0" when these were separate predicates, so
+  // reconciliation raised hasErrors and child-close cleared it — the round-11 bypass, reachable
+  // through a state both validators then accepted.
+  for (const [errors, dropped, warning] of [[0, 0, null], [1, 0, null], [0, 1, null],
+                                            [0, 0, 'w'], [-1, 0, null], [0, -1, null]]) {
+    const asReceipt = { stats: { errors, indexDropped: dropped }, warning };
+    const asStatus = { stats: { errors, index_dropped: dropped }, warning };
+    assert.strictEqual(!rr.runSucceeded(asReceipt), rr.statusNeedsAttention(asStatus),
+      `outcome rule disagrees with itself for errors=${errors} drops=${dropped} `
+      + `warning=${!!warning}: receipt says ${rr.runSucceeded(asReceipt) ? 'clean' : 'attention'}, `
+      + `status says ${rr.statusNeedsAttention(asStatus) ? 'attention' : 'clean'}`);
+  }
 
   console.log(`run-receipt parity OK: ${compared} qualification combos, ${pr.triggers.length} triggers,`
     + ` schema ${pr.schema}, exit ${pr.exit}, ${outcomes} outcome rules, ${compared2} validator`

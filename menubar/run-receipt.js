@@ -39,12 +39,16 @@ function validateReceipt(receipt, { channel = SCHEDULING_CHANNEL, now = new Date
   if (!isIsoString(receipt.finishedAt)) return null;
   if (new Date(receipt.finishedAt) > now) return null;         // clock skew / tampering
   const stats = receipt.stats;
-  if (!stats || typeof stats !== 'object' || !Number.isInteger(stats.errors)) return null;
+  // Counters are semantically non-negative. A negative one is not merely odd: it satisfies neither
+  // "=== 0" nor "> 0", so it used to slip between the success and attention rules.
+  if (!stats || typeof stats !== 'object'
+      || !Number.isInteger(stats.errors) || stats.errors < 0) return null;
   // Additive within schema 2: receipts written before indexDropped existed simply omit it, and
   // absent must mean zero rather than invalid — rejecting those would discard every pre-existing
   // receipt and make the app believe no sync had ever run. Present-but-not-an-integer is still a
   // corrupt receipt.
-  if (stats.indexDropped !== undefined && !Number.isInteger(stats.indexDropped)) return null;
+  if (stats.indexDropped !== undefined
+      && (!Number.isInteger(stats.indexDropped) || stats.indexDropped < 0)) return null;
   // Absent or null means "no warning"; anything present must be a string. Truthiness alone drives
   // the success rule, so an object or a number would sail through and silently mean "failed".
   if (receipt.warning !== undefined && receipt.warning !== null
@@ -59,19 +63,30 @@ function warningOf(receipt) {
 }
 
 /**
- * Does the CANONICAL STATUS (not a receipt) describe something the user must act on?
+ * THE outcome rule. One implementation, two shapes: a receipt (camelCase) and the status file
+ * (snake_case). Everything that decides "was this run clean" goes through here.
  *
- * The same question as runSucceeded, asked of the status file instead of a receipt, so every
- * writer consults one rule. The child-exit handler used to ask its own narrower version — exit
- * code 0 plus stats.errors — and cleared a warning-only outcome half a second after the live
- * handler had correctly raised it. Exit 0 means the process finished, not that the run was clean.
+ * Previously this existed as two predicates that agreed only on the values we expected: one asked
+ * `errors === 0`, the other `errors > 0`. A negative counter — which both validators accepted —
+ * satisfied neither, so reconciliation set hasErrors=true and child-close cleared it again,
+ * reopening the exact bypass this was written to close. Two predicates for one rule is the same
+ * defect as two spellings for one field; `!== 0` also means an impossible value fails loudly
+ * rather than reading as success.
  */
+function outcomeNeedsAttention({ errors, indexDropped, warning }) {
+  const count = (v) => (Number.isInteger(v) ? v : 0);
+  return count(errors) !== 0 || count(indexDropped) !== 0
+    || !!(typeof warning === 'string' && warning);
+}
+
+/** Does the CANONICAL STATUS (not a receipt) describe something the user must act on? */
 function statusNeedsAttention(status) {
   const stats = (status && status.stats) || {};
-  const errors = Number.isInteger(stats.errors) ? stats.errors : 0;
-  const dropped = Number.isInteger(stats.index_dropped) ? stats.index_dropped : 0;
-  const warned = typeof status?.warning === 'string' && !!status.warning;
-  return errors > 0 || dropped > 0 || warned;
+  return outcomeNeedsAttention({
+    errors: stats.errors,
+    indexDropped: stats.index_dropped,
+    warning: status && status.warning,
+  });
 }
 
 /** Repositories excluded from INDEX.md by this run. Absent (older schema-2 receipt) means zero. */
@@ -86,11 +101,13 @@ function indexDroppedOf(receipt) {
  * run with errors:0 and indexDropped:3 must not be reported to the user as a clean sync.
  */
 function runSucceeded(receipt) {
-  const errors = receipt && receipt.stats ? receipt.stats.errors : 0;
   // A warning ("no metadata generated: API key not configured") is actionable even though nothing
   // errored, and the live path already treats it as such. Mirrors Python's errorFree exactly.
-  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0
-    && !warningOf(receipt);
+  return !outcomeNeedsAttention({
+    errors: receipt && receipt.stats ? receipt.stats.errors : 0,
+    indexDropped: indexDroppedOf(receipt),
+    warning: warningOf(receipt),
+  });
 }
 
 /**

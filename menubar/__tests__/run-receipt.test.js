@@ -548,6 +548,41 @@ assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
   assert.strictEqual(warningOf(receipt({ ...base, warning: '' })), null, 'empty is not a warning');
 }
 
+// ── the outcome rule must agree with itself in both shapes ───────────────────────────────
+// It was written as two predicates — `errors === 0` for receipts, `errors > 0` for status — which
+// agree only on the values we expected. A negative counter satisfied neither, so reconciliation
+// set hasErrors=true and child-close cleared it again: the round-11 bypass, reachable through a
+// state both validators accepted. One helper now backs both.
+{
+  for (const [errors, dropped, warning] of [[0, 0, null], [2, 0, null], [0, 3, null],
+                                            [0, 0, 'w'], [-1, 0, null], [0, -1, null],
+                                            [-1, 0, 'w']]) {
+    const asReceipt = { stats: { errors, indexDropped: dropped }, warning };
+    const asStatus = { stats: { errors, index_dropped: dropped }, warning };
+    assert.strictEqual(!runSucceeded(asReceipt), statusNeedsAttention(asStatus),
+      `the two shapes must reach the same verdict for errors=${errors} drops=${dropped}`);
+  }
+  // And an impossible counter must read as "needs attention", never as success.
+  assert.strictEqual(runSucceeded({ stats: { errors: -1, indexDropped: 0 } }), false,
+    'a negative counter is not a clean run');
+  assert.strictEqual(statusNeedsAttention({ stats: { errors: 0, index_dropped: -1 } }), true);
+
+  // Counters are non-negative, so a receipt carrying one is malformed and must not be usable.
+  const base = { finishedAt: '2026-07-30T12:00:00.000Z' };
+  assert.strictEqual(validateReceipt(receipt({ ...base,
+    stats: { total: 1, errors: -1, metadataGenerated: 0, indexDropped: 0 } })), null,
+    'a negative error count must be rejected');
+  assert.strictEqual(validateReceipt(receipt({ ...base,
+    stats: { total: 1, errors: 0, metadataGenerated: 0, indexDropped: -1 } })), null,
+    'a negative drop count must be rejected');
+  assert.strictEqual(validateReceipt(receipt({ ...base,
+    stats: { total: 1, errors: 0, metadataGenerated: 0, indexDropped: null } })), null,
+    'an explicitly null drop count is malformed — distinct from the field being absent');
+  assert.ok(validateReceipt(receipt({ ...base,
+    stats: { total: 1, errors: 0, metadataGenerated: 0 } })),
+    'an ABSENT drop count is a pre-upgrade receipt and stays valid');
+}
+
 // main.js wiring landmarks for the two consumers Codex found still reporting success.
 // NOTE the key difference: the live status-server payload carries Python's raw stats dict
 // (snake_case index_dropped) while the durable receipt uses camelCase indexDropped. Both

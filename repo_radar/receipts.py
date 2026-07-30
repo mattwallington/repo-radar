@@ -97,6 +97,12 @@ def _num(value, default=0):
         return default
 
 
+def _count(value):
+    """A non-negative integer counter. The writer must never emit a receipt its own reader
+    rejects, so clamp here rather than trusting the caller's stats dict."""
+    return max(0, _num(value, 0))
+
+
 # Exit code for a catch-up that correctly declined to run. Distinct from 0 so the caller does not
 # stamp a completion timestamp for work that never happened.
 EXIT_SKIPPED_NO_WORK = 66
@@ -139,11 +145,11 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
         ch = _valid_enum(channel, VALID_CHANNELS, resolve_channel())
         trig = _valid_enum(trigger, VALID_TRIGGERS, 'manual')
         stats = stats if isinstance(stats, dict) else {}
-        errors = _num(stats.get('errors'), 0)
+        errors = _count(stats.get('errors'))
         # Repositories excluded from INDEX.md. Kept out of 'errors' so per-repo error counts stay
         # meaningful, but it must still be able to make a run not error-free: a sync whose index
         # is missing repositories did not leave the cache in a usable state.
-        index_dropped = _num(stats.get('index_dropped'), 0)
+        index_dropped = _count(stats.get('index_dropped'))
         mode = mode if mode in VALID_MODES else 'full'
         payload = {
             'schema': RECEIPT_SCHEMA,
@@ -154,13 +160,13 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
             'finishedAt': finished_at or datetime.now(timezone.utc).isoformat(),
             'version': str(version) if version else None,
             'stats': {
-                'total': _num(stats.get('total'), 0),
-                'updated': _num(stats.get('updated'), 0),
-                'cloned': _num(stats.get('cloned'), 0),
-                'skipped': _num(stats.get('skipped'), 0),
+                'total': _count(stats.get('total')),
+                'updated': _count(stats.get('updated')),
+                'cloned': _count(stats.get('cloned')),
+                'skipped': _count(stats.get('skipped')),
                 'errors': errors,
-                'metadataGenerated': _num(stats.get('metadata_generated'), 0),
-                'apiCost': round(_num(stats.get('api_cost'), 0.0), 4),
+                'metadataGenerated': _count(stats.get('metadata_generated')),
+                'apiCost': max(0.0, round(_num(stats.get('api_cost'), 0.0), 4)),
                 'indexDropped': index_dropped,
             },
             # Actionable outcome the live status update also carries. Without it here, a run that
@@ -227,21 +233,28 @@ def read_receipt(config_dir, channel=None):
         return None
     if not isinstance(data.get('qualifiesForSchedule'), bool):
         return None
-    def _is_int(value):
+    def _is_count(value):
         # bool is a subclass of int in Python but Number.isInteger(true) is false in JS. Without
         # this the two validators disagree on {"errors": true}, which is exactly the kind of
-        # divergence the parity gate exists to prevent.
-        return isinstance(value, int) and not isinstance(value, bool)
+        # divergence the parity gate exists to prevent. Counters are also non-negative: a negative
+        # one satisfies neither "== 0" nor "> 0" and used to slip between the success rule and the
+        # needs-attention rule.
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
     stats = data.get('stats')
-    if not isinstance(stats, dict) or not _is_int(stats.get('errors')):
+    if not isinstance(stats, dict) or not _is_count(stats.get('errors')):
         return None
     # Additive fields, absent on older schema-2 receipts: absent means "none", but anything
     # present must have the right type. Truthiness alone decides whether a warning fails the run,
     # so a dict or a number would silently read as "this run needs attention". Mirrors the JS
     # validator; the parity gate compares them.
-    dropped = stats.get('indexDropped')
-    if dropped is not None and not _is_int(dropped):
+    # A sentinel, because dict.get() conflates "absent" with "explicitly null" — and JS can tell
+    # them apart (undefined vs null). Absent is a pre-upgrade receipt and fine; an explicit null is
+    # a malformed one, and accepting it here while JS rejected it meant the two processes disagreed
+    # about whether the same file was usable.
+    _MISSING = object()
+    dropped = stats.get('indexDropped', _MISSING)
+    if dropped is not _MISSING and not _is_count(dropped):
         return None
     warning = data.get('warning')
     if warning is not None and not isinstance(warning, str):

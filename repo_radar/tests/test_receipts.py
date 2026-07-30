@@ -142,15 +142,41 @@ def test_a_non_string_warning_is_rejected(tmp_path, bad):
     assert read_receipt(tmp_path) is None, f"warning={bad!r} must be rejected, not coerced"
 
 
-@pytest.mark.parametrize("bad", [{"n": 1}, "3", True, 1.5])
+@pytest.mark.parametrize("bad", [{"n": 1}, "3", True, 1.5, None, -1])
 def test_a_non_integer_index_drop_count_is_rejected(tmp_path, bad):
-    """bool is an int in Python but not in JS — the two validators must still agree."""
+    """bool is an int in Python but not in JS — the two validators must still agree.
+
+    `None` is here because dict.get() conflates absent with explicitly null while JS can tell
+    undefined from null; without a sentinel the two disagreed about the same file. `-1` is here
+    because a negative counter satisfies neither "== 0" nor "> 0", so it slipped between the
+    success rule and the needs-attention rule.
+    """
     write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=dict(STATS, errors=0))
     target = receipt_path(tmp_path, "stable")
     payload = json.loads(target.read_text())
     payload["stats"]["indexDropped"] = bad
     target.write_text(json.dumps(payload))
     assert read_receipt(tmp_path) is None, f"indexDropped={bad!r} must be rejected"
+
+
+@pytest.mark.parametrize("bad", [-1, True, "0", None])
+def test_a_malformed_error_count_is_rejected(tmp_path, bad):
+    write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=dict(STATS, errors=0))
+    target = receipt_path(tmp_path, "stable")
+    payload = json.loads(target.read_text())
+    payload["stats"]["errors"] = bad
+    target.write_text(json.dumps(payload))
+    assert read_receipt(tmp_path) is None, f"errors={bad!r} must be rejected"
+
+
+def test_the_writer_never_emits_a_receipt_its_own_reader_rejects(tmp_path):
+    """Negative counters are clamped at write time, not left to fail validation on read."""
+    write_receipt(tmp_path, trigger="scheduled", started_at="x",
+                  stats={"total": -5, "errors": -1, "index_dropped": -2, "api_cost": -1.0})
+    r = read_receipt(tmp_path)
+    assert r is not None, "a receipt we wrote must always pass our own validator"
+    assert r["stats"]["errors"] == 0 and r["stats"]["indexDropped"] == 0
+    assert r["stats"]["total"] == 0 and r["stats"]["apiCost"] == 0.0
 
 
 def test_absent_additive_fields_still_read_as_valid(tmp_path):
