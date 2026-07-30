@@ -9,11 +9,15 @@ import socket
 import traceback
 import hashlib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
+from repo_radar import VERSION as REPO_RADAR_VERSION
+from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
+                                 read_receipt, resolve_channel, resolve_trigger,
+                                 run_mode, write_receipt)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
@@ -196,13 +200,81 @@ def sync_mode(args):
     # UI's rich console output: one line per meaningful event, no progress bars,
     # no ANSI, rotated to the most recent runs.
     sync_logger = _open_sync_logger()
+    # Provenance is DECLARED by the invoker, not guessed. The old heuristic read "is a window
+    # being shown", so a genuine LaunchAgent run recorded itself as "manual" and the logs could
+    # not distinguish scheduled from manual. The window heuristic remains only as the default
+    # for callers that declare nothing.
+    # Every invoker DECLARES its trigger via REPO_RADAR_TRIGGER (LaunchAgent=scheduled,
+    # Electron button=manual, Electron catch-up=catchup, dispatcher/CLI=cli). The previous
+    # heuristic read args.show_window, which the CLI never defines — so it silently resolved to
+    # "manual" for every run, launchd jobs included. 'cli' is the honest default for an
+    # undeclared invocation: it means "something ran this directly".
+    run_trigger = resolve_trigger(default='cli')
+    run_channel = resolve_channel()
+    run_mode_name = run_mode(
+        skip_metadata=bool(getattr(args, 'skip_metadata', False)),
+        metadata_only=bool(getattr(args, 'metadata_only', False)),
+        repos_only=bool(getattr(args, 'repos_only', False)),
+    )
+    run_started_at = datetime.now(timezone.utc).isoformat()
+    def _finalize_run(stats_snapshot):
+        """Record completion once, from whichever path finished the run.
+
+        A zero-repository run returns success early; without going through here it completed
+        every day and left no receipt, so the catch-up logic kept believing a sync was overdue —
+        the very symptom this work exists to remove, surviving on one path.
+        """
+        if getattr(args, 'dry_run', False):
+            return
+        written = write_receipt(
+            CONFIG_DIR,
+            trigger=run_trigger,
+            started_at=run_started_at,
+            stats=stats_snapshot,
+            channel=run_channel,
+            mode=run_mode_name,
+            version=REPO_RADAR_VERSION,
+        )
+        if sync_logger:
+            sync_logger.event("receipt_written" if written else "receipt_failed",
+                              trigger=run_trigger, channel=run_channel, mode=run_mode_name)
+
     if sync_logger:
         sync_logger.event(
             "sync_start",
-            trigger=("scheduled" if not getattr(args, 'show_window', True) else "manual"),
+            trigger=run_trigger,
+            channel=run_channel,
+            mode=run_mode_name,
             dry_run=bool(getattr(args, 'dry_run', False)),
             skip_metadata=bool(getattr(args, 'skip_metadata', False)),
         )
+
+    # Lock-held guard for catch-up runs. The catch-up decision was made in Electron BEFORE the
+    # root execution lock was acquired, so a real scheduled worker could have finished and
+    # released the lock in between — and this run would then redo the same paid work. We are past
+    # the dispatcher's lock acquisition here, so this is the first race-free moment to re-check.
+    if run_trigger == 'catchup':
+        not_before = (os.environ.get('REPO_RADAR_CATCHUP_NOT_BEFORE') or '').strip()
+        existing = read_receipt(CONFIG_DIR, run_channel)
+        # Re-derive via the shared rule rather than trusting the stored flag: a receipt written by
+        # an older build could carry a qualification computed by a different (and wrong) rule.
+        # Compare INSTANTS, not strings. read_receipt already rejects unparseable and future
+        # timestamps, so a corrupt receipt can no longer decline work by sorting above the
+        # watermark lexically.
+        finished_at = parse_instant(existing.get('finishedAt')) if existing else None
+        watermark = parse_instant(not_before)
+        satisfied = bool(existing and finished_at and qualifies_for_schedule(
+            existing.get('channel'), existing.get('mode')))
+        if satisfied:
+            if watermark is None or finished_at > watermark:
+                console.print("[yellow]A qualifying sync already completed — skipping catch-up[/yellow]")
+                if sync_logger:
+                    sync_logger.event("catchup_skipped", reason="already_satisfied",
+                                      satisfied_at=existing['finishedAt'])
+                    sync_logger.close()
+                # Distinct from 0: nothing was synced, so the caller must not stamp a completion
+                # timestamp for this run.
+                return EXIT_SKIPPED_NO_WORK
 
     # Wait for network connectivity (handles laptop wake from sleep)
     def _notify_waiting(elapsed):
@@ -239,6 +311,13 @@ def sync_mode(args):
     repos = config.get('repositories', [])
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
+        # A successful no-op is still a completed run; record it or the schedule looks missed.
+        _finalize_run({'total': 0, 'updated': 0, 'cloned': 0, 'skipped': 0,
+                       'errors': 0, 'metadata_generated': 0, 'api_cost': 0.0})
+        if sync_logger:
+            sync_logger.event("sync_complete", total=0, updated=0, cloned=0, skipped=0,
+                              errors=0, metadata=0, cost="$0.0000")
+            sync_logger.close()
         return 0
 
     # Create directories
@@ -1510,6 +1589,13 @@ Stack Trace:
 
             completion_data['warning'] = warning_msg
 
+        # Carry the provenance the qualification rule needs. Without these the status server had
+        # no way to tell a full stable run from `--skip-metadata --status-server`, so it advanced
+        # lastSync for both — bypassing "partial never qualifies" exactly as dev once did.
+        completion_data['channel'] = run_channel
+        completion_data['mode'] = run_mode_name
+        completion_data['trigger'] = run_trigger
+        completion_data['qualifiesForSchedule'] = qualifies_for_schedule(run_channel, run_mode_name)
         send_status_update('complete', completion_data, args.status_server)
 
     if sync_logger:
@@ -1523,6 +1609,16 @@ Stack Trace:
             metadata=stats['metadata_generated'],
             cost=f"${stats['api_cost']:.4f}",
         )
+
+    # Durable completion receipt. Progress went to a status server inside the app, so a run that
+    # finished with the app closed previously left no trace at all — the tray showed a stale
+    # time and the catch-up logic, reading that same stale value, could launch a redundant paid
+    # sync. Written here regardless of trigger; Electron reconciles it into the status file on
+    # next start. Never fails the run: a completed sync must not report failure because its
+    # receipt could not be written.
+    _finalize_run(stats)
+
+    if sync_logger:
         sync_logger.close()
 
     return 0 if stats['errors'] == 0 else 1

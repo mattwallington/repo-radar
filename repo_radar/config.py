@@ -1,6 +1,8 @@
 """Configuration loading/saving and path constants."""
 
 import json
+import os
+import tempfile
 import hashlib
 from pathlib import Path
 from repo_radar.constants import RED, YELLOW, RESET
@@ -55,14 +57,32 @@ def load_config():
 
 
 def save_config(config):
-    """Save configuration to config file."""
+    """Save configuration to config file, owner-only.
+
+    This file holds the GitHub token and every provider API key. A plain open('w') creates it
+    with the umask applied (0644 under the default 022), and because overwriting preserves an
+    existing mode, a file created permissively by any earlier version stays world-readable
+    forever. So: create through a private temp file, replace atomically, and chmod explicitly —
+    the chmod is what tightens configs that already exist. The Electron writer does the same.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
+    tmp = None
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix='.config-', suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
             json.dump(config, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CONFIG_FILE)   # atomic; readers never see a partial config
+        tmp = None
+        os.chmod(CONFIG_FILE, 0o600)   # tightens a pre-existing 0644 file
         return True
     except Exception as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         print(f"{RED}Error saving config: {e}{RESET}")
         return False
 

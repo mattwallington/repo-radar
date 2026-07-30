@@ -48,3 +48,43 @@ for (const [from, to] of Object.entries(MODEL_SUGGESTIONS)) {
   assert.notStrictEqual(from, to, `suggestion is a self-map: ${from}`);
 }
 console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).length, 'rows');
+
+// ── run-receipt protocol parity across the language boundary ─────────────────────────────
+// The receipt is a contract between Python (writer) and Electron (reader), so its constants and
+// its qualification rule exist in both languages. This review cycle showed repeatedly that
+// independent per-language tests are not enough: the qualification rule agreed in JS and
+// disagreed in Python, and each suite passed. Compare them directly.
+{
+  const rr = require('../run-receipt');
+  const pyOut = execFileSync(py, ['-c',
+    "import sys,json;sys.path.insert(0,'.');from repo_radar import receipts as r;" +
+    "combos=[(c,m) for c in r.VALID_CHANNELS for m in r.VALID_MODES];" +
+    "print(json.dumps({'schema':r.RECEIPT_SCHEMA,'exit':r.EXIT_SKIPPED_NO_WORK," +
+    "'sched':r.SCHEDULING_CHANNEL,'triggers':sorted(r.VALID_TRIGGERS)," +
+    "'channels':sorted(r.VALID_CHANNELS),'modes':sorted(r.VALID_MODES)," +
+    "'table':{f'{c}|{m}': r.qualifies_for_schedule(c,m) for c,m in combos}}))"],
+    { cwd: root, encoding: 'utf8' });
+  const pr = JSON.parse(pyOut);
+
+  assert.strictEqual(rr.SCHEMA, pr.schema, 'receipt SCHEMA drift');
+  assert.strictEqual(rr.EXIT_SKIPPED_NO_WORK, pr.exit, 'EXIT_SKIPPED_NO_WORK drift');
+  assert.strictEqual(rr.SCHEDULING_CHANNEL, pr.sched, 'SCHEDULING_CHANNEL drift');
+  assert.deepStrictEqual([...rr.VALID_TRIGGERS].sort(), pr.triggers, 'VALID_TRIGGERS drift');
+  assert.deepStrictEqual([...rr.VALID_CHANNELS].sort(), pr.channels, 'VALID_CHANNELS drift');
+  assert.deepStrictEqual([...rr.VALID_MODES].sort(), pr.modes, 'VALID_MODES drift');
+
+  // The truth table, every channel x mode. This is the assertion that would have caught Python
+  // persisting qualifiesForSchedule=true for a full DEV run while JS derived false.
+  let compared = 0;
+  for (const [key, pyValue] of Object.entries(pr.table)) {
+    const [channel, mode] = key.split('|');
+    const jsValue = rr.qualifiesForSchedule({ channel, mode, trigger: 'scheduled' });
+    assert.strictEqual(jsValue, pyValue,
+      `qualification drift for ${channel}/${mode}: js=${jsValue} py=${pyValue}`);
+    compared += 1;
+  }
+  assert.strictEqual(compared, pr.channels.length * pr.modes.length,
+    'every channel x mode combination must be compared');
+  console.log(`run-receipt parity OK: ${compared} qualification combos, ${pr.triggers.length} triggers,`
+    + ` schema ${pr.schema}, exit ${pr.exit}`);
+}
