@@ -6,7 +6,8 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { planReconcile, validateReceipt, qualifiesForSchedule, needsCatchUp, SCHEMA } = require('../run-receipt');
+const { planReconcile, validateReceipt, qualifiesForSchedule, needsCatchUp, SCHEMA,
+        EXIT_SKIPPED_NO_WORK } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -204,6 +205,35 @@ assert.ok(/writeFileSync\(configFile,[\s\S]*?\{ mode: 0o600 \}\)/.test(MAIN)
   const body = fn.slice(0, fn.indexOf('\n}'));
   assert.ok(body.indexOf('reconcileRunReceipt()') < body.indexOf('const status = loadStatus()'),
     'reconcile must precede the lastSync read, or a completed run still looks missed');
+}
+
+// ── the schedule watermark has more writers than planReconcile ──────────────────────────
+// planReconcile correctly refused dev receipts, but two unconditional writers bypassed it: the
+// status-server 'complete' handler and the child zero-exit handler. A successful dev run therefore
+// still suppressed stable's catch-up. Both are now channel-gated.
+{
+  const gates = MAIN.match(/if \(runtimeChannel === SCHEDULING_CHANNEL\) \{/g) || [];
+  assert.ok(gates.length >= 2,
+    `both lastSync writers must be channel-gated (found ${gates.length})`);
+  // and no ungated assignment may remain
+  const ungated = MAIN.split('\n').filter((l, i, all) =>
+    /status\.lastSync = new Date\(\)\.toISOString\(\);/.test(l)
+    && !/SCHEDULING_CHANNEL/.test(all.slice(Math.max(0, i - 6), i).join('\n')));
+  assert.strictEqual(ungated.length, 0,
+    `found ${ungated.length} ungated status.lastSync write(s)`);
+}
+// dev must neither run the missed-sync check nor install its periodic timer
+assert.strictEqual((MAIN.match(/checkMissedSync\(\);/g) || []).length,
+  (MAIN.match(/if \(runtimeChannel === SCHEDULING_CHANNEL\) checkMissedSync\(\);/g) || []).length,
+  'every checkMissedSync() call must be channel-gated — dev owns no schedule');
+// a declined catch-up must not be treated as a completion
+assert.ok(/code === EXIT_SKIPPED_NO_WORK/.test(MAIN),
+  'the child-close handler must distinguish a declined catch-up from a completed sync');
+assert.strictEqual(EXIT_SKIPPED_NO_WORK, 66, 'must match receipts.EXIT_SKIPPED_NO_WORK');
+// version is retained, so it is observability with a consumer rather than a write-only field
+{
+  const plan = planReconcile(receipt({ version: '1.0.28' }), { lastSync: iso(6 * 3600_000) });
+  assert.strictEqual(plan.status.channels.stable.version, '1.0.28', 'version recorded');
 }
 
 console.log('run-receipt OK: production planReconcile + validation + main.js wiring landmarks');

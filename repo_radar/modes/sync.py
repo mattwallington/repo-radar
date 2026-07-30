@@ -15,7 +15,8 @@ import threading
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
 from repo_radar import VERSION as REPO_RADAR_VERSION
-from repo_radar.receipts import (read_receipt, resolve_channel, resolve_trigger,
+from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, qualifies_for_schedule,
+                                 read_receipt, resolve_channel, resolve_trigger,
                                  run_mode, write_receipt)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
@@ -255,14 +256,20 @@ def sync_mode(args):
     if run_trigger == 'catchup':
         not_before = (os.environ.get('REPO_RADAR_CATCHUP_NOT_BEFORE') or '').strip()
         existing = read_receipt(CONFIG_DIR, run_channel)
-        if existing and existing.get('qualifiesForSchedule') and existing.get('finishedAt'):
+        # Re-derive via the shared rule rather than trusting the stored flag: a receipt written by
+        # an older build could carry a qualification computed by a different (and wrong) rule.
+        satisfied = bool(existing and existing.get('finishedAt') and qualifies_for_schedule(
+            existing.get('channel'), existing.get('mode')))
+        if satisfied:
             if not not_before or existing['finishedAt'] > not_before:
                 console.print("[yellow]A qualifying sync already completed — skipping catch-up[/yellow]")
                 if sync_logger:
                     sync_logger.event("catchup_skipped", reason="already_satisfied",
                                       satisfied_at=existing['finishedAt'])
                     sync_logger.close()
-                return 0
+                # Distinct from 0: nothing was synced, so the caller must not stamp a completion
+                # timestamp for this run.
+                return EXIT_SKIPPED_NO_WORK
 
     # Wait for network connectivity (handles laptop wake from sleep)
     def _notify_waiting(elapsed):

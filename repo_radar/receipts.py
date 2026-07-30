@@ -30,6 +30,8 @@ RECEIPT_BASENAME = 'last-run'
 CHANNEL_ENV = 'REPO_RADAR_CHANNEL'
 DEFAULT_CHANNEL = 'stable'
 VALID_CHANNELS = ('stable', 'dev')
+# Only the stable channel owns a schedule; a dev run must never satisfy it.
+SCHEDULING_CHANNEL = 'stable'
 
 # Set explicitly by every invoker so provenance is stated, not inferred. The previous code
 # guessed the trigger from whether a window was being shown — and that attribute never existed
@@ -79,6 +81,24 @@ def _num(value, default=0):
         return default
 
 
+# Exit code for a catch-up that correctly declined to run. Distinct from 0 so the caller does not
+# stamp a completion timestamp for work that never happened.
+EXIT_SKIPPED_NO_WORK = 66
+
+VALID_MODES = ('full', 'skip-metadata', 'repos-only', 'metadata-only')
+
+
+def qualifies_for_schedule(channel, mode):
+    """THE schedule-equivalence rule. Mirrors menubar/run-receipt.js qualifiesForSchedule.
+
+    Kept as one function used BOTH when writing a receipt and by the lock-held catch-up guard: an
+    earlier version computed `is_full` at write time while ignoring the channel, so a full DEV run
+    persisted qualifiesForSchedule=true and the guard then trusted that stale value in production —
+    a rule in two places, disagreeing.
+    """
+    return channel == SCHEDULING_CHANNEL and mode == 'full'
+
+
 def run_mode(*, skip_metadata=False, metadata_only=False, repos_only=False):
     """'full' only when the run did the whole job; otherwise which part it skipped."""
     if metadata_only:
@@ -104,13 +124,12 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
         trig = _valid_enum(trigger, VALID_TRIGGERS, 'manual')
         stats = stats if isinstance(stats, dict) else {}
         errors = _num(stats.get('errors'), 0)
-        is_full = mode == 'full'
+        mode = mode if mode in VALID_MODES else 'full'
         payload = {
             'schema': RECEIPT_SCHEMA,
             'channel': ch,
             'trigger': trig,
-            'mode': mode if mode in ('full', 'metadata-only', 'repos-only', 'skip-metadata')
-                    else 'full',
+            'mode': mode,
             'startedAt': str(started_at) if started_at else None,
             'finishedAt': finished_at or datetime.now(timezone.utc).isoformat(),
             'version': str(version) if version else None,
@@ -130,7 +149,7 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
             # Whether this run can stand in for the scheduled job. A partial run did not do the
             # scheduled work, so it must not suppress the next occurrence even though it
             # completed successfully.
-            'qualifiesForSchedule': bool(is_full),
+            'qualifiesForSchedule': qualifies_for_schedule(ch, mode),
         }
 
         target = receipt_path(config_dir, ch)
@@ -173,6 +192,8 @@ def read_receipt(config_dir, channel=None):
     if data.get('channel') not in VALID_CHANNELS:
         return None
     if data.get('trigger') not in VALID_TRIGGERS:
+        return None
+    if data.get('mode') not in VALID_MODES:
         return None
     if not isinstance(data.get('qualifiesForSchedule'), bool):
         return None

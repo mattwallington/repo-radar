@@ -275,7 +275,10 @@ def test_catchup_execution_skips_when_already_satisfied(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, 'wait_for_network',
                         lambda **kw: called.__setitem__('network', True) or True)
     rc = sync_mod.sync_mode(_args())
-    assert rc == 0
+    from repo_radar.receipts import EXIT_SKIPPED_NO_WORK
+    assert rc == EXIT_SKIPPED_NO_WORK, (
+        "a declined catch-up must be distinguishable from a completed sync, or the caller stamps "
+        "a completion timestamp for work that never happened")
     assert called['network'] is False, "must bail BEFORE doing any work"
     # the pre-existing receipt is untouched, not overwritten by the skipped run
     assert read_receipt(tmp_path, 'stable')['finishedAt'] == '2026-07-29T23:00:00+00:00'
@@ -296,3 +299,64 @@ def test_catchup_execution_proceeds_when_not_satisfied(tmp_path, monkeypatch):
     monkeypatch.setenv('REPO_RADAR_CATCHUP_NOT_BEFORE', '2026-07-29T22:00:00+00:00')
     assert sync_mod.sync_mode(_args()) == 0
     assert read_receipt(tmp_path, 'stable')['trigger'] == 'catchup', "the catch-up ran"
+
+
+# ── one qualification rule, shared by the writer and the lock-held guard ──────────────────
+
+
+def test_qualification_rule_is_channel_aware():
+    """A full DEV run previously persisted qualifiesForSchedule=true because the write-time rule
+    ignored the channel, and the lock-held guard then trusted that value in production."""
+    from repo_radar.receipts import qualifies_for_schedule
+    assert qualifies_for_schedule("stable", "full") is True
+    assert qualifies_for_schedule("dev", "full") is False, "dev owns no schedule"
+    assert qualifies_for_schedule("stable", "skip-metadata") is False
+    assert qualifies_for_schedule("stable", "metadata-only") is False
+    assert qualifies_for_schedule("stable", "repos-only") is False
+    assert qualifies_for_schedule(None, "full") is False
+
+
+def test_written_receipt_matches_the_rule_for_every_combination(tmp_path):
+    from repo_radar.receipts import qualifies_for_schedule
+    for channel in ("stable", "dev"):
+        for mode in ("full", "skip-metadata", "metadata-only", "repos-only"):
+            write_receipt(tmp_path, trigger="manual", started_at="x", stats={"errors": 0},
+                          channel=channel, mode=mode)
+            r = read_receipt(tmp_path, channel)
+            assert r["qualifiesForSchedule"] is qualifies_for_schedule(channel, mode), (
+                f"{channel}/{mode} persisted a qualification that contradicts the rule")
+
+
+def test_read_rejects_an_invalid_mode(tmp_path):
+    import json as _json
+    from repo_radar.receipts import receipt_path
+    receipt_path(tmp_path, "stable").write_text(_json.dumps({
+        "schema": 2, "channel": "stable", "trigger": "scheduled", "mode": "sideways",
+        "completed": True, "qualifiesForSchedule": True,
+        "finishedAt": "2026-07-29T22:00:00+00:00", "stats": {"errors": 0}}))
+    assert read_receipt(tmp_path, "stable") is None
+
+
+def test_guard_ignores_a_stale_qualification_flag(tmp_path, monkeypatch):
+    """A receipt written by an older build could claim qualification under a different rule; the
+    guard must re-derive rather than trust it."""
+    import json as _json
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+    from repo_radar.receipts import receipt_path
+
+    # hand-craft a DEV receipt that lies about qualifying
+    receipt_path(tmp_path, "dev").write_text(_json.dumps({
+        "schema": 2, "channel": "dev", "trigger": "scheduled", "mode": "full",
+        "completed": True, "qualifiesForSchedule": True,
+        "finishedAt": "2026-07-29T23:00:00+00:00", "stats": {"errors": 0}}))
+    monkeypatch.setattr(sync_mod, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(sync_mod, "load_config", lambda: {"repositories": []})
+    monkeypatch.setattr(sync_mod, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(sync_mod, "wait_for_network", lambda **kw: True)
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, "catchup")
+    monkeypatch.setenv(receipts_mod.CHANNEL_ENV, "dev")
+    monkeypatch.setenv("REPO_RADAR_CATCHUP_NOT_BEFORE", "2026-07-29T22:00:00+00:00")
+
+    rc = sync_mod.sync_mode(_args())
+    assert rc == 0, "a dev receipt cannot satisfy a catch-up, so the run must proceed"

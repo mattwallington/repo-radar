@@ -13,7 +13,8 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
-const { planReconcile, needsCatchUp } = require('./run-receipt');
+const { planReconcile, needsCatchUp, SCHEDULING_CHANNEL,
+        EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
@@ -987,7 +988,18 @@ function startStatusServer() {
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();
-      status.lastSync = new Date().toISOString();
+      // Only the channel that OWNS the schedule may advance the schedule watermark.
+      // planReconcile already refused dev receipts, but this path bypassed it entirely, so a
+      // successful dev run still suppressed stable's catch-up.
+      if (runtimeChannel === SCHEDULING_CHANNEL) {
+        status.lastSync = new Date().toISOString();
+      } else {
+        status.channels = { ...(status.channels || {}) };
+        status.channels[runtimeChannel] = {
+          ...(status.channels[runtimeChannel] || {}),
+          completedAt: new Date().toISOString(),
+        };
+      }
       status.stats = data.stats || status.stats;
       
       console.log('Sync complete with stats:', data.stats);
@@ -1364,10 +1376,34 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           setTimeout(() => {
             const status = loadStatus();
 
+            // The worker declined this catch-up because a qualifying run already satisfied it.
+            // reconcileRunReceipt has adopted that run's REAL completion time, so stamping "now"
+            // here would overwrite it with this no-op's exit time and shift hourly freshness.
+            if (code === EXIT_SKIPPED_NO_WORK) {
+              console.log('Catch-up declined by the worker — no work done');
+              status.syncing = false;
+              saveStatus(status);
+              currentSyncProcess = null;
+              try { reconcileRunReceipt(); } catch (e) { /* nothing to adopt is fine */ }
+              updateTrayMenu();
+              return;
+            }
+
             console.log('Final status check - hasErrors:', status.hasErrors, 'errors:', status.stats?.errors);
 
             if (code === 0) {
-              status.lastSync = new Date().toISOString();
+              // Only the channel that OWNS the schedule may advance the schedule watermark.
+              // planReconcile already refused dev receipts, but this path bypassed it entirely, so a
+              // successful dev run still suppressed stable's catch-up.
+              if (runtimeChannel === SCHEDULING_CHANNEL) {
+                status.lastSync = new Date().toISOString();
+              } else {
+                status.channels = { ...(status.channels || {}) };
+                status.channels[runtimeChannel] = {
+                  ...(status.channels[runtimeChannel] || {}),
+                  completedAt: new Date().toISOString(),
+                };
+              }
               // Check if errors were reported via status updates
               if (status.stats && status.stats.errors > 0) {
                 console.log('Sync completed but had errors');
@@ -2573,14 +2609,17 @@ app.whenReady().then(async () => {
   // Check for missed syncs after a short delay (let everything initialize)
   setTimeout(() => {
     reconcileRunReceipt();
-    checkMissedSync();
+    // Only the channel that OWNS the schedule may act on it. A dev app would otherwise read
+    // stable's schedule and stable's lastSync and launch a paid dev catch-up for an occurrence it
+    // does not own — after which the stable app may still run the real one.
+    if (runtimeChannel === SCHEDULING_CHANNEL) checkMissedSync();
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes
   // This catches cases where the laptop was asleep at the scheduled time
   setInterval(() => {
     console.log('Periodic check for missed syncs...');
-    checkMissedSync();
+    if (runtimeChannel === SCHEDULING_CHANNEL) checkMissedSync();
   }, 30 * 60 * 1000); // 30 minutes in milliseconds
   
   // Fallback safety check (1 minute interval as ultimate backup)

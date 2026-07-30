@@ -18,6 +18,9 @@ const VALID_CHANNELS = ['stable', 'dev'];
 const VALID_MODES = ['full', 'skip-metadata', 'repos-only', 'metadata-only'];
 // Only the stable channel owns a schedule; a dev build must never be able to satisfy it.
 const SCHEDULING_CHANNEL = 'stable';
+// Exit code meaning "declined, no work done" — distinct from 0 so the caller does not stamp a
+// completion timestamp for a run that deliberately did nothing. Mirrors receipts.EXIT_SKIPPED_NO_WORK.
+const EXIT_SKIPPED_NO_WORK = 66;
 
 function isIsoString(value) {
   if (typeof value !== 'string' || !value) return false;
@@ -86,6 +89,7 @@ function planReconcile(receipt, status, opts = {}) {
     trigger: valid.trigger,
     errors: valid.stats.errors,
     mode: valid.mode,
+    version: valid.version || null,   // observability: which build produced this run
     qualifies,
   };
 
@@ -143,5 +147,6 @@ function needsCatchUp(config, status, now = new Date()) {
 
 module.exports = {
   SCHEMA, VALID_TRIGGERS, VALID_CHANNELS, VALID_MODES, SCHEDULING_CHANNEL,
+  EXIT_SKIPPED_NO_WORK,
   validateReceipt, qualifiesForSchedule, planReconcile, needsCatchUp, channelState,
 };
