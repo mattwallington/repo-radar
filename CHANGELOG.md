@@ -4,6 +4,16 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.28] - 2026-07-30
+
+### Fixed
+- **Config file permissions.** `config.json` — which holds your GitHub token and provider API keys — was created world-readable (0644) by both the app and the CLI, and a file created permissively by an earlier version was never tightened. Both writers now create it owner-only and correct existing files, and the app tightens a legacy config at startup.
+- **Scheduled syncs left no record.** A scheduled run that completed while the app was closed — the normal case for a 9am job — updated nothing, so the menu showed a stale "Last Sync" and the missed-sync check could launch a second, redundant sync. Runs now write a durable completion receipt that the app reconciles, and every run records how it was actually triggered instead of guessing.
+- **Repositories too large to summarise.** Combining a large repository's analyses could exceed the model's context window and fail metadata generation outright. Analyses are now combined hierarchically in bounded batches, so every part still reaches the final summary.
+- **Duplicate index entries.** Every repository appeared twice in `INDEX.md` (and the total was doubled) because the stable symlink was counted alongside the real file.
+- **Silent metadata parse failures.** A failed parse was written and indexed as though it were fine, so `Unknown` fields looked like a model that didn't know rather than a parser that gave up. Failed parses are now flagged, explained, and surfaced in the index.
+- **GPT-5.3 Codex context window.** The catalog recorded the 400K *total* context in a table of *input* windows, so chunks could exceed the real 272K input limit.
+
 ## [1.0.27] - 2026-07-24
 
 ### Added
