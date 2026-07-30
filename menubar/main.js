@@ -14,7 +14,8 @@ const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
 const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
-        EXIT_SKIPPED_NO_WORK, indexDroppedOf, runSucceeded } = require('./run-receipt');
+        EXIT_SKIPPED_NO_WORK, indexDroppedOf, runSucceeded,
+        warningOf, statusNeedsAttention } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
@@ -394,6 +395,9 @@ function showErrorIcon() {
   if (errorCount === 0 && dropped > 0) {
     tray.setToolTip(`Sync incomplete — ${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} `
       + `missing from INDEX.md`);
+  } else if (errorCount === 0 && status.warning) {
+    // A warning-only run has nothing to count, so the old text was "Sync failed with 0 errors".
+    tray.setToolTip(String(status.warning).replace(/^⚠️\s*/, 'Sync: '));
   } else {
     tray.setToolTip(`Sync failed with ${errorCount} error${errorCount !== 1 ? 's' : ''}`);
   }
@@ -556,7 +560,9 @@ function updateTrayMenu() {
         ? `${status.stats.errors} error${status.stats.errors !== 1 ? 's' : ''}`
         : (trayIndexDropped(status) > 0
             ? `⚠️ ${trayIndexDropped(status)} missing from INDEX.md`
-            : `${status.stats.updated + status.stats.cloned} repos synced`),
+            : (status.warning
+                ? '⚠️ No metadata generated'
+                : `${status.stats.updated + status.stats.cloned} repos synced`)),
       enabled: false
     },
     {
@@ -1031,6 +1037,9 @@ function startStatusServer() {
       // that one protection.
       status.statsAt = (typeof data.finishedAt === 'string' && data.finishedAt)
         ? data.finishedAt : new Date().toISOString();
+      // Part of the canonical outcome, so the child-exit handler and the tray read the same
+      // warning this handler acted on, and a later clean run clears it.
+      status.warning = (typeof data.warning === 'string' && data.warning) ? data.warning : null;
 
       console.log('Sync complete with stats:', data.stats);
       
@@ -1458,9 +1467,14 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
                   completedAt: new Date().toISOString(),
                 };
               }
-              // Check if errors were reported via status updates
-              if (status.stats && status.stats.errors > 0) {
-                console.log('Sync completed but had errors');
+              // Exit 0 means the PROCESS finished, not that the run was clean. This asked its own
+              // narrower question — stats.errors only — and half a second after the live handler
+              // correctly raised a warning-only outcome, cleared it again. Consult the one
+              // canonical rule over the outcome that completion or reconciliation established.
+              if (statusNeedsAttention(status)) {
+                console.log('Sync completed but needs attention:', status.stats?.errors,
+                            'errors,', status.stats?.index_dropped, 'index drops,',
+                            status.warning ? 'warning' : 'no warning');
                 showErrorIcon();
                 status.hasErrors = true;
                 // Show progress window on errors if it was a background sync
@@ -2302,9 +2316,12 @@ function reconcileRunReceipt() {
     const dropped = indexDroppedOf(receipt);
     const ok = runSucceeded(receipt);
     if (plan.recordHistory) {
+      // Name the actual problem. A warning-only run has zero errors and zero drops, so this said
+      // "with 0 errors" — detecting that something was wrong while unable to report what.
+      const warning = warningOf(receipt);
       const detail = dropped > 0
         ? `${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} missing from INDEX.md`
-        : `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`;
+        : (warning || `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`);
       adopted.errorLog = (adopted.errorLog || '')
         + `\n⚠️ ${receipt.trigger} sync finished ${receipt.finishedAt} with ${detail}.`;
     }

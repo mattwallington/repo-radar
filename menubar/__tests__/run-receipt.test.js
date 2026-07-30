@@ -8,7 +8,8 @@ const path = require('path');
 
 const { planReconcile, validateReceipt, qualifiesForSchedule, completionQualifies,
         needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK,
-        indexDroppedOf, runSucceeded, statsFromReceipt } = require('../run-receipt');
+        indexDroppedOf, runSucceeded, statsFromReceipt,
+        warningOf, statusNeedsAttention } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -467,6 +468,86 @@ assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
   assert.strictEqual(p.advanceLastSync, true, 'a future lastSync must not wedge the watermark');
 }
 
+// ── the whole completion -> receipt -> child-close sequence ──────────────────────────────
+// Three writers touch the outcome for a single run, and each one used to ask its own question.
+// The shared instant fixed the receipt writer; the child-exit handler still asked "exit 0 and
+// zero errors?" 500ms later and cleared a warning-only outcome the other two had preserved.
+{
+  const same = '2026-07-30T12:00:00.000Z';
+  const WARNING = '⚠️ No metadata generated: ANTHROPIC_API_KEY not configured.';
+  const warned = { schema: SCHEMA, channel: 'stable', trigger: 'manual', mode: 'full',
+    completed: true, qualifiesForSchedule: true, finishedAt: same, warning: WARNING,
+    stats: { total: 30, errors: 0, metadataGenerated: 0, indexDropped: 0 } };
+
+  // 1. live completion writes the canonical outcome (what main.js does on 'complete')
+  let status = { stats: { total: 30, errors: 0, index_dropped: 0 }, statsAt: same,
+                 warning: WARNING, hasErrors: true };
+  // 2. the same run's receipt is reconciled
+  status = planReconcile(warned, status).status;
+  assert.strictEqual(status.hasErrors, true, 'reconciliation preserves it');
+  // 3. child exits 0 — the step that used to erase it
+  assert.strictEqual(statusNeedsAttention(status), true,
+    'exit 0 means the process finished, not that the run was clean');
+
+  // The app-closed variant: no live completion at all, receipt is the only record.
+  const closed = planReconcile(warned, { statsAt: '2026-07-30T10:00:00.000Z' }).status;
+  assert.strictEqual(closed.warning, WARNING,
+    'the REASON must reach presentation, not just the fact that something is wrong');
+  assert.strictEqual(statusNeedsAttention(closed), true);
+
+  // And a newer clean run clears it — last-run state, like hasErrors.
+  const cleanRun = { ...warned, warning: null, finishedAt: '2026-07-30T13:00:00.000Z' };
+  const after = planReconcile(cleanRun, closed).status;
+  assert.strictEqual(after.warning, null, 'a newer clean outcome clears the warning');
+  assert.strictEqual(statusNeedsAttention(after), false);
+
+  // statusNeedsAttention covers all three inputs, not just warnings.
+  assert.strictEqual(statusNeedsAttention({ stats: { errors: 2, index_dropped: 0 } }), true);
+  assert.strictEqual(statusNeedsAttention({ stats: { errors: 0, index_dropped: 3 } }), true);
+  assert.strictEqual(statusNeedsAttention({ stats: { errors: 0, index_dropped: 0 } }), false);
+  assert.strictEqual(statusNeedsAttention({}), false, 'an empty status is not a failure');
+}
+
+// ── a future watermark must be repairable even when the receipt is already absorbed ──────
+// parsePersistedInstant made a corrupt lastSync READ as absent, but advancement was gated on
+// !absorbed — so the exact combination "receipt already absorbed + future lastSync" left the
+// watermark wedged and needsCatchUp reporting the schedule satisfied until 2099.
+{
+  const at = '2026-07-30T12:00:00.000Z';
+  const r = receipt({ finishedAt: at,
+    stats: { total: 30, errors: 0, metadataGenerated: 0, indexDropped: 0 } });
+  const wedged = { channels: { stable: { receiptAt: at } }, statsAt: at,
+                   lastSync: '2099-01-01T00:00:00.000Z' };
+  const plan = planReconcile(r, wedged, { now: new Date('2026-07-30T13:00:00.000Z') });
+
+  assert.strictEqual(plan.reason, 'watermark-repair');
+  assert.strictEqual(plan.advanceLastSync, true);
+  assert.strictEqual(plan.status.lastSync, at, 'the impossible watermark must be repaired');
+  assert.strictEqual(plan.recordHistory, false, 'repair must not re-log an absorbed run');
+  assert.deepStrictEqual(plan.status.channels.stable, wedged.channels.stable,
+    'nor rewrite history');
+
+  // Idempotent: once repaired, the same receipt is inert again.
+  const again = planReconcile(r, plan.status, { now: new Date('2026-07-30T13:00:00.000Z') });
+  assert.strictEqual(again.adopt, false);
+  assert.strictEqual(again.reason, 'already-absorbed');
+}
+
+// ── warning must be a string or absent ───────────────────────────────────────────────────
+// Truthiness drives the success rule, so an object or a number would silently mean "failed".
+{
+  const base = { finishedAt: '2026-07-30T12:00:00.000Z',
+    stats: { total: 1, errors: 0, metadataGenerated: 0, indexDropped: 0 } };
+  for (const bad of [{ msg: 'x' }, ['x'], 42, true]) {
+    assert.strictEqual(validateReceipt(receipt({ ...base, warning: bad })), null,
+      `warning=${JSON.stringify(bad)} must be rejected, not coerced by truthiness`);
+  }
+  assert.ok(validateReceipt(receipt({ ...base, warning: null })), 'null means no warning');
+  assert.ok(validateReceipt(receipt(base)), 'absent means no warning');
+  assert.ok(validateReceipt(receipt({ ...base, warning: 'real' })), 'a string is a warning');
+  assert.strictEqual(warningOf(receipt({ ...base, warning: '' })), null, 'empty is not a warning');
+}
+
 // main.js wiring landmarks for the two consumers Codex found still reporting success.
 // NOTE the key difference: the live status-server payload carries Python's raw stats dict
 // (snake_case index_dropped) while the durable receipt uses camelCase indexDropped. Both
@@ -495,6 +576,14 @@ assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
 }
 
 // The live path must stamp when its outcome was produced, or adoption cannot order the two.
+// The child-exit handler must consult the shared rule rather than re-deriving a narrower one.
+assert.ok(/if \(statusNeedsAttention\(status\)\)/.test(MAIN),
+  'the child-close path must consult the canonical outcome, not just stats.errors');
+assert.ok(!/if \(status\.stats && status\.stats\.errors > 0\) \{/.test(MAIN),
+  'the old errors-only child-close check must be gone, not merely supplemented');
+assert.ok(/status\.warning = \(typeof data\.warning === 'string'/.test(MAIN),
+  'the live handler must record the warning into the canonical outcome');
+
 assert.ok(/data\.finishedAt === 'string'/.test(MAIN) && /status\.statsAt = /.test(MAIN),
   "the live handler must prefer Python's shared completion instant when stamping statsAt, so a "
   + "run's own receipt cannot read as newer than its own live update");

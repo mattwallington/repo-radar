@@ -131,6 +131,39 @@ def test_no_warning_records_null_and_stays_error_free(tmp_path):
     assert r["warning"] is None and r["errorFree"] is True
 
 
+@pytest.mark.parametrize("bad", [{"msg": "x"}, ["x"], 42, True])
+def test_a_non_string_warning_is_rejected(tmp_path, bad):
+    """Truthiness decides whether a warning fails the run, so a dict would silently mean 'failed'."""
+    write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=dict(STATS, errors=0))
+    target = receipt_path(tmp_path, "stable")
+    payload = json.loads(target.read_text())
+    payload["warning"] = bad
+    target.write_text(json.dumps(payload))
+    assert read_receipt(tmp_path) is None, f"warning={bad!r} must be rejected, not coerced"
+
+
+@pytest.mark.parametrize("bad", [{"n": 1}, "3", True, 1.5])
+def test_a_non_integer_index_drop_count_is_rejected(tmp_path, bad):
+    """bool is an int in Python but not in JS — the two validators must still agree."""
+    write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=dict(STATS, errors=0))
+    target = receipt_path(tmp_path, "stable")
+    payload = json.loads(target.read_text())
+    payload["stats"]["indexDropped"] = bad
+    target.write_text(json.dumps(payload))
+    assert read_receipt(tmp_path) is None, f"indexDropped={bad!r} must be rejected"
+
+
+def test_absent_additive_fields_still_read_as_valid(tmp_path):
+    """Older schema-2 receipts omit warning and indexDropped entirely; absent means 'none'."""
+    write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=dict(STATS, errors=0))
+    target = receipt_path(tmp_path, "stable")
+    payload = json.loads(target.read_text())
+    payload.pop("warning")
+    payload["stats"].pop("indexDropped")
+    target.write_text(json.dumps(payload))
+    assert read_receipt(tmp_path) is not None, "a pre-upgrade receipt must remain readable"
+
+
 def test_write_is_atomic_and_leaves_no_temp_files(tmp_path):
     for _ in range(3):
         write_receipt(tmp_path, trigger="manual", started_at="x", stats=STATS)

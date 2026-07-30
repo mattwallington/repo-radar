@@ -45,7 +45,33 @@ function validateReceipt(receipt, { channel = SCHEDULING_CHANNEL, now = new Date
   // receipt and make the app believe no sync had ever run. Present-but-not-an-integer is still a
   // corrupt receipt.
   if (stats.indexDropped !== undefined && !Number.isInteger(stats.indexDropped)) return null;
+  // Absent or null means "no warning"; anything present must be a string. Truthiness alone drives
+  // the success rule, so an object or a number would sail through and silently mean "failed".
+  if (receipt.warning !== undefined && receipt.warning !== null
+      && typeof receipt.warning !== 'string') return null;
   return receipt;
+}
+
+/** The warning a receipt carries, or null. Non-strings are not warnings. */
+function warningOf(receipt) {
+  const w = receipt && receipt.warning;
+  return typeof w === 'string' && w ? w : null;
+}
+
+/**
+ * Does the CANONICAL STATUS (not a receipt) describe something the user must act on?
+ *
+ * The same question as runSucceeded, asked of the status file instead of a receipt, so every
+ * writer consults one rule. The child-exit handler used to ask its own narrower version — exit
+ * code 0 plus stats.errors — and cleared a warning-only outcome half a second after the live
+ * handler had correctly raised it. Exit 0 means the process finished, not that the run was clean.
+ */
+function statusNeedsAttention(status) {
+  const stats = (status && status.stats) || {};
+  const errors = Number.isInteger(stats.errors) ? stats.errors : 0;
+  const dropped = Number.isInteger(stats.index_dropped) ? stats.index_dropped : 0;
+  const warned = typeof status?.warning === 'string' && !!status.warning;
+  return errors > 0 || dropped > 0 || warned;
 }
 
 /** Repositories excluded from INDEX.md by this run. Absent (older schema-2 receipt) means zero. */
@@ -63,8 +89,8 @@ function runSucceeded(receipt) {
   const errors = receipt && receipt.stats ? receipt.stats.errors : 0;
   // A warning ("no metadata generated: API key not configured") is actionable even though nothing
   // errored, and the live path already treats it as such. Mirrors Python's errorFree exactly.
-  const warned = !!(receipt && receipt.warning);
-  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0 && !warned;
+  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0
+    && !warningOf(receipt);
 }
 
 /**
@@ -176,12 +202,19 @@ function planReconcile(receipt, status, opts = {}) {
   const absorbed = !!(seenAt && !(finished > seenAt));
   const isLatestOutcome = !statsAt || finished > statsAt;
 
-  if (absorbed && !isLatestOutcome) {
+  // Repairing the schedule watermark is a THIRD independent question, alongside history absorption
+  // and presentation freshness. parsePersistedInstant returns null for a missing, corrupt or
+  // future lastSync, so `!known` is precisely the "needs repair" case — and gating advancement on
+  // !absorbed left a future watermark wedged forever, with needsCatchUp reporting the schedule
+  // satisfied until 2099.
+  const qualifies = qualifiesForSchedule(valid);
+  const known = parsePersistedInstant(status && status.lastSync, now);
+  const advance = qualifies && channel === SCHEDULING_CHANNEL && (!known || finished > known);
+
+  if (absorbed && !isLatestOutcome && !advance) {
     return { adopt: false, advanceLastSync: false, isLatestOutcome: false,
              recordHistory: false, status, reason: 'already-absorbed' };
   }
-
-  const qualifies = qualifiesForSchedule(valid);
   const next = { ...(status || {}) };
   if (!absorbed) {
     next.channels = { ...((status && status.channels) || {}) };
@@ -210,11 +243,13 @@ function planReconcile(receipt, status, opts = {}) {
     next.stats = statsFromReceipt(valid);
     next.statsAt = valid.finishedAt;
     next.hasErrors = !runSucceeded(valid);
+    // The REASON, not just the fact that something is wrong. Numeric stats alone left the
+    // app-closed path able to detect a problem while unable to name it: the history line read
+    // "with 0 errors" and the tooltip "Sync failed with 0 errors". Cleared by a newer clean
+    // outcome, because this is last-run state exactly like hasErrors.
+    next.warning = warningOf(valid);
   }
 
-  const known = parsePersistedInstant(status && status.lastSync, now);
-  const advance = !absorbed && qualifies && channel === SCHEDULING_CHANNEL
-    && (!known || finished > known);
   if (advance) next.lastSync = valid.finishedAt;
 
   // Whether the caller should append this run to the visible error history. False when the run was
@@ -230,7 +265,9 @@ function planReconcile(receipt, status, opts = {}) {
     recordHistory,
     advanceLastSync: advance,
     status: next,
-    reason: absorbed ? 'presentation-backfill' : (advance ? 'adopted' : 'observability-only'),
+    reason: absorbed
+      ? (isLatestOutcome ? 'presentation-backfill' : 'watermark-repair')
+      : (advance ? 'adopted' : 'observability-only'),
   };
 }
 
@@ -279,4 +316,5 @@ module.exports = {
   EXIT_SKIPPED_NO_WORK,
   validateReceipt, qualifiesForSchedule, completionQualifies, planReconcile, needsCatchUp,
   channelState, indexDroppedOf, runSucceeded, statsFromReceipt,
+  warningOf, statusNeedsAttention, parsePersistedInstant,
 };

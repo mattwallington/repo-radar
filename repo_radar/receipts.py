@@ -227,7 +227,23 @@ def read_receipt(config_dir, channel=None):
         return None
     if not isinstance(data.get('qualifiesForSchedule'), bool):
         return None
+    def _is_int(value):
+        # bool is a subclass of int in Python but Number.isInteger(true) is false in JS. Without
+        # this the two validators disagree on {"errors": true}, which is exactly the kind of
+        # divergence the parity gate exists to prevent.
+        return isinstance(value, int) and not isinstance(value, bool)
+
     stats = data.get('stats')
-    if not isinstance(stats, dict) or not isinstance(stats.get('errors'), int):
+    if not isinstance(stats, dict) or not _is_int(stats.get('errors')):
+        return None
+    # Additive fields, absent on older schema-2 receipts: absent means "none", but anything
+    # present must have the right type. Truthiness alone decides whether a warning fails the run,
+    # so a dict or a number would silently read as "this run needs attention". Mirrors the JS
+    # validator; the parity gate compares them.
+    dropped = stats.get('indexDropped')
+    if dropped is not None and not _is_int(dropped):
+        return None
+    warning = data.get('warning')
+    if warning is not None and not isinstance(warning, str):
         return None
     return data

@@ -132,6 +132,36 @@ console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).l
   }
   assert.strictEqual(outcomes, 8, 'every errors x drops x warning combination must be compared');
 
+  // Validator parity on INVALID types. Each language has its own trap here: Python's bool is an
+  // int subclass, JS coerces almost anything by truthiness. A receipt either language accepts
+  // while the other rejects is a receipt one process acts on and the other ignores.
+  const rejects = JSON.parse(execFileSync(py, ['-c',
+    "import sys,json,tempfile,pathlib;sys.path.insert(0,'.');" +
+    "from repo_radar import receipts as r;d=pathlib.Path(tempfile.mkdtemp());" +
+    "p=r.write_receipt(d,trigger='scheduled',started_at='2026-07-30T00:00:00+00:00'," +
+    "stats={'total':1,'errors':0},channel='stable',mode='full');" +
+    "base=json.loads(p.read_text());out={}\n" +
+    "cases={'warn_obj':('warning',{'m':1}),'warn_num':('warning',42),'warn_bool':('warning',True)," +
+    "'warn_null':('warning',None),'warn_str':('warning','real')}\n" +
+    "for k,(f,v) in cases.items():\n" +
+    "    o=json.loads(json.dumps(base)); o[f]=v; p.write_text(json.dumps(o));" +
+    " out[k]=(r.read_receipt(d) is not None, o)\n" +
+    "for k,v in [('drop_bool',True),('drop_str','3'),('drop_int',2)]:\n" +
+    "    o=json.loads(json.dumps(base)); o['stats']['indexDropped']=v; p.write_text(json.dumps(o));" +
+    " out[k]=(r.read_receipt(d) is not None, o)\n" +
+    "print(json.dumps(out))"], { cwd: root, encoding: 'utf8' }));
+
+  let compared2 = 0;
+  for (const [name, [pyAccepts, payload]] of Object.entries(rejects)) {
+    const jsAccepts = rr.validateReceipt(payload) !== null;
+    assert.strictEqual(jsAccepts, pyAccepts,
+      `validator drift for ${name}: js=${jsAccepts ? 'accepts' : 'rejects'} `
+      + `py=${pyAccepts ? 'accepts' : 'rejects'}`);
+    compared2 += 1;
+  }
+  assert.strictEqual(compared2, 8, 'every invalid-type case must be compared');
+
   console.log(`run-receipt parity OK: ${compared} qualification combos, ${pr.triggers.length} triggers,`
-    + ` schema ${pr.schema}, exit ${pr.exit}, indexDropped round-trip verified`);
+    + ` schema ${pr.schema}, exit ${pr.exit}, ${outcomes} outcome rules, ${compared2} validator`
+    + ` types, indexDropped round-trip verified`);
 }
