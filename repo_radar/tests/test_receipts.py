@@ -108,6 +108,29 @@ def test_a_complete_index_is_error_free_when_nothing_else_failed(tmp_path):
     assert r["errorFree"] is True
 
 
+def test_a_warning_is_recorded_and_makes_the_run_not_error_free(tmp_path):
+    """"No metadata generated: API key not configured" is actionable even with zero errors.
+
+    The warning used to be computed only inside the status-server branch, so a run that finished
+    with the app closed produced none at all and its receipt recorded a clean success — the single
+    case where the receipt is the only record the run happened.
+    """
+    write_receipt(tmp_path, trigger="scheduled", started_at="x",
+                  stats=dict(STATS, errors=0, index_dropped=0),
+                  warning="⚠️ No metadata generated: ANTHROPIC_API_KEY not configured.")
+    r = read_receipt(tmp_path)
+    assert r["warning"].startswith("⚠️ No metadata generated")
+    assert r["errorFree"] is False, "a warning is something the user must act on"
+    assert r["completed"] is True, "but the run did finish — no redundant paid catch-up"
+
+
+def test_no_warning_records_null_and_stays_error_free(tmp_path):
+    write_receipt(tmp_path, trigger="scheduled", started_at="x",
+                  stats=dict(STATS, errors=0, index_dropped=0))
+    r = read_receipt(tmp_path)
+    assert r["warning"] is None and r["errorFree"] is True
+
+
 def test_write_is_atomic_and_leaves_no_temp_files(tmp_path):
     for _ in range(3):
         write_receipt(tmp_path, trigger="manual", started_at="x", stats=STATS)

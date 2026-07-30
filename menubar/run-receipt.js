@@ -61,7 +61,10 @@ function indexDroppedOf(receipt) {
  */
 function runSucceeded(receipt) {
   const errors = receipt && receipt.stats ? receipt.stats.errors : 0;
-  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0;
+  // A warning ("no metadata generated: API key not configured") is actionable even though nothing
+  // errored, and the live path already treats it as such. Mirrors Python's errorFree exactly.
+  const warned = !!(receipt && receipt.warning);
+  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0 && !warned;
 }
 
 /**
@@ -106,6 +109,25 @@ function channelState(status, channel) {
 }
 
 /**
+ * Parse a timestamp WE previously persisted. Missing, unparseable, or future values all read as
+ * absent.
+ *
+ * Incoming receipts were validated this way from the start, but the markers we write ourselves
+ * were trusted blindly — and they are the ones that gate progress. A corrupt statsAt made every
+ * receipt look older and froze presentation forever; a future one blocked it until that date; a
+ * future receiptAt made every receipt "already absorbed", freezing schedule history too. Treating
+ * a marker we cannot trust as absent is the recoverable direction: the worst case is re-absorbing
+ * a run we had already seen, versus never absorbing another one again.
+ */
+function parsePersistedInstant(value, now) {
+  if (typeof value !== 'string' || !value) return null;
+  const at = new Date(value);
+  if (Number.isNaN(at.getTime())) return null;
+  if (at > now) return null;
+  return at;
+}
+
+/**
  * A receipt's outcome in the shape the LIVE path already writes to status.stats.
  *
  * Python's in-process stats dict is snake_case and its receipt is camelCase, so the same run
@@ -136,30 +158,46 @@ function statsFromReceipt(receipt) {
 function planReconcile(receipt, status, opts = {}) {
   const { channel = SCHEDULING_CHANNEL, now = new Date() } = opts;
   const valid = validateReceipt(receipt, { channel, now });
-  if (!valid) return { adopt: false, advanceLastSync: false, status, reason: 'invalid' };
+  if (!valid) {
+    return { adopt: false, advanceLastSync: false, isLatestOutcome: false,
+             recordHistory: false, status, reason: 'invalid' };
+  }
 
   const finished = new Date(valid.finishedAt);
-  const prior = channelState(status, channel).receiptAt;
-  const seenAt = prior ? new Date(prior) : null;
-  if (seenAt && !(finished > seenAt)) {
-    return { adopt: false, advanceLastSync: false, status, reason: 'already-absorbed' };
+  const seenAt = parsePersistedInstant(channelState(status, channel).receiptAt, now);
+  const statsAt = parsePersistedInstant(status && status.statsAt, now);
+
+  // Two INDEPENDENT questions about the same receipt, previously collapsed into one early return:
+  //   - has schedule/history already absorbed it?
+  //   - is it newer than what the tray is presenting?
+  // A build that predates statsAt answers yes to the first and yes to the second, because its
+  // presentation was never migrated. Collapsing them meant an upgraded install kept stale
+  // presentation indefinitely — until some future sync produced a newer receipt.
+  const absorbed = !!(seenAt && !(finished > seenAt));
+  const isLatestOutcome = !statsAt || finished > statsAt;
+
+  if (absorbed && !isLatestOutcome) {
+    return { adopt: false, advanceLastSync: false, isLatestOutcome: false,
+             recordHistory: false, status, reason: 'already-absorbed' };
   }
 
   const qualifies = qualifiesForSchedule(valid);
   const next = { ...(status || {}) };
-  next.channels = { ...((status && status.channels) || {}) };
-  next.channels[channel] = {
-    receiptAt: valid.finishedAt,
-    trigger: valid.trigger,
-    errors: valid.stats.errors,
-    // Retained separately from errors. Without it, an app-closed scheduled run that produced an
-    // incomplete index reconciled into the status file as an unqualified success and the drop
-    // vanished — the one case where the receipt is the ONLY record the run ever happened.
-    indexDropped: indexDroppedOf(valid),
-    mode: valid.mode,
-    version: valid.version || null,   // observability: which build produced this run
-    qualifies,
-  };
+  if (!absorbed) {
+    next.channels = { ...((status && status.channels) || {}) };
+    next.channels[channel] = {
+      receiptAt: valid.finishedAt,
+      trigger: valid.trigger,
+      errors: valid.stats.errors,
+      // Retained separately from errors. Without it, an app-closed scheduled run that produced an
+      // incomplete index reconciled into the status file as an unqualified success and the drop
+      // vanished — the one case where the receipt is the ONLY record the run ever happened.
+      indexDropped: indexDroppedOf(valid),
+      mode: valid.mode,
+      version: valid.version || null,   // observability: which build produced this run
+      qualifies,
+    };
+  }
 
   // Presentation state. The tray reads ONE outcome — status.stats plus hasErrors — and this is
   // where a receipt becomes that outcome. Gated on statsAt, the timestamp the live path stamps
@@ -168,24 +206,31 @@ function planReconcile(receipt, status, opts = {}) {
   // said otherwise, so the icon and the menu could disagree — white tray, "4 missing from
   // INDEX.md" one click away. `channels[...]` above stays as the per-channel scheduling/history
   // record; it is deliberately NOT a second presentation source.
-  const statsAt = status && status.statsAt ? new Date(status.statsAt) : null;
-  const isLatestOutcome = !statsAt || finished > statsAt;
   if (isLatestOutcome) {
     next.stats = statsFromReceipt(valid);
     next.statsAt = valid.finishedAt;
     next.hasErrors = !runSucceeded(valid);
   }
 
-  const known = status && status.lastSync ? new Date(status.lastSync) : null;
-  const advance = qualifies && channel === SCHEDULING_CHANNEL && (!known || finished > known);
+  const known = parsePersistedInstant(status && status.lastSync, now);
+  const advance = !absorbed && qualifies && channel === SCHEDULING_CHANNEL
+    && (!known || finished > known);
   if (advance) next.lastSync = valid.finishedAt;
+
+  // Whether the caller should append this run to the visible error history. False when the run was
+  // already absorbed (a presentation backfill must not re-log an old failure) and false when the
+  // live path already reported this same run — which is now detectable, because both transports
+  // carry ONE completion instant, so a run's own receipt is equal to rather than later than its
+  // live update.
+  const recordHistory = !absorbed && isLatestOutcome && !runSucceeded(valid);
 
   return {
     adopt: true,
     isLatestOutcome,
+    recordHistory,
     advanceLastSync: advance,
     status: next,
-    reason: advance ? 'adopted' : 'observability-only',
+    reason: absorbed ? 'presentation-backfill' : (advance ? 'adopted' : 'observability-only'),
   };
 }
 

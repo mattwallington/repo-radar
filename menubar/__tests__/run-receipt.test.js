@@ -385,6 +385,88 @@ assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
     errors: 0, metadata_generated: 0, index_dropped: 0, api_cost: 0 }, 'missing fields read as zero');
 }
 
+// ── a run must not overwrite its own richer live result ──────────────────────────────────
+// The live update and the receipt describe the SAME completion. Each used to stamp its own "now",
+// so the receipt was always milliseconds later and read as a newer, cleaner run — silently
+// clearing the warning the live path had just raised. Python now stamps one instant for both.
+{
+  const same = '2026-07-30T12:00:00.000Z';
+  const warned = { schema: SCHEMA, channel: 'stable', trigger: 'manual', mode: 'full',
+    completed: true, qualifiesForSchedule: true, finishedAt: same,
+    warning: '⚠️ No metadata generated: ANTHROPIC_API_KEY not configured.',
+    stats: { total: 30, errors: 0, metadataGenerated: 0, indexDropped: 0 } };
+
+  const live = { stats: { total: 30, errors: 0, index_dropped: 0 }, statsAt: same,
+                 hasErrors: true, errorLog: 'the warning' };
+  const plan = planReconcile(warned, live);
+  assert.strictEqual(plan.isLatestOutcome, false,
+    "a run's own receipt is not newer than its own live update — same instant, same event");
+  assert.strictEqual(plan.status.hasErrors, true,
+    'the live warning must survive this run writing its own receipt');
+  assert.strictEqual(plan.recordHistory, false,
+    'the live path already logged this run — do not append it twice');
+
+  // A warning is actionable even with zero errors, so an app-closed warning-only run must still
+  // surface. Before this, the warning was computed only when someone was listening.
+  assert.strictEqual(runSucceeded(warned), false, 'a warning means the run needs attention');
+  const closed = planReconcile(warned, { statsAt: '2026-07-30T10:00:00.000Z' });
+  assert.strictEqual(closed.status.hasErrors, true);
+  assert.strictEqual(closed.recordHistory, true, 'nothing else recorded this one');
+}
+
+// ── upgrading from a build that predates statsAt ─────────────────────────────────────────
+// v1.0.28 stored channels[channel].receiptAt but no statsAt and never normalized a receipt into
+// status.stats. Equality with that already-absorbed receipt returned early, so the upgraded app
+// kept stale presentation until some future sync happened to produce a newer receipt — which for
+// a manual-only user could be never.
+{
+  const at = '2026-07-30T12:00:00.000Z';
+  const legacy = {
+    stats: { total: 30, errors: 0, index_dropped: 4 },   // stale: a since-fixed failure
+    hasErrors: true,
+    channels: { stable: { receiptAt: at, errors: 0, mode: 'full', qualifies: true } },
+    lastSync: at,
+  };
+  const clean = receipt({ finishedAt: at,
+    stats: { total: 30, errors: 0, metadataGenerated: 0, indexDropped: 0 } });
+  const plan = planReconcile(clean, legacy);
+
+  assert.strictEqual(plan.reason, 'presentation-backfill');
+  assert.strictEqual(plan.status.stats.index_dropped, 0, 'stale presentation must be migrated');
+  assert.strictEqual(plan.status.hasErrors, false);
+  assert.strictEqual(plan.status.statsAt, at, 'and the marker backfilled so it happens once');
+  assert.strictEqual(plan.advanceLastSync, false,
+    'schedule state was already absorbed — backfill must not re-advance it');
+  assert.strictEqual(plan.recordHistory, false, 'nor re-append an old failure to the log');
+  assert.deepStrictEqual(plan.status.channels.stable, legacy.channels.stable,
+    'history is untouched: this is a presentation-only migration');
+
+  // Idempotent: once statsAt exists, the same receipt is inert.
+  const again = planReconcile(clean, plan.status);
+  assert.strictEqual(again.adopt, false);
+  assert.strictEqual(again.reason, 'already-absorbed');
+}
+
+// ── markers we wrote ourselves are not automatically trustworthy ─────────────────────────
+// Incoming receipts were validated from the start; the timestamps WE persist gate progress and
+// were trusted blindly. Corrupt or future values froze reconciliation permanently.
+{
+  const now = new Date('2026-07-30T13:00:00.000Z');
+  const r = receipt({ finishedAt: '2026-07-30T12:00:00.000Z',
+    stats: { total: 30, errors: 0, metadataGenerated: 0, indexDropped: 0 } });
+
+  for (const bad of ['not-a-date', '', '2099-01-01T00:00:00.000Z']) {
+    assert.strictEqual(planReconcile(r, { statsAt: bad }, { now }).isLatestOutcome, true,
+      `statsAt=${bad || '(empty)'} must read as absent, not freeze presentation forever`);
+    const p = planReconcile(r, { channels: { stable: { receiptAt: bad } } }, { now });
+    assert.strictEqual(p.adopt, true,
+      `receiptAt=${bad || '(empty)'} must read as absent, not freeze schedule history forever`);
+  }
+  // A future lastSync must not permanently block advancing either.
+  const p = planReconcile(r, { lastSync: '2099-01-01T00:00:00.000Z' }, { now });
+  assert.strictEqual(p.advanceLastSync, true, 'a future lastSync must not wedge the watermark');
+}
+
 // main.js wiring landmarks for the two consumers Codex found still reporting success.
 // NOTE the key difference: the live status-server payload carries Python's raw stats dict
 // (snake_case index_dropped) while the durable receipt uses camelCase indexDropped. Both
@@ -405,15 +487,17 @@ assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
   // on the same freshness ordering — an older receipt has no business writing "current" text.
   assert.ok(!/adopted\.hasErrors\s*=/.test(body),
     'main.js must not set hasErrors itself — planReconcile owns the canonical outcome');
-  assert.ok(/plan\.isLatestOutcome && !ok/.test(body),
-    'the errorLog append must be gated on the receipt actually being the latest outcome');
+  assert.ok(/if \(plan\.recordHistory\)/.test(body),
+    'the errorLog append must be gated on the shared record-history decision, so a presentation '
+    + 'backfill or a run the live path already logged cannot double-write history');
   assert.ok(/errorLog = \(adopted\.errorLog \|\| ''\)/.test(body),
     'errorLog is history and may only be appended to, never erased on success');
 }
 
 // The live path must stamp when its outcome was produced, or adoption cannot order the two.
-assert.ok(/status\.statsAt = new Date\(\)\.toISOString\(\)/.test(MAIN),
-  'the live completion handler must stamp statsAt alongside status.stats');
+assert.ok(/data\.finishedAt === 'string'/.test(MAIN) && /status\.statsAt = /.test(MAIN),
+  "the live handler must prefer Python's shared completion instant when stamping statsAt, so a "
+  + "run's own receipt cannot read as newer than its own live update");
 {
   const fn = MAIN.slice(MAIN.indexOf('function trayIndexDropped(status)'));
   const body = fn.slice(0, fn.indexOf('\n}'));

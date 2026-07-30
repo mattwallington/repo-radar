@@ -109,6 +109,29 @@ console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).l
     'the run still COMPLETED — marking it otherwise would trigger a redundant paid catch-up');
   assert.ok(rr.validateReceipt(written), 'a real Python receipt must pass JS validation');
 
+  // errorFree and runSucceeded are the same rule in two languages, over three inputs. Compare
+  // them across every combination against receipts Python actually wrote — the warning input was
+  // added last and is exactly the kind of field one side can start honouring alone.
+  let outcomes = 0;
+  for (const errors of [0, 2]) {
+    for (const drops of [0, 3]) {
+      for (const warn of ['', 'no metadata generated']) {
+        const outcome = JSON.parse(execFileSync(py, ['-c',
+          "import sys,json,tempfile,pathlib;sys.path.insert(0,'.');" +
+          "from repo_radar import receipts as r;d=pathlib.Path(tempfile.mkdtemp());" +
+          `p=r.write_receipt(d,trigger='scheduled',started_at='2026-07-30T00:00:00+00:00',` +
+          `stats={'total':1,'errors':${errors},'index_dropped':${drops}},channel='stable',` +
+          `mode='full',warning=${warn ? JSON.stringify(warn) : 'None'});print(p.read_text())`],
+          { cwd: root, encoding: 'utf8' }));
+        assert.strictEqual(rr.runSucceeded(outcome), outcome.errorFree,
+          `outcome drift for errors=${errors} drops=${drops} warning=${!!warn}: `
+          + `js=${rr.runSucceeded(outcome)} py=${outcome.errorFree}`);
+        outcomes += 1;
+      }
+    }
+  }
+  assert.strictEqual(outcomes, 8, 'every errors x drops x warning combination must be compared');
+
   console.log(`run-receipt parity OK: ${compared} qualification combos, ${pr.triggers.length} triggers,`
     + ` schema ${pr.schema}, exit ${pr.exit}, indexDropped round-trip verified`);
 }

@@ -98,11 +98,15 @@ def sync_harness(tmp_path, monkeypatch):
 
     calls = []
 
-    def run(index_drops, skip_metadata=True):
+    posted = []
+    monkeypatch.setattr(sync, 'send_status_update',
+                        lambda kind, data, server: posted.append((kind, data)))
+
+    def run(index_drops, skip_metadata=True, status_server='127.0.0.1:0'):
         monkeypatch.setattr(sync, 'regenerate_index', lambda args: (calls.append(args), index_drops)[1])
         args = types.SimpleNamespace(
             dry_run=False, skip_metadata=skip_metadata, metadata_only=False, repos_only=False,
-            force=False, status_server=None, show_window=False, verbose=False,
+            force=False, status_server=status_server, show_window=False, verbose=False,
             wait_for_network=False, repo=None, jobs=1, regenerate_metadata=False,
         )
         rc = sync.sync_mode(args)
@@ -113,6 +117,7 @@ def sync_harness(tmp_path, monkeypatch):
     run.pristine = pristine
     run.src = src
     run.llm_attempts = llm_attempts
+    run.posted = posted
     return run
 
 
@@ -142,6 +147,22 @@ def test_sync_fails_and_records_the_drop_when_the_index_is_incomplete(sync_harne
     assert receipt['errorFree'] is False
     assert receipt['completed'] is True, (
         "the run did finish; marking it incomplete would trigger a redundant paid catch-up")
+
+
+def test_both_transports_report_one_shared_completion_instant(sync_harness):
+    """The live update and the receipt describe the SAME completion and must say so.
+
+    Each used to stamp its own datetime.now(), so the receipt was always a few milliseconds later
+    than the live update. Electron read that as a newer, cleaner run and let a run silently
+    overwrite its own richer live result — clearing a warning it had raised moments earlier.
+    Equal timestamps are what let the reader tell "same event" from "two events".
+    """
+    _, receipt, _ = sync_harness(index_drops=0)
+
+    complete = [data for kind, data in sync_harness.posted if kind == 'complete']
+    assert len(complete) == 1, "precondition: exactly one completion was posted"
+    assert complete[0]['finishedAt'] == receipt['finishedAt'], (
+        "the live payload and the receipt must carry one instant, not two readings of the clock")
 
 
 def test_sync_rebuilds_the_index_on_a_genuine_steady_state_run(sync_harness):

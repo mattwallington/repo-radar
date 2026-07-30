@@ -1024,10 +1024,13 @@ function startStatusServer() {
         };
       }
       status.stats = data.stats || status.stats;
-      // When this outcome was produced. Receipt adoption compares against it to decide whether a
-      // receipt is newer than what the tray is already showing; without it, adoption had no way
-      // to order two representations of possibly-different runs and simply guessed.
-      status.statsAt = new Date().toISOString();
+      // When this outcome was produced, as stamped by Python for the run as a whole. Its receipt
+      // carries the SAME instant, so this run's receipt reads as equal rather than newer and
+      // cannot overwrite the richer state recorded here — warnings in particular exist only on
+      // this path. Falling back to local time keeps older Python builds working, at the cost of
+      // that one protection.
+      status.statsAt = (typeof data.finishedAt === 'string' && data.finishedAt)
+        ? data.finishedAt : new Date().toISOString();
 
       console.log('Sync complete with stats:', data.stats);
       
@@ -2298,7 +2301,7 @@ function reconcileRunReceipt() {
     const adopted = { ...plan.status };
     const dropped = indexDroppedOf(receipt);
     const ok = runSucceeded(receipt);
-    if (plan.isLatestOutcome && !ok) {
+    if (plan.recordHistory) {
       const detail = dropped > 0
         ? `${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} missing from INDEX.md`
         : `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`;

@@ -217,7 +217,7 @@ def sync_mode(args):
         repos_only=bool(getattr(args, 'repos_only', False)),
     )
     run_started_at = datetime.now(timezone.utc).isoformat()
-    def _finalize_run(stats_snapshot):
+    def _finalize_run(stats_snapshot, finished_at=None, warning=None):
         """Record completion once, from whichever path finished the run.
 
         A zero-repository run returns success early; without going through here it completed
@@ -234,6 +234,8 @@ def sync_mode(args):
             channel=run_channel,
             mode=run_mode_name,
             version=REPO_RADAR_VERSION,
+            finished_at=finished_at,
+            warning=warning,
         )
         if sync_logger:
             sync_logger.event("receipt_written" if written else "receipt_failed",
@@ -1597,29 +1599,41 @@ Stack Trace:
                 # Metadata already exists, no warning needed
                 console.print(f"[dim]  Note: No metadata regenerated (existing {existing_metadata_count} files are up-to-date)[/dim]")
 
+    # ONE completion instant for the whole run, shared by both transports. The live status update
+    # and the durable receipt describe the SAME completion, but each used to stamp its own "now" —
+    # so the receipt was always a few milliseconds later and Electron read it as a newer run,
+    # letting a run silently overwrite its own richer live result. Stamping once makes them equal,
+    # which is what tells the reader "these are the same event, not two".
+    run_finished_at = datetime.now(timezone.utc).isoformat()
+
+    # Computed regardless of whether anyone is listening. This used to live inside the
+    # status-server branch, so a run that finished with the app closed produced no warning at all
+    # and its receipt recorded a clean success — the warning existed only if someone happened to
+    # be watching.
+    warning_msg = None
+    if not args.skip_metadata and stats['metadata_generated'] == 0 and (stats['cloned'] > 0 or stats['updated'] > 0):
+        model = get_ai_model()
+        provider = provider_for_model(model)
+        if provider == 'gemini' and not os.getenv('GEMINI_API_KEY'):
+            warning_msg = "⚠️ No metadata generated: GEMINI_API_KEY not configured. Configure in Settings → API Configuration."
+        elif provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
+            warning_msg = "⚠️ No metadata generated: ANTHROPIC_API_KEY not configured. Configure in Settings → API Configuration."
+        elif provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
+            warning_msg = "⚠️ No metadata generated: OPENAI_API_KEY not configured. Configure in Settings → API Configuration."
+        elif stats['errors'] > 0:
+            warning_msg = f"⚠️ No metadata generated: {stats['errors']} errors occurred (possible model not found or API issues)."
+        else:
+            warning_msg = f"⚠️ No metadata generated: Unknown reason. Current model: {model}"
+
     # Send final completion status to server
     if args.status_server:
         completion_data = {
-            'stats': stats
+            'stats': stats,
+            # The shared instant. Electron stores it as the presentation freshness marker, so this
+            # run's own receipt cannot later present as newer than itself.
+            'finishedAt': run_finished_at,
         }
-
-        # Add warnings if metadata wasn't generated
-        if not args.skip_metadata and stats['metadata_generated'] == 0 and (stats['cloned'] > 0 or stats['updated'] > 0):
-            model = get_ai_model()
-            warning_msg = ""
-
-            provider = provider_for_model(model)
-            if provider == 'gemini' and not os.getenv('GEMINI_API_KEY'):
-                warning_msg = "⚠️ No metadata generated: GEMINI_API_KEY not configured. Configure in Settings → API Configuration."
-            elif provider == 'anthropic' and not os.getenv('ANTHROPIC_API_KEY'):
-                warning_msg = "⚠️ No metadata generated: ANTHROPIC_API_KEY not configured. Configure in Settings → API Configuration."
-            elif provider == 'openai' and not os.getenv('OPENAI_API_KEY'):
-                warning_msg = "⚠️ No metadata generated: OPENAI_API_KEY not configured. Configure in Settings → API Configuration."
-            elif stats['errors'] > 0:
-                warning_msg = f"⚠️ No metadata generated: {stats['errors']} errors occurred (possible model not found or API issues)."
-            else:
-                warning_msg = f"⚠️ No metadata generated: Unknown reason. Current model: {model}"
-
+        if warning_msg:
             completion_data['warning'] = warning_msg
 
         # Carry the provenance the qualification rule needs. Without these the status server had
@@ -1649,7 +1663,7 @@ Stack Trace:
     # sync. Written here regardless of trigger; Electron reconciles it into the status file on
     # next start. Never fails the run: a completed sync must not report failure because its
     # receipt could not be written.
-    _finalize_run(stats)
+    _finalize_run(stats, finished_at=run_finished_at, warning=warning_msg)
 
     if sync_logger:
         sync_logger.close()

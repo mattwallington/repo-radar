@@ -127,7 +127,7 @@ def run_mode(*, skip_metadata=False, metadata_only=False, repos_only=False):
 
 
 def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode='full',
-                  version=None, finished_at=None):
+                  version=None, finished_at=None, warning=None):
     """Atomically write an owner-only completion receipt. Returns the path, or None on failure.
 
     NEVER raises. Everything — including payload construction — is inside the boundary, because
@@ -163,10 +163,16 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
                 'apiCost': round(_num(stats.get('api_cost'), 0.0), 4),
                 'indexDropped': index_dropped,
             },
+            # Actionable outcome the live status update also carries. Without it here, a run that
+            # finished with the app closed and generated no metadata (missing API key, say)
+            # recorded itself as a clean success, and the reader had no way to know otherwise.
+            'warning': str(warning) if warning else None,
             # A run with per-repo errors still COMPLETED; the catch-up logic must not re-run a
             # sync that finished, only one that never happened.
             'completed': True,
-            'errorFree': errors == 0 and index_dropped == 0,
+            # "Nothing the user needs to act on" — errors, an incomplete index, or a warning all
+            # disqualify. JS runSucceeded() mirrors this exactly; the parity gate compares them.
+            'errorFree': errors == 0 and index_dropped == 0 and not warning,
             # Whether this run can stand in for the scheduled job. A partial run did not do the
             # scheduled work, so it must not suppress the next occurrence even though it
             # completed successfully.
