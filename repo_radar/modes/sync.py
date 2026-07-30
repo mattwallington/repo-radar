@@ -335,7 +335,12 @@ def sync_mode(args):
         'skipped': 0,
         'errors': 0,
         'metadata_generated': 0,
-        'api_cost': 0.0
+        'api_cost': 0.0,
+        # Repositories excluded from INDEX.md. Tracked separately from 'errors' because the
+        # per-repo error heuristics below (the "no metadata generated" diagnosis) read that
+        # field to explain WHY nothing was generated; an index drop is a different failure and
+        # would make those explanations wrong.
+        'index_dropped': 0,
     }
     stats_lock = threading.Lock()
 
@@ -1517,8 +1522,16 @@ Stack Trace:
         # Regenerate INDEX.md
         if not args.dry_run:
             console.print(f"[cyan]Regenerating INDEX.md...[/cyan]")
-            regenerate_index(args)
-            console.print(f"[green]✓ INDEX.md updated[/green]")
+            # Consume the drop count. This call discarded it and printed the green line
+            # unconditionally, so a run that excluded repositories from INDEX.md still exited 0
+            # and reported success — the returned signal existed but nothing read it, which is
+            # indistinguishable from not having the signal at all.
+            stats['index_dropped'] = regenerate_index(args) or 0
+            if stats['index_dropped']:
+                console.print(f"[red]✗ INDEX.md is INCOMPLETE — {stats['index_dropped']} "
+                              f"repositories excluded (see warnings above)[/red]")
+            else:
+                console.print(f"[green]✓ INDEX.md updated[/green]")
 
     # Summary
     console.print()
@@ -1528,6 +1541,8 @@ Stack Trace:
     console.print(f"  Updated: [green]{stats['updated']}[/green]")
     console.print(f"  Skipped: [yellow]{stats['skipped']}[/yellow]")
     console.print(f"  Errors: [red]{stats['errors']}[/red]")
+    if stats.get('index_dropped'):
+        console.print(f"  Excluded from INDEX: [red]{stats['index_dropped']}[/red]")
     if not args.skip_metadata:
         console.print(f"  Metadata generated: [green]{stats['metadata_generated']}[/green]")
         if stats['api_cost'] > 0:
@@ -1621,4 +1636,7 @@ Stack Trace:
     if sync_logger:
         sync_logger.close()
 
-    return 0 if stats['errors'] == 0 else 1
+    # An incomplete index fails the run. INDEX.md is the filter agents use to decide what is
+    # worth reading, so a repository missing from it is invisible regardless of how cleanly its
+    # own clone and metadata succeeded.
+    return 0 if stats['errors'] == 0 and stats.get('index_dropped', 0) == 0 else 1

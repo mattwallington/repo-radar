@@ -67,6 +67,29 @@ def test_a_run_with_errors_still_counts_as_completed(tmp_path):
     assert r["completed"] is True and r["errorFree"] is False
 
 
+def test_an_incomplete_index_makes_a_run_not_error_free(tmp_path):
+    """Every repo synced cleanly, but some are missing from INDEX.md — that is not error-free.
+
+    Index drops are counted separately from per-repo errors (the "why was no metadata
+    generated" diagnosis reads that field), so without being folded in here a run that excluded
+    repositories would record errorFree: true and present as a clean sync.
+    """
+    clean_but_partial = dict(STATS, errors=0, index_dropped=2)
+    write_receipt(tmp_path, trigger="scheduled", started_at="x", stats=clean_but_partial)
+    r = read_receipt(tmp_path)
+    assert r["stats"]["indexDropped"] == 2
+    assert r["completed"] is True, "the run did finish; do not trigger a redundant paid re-run"
+    assert r["errorFree"] is False, "repositories missing from INDEX.md is not a clean result"
+
+
+def test_a_complete_index_is_error_free_when_nothing_else_failed(tmp_path):
+    write_receipt(tmp_path, trigger="scheduled", started_at="x",
+                  stats=dict(STATS, errors=0, index_dropped=0))
+    r = read_receipt(tmp_path)
+    assert r["stats"]["indexDropped"] == 0
+    assert r["errorFree"] is True
+
+
 def test_write_is_atomic_and_leaves_no_temp_files(tmp_path):
     for _ in range(3):
         write_receipt(tmp_path, trigger="manual", started_at="x", stats=STATS)

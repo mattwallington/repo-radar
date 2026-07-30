@@ -244,7 +244,7 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
     return target
 
 
-def _parse_status_of(info):
+def _parse_status_of(info, source=''):
     """Trust a recorded parse_status; otherwise infer one from the frontmatter.
 
     Files written before parse_status existed carry no marker, so inferring it means the
@@ -274,8 +274,15 @@ def _parse_status_of(info):
         if not brief or _looks_like_fragment(brief):
             return PARSE_STATUS_DEGRADED
         return PARSE_STATUS_OK
-    except Exception:
+    except Exception as exc:
         # Classification can never justify losing a repository; treat the unexpected as degraded.
+        # But TOTAL and SILENT are different things: a silent fallback recreates the original
+        # hidden-failure pattern one level down, where the next NameError would mislabel every
+        # healthy repository as degraded with nothing printed to say so. Announce it — the
+        # repository stays in the index either way, which is the point of being total.
+        print(f"  {RED}Warning: parse-status classification failed for "
+              f"{source or 'entry'}: {type(exc).__name__}: {exc}{RESET}")
+        print(f"  {RED}  This is an internal defect — the entry is kept but marked degraded.{RESET}")
         return PARSE_STATUS_DEGRADED
 
 
@@ -298,13 +305,14 @@ def regenerate_index(args):
 
     if not metadata_files:
         print(f"  {YELLOW}No metadata files found{RESET}")
-        return
+        return 0
 
     # Parse metadata from each file
     repos_info = []
     dropped = []          # files that failed to parse — each is a repository missing from INDEX
     for metadata_file in metadata_files:
         before = len(repos_info)
+        reason = None     # set when we can name why this file yielded no entry
         try:
             with open(metadata_file, 'r') as f:
                 content = f.read()
@@ -320,20 +328,33 @@ def regenerate_index(args):
                                 key, value = line.split(':', 1)
                                 info[key.strip()] = value.strip()
 
-                        repos_info.append({
-                            'full_name': info.get('full_name', ''),
-                            'cache_dir': info.get('cache_dir', ''),
-                            'brief': info.get('brief', 'Repository analysis'),
-                            'type': info.get('type', 'Unknown'),
-                            'language': info.get('language', 'Unknown'),
-                            'framework': info.get('framework', 'None'),
-                            'database': info.get('database', 'None'),
-                            'port': info.get('port', 'N/A'),
-                            'apis': info.get('apis', 'None'),
-                            'related_repos': info.get('related_repos', '[]'),
-                            'parse_status': _parse_status_of(info),
-                            'metadata_file': metadata_file.name
-                        })
+                        # Syntactically closed frontmatter is not the same as a usable entry.
+                        # Without these two fields the row renders as "### (`/`)" — naming no
+                        # repository and linking to no clone — so the repository is effectively
+                        # invisible while the index counts it as covered. That is the same
+                        # failure as dropping it, minus the warning.
+                        full_name = (info.get('full_name') or '').strip()
+                        cache_dir = (info.get('cache_dir') or '').strip()
+                        if not full_name or not cache_dir:
+                            missing = ', '.join(
+                                n for n, v in (('full_name', full_name), ('cache_dir', cache_dir))
+                                if not v)
+                            reason = f'frontmatter missing required identity field(s): {missing}'
+                        else:
+                            repos_info.append({
+                                'full_name': full_name,
+                                'cache_dir': cache_dir,
+                                'brief': info.get('brief', 'Repository analysis'),
+                                'type': info.get('type', 'Unknown'),
+                                'language': info.get('language', 'Unknown'),
+                                'framework': info.get('framework', 'None'),
+                                'database': info.get('database', 'None'),
+                                'port': info.get('port', 'N/A'),
+                                'apis': info.get('apis', 'None'),
+                                'related_repos': info.get('related_repos', '[]'),
+                                'parse_status': _parse_status_of(info, source=metadata_file.name),
+                                'metadata_file': metadata_file.name
+                            })
         except Exception as e:
             # A repository disappearing from the index is a CORRECTNESS failure, not noise. This
             # handler previously printed a warning and continued, so a NameError dropped 21 of 31
@@ -346,9 +367,13 @@ def regenerate_index(args):
         # Count by OUTCOME, not by exception. A file with malformed frontmatter (no closing
         # delimiter) falls through both `if` guards and appends nothing — no raise, no warning,
         # no entry. That is a second silent-drop path, invisible to any except-based accounting.
+        # Every no-entry path funnels through this single check, so a new one cannot be added
+        # without being counted; `reason` only supplies a better message when we know one.
         if len(repos_info) == before:
-            dropped.append((metadata_file.name, 'no frontmatter entry produced (malformed?)'))
-            print(f"  {YELLOW}Warning: {metadata_file.name} produced no index entry{RESET}")
+            detail = reason or 'no frontmatter entry produced (malformed?)'
+            dropped.append((metadata_file.name, detail))
+            print(f"  {YELLOW}Warning: {metadata_file.name} produced no index entry: "
+                  f"{detail}{RESET}")
 
     # Sort by full name
     repos_info.sort(key=lambda x: x['full_name'])
@@ -418,11 +443,14 @@ def regenerate_index(args):
     with open(INDEX_FILE, 'w') as f:
         f.write(index_content)
 
+    # A partial index must never present as a success. Printing the red block and then the green
+    # checkmark anyway is what let 21 missing repositories read as a clean run for months.
     if dropped:
         total = len(repos_info) + len(dropped)
         print(f"  {RED}✗ {len(dropped)} of {total} repositories were EXCLUDED from INDEX.md{RESET}")
         for name, err in dropped:
             print(f"    {RED}- {name}: {err}{RESET}")
         print(f"  {RED}  INDEX.md is INCOMPLETE — agents cannot see the excluded repositories.{RESET}")
-    print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
+    else:
+        print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
     return len(dropped)

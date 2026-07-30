@@ -397,14 +397,19 @@ def test_parse_status_of_healthy_frontmatter_returns_ok():
     assert _parse_status_of(info) == PARSE_STATUS_OK
 
 
-def test_parse_status_of_never_raises_on_any_input():
-    """It classifies; it must never be able to remove a repository from the index."""
+def test_parse_status_of_never_raises_and_always_returns_a_valid_status():
+    """It classifies; it must never be able to remove a repository from the index.
+
+    Asserting only "does not raise" would pass if the function returned None or any other
+    junk — and a None parse_status flows straight into the degraded-entry filter, where it
+    silently reads as healthy. The returned value has to be one of the two real statuses.
+    """
     from repo_radar.metadata import _parse_status_of
 
     for info in ({}, {"brief": None}, {"brief": 123}, {"type": None, "language": None},
                  {"brief": "ok", "type": "API Service", "language": "Go"},
                  {"parse_status": "nonsense", "brief": "x", "type": "T", "language": "L"}):
-        _parse_status_of(info)  # must not raise
+        assert _parse_status_of(info) in (PARSE_STATUS_OK, PARSE_STATUS_DEGRADED), info
 
 
 def test_regenerate_index_includes_healthy_repos(tmp_path, monkeypatch):
@@ -430,3 +435,141 @@ def test_regenerate_index_includes_healthy_repos(tmp_path, monkeypatch):
     content = index_file.read_text()
     assert "**Total Repositories:** 2" in content, "a healthy repo must not be dropped"
     assert "org/healthy" in content and "org/degraded" in content
+
+
+HEALTHY_FRONTMATTER = (
+    "---\nrepo_name: healthy\nfull_name: org/healthy\ncache_dir: healthy-aaa1111\n"
+    "brief: A healthy repository with real analysis.\n"
+    "type: Backend Service\nlanguage: Python 3.9\nrelated_repos: []\n---\n\n# Repository\n")
+
+
+def _index_env(tmp_path, monkeypatch):
+    """Point regenerate_index at an isolated corpus and return its INDEX path."""
+    import repo_radar.metadata as metadata
+
+    index_file = tmp_path / "INDEX.md"
+    monkeypatch.setattr(metadata, "PRISTINE_DIR", tmp_path)
+    monkeypatch.setattr(metadata, "INDEX_FILE", index_file)
+    monkeypatch.setattr(metadata, "load_cache_index", lambda: {})
+    return metadata, index_file
+
+
+def test_regenerate_index_reports_zero_drops_and_succeeds_when_every_file_parses(
+        tmp_path, monkeypatch, capsys):
+    metadata, _ = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 0
+    out = capsys.readouterr().out
+    assert "INDEX.md updated" in out
+    assert "EXCLUDED" not in out and "INCOMPLETE" not in out
+
+
+def test_regenerate_index_returns_drop_count_and_refuses_to_claim_success(
+        tmp_path, monkeypatch, capsys):
+    """A partial index printed the red warning AND the green checkmark, so it read as a success.
+
+    The count is the signal sync uses to fail the run, so it has to be both correct and
+    accompanied by the absence of a success line — either alone is still misreportable.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+    # Frontmatter opened but never closed: appends nothing and raises nothing.
+    (tmp_path / "malformed-ccc3333.md").write_text(
+        "---\nfull_name: org/malformed\ncache_dir: malformed-ccc3333\n# never closed\n")
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 1, "the malformed file is one excluded repository"
+    out = capsys.readouterr().out
+    assert "1 of 2 repositories were EXCLUDED" in out
+    assert "INDEX.md is INCOMPLETE" in out
+    assert "✓ INDEX.md updated" not in out, "a partial index must not print a success line"
+    assert "org/healthy" in index_file.read_text(), "the parseable repo is still written"
+
+
+def test_closed_frontmatter_without_identity_fields_is_excluded_not_silently_listed(
+        tmp_path, monkeypatch, capsys):
+    """Well-formed delimiters are not proof of a usable entry.
+
+    Without full_name/cache_dir the row renders as "### (`/`)" — no repository name, no clone
+    path — so the repository is just as invisible as if it had been dropped, except the index
+    reports itself complete.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+    (tmp_path / "nameless-ddd4444.md").write_text(
+        "---\nbrief: Something was analysed here.\n"
+        "type: Backend Service\nlanguage: Go\nrelated_repos: []\n---\n\n# Repository\n")
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 1
+    out = capsys.readouterr().out
+    assert "full_name" in out and "cache_dir" in out, "the message must name what is missing"
+    content = index_file.read_text()
+    assert "### (`/`)" not in content, "an anonymous row must never be written"
+    assert "**Total Repositories:** 1" in content, "it must not be counted as covered"
+
+
+def test_classifier_failure_is_announced_and_the_repository_is_still_indexed(
+        tmp_path, monkeypatch, capsys):
+    """Totality is correct; SILENT totality rebuilds the original defect one level down.
+
+    If the classifier starts raising again, every healthy repository gets relabelled degraded.
+    That is far better than losing them, but with nothing printed it is exactly as undiagnosable
+    as the NameError was — the symptom shows up in the data, months later.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+
+    def _boom(_brief):
+        raise NameError("_FRAGMENT_PREFIXES")
+    monkeypatch.setattr(metadata, "_looks_like_fragment", _boom)
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 0, "a classifier bug must never remove a repository"
+    out = capsys.readouterr().out
+    assert "classification failed" in out and "NameError" in out, (
+        "an internal classifier defect must be visible, not absorbed into 'degraded'")
+    assert "healthy-aaa1111.md" in out, "the message must identify which file failed"
+    assert "org/healthy" in index_file.read_text()
+
+
+def test_sync_consumes_the_index_drop_count():
+    """Landmark: the drop signal must reach sync's result, not merely be returned.
+
+    regenerate_index already returned a count before this test existed, and sync called it as a
+    bare statement — so an incomplete index printed a red warning and the run still exited 0 with
+    a green success line. A returned value that nothing reads is the same defect as no value at
+    all, and it is invisible to every behavioural test of regenerate_index itself.
+    """
+    import ast
+    from pathlib import Path
+
+    import repo_radar.modes.sync as sync_module
+
+    tree = ast.parse(Path(sync_module.__file__).read_text())
+
+    def _is_call(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "regenerate_index")
+
+    calls = [n for n in ast.walk(tree) if _is_call(n)]
+    assert calls, "sync no longer calls regenerate_index at all"
+
+    discarded = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Expr) and _is_call(n.value)]
+    assert not discarded, (
+        f"regenerate_index() is called as a bare statement at line(s) "
+        f"{[n.lineno for n in discarded]} — its drop count is discarded")
+
+    sync_fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "sync_mode")
+    returns = [ast.unparse(n) for n in ast.walk(sync_fn)
+               if isinstance(n, ast.Return) and n.value is not None]
+    assert any("index_dropped" in r for r in returns), (
+        "sync_mode's exit code ignores index drops, so an incomplete index still exits 0")

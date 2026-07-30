@@ -140,6 +140,10 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
         trig = _valid_enum(trigger, VALID_TRIGGERS, 'manual')
         stats = stats if isinstance(stats, dict) else {}
         errors = _num(stats.get('errors'), 0)
+        # Repositories excluded from INDEX.md. Kept out of 'errors' so per-repo error counts stay
+        # meaningful, but it must still be able to make a run not error-free: a sync whose index
+        # is missing repositories did not leave the cache in a usable state.
+        index_dropped = _num(stats.get('index_dropped'), 0)
         mode = mode if mode in VALID_MODES else 'full'
         payload = {
             'schema': RECEIPT_SCHEMA,
@@ -157,11 +161,12 @@ def write_receipt(config_dir, *, trigger, started_at, stats, channel=None, mode=
                 'errors': errors,
                 'metadataGenerated': _num(stats.get('metadata_generated'), 0),
                 'apiCost': round(_num(stats.get('api_cost'), 0.0), 4),
+                'indexDropped': index_dropped,
             },
             # A run with per-repo errors still COMPLETED; the catch-up logic must not re-run a
             # sync that finished, only one that never happened.
             'completed': True,
-            'errorFree': errors == 0,
+            'errorFree': errors == 0 and index_dropped == 0,
             # Whether this run can stand in for the scheduled job. A partial run did not do the
             # scheduled work, so it must not suppress the next occurrence even though it
             # completed successfully.
