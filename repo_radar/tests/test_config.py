@@ -105,3 +105,32 @@ def test_missing_or_malformed_exclusions_exclude_nothing():
     assert load_exclusions({"exclusions": ["  a  ", "", "  "]}) == ["a"]
     assert not is_excluded("Org/repo", [])
     assert not is_excluded(None, ["repo"])
+
+
+def test_reconfiguring_preserves_everything_the_wizard_does_not_ask_about(tmp_path, monkeypatch):
+    """`configure` rebuilt the config dict from scratch, silently discarding the model choice,
+    all four provider API keys, the schedule, and — worst, because it is invisible — the
+    exclusions list, so the next sync re-cloned repositories that had been deliberately removed."""
+    import repo_radar.config as cfg
+
+    monkeypatch.setattr(cfg, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(cfg, "CONFIG_DIR", tmp_path)
+    cfg.save_config({
+        "github_token": "old", "repositories": [{"full_name": "Org/a"}],
+        "exclusions": ["firmware"], "ai_model": "gemini/gemini-3.6-flash",
+        "anthropic_api_key": "sk-ant", "schedule": {"enabled": True, "time": "09:00"},
+    })
+
+    # What configure_mode now does: merge, not replace.
+    updated = cfg.load_config()
+    updated.update({"github_token": "new", "repositories": [{"full_name": "Org/b"}],
+                    "last_configured": "2026-07-30T00:00:00"})
+    cfg.save_config(updated)
+
+    after = cfg.load_config()
+    assert after["repositories"] == [{"full_name": "Org/b"}], "the wizard's own fields update"
+    assert after["github_token"] == "new"
+    assert after["exclusions"] == ["firmware"], "exclusions must survive reconfiguration"
+    assert after["ai_model"] == "gemini/gemini-3.6-flash"
+    assert after["anthropic_api_key"] == "sk-ant"
+    assert after["schedule"] == {"enabled": True, "time": "09:00"}

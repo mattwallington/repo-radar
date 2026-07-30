@@ -19,6 +19,8 @@ def _repo(pristine, name, full_name, body='brief: A repository.\ntype: Library\n
     """A cache directory with a real git commit, plus its cache-named metadata file."""
     cache = f'{name}-abc1234'
     clone = pristine / cache
+    if clone.exists():
+        return cache                    # idempotent: tests may publish the same corpus twice
     clone.mkdir()
     (clone / 'README.md').write_text('# x\n')
     subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=clone, check=True)
@@ -37,7 +39,7 @@ def _corpus(tmp_path, repos, indexed=None):
     """`indexed` defaults to every repo — regenerate_index omits excluded ones, so tests that
     exclude something pass the reduced set to mirror what the real index would contain."""
     pristine = tmp_path / 'pristine'
-    pristine.mkdir()
+    pristine.mkdir(exist_ok=True)
     caches = {full: _repo(pristine, name, full) for name, full in repos.items()}
     listed = sorted(caches if indexed is None else indexed)
     entries = '\n\n'.join(
@@ -49,8 +51,10 @@ def _corpus(tmp_path, repos, indexed=None):
 
 
 def _args(out, src, **over):
-    return types.SimpleNamespace(out=str(out), src=str(src), generator_version='test/1',
-                                 generated_at='2026-07-30T00:00:00Z', dry_run=False, **over)
+    fields = {'out': str(out), 'src': str(src), 'generator_version': 'test/1',
+              'generated_at': '2026-07-30T00:00:00Z', 'dry_run': False}
+    fields.update(over)
+    return types.SimpleNamespace(**fields)
 
 
 @pytest.fixture
@@ -196,7 +200,7 @@ def test_publishing_refuses_to_delete_a_directory_it_did_not_create(publish, tmp
     rc, _out, _manifest = publish({'alpha': 'Org/alpha'})
 
     assert rc == 1
-    assert 'not a previous snapshot' in capsys.readouterr().out
+    assert 'not a valid previous snapshot' in capsys.readouterr().out
     assert (victim / 'important.txt').read_text() == 'do not delete me'
 
 
@@ -250,3 +254,178 @@ def test_expected_keys_ignore_blank_and_excluded_entries():
                                {'full_name': 'Org/skip'}]}
     assert expected_repo_keys(config, ['skip']) == {'Org/a'}
     assert expected_repo_keys({}, []) == set()
+
+
+# ── adversarial: destructive and success-reporting paths ─────────────────────────────────
+
+def test_publishing_into_the_corpus_is_refused(tmp_path, monkeypatch, capsys):
+    """--src snapshot/pristine --out snapshot would delete its own source before copying it."""
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
+    monkeypatch.setattr(pub, 'load_config', lambda: {'repositories': [{'full_name': 'Org/alpha'}]})
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    for out in (pristine, pristine.parent, pristine / 'nested'):
+        rc = publish_mode(_args(out, pristine))
+        assert rc == 1, f'{out} overlaps the source and must be refused'
+        assert 'overlaps' in capsys.readouterr().out
+    assert (pristine / 'INDEX.md').is_file(), 'the corpus must be untouched'
+
+
+def test_a_directory_with_a_token_manifest_is_not_treated_as_a_snapshot(tmp_path, capsys):
+    """`{}` parses as JSON, so requiring only "a file named manifest.json" deleted real data."""
+    from repo_radar.publish import looks_like_snapshot
+
+    victim = tmp_path / 'notes'
+    victim.mkdir()
+    (victim / 'manifest.json').write_text('{}')
+    (victim / 'important.txt').write_text('keep me')
+
+    ok, why = looks_like_snapshot(victim)
+    assert not ok and 'schemaVersion' in why
+
+
+def test_a_snapshot_missing_a_declared_file_is_not_replaceable(tmp_path):
+    from repo_radar.publish import looks_like_snapshot
+
+    fake = tmp_path / 'snap'
+    (fake / 'pristine').mkdir(parents=True)
+    (fake / 'pristine/INDEX.md').write_text('# i\n')
+    (fake / 'manifest.json').write_text(json.dumps({
+        'schemaVersion': 1, 'metadataSnapshotId': 'sha256:x',
+        'index': {'path': 'pristine/INDEX.md', 'sha256': 'x'},
+        'repos': {'Org/a': {'metadataPath': 'pristine/a.md', 'metadataSha256': 'x',
+                            'sourceCommit': 'a' * 40}}}))
+
+    ok, why = looks_like_snapshot(fake)
+    assert not ok and 'missing' in why
+
+
+def test_a_failed_publish_leaves_the_previous_snapshot_intact(publish, tmp_path):
+    """Building straight into --out deleted a known-good snapshot before knowing the new one
+    was valid, and a failure then left a partial tree that still carried manifest.json."""
+    rc, out, good = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    before = (out / 'manifest.json').read_text()
+
+    rc, out, _ = publish({'alpha': 'Org/alpha'},
+                         config={'repositories': [{'full_name': 'Org/alpha'},
+                                                  {'full_name': 'Org/missing'}],
+                                 'exclusions': []})
+
+    assert rc == 1
+    assert (out / 'manifest.json').read_text() == before, 'the good snapshot must survive'
+    assert not (out.parent / f'.{out.name}.staging').exists(), 'staging must be cleaned up'
+
+
+def test_two_repositories_with_the_same_basename_fail_rather_than_overwrite(
+        tmp_path, monkeypatch, capsys):
+    """OrgA/foo and OrgB/foo both canonicalise to pristine/foo.md.
+
+    Unchecked, the second copy overwrites the first, both manifest entries point at one file, and
+    one recorded hash describes bytes that are no longer there — and the run reports success.
+    """
+    import repo_radar.publish as pub
+
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    for cache, full in (('foo-abc1234', 'OrgA/foo'), ('foo-def5678', 'OrgB/foo')):
+        clone = pristine / cache
+        clone.mkdir()
+        (clone / 'R.md').write_text(f'# {full}\n')
+        subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=clone, check=True)
+        subprocess.run(['git', 'add', 'R.md'], cwd=clone, check=True)
+        subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-qm', 'i'],
+                       cwd=clone, check=True)
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=clone,
+                              capture_output=True, text=True).stdout.strip()
+        (pristine / f'{cache}.md').write_text(
+            f'---\nfull_name: {full}\ncache_dir: {cache}\nlast_commit: {head}\n'
+            f'brief: b\ntype: Library\nlanguage: Go\n---\n')
+    (pristine / 'INDEX.md').write_text(
+        '# Index\n\n### OrgA/foo (`foo-abc1234/`)\n**[View Details](foo-abc1234.md)**\n\n'
+        '### OrgB/foo (`foo-def5678/`)\n**[View Details](foo-def5678.md)**\n')
+
+    cfg = {'repositories': [{'full_name': 'OrgA/foo'}, {'full_name': 'OrgB/foo'}],
+           'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert 'name collision' in out and 'pristine/foo.md' in out
+    assert not (tmp_path / 'snap').exists(), 'nothing may be published on a collision'
+
+
+def test_stale_metadata_is_refused_rather_than_mislabelled(tmp_path, monkeypatch, capsys):
+    """sourceCommit must name the commit the METADATA describes.
+
+    Preferring the clone's HEAD published a commit the metadata had never seen whenever analysis
+    failed or was skipped after a pull, telling the agent "this describes B" when it described A.
+    """
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
+    clone = pristine / 'alpha-abc1234'
+    md = pristine / 'alpha-abc1234.md'
+    stale = 'a' * 40
+    md.write_text(md.read_text().replace('cache_dir: alpha-abc1234',
+                                         f'cache_dir: alpha-abc1234\nlast_commit: {stale}'))
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=clone,
+                          capture_output=True, text=True).stdout.strip()
+    assert head.lower() != stale
+
+    cfg = {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert 'metadata is stale' in out and 're-sync before publishing' in out
+
+
+def test_duplicates_are_caught_before_set_comparison_collapses_them(tmp_path, monkeypatch, capsys):
+    """Converting to sets makes a repository listed twice — in config or in INDEX — disappear,
+    so the publisher could report exact agreement over an ambiguous index."""
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
+    index = pristine / 'INDEX.md'
+    index.write_text(index.read_text() + '\n### Org/alpha (`alpha-abc1234/`)\n')
+
+    cfg = {'repositories': [{'full_name': 'Org/alpha'}, {'full_name': 'Org/alpha'}],
+           'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert 'appears 2 times in the configured repositories' in out
+    assert 'has 2 sections in INDEX.md' in out
+
+
+def test_dry_run_returns_the_same_verdict_as_a_real_publish(publish, tmp_path, capsys):
+    """A dry run that skips validation previews success for a corpus the real run rejects."""
+    bad = {'repositories': [{'full_name': 'Org/alpha'}, {'full_name': 'Org/missing'}],
+           'exclusions': []}
+
+    rc_dry, _out, _ = publish({'alpha': 'Org/alpha'}, config=bad, dry_run=True)
+    assert rc_dry == 1, 'the dry run must reach the same conclusion'
+    assert 'Would FAIL' in capsys.readouterr().out
+    assert not (tmp_path / 'snap').exists(), 'a dry run must not write anything'
+
+    rc_real, _out, _ = publish({'alpha': 'Org/alpha'}, config=bad)
+    assert rc_real == rc_dry
+
+
+def test_dry_run_passes_when_the_real_publish_would(publish, capsys):
+    rc, _out, _ = publish({'alpha': 'Org/alpha'}, dry_run=True)
+    assert rc == 0
+    assert 'Validation passed' in capsys.readouterr().out

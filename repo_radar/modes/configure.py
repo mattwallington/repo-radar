@@ -262,12 +262,17 @@ def configure_mode(args):
         print(f"{YELLOW}No repositories selected{RESET}")
         return 0
 
-    # Save configuration
-    config = {
+    # MERGE into the existing configuration rather than replacing it. Rebuilding the dict from
+    # scratch silently discarded everything this wizard does not ask about — the model choice, all
+    # four provider API keys, the schedule, and the exclusions list. Losing exclusions is the worst
+    # of those because it is invisible: the next sync happily re-clones and re-publishes a
+    # repository that was deliberately removed from the corpus.
+    config = load_config() or {}
+    config.update({
         'github_token': github_token,
         'repositories': all_selected_repos,
-        'last_configured': datetime.now().isoformat()
-    }
+        'last_configured': datetime.now().isoformat(),
+    })
 
     if save_config(config):
         print()

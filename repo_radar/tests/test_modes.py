@@ -213,6 +213,7 @@ def _corpus(tmp_path, entries):
     pristine.mkdir()
     for cache_name, full_name in entries.items():
         (pristine / cache_name).mkdir()
+        (pristine / cache_name / '.git').mkdir()   # a real cache entry is a clone
         if full_name:
             (pristine / f'{cache_name}.md').write_text(
                 f"---\nfull_name: {full_name}\ncache_dir: {cache_name}\n---\n")
@@ -233,7 +234,7 @@ def test_configured_repositories_are_never_orphans(tmp_path):
     from repo_radar.modes.clean import find_orphans
 
     pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
-    orphans, kept = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+    orphans, kept, _unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
 
     assert orphans == [], "a configured repository's cache must never be reported"
     assert len(kept) == 2, "its directory and its metadata file"
@@ -244,7 +245,7 @@ def test_an_unconfigured_repository_is_an_orphan(tmp_path):
 
     pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept',
                                   _cache('org/gone'): 'org/gone'})
-    orphans, _ = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+    orphans, _kept, _unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
 
     names = {p.name for p, _f, _r in orphans}
     assert names == {_cache('org/gone'), f"{_cache('org/gone')}.md"}
@@ -256,8 +257,8 @@ def test_an_excluded_repository_is_an_orphan_even_while_still_configured(tmp_pat
     from repo_radar.modes.clean import find_orphans
 
     pristine = _corpus(tmp_path, {_cache('org/firmware'): 'org/firmware'})
-    orphans, kept = find_orphans(pristine, {'repositories': [_repo('org/firmware')],
-                                            'exclusions': ['firmware']})
+    orphans, kept, _unknown = find_orphans(pristine, {'repositories': [_repo('org/firmware')],
+                                                      'exclusions': ['firmware']})
 
     assert kept == [], "an excluded repository is not 'kept'"
     assert len(orphans) == 2
@@ -269,8 +270,8 @@ def test_a_clone_with_no_metadata_is_identified_from_its_directory_name(tmp_path
     from repo_radar.modes.clean import find_orphans
 
     pristine = _corpus(tmp_path, {'reperio-nordic-fw-0a10653': None})
-    orphans, _ = find_orphans(pristine, {'repositories': [],
-                                         'exclusions': ['reperio-nordic-fw']})
+    orphans, _kept, _unknown = find_orphans(pristine, {'repositories': [],
+                                                       'exclusions': ['reperio-nordic-fw']})
 
     assert len(orphans) == 1
     assert 'excluded by configuration (reperio-nordic-fw)' in orphans[0][2], (
@@ -284,6 +285,79 @@ def test_index_and_symlinks_are_never_reported_as_orphans(tmp_path):
     (pristine / 'kept').symlink_to(pristine / _cache('org/kept'))
     (pristine / '.cache-index.json').write_text('{}')
 
-    orphans, _ = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+    orphans, _kept, _unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
 
     assert orphans == [], "INDEX.md, dotfiles and stable-name symlinks are not orphans"
+
+
+# ── adversarial: orphan cleanup must fail closed ─────────────────────────────────────────
+# Everything here decides what to DELETE, so every uncertainty must resolve toward keeping data.
+
+@pytest.mark.parametrize("config", [None, {}, {'repositories': 'not-a-list'},
+                                    {'repositories': ['not-an-object']}])
+def test_an_unusable_config_refuses_to_classify_anything(tmp_path, config):
+    """`config or {}` made a missing or corrupt config read as "nothing is configured", which
+    makes the ENTIRE corpus an orphan — reproduced as a full corpus deletion."""
+    from repo_radar.modes.clean import find_orphans, UnusableConfig
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    with pytest.raises(UnusableConfig):
+        find_orphans(pristine, config)
+
+
+def test_unidentifiable_items_are_reported_but_never_deletable(tmp_path):
+    """A directory we cannot recognise is not ours to remove, however tempting its name."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    (pristine / 'handwritten-notes').mkdir()
+    (pristine / 'handwritten-notes' / 'notes.txt').write_text('mine')
+    (pristine / 'budget.xlsx').write_text('mine too')
+
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], 'nothing unidentifiable may become a deletion candidate'
+    assert {p.name for p, _why in unknown} == {'handwritten-notes', 'budget.xlsx'}
+
+
+def test_a_cache_shaped_directory_that_is_not_a_git_clone_is_not_ours(tmp_path):
+    """'-[0-9a-f]{7,}' is a weak signal; requiring a .git directory makes it evidence."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    (pristine / 'photos-abc1234').mkdir()
+
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == []
+    assert [p.name for p, _why in unknown] == ['photos-abc1234']
+
+
+def test_the_cache_index_mapping_is_authoritative_over_a_recomputed_name(tmp_path):
+    """sync treats .cache-index.json as the url -> cache-name mapping, so a legacy or migrated
+    directory whose name does not match get_cache_name is still a live cache, not an orphan."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    legacy = pristine / 'kept-legacyname'
+    legacy.mkdir()
+    (legacy / '.git').mkdir()
+    (pristine / 'INDEX.md').write_text('# Index\n')
+    config = {'repositories': [_repo('org/kept')]}
+
+    orphans, kept, _unknown = find_orphans(
+        pristine, config, cache_index={'https://github.com/org/kept.git': 'kept-legacyname'})
+
+    assert orphans == [], 'the recorded mapping must win over the deterministic name'
+    assert [p.name for p, _f in kept] == ['kept-legacyname']
+
+
+def test_index_md_is_never_an_orphan_or_an_unknown(tmp_path):
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert 'INDEX.md' not in {p.name for p, _f, _r in orphans}
+    assert 'INDEX.md' not in {p.name for p, _why in unknown}

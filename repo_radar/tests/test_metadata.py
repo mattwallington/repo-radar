@@ -615,3 +615,42 @@ def test_sync_consumes_the_index_drop_count():
                if isinstance(n, ast.Return) and n.value is not None]
     assert any("index_dropped" in r for r in returns), (
         "sync_mode's exit code ignores index drops, so an incomplete index still exits 0")
+
+
+def test_an_empty_corpus_writes_an_empty_index_rather_than_leaving_a_stale_one(
+        tmp_path, monkeypatch):
+    """After the last metadata file is removed, the index must stop advertising repositories.
+
+    Returning early left whatever INDEX.md already existed, and every subsequent run took the
+    same early return — so a stale index could advertise removed repositories indefinitely.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    index_file.write_text('# Pristine Repository Index\n\n**Total Repositories:** 3\n\n'
+                          '### org/removed (`removed-aaa1111/`)\n')
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 0
+    content = index_file.read_text()
+    assert '**Total Repositories:** 0' in content
+    assert 'org/removed' not in content, 'a removed repository must not survive in the index'
+
+
+def test_an_excluded_entry_missing_cache_dir_is_excluded_not_dropped(tmp_path, monkeypatch):
+    """Exclusion is decided as soon as full_name is known.
+
+    Checked after the identity fields, an excluded file that also lacked cache_dir became a
+    permanent drop — failing every sync forever over a repository we had decided not to care
+    about and could not fix without editing the file by hand.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+    (tmp_path / "firmware-eee5555.md").write_text(
+        "---\nfull_name: org/firmware\nbrief: No cache_dir here.\n"
+        "type: Firmware\nlanguage: C\n---\n")
+    monkeypatch.setattr(metadata, "load_exclusions", lambda: ["firmware"])
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 0, "an excluded repo must never become a permanent drop"
+    assert "org/firmware" not in index_file.read_text()

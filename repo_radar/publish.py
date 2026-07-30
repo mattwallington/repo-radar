@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,10 +118,14 @@ def discover(src, exclusions):
         clone = Path(src) / stem
 
         meta = frontmatter(md)
-        key = meta.get('full_name') or owner_name(_git(clone, 'remote', 'get-url', 'origin'))
-        # git HEAD is authoritative for the commit the metadata describes; frontmatter is the
-        # fallback for a repo whose clone has been removed.
-        commit = _git(clone, 'rev-parse', 'HEAD') or meta.get('last_commit')
+        origin = owner_name(_git(clone, 'remote', 'get-url', 'origin'))
+        key = meta.get('full_name') or origin
+        # The metadata's own last_commit is authoritative: sourceCommit must name the commit this
+        # METADATA describes, and preferring the clone's HEAD meant publishing a commit the
+        # metadata had never seen whenever analysis failed or was skipped after a pull. The
+        # snapshot then told an agent "this description is of commit B" when it described A.
+        head = _git(clone, 'rev-parse', 'HEAD')
+        commit = meta.get('last_commit') or head
 
         if key and is_excluded(key, exclusions):
             excluded.append(key)
@@ -130,6 +135,14 @@ def discover(src, exclusions):
             continue
         if not commit or not SHA40.match(commit.lower()):
             skipped.append((stem, f'no 40-hex sourceCommit (got {commit!r})'))
+            continue
+        if head and meta.get('last_commit') and head.lower() != commit.lower():
+            skipped.append((stem, f'metadata is stale: describes {commit[:8]} but the clone is '
+                                  f'at {head[:8]} — re-sync before publishing'))
+            continue
+        if origin and meta.get('full_name') and origin != meta['full_name']:
+            skipped.append((stem, f'identity mismatch: frontmatter says {meta["full_name"]} but '
+                                  f'origin is {origin}'))
             continue
         if key in repos:
             skipped.append((stem, f'duplicate key {key}'))
@@ -165,6 +178,82 @@ def build_manifest(repos, out, generated_at, generator_version):
     return {**manifest, 'metadataSnapshotId': snapshot_id}, snapshot_id
 
 
+def paths_overlap(src, out):
+    """True if publishing into `out` would read from or destroy `src`.
+
+    `--src snapshot/pristine --out snapshot` deletes its own source before copying it.
+    """
+    src, out = Path(src).resolve(), Path(out).resolve()
+    return src == out or src in out.parents or out in src.parents
+
+
+def looks_like_snapshot(path):
+    """Is `path` a tree this tool produced? Returns (ok, reason).
+
+    Replacing a destination destroys whatever is there, so the bar is evidence rather than a
+    guess: the presence of *some* file named manifest.json was enough to delete an unrelated
+    directory, because `{}` parses as JSON.
+    """
+    path = Path(path)
+    manifest_file = path / 'manifest.json'
+    if not manifest_file.is_file():
+        return False, 'no manifest.json'
+    try:
+        manifest = json.loads(manifest_file.read_text())
+    except (OSError, ValueError) as exc:
+        return False, f'manifest.json is not readable JSON ({exc})'
+    if not isinstance(manifest, dict) or manifest.get('schemaVersion') != 1:
+        return False, 'manifest.json has no schemaVersion 1'
+    for key in ('repos', 'index', 'metadataSnapshotId'):
+        if key not in manifest:
+            return False, f'manifest.json has no "{key}"'
+    if not isinstance(manifest.get('repos'), dict):
+        return False, 'manifest.json "repos" is not an object'
+    # Identity, not perfection: every file the manifest DECLARES must be present and hash-match.
+    # Undeclared extras deliberately do NOT disqualify — a stale file left by an interrupted run
+    # is precisely what republishing exists to clear, and refusing would strand the user with a
+    # broken snapshot they could only fix by hand.
+    problems = verify_tree(path, manifest, allow_undeclared=True)
+    if problems:
+        return False, problems[0]
+    return True, 'a valid snapshot'
+
+
+def verify_tree(root, manifest, allow_undeclared=False):
+    """Check a built tree against its own manifest. Returns a list of problems.
+
+    Run against the tree we just wrote — the manifest describes what we *intended*, and copying
+    two repositories to the same path would otherwise leave one recorded hash describing bytes
+    that are no longer there.
+
+    `allow_undeclared` relaxes only the exact-set rule, for the separate question of whether an
+    existing directory is recognisably one of ours.
+    """
+    root = Path(root)
+    problems = []
+    declared = {'manifest.json', 'pristine/INDEX.md'}
+    for key, entry in (manifest.get('repos') or {}).items():
+        path = entry.get('metadataPath', '')
+        declared.add(path)
+        target = root / path
+        if not target.is_file():
+            problems.append(f'{key}: declared {path} is missing')
+            continue
+        if sha256_file(target) != entry.get('metadataSha256'):
+            problems.append(f'{key}: {path} does not match its recorded metadataSha256')
+    actual = {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
+    if not allow_undeclared:
+        for extra in sorted(actual - declared):
+            problems.append(f'undeclared file in snapshot: {extra}')
+    for missing in sorted(declared - actual):
+        problems.append(f'declared file missing from snapshot: {missing}')
+    for link in root.rglob('*'):
+        if link.is_symlink():
+            problems.append(f'symlink in snapshot (rejected by the contract): '
+                            f'{link.relative_to(root)}')
+    return problems
+
+
 def expected_repo_keys(config, exclusions):
     """The repositories the corpus is SUPPOSED to contain: configured, minus excluded."""
     keys = set()
@@ -193,70 +282,72 @@ def publish_mode(args):
     if not index_src.is_file():
         print(f'{RED}error: {index_src} missing — the contract requires pristine/INDEX.md{RESET}')
         return 1
+    if paths_overlap(src, out):
+        print(f'{RED}error: --out {out} overlaps --src {src}{RESET}')
+        print(f'{YELLOW}  Publishing replaces the destination, so this would destroy the corpus '
+              f'it is reading.{RESET}')
+        return 1
+    # Only a directory we can positively identify as a previous snapshot may be replaced.
+    if out.exists() and not args.dry_run:
+        ok, why = looks_like_snapshot(out)
+        if not ok:
+            print(f'{RED}error: {out} exists and is not a valid previous snapshot ({why}){RESET}')
+            print(f'{YELLOW}  Refusing to delete it. Choose an empty path or remove it '
+                  f'yourself.{RESET}')
+            return 1
 
     config = load_config() or {}
     exclusions = load_exclusions(config)
     repos, skipped, rename, excluded = discover(src, exclusions)
     if not repos:
+        # Say WHY. Reporting only "nothing to publish" hid the reason whenever every candidate was
+        # skipped — which is the case that most needs explaining.
         print(f'{RED}error: no publishable repositories found{RESET}')
+        for stem, why in skipped:
+            print(f'  {RED}- skipped {stem}: {why}{RESET}')
+        if excluded:
+            print(f'  {CYAN}({len(excluded)} excluded by configuration){RESET}')
         return 1
 
-    if args.dry_run:
-        print(f'{CYAN}[DRY RUN]{RESET} would publish {len(repos)} repositories to {out}')
-        for key in sorted(repos):
-            print(f'    {key}')
-        return 0
+    # Every check below is non-mutating, so a dry run performs exactly the same validation and
+    # returns the same status. Exiting early with "would publish" meant a corpus the real run
+    # rejects previewed as fine.
+    failures = []
 
-    # Refusing to remove anything we did not create. The contract validates <out> as an exact
-    # set, so a stale file from a previous run fails the review — but blindly rmtree-ing a path
-    # the user typed is not an acceptable way to guarantee that.
-    if out.exists():
-        if not (out / 'manifest.json').is_file():
-            print(f'{RED}error: {out} exists and is not a previous snapshot{RESET}')
-            print(f'{YELLOW}  Refusing to delete it. Choose an empty path or remove it '
-                  f'yourself.{RESET}')
-            return 1
-        shutil.rmtree(out)
-    (out / 'pristine').mkdir(parents=True)
+    # Two repositories with the same basename (OrgA/foo, OrgB/foo) both canonicalise to
+    # pristine/foo.md. Left alone, the second copy overwrites the first, both manifest entries
+    # point at one file, and one recorded hash describes bytes that no longer exist.
+    by_path = {}
+    for key, repo in sorted(repos.items()):
+        by_path.setdefault(repo['canon'], []).append(key)
+    for canon, keys in sorted(by_path.items()):
+        if len(keys) > 1:
+            failures.append(f'name collision: {", ".join(keys)} all publish to '
+                            f'pristine/{canon}.md')
+
+    # Duplicates must be caught BEFORE set comparison, which silently collapses them: a config
+    # listing a repository twice, or an INDEX with two sections for it, would compare equal.
+    configured_keys = [(r.get('full_name') or '').strip()
+                       for r in (config.get('repositories') or [])
+                       if (r.get('full_name') or '').strip()]
+    for key, count in sorted(Counter(configured_keys).items()):
+        if count > 1:
+            failures.append(f'{key} appears {count} times in the configured repositories')
 
     index_text, links = rewrite_index(index_src.read_text(encoding='utf-8'), rename)
-    (out / 'pristine/INDEX.md').write_text(index_text, encoding='utf-8', newline='\n')
+    index_headings = re.findall(r'^###\s+(\S+/\S+)', index_text, re.M)
+    for key, count in sorted(Counter(index_headings).items()):
+        if count > 1:
+            failures.append(f'{key} has {count} sections in INDEX.md')
 
-    generated_at = (getattr(args, 'generated_at', None)
-                    or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
-    generator_version = (getattr(args, 'generator_version', None)
-                         or f'repo-radar/{REPO_RADAR_VERSION}')
-    manifest, snapshot_id = build_manifest(repos, out, generated_at, generator_version)
-    (out / 'manifest.json').write_text(canonical(manifest), encoding='utf-8', newline='\n')
-
-    # Local limit checks, so a bad snapshot fails here rather than mid-review.
-    files = [p for p in out.rglob('*') if p.is_file()]
-    entries = len(files) + len([p for p in out.rglob('*') if p.is_dir()])
-    total = sum(p.stat().st_size for p in files)
-    problems = [f'{p.relative_to(out)} is {p.stat().st_size}B > {MAX_FILE}'
-                for p in files if p.stat().st_size > MAX_FILE]
-    if total > MAX_TOTAL:
-        problems.append(f'total {total}B > {MAX_TOTAL}')
-    if entries > MAX_ENTRIES:
-        problems.append(f'{entries} entries > {MAX_ENTRIES}')
-
-    published = set(manifest['repos'])
-    indexed = set(re.findall(r'^###\s+(\S+/\S+)', index_text, re.M))
+    published = set(repos)
+    indexed = set(index_headings)
     expected = expected_repo_keys(config, exclusions)
-
-    print(f'snapshot     : {out}')
-    print(f'metadataSnapshotId = {snapshot_id}')
-    print(f'repos        : {len(published)} published, {len(skipped)} skipped, '
-          f'{len(excluded)} excluded')
-    print(f'size         : {total / 1024:.0f} KB across {entries} entries')
-    print(f'INDEX links  : {links} rewritten to canonical names')
-    print(f'INDEX covers : {len(indexed)} repos')
 
     # Set equality, not a count. Three views of the corpus must name the SAME repositories:
     # what the config says should exist, what the index advertises, and what the manifest ships.
     # A count check passes when one repo is silently swapped for another; agents then either
     # cannot find a repo the index promised, or read metadata nothing points at.
-    failures = []
     for label, actual in (('INDEX', indexed), ('manifest', published)):
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
@@ -267,19 +358,90 @@ def publish_mode(args):
         if extra:
             failures.append(f'{len(extra)} repositor{"ies" if len(extra) != 1 else "y"} in '
                             f'{label} but not configured: {", ".join(extra)}')
-
     for stem, why in skipped:
         failures.append(f'skipped {stem}: {why}')
+
+    if args.dry_run:
+        print(f'{CYAN}[DRY RUN]{RESET} would publish {len(repos)} repositories to {out}')
+        for key in sorted(repos):
+            print(f'    {key}')
+        if failures:
+            print()
+            print(f'{RED}✗ Would FAIL — {len(failures)} problem'
+                  f'{"s" if len(failures) != 1 else ""}:{RESET}')
+            for failure in failures:
+                print(f'  {RED}- {failure}{RESET}')
+            return 1
+        print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree')
+        return 0
+
+    # Build into a sibling staging directory and swap only once the result validates. Writing
+    # directly into --out meant deleting a known-good previous snapshot BEFORE knowing whether the
+    # replacement was any good; a failure then left a partial tree that still carried
+    # manifest.json, so the next run would happily delete that too.
+    staging = out.parent / f'.{out.name}.staging'
+    if staging.exists():
+        shutil.rmtree(staging)
+    (staging / 'pristine').mkdir(parents=True)
+
+    (staging / 'pristine/INDEX.md').write_text(index_text, encoding='utf-8', newline='\n')
+
+    generated_at = (getattr(args, 'generated_at', None)
+                    or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    generator_version = (getattr(args, 'generator_version', None)
+                         or f'repo-radar/{REPO_RADAR_VERSION}')
+    manifest, snapshot_id = build_manifest(repos, staging, generated_at, generator_version)
+    (staging / 'manifest.json').write_text(canonical(manifest), encoding='utf-8', newline='\n')
+
+    # Local limit checks, so a bad snapshot fails here rather than mid-review.
+    files = [p for p in staging.rglob('*') if p.is_file()]
+    entries = len(files) + len([p for p in staging.rglob('*') if p.is_dir()])
+    total = sum(p.stat().st_size for p in files)
+    problems = [f'{p.relative_to(staging)} is {p.stat().st_size}B > {MAX_FILE}'
+                for p in files if p.stat().st_size > MAX_FILE]
+    if total > MAX_TOTAL:
+        problems.append(f'total {total}B > {MAX_TOTAL}')
+    if entries > MAX_ENTRIES:
+        problems.append(f'{entries} entries > {MAX_ENTRIES}')
+    # Re-verify the tree we actually wrote, rather than trusting that copying went as planned.
+    problems.extend(verify_tree(staging, manifest))
+
+    print(f'snapshot     : {out}')
+    print(f'metadataSnapshotId = {snapshot_id}')
+    print(f'repos        : {len(published)} published, {len(skipped)} skipped, '
+          f'{len(excluded)} excluded')
+    print(f'size         : {total / 1024:.0f} KB across {entries} entries')
+    print(f'INDEX links  : {links} rewritten to canonical names')
+    print(f'INDEX covers : {len(indexed)} repos')
+
     for problem in problems:
         failures.append(f'LIMIT VIOLATION: {problem}')
 
     if failures:
+        # The previous snapshot, if any, is untouched — the staging tree never became `out`.
+        shutil.rmtree(staging, ignore_errors=True)
         print()
         print(f'{RED}✗ Snapshot is INCOMPLETE — {len(failures)} problem'
               f'{"s" if len(failures) != 1 else ""}:{RESET}')
         for failure in failures:
             print(f'  {RED}- {failure}{RESET}')
+        print(f'{YELLOW}  Nothing was published; any existing snapshot at {out} is '
+              f'unchanged.{RESET}')
         return 1
+
+    # Swap. Move the old tree aside first so the window in which `out` does not exist is as short
+    # as a rename, then delete the old one only after the new one is in place.
+    retired = out.parent / f'.{out.name}.previous'
+    shutil.rmtree(retired, ignore_errors=True)
+    if out.exists():
+        out.rename(retired)
+    try:
+        staging.rename(out)
+    except OSError:
+        if retired.exists():
+            retired.rename(out)          # put it back rather than leaving nothing
+        raise
+    shutil.rmtree(retired, ignore_errors=True)
 
     print()
     print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '

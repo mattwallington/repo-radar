@@ -305,7 +305,13 @@ def regenerate_index(args):
     ]
 
     if not metadata_files:
+        # Write a valid empty index rather than returning early. Returning left whatever INDEX.md
+        # already existed on disk, so after the last metadata file was removed the index kept
+        # advertising repositories that no longer had metadata — indefinitely, since every
+        # subsequent run took this same early return.
         print(f"  {YELLOW}No metadata files found{RESET}")
+        _write_index([], INDEX_FILE)
+        print(f"  {GREEN}✓ INDEX.md updated{RESET} (0 repositories)")
         return 0
 
     # Parse metadata from each file
@@ -339,17 +345,21 @@ def regenerate_index(args):
                         # failure as dropping it, minus the warning.
                         full_name = (info.get('full_name') or '').strip()
                         cache_dir = (info.get('cache_dir') or '').strip()
-                        if not full_name or not cache_dir:
-                            missing = ', '.join(
-                                n for n, v in (('full_name', full_name), ('cache_dir', cache_dir))
-                                if not v)
-                            reason = f'frontmatter missing required identity field(s): {missing}'
-                        elif is_excluded(full_name, exclusions):
+                        # Exclusion is decided as soon as full_name is known, BEFORE the remaining
+                        # index fields are required. Checked afterwards, an excluded file that also
+                        # lacked cache_dir became a permanent drop — failing every sync forever
+                        # over a repository we had already decided not to care about.
+                        if full_name and is_excluded(full_name, exclusions):
                             # Deliberately omitted, so it must NOT be counted as a drop: a drop
                             # means "this should be here and is not" and fails the run. Recording
                             # it separately keeps the distinction between a decision and a defect.
                             excluded.append(full_name)
                             omitted = True
+                        elif not full_name or not cache_dir:
+                            missing = ', '.join(
+                                n for n, v in (('full_name', full_name), ('cache_dir', cache_dir))
+                                if not v)
+                            reason = f'frontmatter missing required identity field(s): {missing}'
                         else:
                             repos_info.append({
                                 'full_name': full_name,
@@ -387,7 +397,27 @@ def regenerate_index(args):
 
     # Sort by full name
     repos_info.sort(key=lambda x: x['full_name'])
+    _write_index(repos_info, INDEX_FILE)
 
+    if excluded:
+        print(f"  {CYAN}Excluded {len(excluded)} repositor{'ies' if len(excluded) != 1 else 'y'} "
+              f"per configuration:{RESET} {', '.join(sorted(excluded))}")
+
+    # A partial index must never present as a success. Printing the red block and then the green
+    # checkmark anyway is what let 21 missing repositories read as a clean run for months.
+    if dropped:
+        total = len(repos_info) + len(dropped)
+        print(f"  {RED}✗ {len(dropped)} of {total} repositories were EXCLUDED from INDEX.md{RESET}")
+        for name, err in dropped:
+            print(f"    {RED}- {name}: {err}{RESET}")
+        print(f"  {RED}  INDEX.md is INCOMPLETE — agents cannot see the excluded repositories.{RESET}")
+    else:
+        print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
+    return len(dropped)
+
+
+def _write_index(repos_info, index_file):
+    """Render and write INDEX.md. Separate so the zero-repository case writes a real index too."""
     # Consumers are told this index is the filter that decides whether code is worth reading,
     # so entries whose metadata is known-degraded have to be visible rather than blend in.
     degraded = [i for i in repos_info if i.get('parse_status') == PARSE_STATUS_DEGRADED]
@@ -450,21 +480,5 @@ def regenerate_index(args):
 """
 
     # Write INDEX.md
-    with open(INDEX_FILE, 'w') as f:
+    with open(index_file, 'w') as f:
         f.write(index_content)
-
-    if excluded:
-        print(f"  {CYAN}Excluded {len(excluded)} repositor{'ies' if len(excluded) != 1 else 'y'} "
-              f"per configuration:{RESET} {', '.join(sorted(excluded))}")
-
-    # A partial index must never present as a success. Printing the red block and then the green
-    # checkmark anyway is what let 21 missing repositories read as a clean run for months.
-    if dropped:
-        total = len(repos_info) + len(dropped)
-        print(f"  {RED}✗ {len(dropped)} of {total} repositories were EXCLUDED from INDEX.md{RESET}")
-        for name, err in dropped:
-            print(f"    {RED}- {name}: {err}{RESET}")
-        print(f"  {RED}  INDEX.md is INCOMPLETE — agents cannot see the excluded repositories.{RESET}")
-    else:
-        print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
-    return len(dropped)
