@@ -80,18 +80,20 @@ def sync_harness(tmp_path, monkeypatch):
 
     calls = []
 
-    def run(index_drops):
+    def run(index_drops, skip_metadata=True):
         monkeypatch.setattr(sync, 'regenerate_index', lambda args: (calls.append(args), index_drops)[1])
         args = types.SimpleNamespace(
-            dry_run=False, skip_metadata=True, metadata_only=False, repos_only=False,
+            dry_run=False, skip_metadata=skip_metadata, metadata_only=False, repos_only=False,
             force=False, status_server=None, show_window=False, verbose=False,
-            wait_for_network=False, repo=None, jobs=1,
+            wait_for_network=False, repo=None, jobs=1, regenerate_metadata=False,
         )
         rc = sync.sync_mode(args)
         receipt_file = config_dir / 'last-run-stable.json'
         receipt = json.loads(receipt_file.read_text()) if receipt_file.exists() else None
         return rc, receipt, calls
 
+    run.pristine = pristine
+    run.src = src
     return run
 
 
@@ -121,3 +123,30 @@ def test_sync_fails_and_records_the_drop_when_the_index_is_incomplete(sync_harne
     assert receipt['errorFree'] is False
     assert receipt['completed'] is True, (
         "the run did finish; marking it incomplete would trigger a redundant paid catch-up")
+
+
+def test_sync_rebuilds_the_index_on_a_genuine_steady_state_run(sync_harness):
+    """The literal case the bug was about: metadata enabled and every repository already current.
+
+    The other tests reach an empty repos_needing_metadata via skip_metadata, which the old
+    condition (`repos_needing_metadata and not args.skip_metadata`) also short-circuited — so they
+    would pass against a partial fix that only handled one half of that `and`. Here nothing is
+    skipped: the clone exists, HEAD is unchanged, and the metadata file records that same commit,
+    so the repository genuinely needs no work.
+    """
+    rc, _, calls = sync_harness(index_drops=0)          # first run clones
+    assert len(calls) == 1
+
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=sync_harness.src,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    cache_dir = next(p for p in sync_harness.pristine.iterdir() if p.is_dir())
+    (sync_harness.pristine / f'{cache_dir.name}.md').write_text(
+        f"---\nfull_name: org/probe\ncache_dir: {cache_dir.name}\nlast_commit: {head}\n"
+        f"brief: Already analysed.\ntype: Library\nlanguage: Go\nrelated_repos: []\n---\n")
+
+    rc, receipt, calls = sync_harness(index_drops=1, skip_metadata=False)
+
+    assert receipt['stats']['metadataGenerated'] == 0, (
+        "precondition: this run must have had no metadata work to do")
+    assert len(calls) == 2, "a steady-state run must still validate the derived index"
+    assert rc == 1 and receipt['stats']['indexDropped'] == 1

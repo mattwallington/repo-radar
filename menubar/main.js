@@ -360,6 +360,20 @@ function showSuccessIcon() {
   }, 5000);
 }
 
+// Repositories excluded from INDEX.md by the most recent run we know about. The count reaches us
+// by two different transports with two different spellings: a live run posts Python's raw stats
+// dict (snake_case index_dropped, copied into status.stats), while a run that finished with the
+// app closed is learned from its receipt (camelCase indexDropped, stored per channel). Reading
+// only one of them silently reports an incomplete index as a clean sync.
+function trayIndexDropped(status) {
+  if (!status) return 0;
+  const live = status.stats && status.stats.index_dropped;
+  if (Number.isInteger(live) && live > 0) return live;
+  const ch = status.channels && status.channels[runtimeChannel];
+  const reconciled = ch && ch.indexDropped;
+  return Number.isInteger(reconciled) ? reconciled : 0;
+}
+
 // Show error icon (stays until next successful sync)
 function showErrorIcon() {
   stopIconAnimation();
@@ -377,7 +391,15 @@ function showErrorIcon() {
   
   const status = loadStatus();
   const errorCount = status.stats?.errors || 0;
-  tray.setToolTip(`Sync failed with ${errorCount} error${errorCount !== 1 ? 's' : ''}`);
+  // An index-only failure has zero per-repo errors, so the old text read "Sync failed with 0
+  // errors".
+  const dropped = trayIndexDropped(status);
+  if (errorCount === 0 && dropped > 0) {
+    tray.setToolTip(`Sync incomplete — ${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} `
+      + `missing from INDEX.md`);
+  } else {
+    tray.setToolTip(`Sync failed with ${errorCount} error${errorCount !== 1 ? 's' : ''}`);
+  }
 }
 
 // Start icon animation
@@ -531,9 +553,13 @@ function updateTrayMenu() {
       enabled: false
     },
     {
-      label: status.stats.errors > 0 ? 
-        `${status.stats.errors} error${status.stats.errors !== 1 ? 's' : ''}` :
-        `${status.stats.updated + status.stats.cloned} repos synced`,
+      // An incomplete index is reported here too, otherwise the menu says "N repos synced" while
+      // some of those repos are missing from the file agents actually read.
+      label: status.stats.errors > 0
+        ? `${status.stats.errors} error${status.stats.errors !== 1 ? 's' : ''}`
+        : (trayIndexDropped(status) > 0
+            ? `⚠️ ${trayIndexDropped(status)} missing from INDEX.md`
+            : `${status.stats.updated + status.stats.cloned} repos synced`),
       enabled: false
     },
     {
@@ -2260,12 +2286,17 @@ function reconcileRunReceipt() {
     // A run that finished while the app was closed has NO other record — the status server was
     // not listening, so this receipt is the only evidence it happened. Adopting it silently meant
     // a run that failed, or that produced an incomplete index, presented afterwards as a clean
-    // sync. Note this deliberately does not clear hasErrors on success: a prior failure the user
-    // has not looked at yet is not resolved by a later run.
+    // sync.
+    //
+    // hasErrors tracks the LAST run, not unread history: showErrorIcon documents it as "stays
+    // until next successful sync", and both the live-completion and child-exit paths clear it on
+    // success. A receipt-driven success must behave the same or the tray can stay red forever.
+    // errorLog is the history and is only ever appended to.
     const adopted = { ...plan.status };
     const dropped = indexDroppedOf(receipt);
-    if (!runSucceeded(receipt)) {
-      adopted.hasErrors = true;
+    const ok = runSucceeded(receipt);
+    adopted.hasErrors = !ok;
+    if (!ok) {
       const detail = dropped > 0
         ? `${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} missing from INDEX.md`
         : `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`;
@@ -2547,18 +2578,18 @@ app.whenReady().then(async () => {
   
   // currentSyncProcess is already null on startup - no stale state possible
   
-  // Clear error state from previous runs - start fresh
-  // User can view old errors from "View Errors" but icon should be neutral
-  console.log('Starting fresh - clearing error state from previous session');
-  status.hasErrors = false;
-  saveStatus(status);
-  
-  // Always start with white (idle) icon - no stale error indicators
-  stopIconAnimation();  // Ensure not spinning
-  const freshIcon = createTrayIcon('white', 0);
-  if (freshIcon) {
-    tray.setImage(freshIcon);
-    tray.setToolTip(`${getAppDisplayName()} ${getVersionString()}`);
+  // Render whatever the reconciled status actually says. This used to unconditionally clear
+  // hasErrors and force a white icon "to start fresh", which erased the failure that
+  // reconcileRunReceipt() had adopted moments earlier — and for a run that completed while the
+  // app was closed, that receipt is the only record it ever happened. The failure flashed for one
+  // tray render and then "View Errors" disappeared with it.
+  stopIconAnimation();  // never resume a spinner belonging to a previous process
+  const startupIcon = createTrayIcon(status.hasErrors ? 'red' : 'white', 0);
+  if (startupIcon) {
+    tray.setImage(startupIcon);
+    tray.setToolTip(status.hasErrors
+      ? `${getAppDisplayName()} — last sync did not complete cleanly`
+      : `${getAppDisplayName()} ${getVersionString()}`);
   }
   
   // Clean up orphaned files from previous installs

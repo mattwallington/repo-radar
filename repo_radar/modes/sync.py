@@ -311,14 +311,26 @@ def sync_mode(args):
     repos = config.get('repositories', [])
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
+        # An empty CONFIG is not an empty CORPUS. Metadata files and a stale INDEX.md remain on
+        # disk after repositories are removed from configuration, and the index is derived from
+        # those files rather than from the config — so returning here left the derived index
+        # corrupt purely because nothing happened to be configured. regenerate_index returns 0
+        # when there are genuinely no metadata files, making this a no-op in the empty case.
+        index_dropped = 0
+        if not args.dry_run:
+            index_dropped = regenerate_index(args) or 0
+            if index_dropped:
+                console.print(f"[red]✗ INDEX.md is INCOMPLETE — {index_dropped} "
+                              f"repositories excluded (see warnings above)[/red]")
         # A successful no-op is still a completed run; record it or the schedule looks missed.
         _finalize_run({'total': 0, 'updated': 0, 'cloned': 0, 'skipped': 0,
-                       'errors': 0, 'metadata_generated': 0, 'api_cost': 0.0})
+                       'errors': 0, 'metadata_generated': 0, 'api_cost': 0.0,
+                       'index_dropped': index_dropped})
         if sync_logger:
             sync_logger.event("sync_complete", total=0, updated=0, cloned=0, skipped=0,
-                              errors=0, metadata=0, cost="$0.0000")
+                              errors=0, metadata=0, cost="$0.0000", index_dropped=index_dropped)
             sync_logger.close()
-        return 0
+        return 0 if index_dropped == 0 else 1
 
     # Create directories
     if not args.dry_run:

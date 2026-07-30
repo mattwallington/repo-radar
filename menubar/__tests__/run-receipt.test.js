@@ -322,8 +322,37 @@ assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
 {
   const fn = MAIN.slice(MAIN.indexOf('function reconcileRunReceipt()'));
   const body = fn.slice(0, fn.indexOf('\n}'));
-  assert.ok(/hasErrors = true/.test(body),
-    'adopting a failed app-closed run must mark the tray — the receipt is its only record');
+  // hasErrors is LAST-RUN state, not unread history: showErrorIcon documents it as "stays until
+  // next successful sync", and the live-completion and child-exit paths both clear it on success.
+  // A receipt-driven success must behave identically or the tray can stay red indefinitely.
+  assert.ok(/adopted\.hasErrors = !ok/.test(body),
+    'reconciliation must SET hasErrors from the receipt, clearing it on a newer clean run');
+  assert.ok(/errorLog = \(adopted\.errorLog \|\| ''\)/.test(body),
+    'errorLog is history and may only be appended to, never erased on success');
+}
+
+// The startup reset that erased the failure reconciled moments earlier. reconcileRunReceipt() runs
+// during app.whenReady(); an unconditional `status.hasErrors = false` after it meant an app-closed
+// failure flashed for one tray render and then "View Errors" vanished.
+{
+  const ready = MAIN.slice(MAIN.indexOf('app.whenReady().then'));
+  assert.ok(!/status\.hasErrors = false;\s*\n\s*saveStatus\(status\);/.test(ready),
+    'startup must not unconditionally clear the error state it just reconciled');
+  assert.ok(/createTrayIcon\(status\.hasErrors \? 'red' : 'white', 0\)/.test(ready),
+    'the first tray render must reflect the reconciled status, not a forced white icon');
+}
+
+// Index-only failures must not render as "Sync failed with 0 errors".
+assert.ok(/function trayIndexDropped\(status\)/.test(MAIN),
+  'the two-transport drop lookup must live in one place');
+assert.ok(/Sync incomplete — \$\{dropped\} repositor/.test(MAIN),
+  'an index-only failure needs its own tooltip, not a "0 errors" one');
+{
+  const fn = MAIN.slice(MAIN.indexOf('function trayIndexDropped(status)'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+  assert.ok(/status\.stats && status\.stats\.index_dropped/.test(body)
+    && /ch\.indexDropped/.test(body),
+    'both transports must be consulted: live snake_case stats AND the reconciled camelCase receipt');
 }
 
 console.log('run-receipt OK: production planReconcile + validation + index-drop propagation'

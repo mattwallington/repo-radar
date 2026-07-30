@@ -18,6 +18,24 @@ STATS = {"total": 30, "updated": 30, "cloned": 0, "skipped": 0,
          "errors": 3, "metadata_generated": 2, "api_cost": 4.9665}
 
 
+@pytest.fixture(autouse=True)
+def isolate_corpus(tmp_path, monkeypatch):
+    """No test in this module may touch the real ~/repos-pristine.
+
+    Six tests here EXECUTE sync_mode with an empty repository list, and that path now regenerates
+    INDEX.md (an empty config is not an empty corpus). Without this, asserting something about a
+    receipt would read the user's real corpus and rewrite their real INDEX.md as a side effect.
+    Autouse so a future test cannot reintroduce the hazard by omitting a fixture.
+    """
+    import repo_radar.metadata as metadata
+
+    corpus = tmp_path / "pristine"
+    corpus.mkdir()
+    monkeypatch.setattr(metadata, "PRISTINE_DIR", corpus)
+    monkeypatch.setattr(metadata, "INDEX_FILE", corpus / "INDEX.md")
+    return corpus
+
+
 def test_trigger_is_declared_not_inferred(monkeypatch):
     """The old code guessed from 'is a window shown', so launchd runs logged 'manual'."""
     monkeypatch.setenv(TRIGGER_ENV, "scheduled")
@@ -152,14 +170,27 @@ def test_sync_module_calls_the_finalizer_and_declares_the_trigger():
 
 
 def test_zero_repository_success_still_finalizes():
-    """A successful no-op run must leave a receipt, or the schedule looks perpetually missed."""
+    """A successful no-op run must leave a receipt, or the schedule looks perpetually missed.
+
+    Structural rather than a fixed-width source slice: the previous version read 600 characters
+    after the console message and broke the moment that branch grew a comment, which says nothing
+    about whether the contract still holds.
+    """
+    import ast
     import inspect
+    import textwrap
+
     from repo_radar.modes import sync
 
-    src = inspect.getsource(sync.sync_mode)
-    idx = src.index("No repositories configured")
-    tail = src[idx:idx + 600]
-    assert "_finalize_run(" in tail, "the zero-repo return-0 path must finalize before returning"
+    tree = ast.parse(textwrap.dedent(inspect.getsource(sync.sync_mode)))
+    branch = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and 'No repositories configured' in ast.dump(node))
+    calls = {n.func.id for n in ast.walk(branch)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert '_finalize_run' in calls, "the zero-repo path must finalize before returning"
+    assert 'regenerate_index' in calls, (
+        "an empty config is not an empty corpus — the derived index must still be validated")
 
 
 def test_completion_path_writes_a_readable_receipt_end_to_end(tmp_path, monkeypatch):
@@ -265,6 +296,53 @@ def test_zero_repo_sync_mode_execution_writes_a_receipt(tmp_path, monkeypatch):
     assert r['trigger'] == 'scheduled' and r['channel'] == 'stable'
     assert r['completed'] is True and r['qualifiesForSchedule'] is True
     assert r['stats']['total'] == 0
+
+
+def test_zero_config_sync_still_repairs_the_index_on_disk(tmp_path, monkeypatch, isolate_corpus):
+    """An empty CONFIG is not an empty CORPUS.
+
+    Metadata files and a stale INDEX.md survive removing every repository from configuration, so
+    returning early here left the derived index corrupt purely because nothing was configured —
+    the same shape as the metadata-conditional bypass, one early return further up.
+    """
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+
+    (isolate_corpus / "healthy-aaa1111.md").write_text(
+        "---\nfull_name: org/healthy\ncache_dir: healthy-aaa1111\nbrief: Real analysis.\n"
+        "type: Backend Service\nlanguage: Go\nrelated_repos: []\n---\n")
+    (isolate_corpus / "broken-bbb2222.md").write_text("---\nfull_name: org/broken\n# never closed\n")
+
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'scheduled')
+    monkeypatch.setenv(receipts_mod.CHANNEL_ENV, 'stable')
+
+    rc = sync_mod.sync_mode(_args())
+
+    index = (isolate_corpus / "INDEX.md").read_text()
+    assert "org/healthy" in index, "the index must be rebuilt from what is on disk"
+    assert rc == 1, "the malformed file is an excluded repository, so the run failed"
+    r = read_receipt(tmp_path, 'stable')
+    assert r['stats']['indexDropped'] == 1 and r['errorFree'] is False
+    assert r['completed'] is True, "the run still finished — do not provoke a paid catch-up"
+
+
+def test_zero_config_sync_with_an_empty_corpus_is_still_a_clean_success(
+        tmp_path, monkeypatch, isolate_corpus):
+    """The no-op case must stay a no-op: nothing configured, nothing cached, still exit 0."""
+    from repo_radar.modes import sync as sync_mod
+
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+
+    assert sync_mod.sync_mode(_args()) == 0
+    r = read_receipt(tmp_path, 'stable')
+    assert r['stats']['indexDropped'] == 0 and r['errorFree'] is True
 
 
 def test_dry_run_execution_writes_no_receipt(tmp_path, monkeypatch):
