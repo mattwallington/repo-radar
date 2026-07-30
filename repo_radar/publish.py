@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,7 +38,11 @@ from repo_radar.config import PRISTINE_DIR, load_config, load_exclusions, is_exc
 from repo_radar.constants import GREEN, CYAN, YELLOW, RED, BOLD, RESET
 
 SHA40 = re.compile(r'^[0-9a-f]{40}$')
+SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 REPO_KEY = re.compile(r'^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')
+# The snapshot's own index lives at pristine/INDEX.md, so a repository whose canonical name is
+# INDEX would publish over it and the run would report success.
+RESERVED_CANONICAL_NAMES = {'INDEX'}
 # repo-radar names metadata "<repo>-<short-sha>.md" beside a "<repo>.md" symlink; the snapshot
 # publishes the canonical name and never the symlink, which the contract rejects outright.
 CACHE_SUFFIX = re.compile(r'-[0-9a-f]{7,}$')
@@ -125,7 +130,8 @@ def discover(src, exclusions):
         # metadata had never seen whenever analysis failed or was skipped after a pull. The
         # snapshot then told an agent "this description is of commit B" when it described A.
         head = _git(clone, 'rev-parse', 'HEAD')
-        commit = meta.get('last_commit') or head
+        clone_exists = clone.is_dir()
+        commit = meta.get('last_commit') or (None if clone_exists else head)
 
         if key and is_excluded(key, exclusions):
             excluded.append(key)
@@ -133,16 +139,36 @@ def discover(src, exclusions):
         if not key or not REPO_KEY.match(key):
             skipped.append((stem, f'no owner/name key (got {key!r})'))
             continue
+        if canon in RESERVED_CANONICAL_NAMES:
+            skipped.append((stem, f'{canon!r} is reserved — it would publish over the '
+                                  f'snapshot index at pristine/INDEX.md'))
+            continue
+        # When the clone is present, its evidence is REQUIRED rather than merely preferred.
+        # Falling back on missing evidence published unproven source under a plausible identity:
+        # an unreadable origin was accepted, and absent last_commit silently became clone HEAD —
+        # the exact substitution that made sourceCommit describe something the metadata never saw.
+        if clone_exists:
+            if not meta.get('last_commit'):
+                skipped.append((stem, 'clone exists but metadata has no last_commit — cannot '
+                                      'prove which commit this description is of'))
+                continue
+            if not head:
+                skipped.append((stem, 'clone exists but its HEAD is unreadable'))
+                continue
+            if not origin:
+                skipped.append((stem, 'clone exists but its origin remote is unreadable — '
+                                      'cannot confirm identity'))
+                continue
+            if origin != key:
+                skipped.append((stem, f'identity mismatch: metadata says {key} but origin '
+                                      f'is {origin}'))
+                continue
         if not commit or not SHA40.match(commit.lower()):
             skipped.append((stem, f'no 40-hex sourceCommit (got {commit!r})'))
             continue
-        if head and meta.get('last_commit') and head.lower() != commit.lower():
+        if head and head.lower() != commit.lower():
             skipped.append((stem, f'metadata is stale: describes {commit[:8]} but the clone is '
                                   f'at {head[:8]} — re-sync before publishing'))
-            continue
-        if origin and meta.get('full_name') and origin != meta['full_name']:
-            skipped.append((stem, f'identity mismatch: frontmatter says {meta["full_name"]} but '
-                                  f'origin is {origin}'))
             continue
         if key in repos:
             skipped.append((stem, f'duplicate key {key}'))
@@ -187,12 +213,62 @@ def paths_overlap(src, out):
     return src == out or src in out.parents or out in src.parents
 
 
+def validate_manifest(manifest):
+    """Full contract check on a parsed manifest. Returns a list of problems."""
+    problems = []
+    if not isinstance(manifest, dict):
+        return ['manifest.json is not an object']
+    if manifest.get('schemaVersion') != 1:
+        return ['manifest.json has no schemaVersion 1']
+    index = manifest.get('index')
+    if not isinstance(index, dict) or index.get('path') != 'pristine/INDEX.md':
+        problems.append('manifest index.path must be exactly pristine/INDEX.md')
+    elif not SHA256_HEX.fullmatch(str(index.get('sha256', ''))):
+        problems.append('manifest index.sha256 is not 64 lowercase hex')
+    repos = manifest.get('repos')
+    if not isinstance(repos, dict):
+        return problems + ['manifest.json "repos" is not an object']
+
+    seen_paths = set()
+    for key, entry in repos.items():
+        if not REPO_KEY.match(str(key)):
+            problems.append(f'manifest repo key is not owner/name: {key!r}')
+        if not isinstance(entry, dict):
+            problems.append(f'{key}: manifest entry is not an object')
+            continue
+        path = str(entry.get('metadataPath', ''))
+        if not path.startswith('pristine/') or path.count('/') != 1 or path == 'pristine/INDEX.md':
+            problems.append(f'{key}: metadataPath must be a direct child of pristine/ and not '
+                            f'the index (got {path!r})')
+        elif path in seen_paths:
+            problems.append(f'{key}: metadataPath {path} is declared more than once')
+        seen_paths.add(path)
+        if not SHA256_HEX.fullmatch(str(entry.get('metadataSha256', ''))):
+            problems.append(f'{key}: metadataSha256 is not 64 lowercase hex')
+        if not SHA40.fullmatch(str(entry.get('sourceCommit', ''))):
+            problems.append(f'{key}: sourceCommit is not 40 lowercase hex')
+
+    # The id is what makes a snapshot self-certifying, so it is part of being a valid snapshot.
+    without = {k: v for k, v in manifest.items() if k != 'metadataSnapshotId'}
+    expected = 'sha256:' + hashlib.sha256(canonical(without).encode('utf-8')).hexdigest()
+    if manifest.get('metadataSnapshotId') != expected:
+        problems.append('metadataSnapshotId does not match the canonical manifest hash')
+    return problems
+
+
 def looks_like_snapshot(path):
     """Is `path` a tree this tool produced? Returns (ok, reason).
 
-    Replacing a destination destroys whatever is there, so the bar is evidence rather than a
-    guess: the presence of *some* file named manifest.json was enough to delete an unrelated
-    directory, because `{}` parses as JSON.
+    Replacing a destination destroys whatever is there, so the bar is PROOF OF OWNERSHIP of every
+    file that will be removed, not a plausible-looking manifest. Two earlier versions were too
+    weak: one accepted any file named manifest.json (`{}` parses as JSON), and one accepted a
+    schema-1 manifest without checking the snapshot id, the index entry, field shapes, or whether
+    the tree contained anything the manifest never mentioned.
+
+    Undeclared files now disqualify. The tree is built in a staging directory and swapped in, so
+    a failed run no longer leaves debris in the destination — which was the only argument for
+    tolerating extras, and it no longer holds. A valid manifest sitting beside unrelated files is
+    not evidence that those files are ours to delete.
     """
     path = Path(path)
     manifest_file = path / 'manifest.json'
@@ -202,32 +278,19 @@ def looks_like_snapshot(path):
         manifest = json.loads(manifest_file.read_text())
     except (OSError, ValueError) as exc:
         return False, f'manifest.json is not readable JSON ({exc})'
-    if not isinstance(manifest, dict) or manifest.get('schemaVersion') != 1:
-        return False, 'manifest.json has no schemaVersion 1'
-    for key in ('repos', 'index', 'metadataSnapshotId'):
-        if key not in manifest:
-            return False, f'manifest.json has no "{key}"'
-    if not isinstance(manifest.get('repos'), dict):
-        return False, 'manifest.json "repos" is not an object'
-    # Identity, not perfection: every file the manifest DECLARES must be present and hash-match.
-    # Undeclared extras deliberately do NOT disqualify — a stale file left by an interrupted run
-    # is precisely what republishing exists to clear, and refusing would strand the user with a
-    # broken snapshot they could only fix by hand.
-    problems = verify_tree(path, manifest, allow_undeclared=True)
+    problems = validate_manifest(manifest) + verify_tree(path, manifest)
     if problems:
         return False, problems[0]
     return True, 'a valid snapshot'
 
 
-def verify_tree(root, manifest, allow_undeclared=False):
-    """Check a built tree against its own manifest. Returns a list of problems.
+def verify_tree(root, manifest):
+    """Check a tree against its own manifest as an EXACT SET. Returns a list of problems.
 
     Run against the tree we just wrote — the manifest describes what we *intended*, and copying
     two repositories to the same path would otherwise leave one recorded hash describing bytes
-    that are no longer there.
-
-    `allow_undeclared` relaxes only the exact-set rule, for the separate question of whether an
-    existing directory is recognisably one of ours.
+    that are no longer there — and against an existing destination, where every file it contains
+    must be one this tool put there before any of it may be deleted.
     """
     root = Path(root)
     problems = []
@@ -242,9 +305,8 @@ def verify_tree(root, manifest, allow_undeclared=False):
         if sha256_file(target) != entry.get('metadataSha256'):
             problems.append(f'{key}: {path} does not match its recorded metadataSha256')
     actual = {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
-    if not allow_undeclared:
-        for extra in sorted(actual - declared):
-            problems.append(f'undeclared file in snapshot: {extra}')
+    for extra in sorted(actual - declared):
+        problems.append(f'undeclared file in snapshot: {extra}')
     for missing in sorted(declared - actual):
         problems.append(f'declared file missing from snapshot: {missing}')
     for link in root.rglob('*'):
@@ -287,8 +349,9 @@ def publish_mode(args):
         print(f'{YELLOW}  Publishing replaces the destination, so this would destroy the corpus '
               f'it is reading.{RESET}')
         return 1
-    # Only a directory we can positively identify as a previous snapshot may be replaced.
-    if out.exists() and not args.dry_run:
+    # Only a directory we can positively identify as a previous snapshot may be replaced. Checked
+    # on dry runs too: "would publish" is worthless if the real run refuses the destination.
+    if out.exists():
         ok, why = looks_like_snapshot(out)
         if not ok:
             print(f'{RED}error: {out} exists and is not a valid previous snapshot ({why}){RESET}')
@@ -363,25 +426,32 @@ def publish_mode(args):
 
     if args.dry_run:
         print(f'{CYAN}[DRY RUN]{RESET} would publish {len(repos)} repositories to {out}')
-        for key in sorted(repos):
-            print(f'    {key}')
-        if failures:
-            print()
-            print(f'{RED}✗ Would FAIL — {len(failures)} problem'
-                  f'{"s" if len(failures) != 1 else ""}:{RESET}')
-            for failure in failures:
-                print(f'  {RED}- {failure}{RESET}')
-            return 1
-        print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree')
-        return 0
 
+    # A dry run performs the SAME build and the SAME validation, into a disposable directory, and
+    # skips only the final swap. Keeping a separate list of "checks the preview also runs"
+    # guaranteed divergence: an unrelated destination and an oversized metadata file each passed
+    # the preview and then failed the real run.
+    #
     # Build into a sibling staging directory and swap only once the result validates. Writing
     # directly into --out meant deleting a known-good previous snapshot BEFORE knowing whether the
     # replacement was any good; a failure then left a partial tree that still carried
     # manifest.json, so the next run would happily delete that too.
-    staging = out.parent / f'.{out.name}.staging'
-    if staging.exists():
-        shutil.rmtree(staging)
+    # mkdtemp, not a predictable name. `.{out.name}.staging` and `.{out.name}.previous` were
+    # deterministic paths this code rmtree'd unconditionally, so a sibling directory that happened
+    # to carry either name was destroyed by a SUCCESSFUL publish. Never delete a path we did not
+    # just create; a unique directory needs no clearing.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f'.{out.name}.staging-', dir=out.parent))
+    retired = None
+    try:
+        return _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
+                               published, indexed, expected, failures)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
+                    published, indexed, expected, failures):
     (staging / 'pristine').mkdir(parents=True)
 
     (staging / 'pristine/INDEX.md').write_text(index_text, encoding='utf-8', newline='\n')
@@ -419,7 +489,6 @@ def publish_mode(args):
 
     if failures:
         # The previous snapshot, if any, is untouched — the staging tree never became `out`.
-        shutil.rmtree(staging, ignore_errors=True)
         print()
         print(f'{RED}✗ Snapshot is INCOMPLETE — {len(failures)} problem'
               f'{"s" if len(failures) != 1 else ""}:{RESET}')
@@ -429,19 +498,40 @@ def publish_mode(args):
               f'unchanged.{RESET}')
         return 1
 
-    # Swap. Move the old tree aside first so the window in which `out` does not exist is as short
-    # as a rename, then delete the old one only after the new one is in place.
-    retired = out.parent / f'.{out.name}.previous'
-    shutil.rmtree(retired, ignore_errors=True)
+    if args.dry_run:
+        print()
+        print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree. '
+              f'Nothing was written.')
+        return 0
+
+    # Re-validate the destination immediately before touching it. It was checked before the build,
+    # which can take a while on a large corpus, and another process could have replaced it in the
+    # meantime — we would then move or delete whatever arrived.
     if out.exists():
+        ok, why = looks_like_snapshot(out)
+        if not ok:
+            print()
+            print(f'{RED}✗ {out} changed while the snapshot was being built and is no longer a '
+                  f'valid snapshot ({why}){RESET}')
+            print(f'{YELLOW}  Nothing was published.{RESET}')
+            return 1
+
+    # Swap. Move the old tree aside under a unique name first, so the window in which `out` does
+    # not exist is as short as a rename, then delete the old one only after the new one is in
+    # place. On any failure, put the old one back rather than leaving nothing.
+    retired = None
+    if out.exists():
+        retired = Path(tempfile.mkdtemp(prefix=f'.{out.name}.previous-', dir=out.parent))
+        retired.rmdir()                  # mkdtemp reserved the name; rename needs it free
         out.rename(retired)
     try:
         staging.rename(out)
     except OSError:
-        if retired.exists():
-            retired.rename(out)          # put it back rather than leaving nothing
+        if retired is not None and retired.exists():
+            retired.rename(out)
         raise
-    shutil.rmtree(retired, ignore_errors=True)
+    if retired is not None:
+        shutil.rmtree(retired, ignore_errors=True)
 
     print()
     print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '

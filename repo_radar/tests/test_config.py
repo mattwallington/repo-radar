@@ -1,3 +1,4 @@
+import re
 from repo_radar.config import get_cache_name
 
 
@@ -134,3 +135,31 @@ def test_reconfiguring_preserves_everything_the_wizard_does_not_ask_about(tmp_pa
     assert after["ai_model"] == "gemini/gemini-3.6-flash"
     assert after["anthropic_api_key"] == "sk-ant"
     assert after["schedule"] == {"enabled": True, "time": "09:00"}
+
+
+def test_configure_mode_builds_its_config_from_the_existing_one():
+    """Landmark: the merge must live in configure_mode, not only in a test's imitation of it.
+
+    The behavioural test above reproduces the semantics, but it drives load/update/save by hand —
+    so deleting the merge from configure_mode would leave it green. This reads the production
+    function: the dict it saves must be derived from load_config(), never built from literals.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from repo_radar.modes import configure
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(configure.configure_mode)))
+    saves = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == 'save_config']
+    assert saves, 'configure_mode no longer saves a configuration at all'
+
+    src = ast.unparse(tree)
+    assert 'config = load_config() or {}' in src, (
+        'configure_mode must start from the existing config; rebuilding it from literals '
+        'silently discarded exclusions, the model, the API keys and the schedule')
+    assert 'config.update(' in src, 'and update it rather than replacing it'
+    assert not re.search(r"config = \{\s*'github_token'", src), (
+        'the from-scratch dict literal must be gone, not merely supplemented')

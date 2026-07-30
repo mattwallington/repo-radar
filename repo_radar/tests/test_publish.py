@@ -6,6 +6,7 @@ every mistake here fails the review rather than degrading gracefully.
 import hashlib
 import json
 import pathlib
+import re
 import subprocess
 import types
 
@@ -24,11 +25,18 @@ def _repo(pristine, name, full_name, body='brief: A repository.\ntype: Library\n
     clone.mkdir()
     (clone / 'README.md').write_text('# x\n')
     subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=clone, check=True)
+    # A real cache entry has an origin remote and its metadata records the commit it describes;
+    # the publisher now requires both when a clone is present, so the fixture must be faithful.
+    subprocess.run(['git', 'remote', 'add', 'origin',
+                    f'https://github.com/{full_name}.git'], cwd=clone, check=True)
     subprocess.run(['git', 'add', 'README.md'], cwd=clone, check=True)
     subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-qm', 'i'],
                    cwd=clone, check=True)
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=clone,
+                          capture_output=True, text=True, check=True).stdout.strip()
     (pristine / f'{cache}.md').write_text(
-        f'---\nfull_name: {full_name}\ncache_dir: {cache}\n{body}\nrelated_repos: []\n---\n\n#\n')
+        f'---\nfull_name: {full_name}\ncache_dir: {cache}\nlast_commit: {head}\n'
+        f'{body}\nrelated_repos: []\n---\n\n#\n')
     # repo-radar also writes a stable-name symlink beside the canonical file; the contract
     # rejects symlinks, so the publisher must never follow or copy these.
     (pristine / f'{name}.md').symlink_to(pristine / f'{cache}.md')
@@ -83,6 +91,8 @@ def publish(tmp_path, monkeypatch):
         return rc, out, manifest
 
     run.again = lambda: _invoke(state['args'])
+    run.again_dry = lambda: _invoke(types.SimpleNamespace(
+        **{**vars(state['args']), 'dry_run': True}))
     return run
 
 
@@ -204,19 +214,19 @@ def test_publishing_refuses_to_delete_a_directory_it_did_not_create(publish, tmp
     assert (victim / 'important.txt').read_text() == 'do not delete me'
 
 
-def test_a_previous_snapshot_is_replaced_leaving_no_stale_files(publish, tmp_path):
-    """Stale files from an earlier run break the exact-set validation."""
-    rc, out, _ = publish({'alpha': 'Org/alpha', 'beta': 'Org/beta'})
+def test_a_clean_previous_snapshot_is_replaced_atomically(publish, tmp_path):
+    """Republishing over a valid snapshot swaps in a fresh tree with nothing carried over."""
+    rc, out, first = publish({'alpha': 'Org/alpha', 'beta': 'Org/beta'})
     assert rc == 0
-    (out / 'pristine' / 'stale.md').write_text('left over')
 
     rc, out, manifest = publish.again()
 
     assert rc == 0
-    assert not (out / 'pristine' / 'stale.md').exists()
     declared = {'manifest.json', 'pristine/INDEX.md'}
     declared |= {r['metadataPath'] for r in manifest['repos'].values()}
     assert {str(p.relative_to(out)) for p in out.rglob('*') if p.is_file()} == declared
+    assert not list(tmp_path.glob('.snap.staging-*')), 'staging must be cleaned up'
+    assert not list(tmp_path.glob('.snap.previous-*')), 'the retired tree must be removed'
 
 
 def test_the_manifest_is_canonical_json_so_the_id_is_reproducible(publish):
@@ -286,20 +296,73 @@ def test_a_directory_with_a_token_manifest_is_not_treated_as_a_snapshot(tmp_path
     assert not ok and 'schemaVersion' in why
 
 
-def test_a_snapshot_missing_a_declared_file_is_not_replaceable(tmp_path):
+def test_a_genuine_snapshot_is_replaceable(publish):
+    """The positive control: whatever else is rejected, a real snapshot must be replaceable."""
     from repo_radar.publish import looks_like_snapshot
 
-    fake = tmp_path / 'snap'
-    (fake / 'pristine').mkdir(parents=True)
-    (fake / 'pristine/INDEX.md').write_text('# i\n')
-    (fake / 'manifest.json').write_text(json.dumps({
-        'schemaVersion': 1, 'metadataSnapshotId': 'sha256:x',
-        'index': {'path': 'pristine/INDEX.md', 'sha256': 'x'},
-        'repos': {'Org/a': {'metadataPath': 'pristine/a.md', 'metadataSha256': 'x',
-                            'sourceCommit': 'a' * 40}}}))
+    _rc, out, _m = publish({'alpha': 'Org/alpha'})
+    ok, why = looks_like_snapshot(out)
+    assert ok, why
 
-    ok, why = looks_like_snapshot(fake)
+
+def test_a_snapshot_missing_a_declared_file_is_not_replaceable(publish):
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, manifest = publish({'alpha': 'Org/alpha'})
+    (out / manifest['repos']['Org/alpha']['metadataPath']).unlink()
+
+    ok, why = looks_like_snapshot(out)
     assert not ok and 'missing' in why
+
+
+def test_a_snapshot_holding_an_undeclared_file_is_not_replaceable(publish):
+    """Ownership of EVERY file must be proven before any of them is deleted.
+
+    Tolerating extras was my earlier relaxation and it was wrong: the tree is now built in a
+    staging directory and swapped in, so a failed run leaves no debris in the destination — which
+    was the only argument for it. A valid manifest beside unrelated files proves nothing about
+    those files.
+    """
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, _m = publish({'alpha': 'Org/alpha'})
+    (out / 'someone-elses-notes.txt').write_text('not ours')
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and 'undeclared' in why
+
+
+def test_a_tampered_snapshot_id_makes_a_directory_unreplaceable(publish):
+    """The id is what makes a snapshot self-certifying, so it is part of proving ownership."""
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, manifest = publish({'alpha': 'Org/alpha'})
+    manifest['metadataSnapshotId'] = 'not-a-hash'
+    (out / 'manifest.json').write_text(canonical(manifest))
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and 'metadataSnapshotId' in why
+
+
+@pytest.mark.parametrize("mutate,expected", [
+    (lambda m: m['index'].__setitem__('path', 'elsewhere/INDEX.md'), 'index.path'),
+    (lambda m: m['index'].__setitem__('sha256', 'zz'), 'index.sha256'),
+    (lambda m: m['repos']['Org/alpha'].__setitem__('sourceCommit', 'nope'), 'sourceCommit'),
+    (lambda m: m['repos']['Org/alpha'].__setitem__('metadataSha256', 'nope'), 'metadataSha256'),
+    (lambda m: m['repos']['Org/alpha'].__setitem__('metadataPath', 'pristine/INDEX.md'),
+     'metadataPath'),
+])
+def test_every_manifest_field_is_validated_before_a_directory_may_be_replaced(
+        publish, mutate, expected):
+    """A schema-1 manifest alone was enough; each of these was previously accepted."""
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, manifest = publish({'alpha': 'Org/alpha'})
+    mutate(manifest)
+    (out / 'manifest.json').write_text(canonical(manifest))
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and expected in why
 
 
 def test_a_failed_publish_leaves_the_previous_snapshot_intact(publish, tmp_path):
@@ -335,6 +398,8 @@ def test_two_repositories_with_the_same_basename_fail_rather_than_overwrite(
         clone.mkdir()
         (clone / 'R.md').write_text(f'# {full}\n')
         subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=clone, check=True)
+        subprocess.run(['git', 'remote', 'add', 'origin',
+                        f'https://github.com/{full}.git'], cwd=clone, check=True)
         subprocess.run(['git', 'add', 'R.md'], cwd=clone, check=True)
         subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=T', 'commit', '-qm', 'i'],
                        cwd=clone, check=True)
@@ -371,12 +436,11 @@ def test_stale_metadata_is_refused_rather_than_mislabelled(tmp_path, monkeypatch
     pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
     clone = pristine / 'alpha-abc1234'
     md = pristine / 'alpha-abc1234.md'
-    stale = 'a' * 40
-    md.write_text(md.read_text().replace('cache_dir: alpha-abc1234',
-                                         f'cache_dir: alpha-abc1234\nlast_commit: {stale}'))
     head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=clone,
                           capture_output=True, text=True).stdout.strip()
+    stale = 'a' * 40
     assert head.lower() != stale
+    md.write_text(re.sub(r'last_commit: .*', f'last_commit: {stale}', md.read_text()))
 
     cfg = {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
     monkeypatch.setattr(pub, 'load_config', lambda: cfg)
@@ -418,8 +482,10 @@ def test_dry_run_returns_the_same_verdict_as_a_real_publish(publish, tmp_path, c
 
     rc_dry, _out, _ = publish({'alpha': 'Org/alpha'}, config=bad, dry_run=True)
     assert rc_dry == 1, 'the dry run must reach the same conclusion'
-    assert 'Would FAIL' in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert 'DRY RUN' in out and 'INCOMPLETE' in out
     assert not (tmp_path / 'snap').exists(), 'a dry run must not write anything'
+    assert not list(tmp_path.glob('.snap.staging-*')), 'nor leave its scratch directory behind'
 
     rc_real, _out, _ = publish({'alpha': 'Org/alpha'}, config=bad)
     assert rc_real == rc_dry
@@ -429,3 +495,104 @@ def test_dry_run_passes_when_the_real_publish_would(publish, capsys):
     rc, _out, _ = publish({'alpha': 'Org/alpha'}, dry_run=True)
     assert rc == 0
     assert 'Validation passed' in capsys.readouterr().out
+
+
+def test_publishing_never_touches_deterministically_named_siblings(publish, tmp_path):
+    """`.snap.staging` and `.snap.previous` were fixed names this code rmtree'd unconditionally,
+    so a SUCCESSFUL publish destroyed sibling directories that happened to carry them."""
+    for name in ('.snap.staging', '.snap.previous'):
+        victim = tmp_path / name
+        victim.mkdir()
+        (victim / 'important.txt').write_text('mine')
+
+    rc, _out, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 0
+    for name in ('.snap.staging', '.snap.previous'):
+        assert (tmp_path / name / 'important.txt').read_text() == 'mine', \
+            f'{name} belongs to someone else'
+
+
+def test_a_repository_named_index_cannot_overwrite_the_snapshot_index(tmp_path, monkeypatch,
+                                                                      capsys):
+    """A repo whose canonical name is INDEX publishes to pristine/INDEX.md — the generated index."""
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'INDEX': 'Org/INDEX', 'alpha': 'Org/alpha'})
+    cfg = {'repositories': [{'full_name': 'Org/INDEX'}, {'full_name': 'Org/alpha'}],
+           'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    assert 'reserved' in capsys.readouterr().out
+
+
+def test_dry_run_and_real_publish_agree_on_an_unrelated_destination(publish, tmp_path, capsys):
+    """Reproduced by Codex: dry run returned 0 where the real publish returned 1."""
+    victim = tmp_path / 'snap'
+    victim.mkdir()
+    (victim / 'important.txt').write_text('mine')
+
+    rc_dry, _o, _m = publish({'alpha': 'Org/alpha'}, dry_run=True)
+    capsys.readouterr()
+    rc_real, _o, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc_dry == rc_real == 1, 'both must refuse an unrelated destination'
+    assert (victim / 'important.txt').read_text() == 'mine'
+
+
+def test_dry_run_and_real_publish_agree_on_an_oversized_metadata_file(publish, tmp_path, capsys):
+    """The other reproduction: a file over MAX_FILE passed dry run and failed the real publish."""
+    from repo_radar.publish import MAX_FILE
+
+    pristine = tmp_path / 'pristine'
+    rc_first, _o, _m = publish({'alpha': 'Org/alpha'})
+    assert rc_first == 0
+    md = pristine / 'alpha-abc1234.md'
+    md.write_text(md.read_text() + 'x' * (MAX_FILE + 1))
+
+    capsys.readouterr()
+    rc_dry, _o, _m = publish.again_dry()
+    dry_out = capsys.readouterr().out
+    rc_real, _o, _m = publish.again()
+
+    assert rc_dry == rc_real == 1
+    assert 'LIMIT' in dry_out or 'too large' in dry_out
+
+
+def test_a_clone_without_a_readable_origin_is_refused(tmp_path, monkeypatch, capsys):
+    """Missing evidence is not evidence: an unresolvable origin was accepted, publishing
+    unproven source under whatever identity the frontmatter claimed."""
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
+    subprocess.run(['git', 'remote', 'remove', 'origin'],
+                   cwd=pristine / 'alpha-abc1234', check=True)
+    cfg = {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    assert 'origin remote is unreadable' in capsys.readouterr().out
+
+
+def test_a_clone_whose_origin_contradicts_the_metadata_is_refused(tmp_path, monkeypatch, capsys):
+    import repo_radar.publish as pub
+
+    pristine = _corpus(tmp_path, {'alpha': 'Org/alpha'})
+    subprocess.run(['git', 'remote', 'set-url', 'origin',
+                    'https://github.com/Someone/else.git'],
+                   cwd=pristine / 'alpha-abc1234', check=True)
+    cfg = {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+    monkeypatch.setattr(pub, 'load_config', lambda: cfg)
+    monkeypatch.setattr(pub, 'load_exclusions', lambda c=None: [])
+
+    rc = publish_mode(_args(tmp_path / 'snap', pristine))
+
+    assert rc == 1
+    assert 'identity mismatch' in capsys.readouterr().out

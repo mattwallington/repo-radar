@@ -361,3 +361,66 @@ def test_index_md_is_never_an_orphan_or_an_unknown(tmp_path):
 
     assert 'INDEX.md' not in {p.name for p, _f, _r in orphans}
     assert 'INDEX.md' not in {p.name for p, _why in unknown}
+
+
+@pytest.mark.parametrize("config", [
+    {'repositories': [{}]},
+    {'repositories': [{'full_name': ''}]},
+    {'repositories': [{'full_name': 'Org/a'}, {'clone_url': 'x'}]},
+])
+def test_a_repository_entry_without_a_name_refuses_rather_than_shrinking_the_corpus(
+        tmp_path, config):
+    """Skipping a nameless entry quietly shrank the configured set, turning live caches into
+    orphans — Codex reproduced a live clone and its metadata being deleted this way."""
+    from repo_radar.modes.clean import find_orphans, UnusableConfig
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    with pytest.raises(UnusableConfig):
+        find_orphans(pristine, config)
+
+
+def test_a_malformed_cache_index_refuses_but_an_absent_one_does_not(tmp_path):
+    """Absent is a legitimate pre-migration state; unreadable may be the only evidence that a
+    nonstandard directory is live, so losing it must not read as "no mappings"."""
+    from repo_radar.modes.clean import find_orphans, UnusableConfig, MALFORMED_CACHE_INDEX
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    config = {'repositories': [_repo('org/kept')]}
+
+    with pytest.raises(UnusableConfig):
+        find_orphans(pristine, config, MALFORMED_CACHE_INDEX)
+
+    orphans, kept, _unknown = find_orphans(pristine, config, None)
+    assert orphans == [] and len(kept) == 2, 'an absent cache index is fine'
+
+
+def test_a_metadata_file_with_no_usable_frontmatter_is_not_ours_to_delete(tmp_path):
+    """`meeting-deadbee.md` matches <name>-<7hex>. Filename shape is not ownership evidence."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    (pristine / 'meeting-deadbee.md').write_text('# Notes from the meeting\n\nNo frontmatter.\n')
+
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == []
+    assert [p.name for p, _why in unknown] == ['meeting-deadbee.md']
+
+
+def test_a_configured_repo_under_a_migrated_cache_name_is_kept(tmp_path):
+    """Its metadata identifies it as configured; believing only the computed name deleted it."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    migrated = pristine / 'kept-oldstyle01'
+    migrated.mkdir()
+    (migrated / '.git').mkdir()
+    (pristine / 'kept-oldstyle01.md').write_text(
+        '---\nfull_name: org/kept\ncache_dir: kept-oldstyle01\n---\n')
+    (pristine / 'INDEX.md').write_text('# Index\n')
+
+    orphans, kept, _unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], 'frontmatter identity must preserve a configured migrated cache'
+    assert {p.name for p, _f in kept} == {'kept-oldstyle01', 'kept-oldstyle01.md'}

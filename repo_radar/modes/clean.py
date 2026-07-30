@@ -1,12 +1,14 @@
 """Clean mode: remove cached repositories and metadata."""
 
+import json
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
-from repo_radar.config import (PRISTINE_DIR, INDEX_FILE, CONFIG_FILE, load_config,
-                               load_cache_index, load_exclusions, is_excluded, get_cache_name)
+from repo_radar.config import (PRISTINE_DIR, INDEX_FILE, CONFIG_FILE, CACHE_INDEX_FILE,
+                               load_config, load_exclusions, is_excluded, get_cache_name)
 from repo_radar.constants import GREEN, CYAN, YELLOW, RED, BOLD, RESET
 from repo_radar.ui import format_size
 
@@ -56,18 +58,29 @@ def find_orphans(pristine_dir, config, cache_index=None):
     repositories = config.get('repositories')
     if not isinstance(repositories, list):
         raise UnusableConfig('config "repositories" is not a list — refusing to guess')
+    if cache_index is MALFORMED_CACHE_INDEX:
+        # Distinct from "no cache index at all", which is a legitimate pre-migration state. A
+        # cache index we cannot read may hold the only mapping proving a nonstandard directory
+        # belongs to a live repository, so its loss must not be silently treated as "no mappings".
+        raise UnusableConfig('.cache-index.json is unreadable — its mappings may be the only '
+                             'evidence that a cache directory is live')
+    cache_index = cache_index if isinstance(cache_index, dict) else {}
 
     exclusions = load_exclusions(config)
-    cache_index = cache_index if isinstance(cache_index, dict) else {}
-    configured = {}
+    configured = {}          # cache name -> full name
+    configured_names = set()  # every non-excluded configured full name
     for repo in repositories:
         if not isinstance(repo, dict):
             raise UnusableConfig('config contains a non-object repository entry')
         full_name = (repo.get('full_name') or '').strip()
         if not full_name:
-            continue
+            # An entry we cannot name is not evidence that nothing is configured. Skipping it
+            # quietly shrank the "configured" set and turned live caches into orphans.
+            raise UnusableConfig('a configured repository entry has no full_name — refusing to '
+                                 'treat the rest as the complete corpus')
         if is_excluded(full_name, exclusions):
             continue                      # configured but excluded: its cache is an orphan
+        configured_names.add(full_name)
         clone_url = repo.get('clone_url', '')
         # The recorded mapping wins; the deterministic name is only the fallback.
         cache_name = cache_index.get(clone_url) or get_cache_name(clone_url,
@@ -95,12 +108,29 @@ def find_orphans(pristine_dir, config, cache_index=None):
             continue
 
         full_name = _full_name_of(Path(pristine_dir) / f'{name}.md')
-        # Fall back to the cache-directory shape when there is no metadata. The largest orphan in
-        # practice was a 659 MB clone that had never been analyzed, so it had no metadata file and
-        # no other way to be recognised as the repository it plainly is.
+        # A configured repository stored under a nonstandard cache name — migrated, or predating
+        # the current naming — is still live. Its metadata says so, and believing only the
+        # computed name deleted it.
+        if full_name and full_name in configured_names:
+            kept.append((item, full_name))
+            continue
+        if item.is_dir():
+            origin = owner_name_of_clone(item)
+            if origin and origin in configured_names:
+                kept.append((item, origin))
+                continue
+
+        # Ownership evidence, in descending strength. A filename SHAPE is not evidence on its own:
+        # `meeting-deadbee.md` matches `<name>-<7hex>` and is not ours.
         inferred = _repo_name_from_cache_dir(name)
-        recognised = (name in known_cache_names) or bool(full_name) or (
-            inferred is not None and _looks_like_repo_radar_artifact(item))
+        if name in known_cache_names:
+            recognised = True
+        elif full_name:
+            recognised = True                      # valid frontmatter naming a repository
+        elif item.is_dir():
+            recognised = inferred is not None and (item / '.git').exists()
+        else:
+            recognised = False                     # a .md with no usable frontmatter is not ours
         if not recognised:
             unknown.append((item, 'cannot identify as a repo-radar cache entry'))
             continue
@@ -114,6 +144,33 @@ def find_orphans(pristine_dir, config, cache_index=None):
             reason = f'not in configured repositories ({identity}, inferred from directory name)'
         orphans.append((item, full_name, reason))
     return orphans, kept, unknown
+
+
+MALFORMED_CACHE_INDEX = object()
+
+
+def load_cache_index_strict():
+    """The cache index, or MALFORMED_CACHE_INDEX. Absent is {} — absent and corrupt differ."""
+    if not CACHE_INDEX_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CACHE_INDEX_FILE.read_text())
+    except (OSError, ValueError):
+        return MALFORMED_CACHE_INDEX
+    return data if isinstance(data, dict) else MALFORMED_CACHE_INDEX
+
+
+def owner_name_of_clone(path):
+    """Owner/Name from a clone's origin remote, or None. Never raises."""
+    try:
+        result = subprocess.run(['git', '-C', str(path), 'remote', 'get-url', 'origin'],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            return None
+        match = re.search(r'[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$', result.stdout.strip())
+        return f'{match.group(1)}/{match.group(2)}' if match else None
+    except Exception:
+        return None
 
 
 def _looks_like_repo_radar_artifact(path):
@@ -160,7 +217,7 @@ def _clean_orphans(args):
     """Report — and with --force, remove — cached data for unconfigured/excluded repositories."""
     config = load_config()
     try:
-        orphans, kept, unknown = find_orphans(PRISTINE_DIR, config, load_cache_index())
+        orphans, kept, unknown = find_orphans(PRISTINE_DIR, config, load_cache_index_strict())
     except UnusableConfig as e:
         # Deleting on the basis of a config we could not read would delete everything, since a
         # config that lists nothing makes every cached repository an orphan.
