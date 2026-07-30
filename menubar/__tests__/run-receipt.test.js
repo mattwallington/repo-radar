@@ -6,8 +6,8 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { planReconcile, validateReceipt, qualifiesForSchedule, needsCatchUp, SCHEMA,
-        EXIT_SKIPPED_NO_WORK } = require('../run-receipt');
+const { planReconcile, validateReceipt, qualifiesForSchedule, completionQualifies,
+        needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -212,15 +212,22 @@ assert.ok(/writeFileSync\(configFile,[\s\S]*?\{ mode: 0o600 \}\)/.test(MAIN)
 // status-server 'complete' handler and the child zero-exit handler. A successful dev run therefore
 // still suppressed stable's catch-up. Both are now channel-gated.
 {
-  const gates = MAIN.match(/if \(runtimeChannel === SCHEDULING_CHANNEL\) \{/g) || [];
-  assert.ok(gates.length >= 2,
-    `both lastSync writers must be channel-gated (found ${gates.length})`);
-  // and no ungated assignment may remain
-  const ungated = MAIN.split('\n').filter((l, i, all) =>
-    /status\.lastSync = new Date\(\)\.toISOString\(\);/.test(l)
-    && !/SCHEDULING_CHANNEL/.test(all.slice(Math.max(0, i - 6), i).join('\n')));
-  assert.strictEqual(ungated.length, 0,
-    `found ${ungated.length} ungated status.lastSync write(s)`);
+  // The real invariant: EVERY write to the schedule watermark is guarded by the shared rule —
+  // either completionQualifies (live status-server path, which must judge channel AND mode) or the
+  // channel comparison (child-close path). Counting a specific guard shape would go stale; this
+  // asserts the property instead.
+  const lines = MAIN.split('\n');
+  const unguarded = lines.filter((line, i) => {
+    if (!/status\.lastSync = new Date\(\)\.toISOString\(\);/.test(line)) return false;
+    const preceding = lines.slice(Math.max(0, i - 8), i).join('\n');
+    return !/completionQualifies\(|runtimeChannel === SCHEDULING_CHANNEL/.test(preceding);
+  });
+  assert.strictEqual(unguarded.length, 0,
+    `${unguarded.length} write(s) to status.lastSync bypass the qualification rule`);
+  const guarded = lines.filter((line) =>
+    /status\.lastSync = new Date\(\)\.toISOString\(\);/.test(line));
+  assert.strictEqual(guarded.length, 2,
+    `expected exactly 2 schedule-watermark writers, found ${guarded.length} — a new one must be guarded too`);
 }
 // dev must neither run the missed-sync check nor install its periodic timer
 assert.strictEqual((MAIN.match(/checkMissedSync\(\);/g) || []).length,
@@ -235,5 +242,26 @@ assert.strictEqual(EXIT_SKIPPED_NO_WORK, 66, 'must match receipts.EXIT_SKIPPED_N
   const plan = planReconcile(receipt({ version: '1.0.28' }), { lastSync: iso(6 * 3600_000) });
   assert.strictEqual(plan.status.channels.stable.version, '1.0.28', 'version recorded');
 }
+
+// ── the live completion path must obey the same rule ────────────────────────────────────
+// The channel gate alone let a stable PARTIAL run advance lastSync via
+// `--skip-metadata --status-server`, because the payload carried no mode and the handler assumed
+// "advance". planReconcile is forward-only, so nothing could undo it afterwards.
+assert.strictEqual(completionQualifies({ channel: 'stable', mode: 'full', trigger: 'manual' }), true,
+  'a full stable run may advance');
+assert.strictEqual(completionQualifies({ channel: 'stable', mode: 'skip-metadata', trigger: 'manual' }),
+  false, 'a stable --skip-metadata run must NOT advance lastSync');
+assert.strictEqual(completionQualifies({ channel: 'stable', mode: 'metadata-only', trigger: 'cli' }),
+  false, 'a stable --metadata-only run must NOT advance lastSync');
+assert.strictEqual(completionQualifies({ channel: 'dev', mode: 'full', trigger: 'manual' }, 'stable'),
+  false, 'a dev completion must not advance the stable watermark');
+// unvalidated provenance fails CLOSED: refusing is recoverable (the receipt reconciles moments
+// later); wrongly advancing is not, because forward-only reconciliation cannot undo it
+assert.strictEqual(completionQualifies({ channel: 'stable', mode: 'full' }), false, 'no trigger');
+assert.strictEqual(completionQualifies({ channel: 'stable', trigger: 'manual' }), false, 'no mode');
+assert.strictEqual(completionQualifies({}), false, 'empty payload');
+assert.strictEqual(completionQualifies(null), false, 'null payload');
+assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
+  'the status-server complete handler must consult the shared rule, not just the channel');
 
 console.log('run-receipt OK: production planReconcile + validation + main.js wiring landmarks');

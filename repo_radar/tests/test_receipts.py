@@ -360,3 +360,61 @@ def test_guard_ignores_a_stale_qualification_flag(tmp_path, monkeypatch):
 
     rc = sync_mod.sync_mode(_args())
     assert rc == 0, "a dev receipt cannot satisfy a catch-up, so the run must proceed"
+
+
+def test_guard_rejects_a_corrupt_timestamp_instead_of_declining_work(tmp_path, monkeypatch):
+    """A receipt with finishedAt="zzzz" once suppressed every catch-up: the string check passed and
+    "zzzz" sorts above any ISO date, so the lexical comparison declined the run indefinitely."""
+    import json as _json
+    from repo_radar.modes import sync as sync_mod
+    import repo_radar.receipts as receipts_mod
+    from repo_radar.receipts import receipt_path
+
+    receipt_path(tmp_path, 'stable').write_text(_json.dumps({
+        'schema': 2, 'channel': 'stable', 'trigger': 'scheduled', 'mode': 'full',
+        'completed': True, 'qualifiesForSchedule': True, 'finishedAt': 'zzzz',
+        'stats': {'errors': 0}}))
+    monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
+    monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'catchup')
+    monkeypatch.setenv('REPO_RADAR_CATCHUP_NOT_BEFORE', '2026-07-29T22:00:00+00:00')
+
+    assert sync_mod.sync_mode(_args()) == 0, "corrupt evidence must not decline the work"
+
+
+def test_parse_instant_rejects_junk_and_normalises_zulu():
+    from repo_radar.receipts import parse_instant
+    assert parse_instant('zzzz') is None
+    assert parse_instant('') is None
+    assert parse_instant(None) is None
+    assert parse_instant(12345) is None
+    naive = parse_instant('2026-07-29T22:00:00')
+    assert naive is not None and naive.tzinfo is not None, "naive input must be made aware"
+    assert parse_instant('2026-07-29T22:00:00Z') == parse_instant('2026-07-29T22:00:00+00:00')
+
+
+def test_read_rejects_future_and_unparseable_timestamps(tmp_path):
+    import json as _json
+    from repo_radar.receipts import receipt_path
+    base = {'schema': 2, 'channel': 'stable', 'trigger': 'scheduled', 'mode': 'full',
+            'completed': True, 'qualifiesForSchedule': True, 'stats': {'errors': 0}}
+    for label, ts in (('junk', 'zzzz'), ('future', '2099-01-01T00:00:00+00:00'), ('empty', '')):
+        receipt_path(tmp_path, 'stable').write_text(_json.dumps({**base, 'finishedAt': ts}))
+        assert read_receipt(tmp_path, 'stable') is None, f"must reject {label}"
+    receipt_path(tmp_path, 'stable').write_text(
+        _json.dumps({**base, 'finishedAt': '2026-07-29T22:00:00+00:00'}))
+    assert read_receipt(tmp_path, 'stable') is not None, "a valid past timestamp is accepted"
+
+
+def test_completion_payload_carries_qualification_provenance():
+    """The status server had no channel/mode to judge with, so it advanced lastSync for everything."""
+    import inspect
+    from repo_radar.modes import sync as sync_mod
+    src = inspect.getsource(sync_mod.sync_mode)
+    idx = src.index("send_status_update('complete'")
+    head = src[max(0, idx - 700):idx]
+    for field in ("completion_data['channel']", "completion_data['mode']",
+                  "completion_data['trigger']", "completion_data['qualifiesForSchedule']"):
+        assert field in head, f"the complete payload must carry {field}"

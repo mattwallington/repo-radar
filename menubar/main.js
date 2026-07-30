@@ -13,7 +13,7 @@ const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-polic
 const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
-const { planReconcile, needsCatchUp, SCHEDULING_CHANNEL,
+const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
@@ -988,10 +988,10 @@ function startStatusServer() {
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();
-      // Only the channel that OWNS the schedule may advance the schedule watermark.
-      // planReconcile already refused dev receipts, but this path bypassed it entirely, so a
-      // successful dev run still suppressed stable's catch-up.
-      if (runtimeChannel === SCHEDULING_CHANNEL) {
+      // The channel gate alone was not enough: a stable PARTIAL run (--skip-metadata
+      // --status-server) still advanced lastSync here, bypassing "partial never qualifies" just
+      // as dev did. Now the same production rule decides, using provenance the payload carries.
+      if (completionQualifies(data, runtimeChannel)) {
         status.lastSync = new Date().toISOString();
       } else {
         status.channels = { ...(status.channels || {}) };

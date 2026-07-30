@@ -60,6 +60,25 @@ function qualifiesForSchedule(receipt) {
   return VALID_TRIGGERS.includes(receipt.trigger);
 }
 
+/**
+ * May a live completion notification advance the schedule watermark?
+ *
+ * The status-server 'complete' handler used to advance lastSync unconditionally for any stable
+ * run, so `--skip-metadata --status-server` suppressed the schedule even though Python wrote a
+ * correctly non-qualifying receipt — and planReconcile is forward-only, so it could not undo it.
+ * Same rule, same inputs, one implementation. Anything unvalidated returns false: refusing to
+ * advance is recoverable (the receipt reconciles moments later), wrongly advancing is not.
+ */
+function completionQualifies(payload, channel = SCHEDULING_CHANNEL) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.channel !== channel) return false;
+  return qualifiesForSchedule({
+    channel: payload.channel,
+    mode: payload.mode,
+    trigger: payload.trigger,
+  });
+}
+
 function channelState(status, channel) {
   const channels = (status && status.channels) || {};
   return channels[channel] || {};
@@ -148,5 +167,6 @@ function needsCatchUp(config, status, now = new Date()) {
 module.exports = {
   SCHEMA, VALID_TRIGGERS, VALID_CHANNELS, VALID_MODES, SCHEDULING_CHANNEL,
   EXIT_SKIPPED_NO_WORK,
-  validateReceipt, qualifiesForSchedule, planReconcile, needsCatchUp, channelState,
+  validateReceipt, qualifiesForSchedule, completionQualifies, planReconcile, needsCatchUp,
+  channelState,
 };

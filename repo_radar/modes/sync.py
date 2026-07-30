@@ -15,7 +15,7 @@ import threading
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
 from repo_radar import VERSION as REPO_RADAR_VERSION
-from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, qualifies_for_schedule,
+from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
                                  read_receipt, resolve_channel, resolve_trigger,
                                  run_mode, write_receipt)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
@@ -258,10 +258,15 @@ def sync_mode(args):
         existing = read_receipt(CONFIG_DIR, run_channel)
         # Re-derive via the shared rule rather than trusting the stored flag: a receipt written by
         # an older build could carry a qualification computed by a different (and wrong) rule.
-        satisfied = bool(existing and existing.get('finishedAt') and qualifies_for_schedule(
+        # Compare INSTANTS, not strings. read_receipt already rejects unparseable and future
+        # timestamps, so a corrupt receipt can no longer decline work by sorting above the
+        # watermark lexically.
+        finished_at = parse_instant(existing.get('finishedAt')) if existing else None
+        watermark = parse_instant(not_before)
+        satisfied = bool(existing and finished_at and qualifies_for_schedule(
             existing.get('channel'), existing.get('mode')))
         if satisfied:
-            if not not_before or existing['finishedAt'] > not_before:
+            if watermark is None or finished_at > watermark:
                 console.print("[yellow]A qualifying sync already completed — skipping catch-up[/yellow]")
                 if sync_logger:
                     sync_logger.event("catchup_skipped", reason="already_satisfied",
@@ -1584,6 +1589,13 @@ Stack Trace:
 
             completion_data['warning'] = warning_msg
 
+        # Carry the provenance the qualification rule needs. Without these the status server had
+        # no way to tell a full stable run from `--skip-metadata --status-server`, so it advanced
+        # lastSync for both — bypassing "partial never qualifies" exactly as dev once did.
+        completion_data['channel'] = run_channel
+        completion_data['mode'] = run_mode_name
+        completion_data['trigger'] = run_trigger
+        completion_data['qualifiesForSchedule'] = qualifies_for_schedule(run_channel, run_mode_name)
         send_status_update('complete', completion_data, args.status_server)
 
     if sync_logger:

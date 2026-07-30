@@ -45,6 +45,22 @@ VALID_TRIGGERS = ('scheduled', 'catchup', 'manual', 'cli')
 SCHEDULE_TRIGGERS = ('scheduled', 'catchup')
 
 
+def parse_instant(value):
+    """Parse an ISO-8601 timestamp into a timezone-aware datetime, or None.
+
+    Exists because the lock-held guard once compared timestamps as STRINGS: a receipt with
+    finishedAt="zzzz" passed a non-empty-string check, and "zzzz" sorts above any ISO date, so a
+    corrupt receipt declined every catch-up indefinitely. Invalid evidence must never decline work.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _valid_enum(value, allowed, default):
     candidate = (value or '').strip().lower()
     return candidate if candidate in allowed else default
@@ -187,8 +203,11 @@ def read_receipt(config_dir, channel=None):
         return None
     if data.get('completed') is not True:
         return None
-    if not isinstance(data.get('finishedAt'), str) or not data['finishedAt']:
-        return None
+    finished = parse_instant(data.get('finishedAt'))
+    if finished is None:
+        return None                     # unparseable — matches the JS validator
+    if finished > datetime.now(timezone.utc):
+        return None                     # clock skew / tampering — also matches JS
     if data.get('channel') not in VALID_CHANNELS:
         return None
     if data.get('trigger') not in VALID_TRIGGERS:
