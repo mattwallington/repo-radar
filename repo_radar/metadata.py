@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from repo_radar.config import PRISTINE_DIR, INDEX_FILE, load_cache_index
-from repo_radar.constants import CYAN, GREEN, YELLOW, RESET
+from repo_radar.constants import CYAN, GREEN, YELLOW, RED, RESET
 
 
 def extract_between(text, start_marker, end_marker):
@@ -250,16 +250,33 @@ def _parse_status_of(info):
     Files written before parse_status existed carry no marker, so inferring it means the
     already-degraded entries surface on the next index regeneration instead of staying
     invisible until each repo happens to be re-synced.
+
+    This function CLASSIFIES; it must never be able to remove a repository from the index, so
+    it is total: any input returns a status rather than raising. It previously referenced a
+    constant that had been deleted, and because it returns early for files with a recorded
+    status and for Unknown type/language, only HEALTHY files reached that line — so it raised
+    on exactly the good entries and regenerate_index's broad handler dropped them. The index
+    kept the bad repositories and discarded the good ones.
     """
-    recorded = info.get('parse_status')
-    if recorded in (PARSE_STATUS_OK, PARSE_STATUS_DEGRADED):
-        return recorded
-    brief = (info.get('brief') or '').strip()
-    if info.get('type', 'Unknown') == 'Unknown' or info.get('language', 'Unknown') == 'Unknown':
+    try:
+        recorded = info.get('parse_status')
+        if recorded in (PARSE_STATUS_OK, PARSE_STATUS_DEGRADED):
+            return recorded
+        brief = (info.get('brief') or '').strip()
+        if info.get('type', 'Unknown') == 'Unknown' or info.get('language', 'Unknown') == 'Unknown':
+            return PARSE_STATUS_DEGRADED
+        # Same tightened heuristic degradation_reasons() uses — one rule, both call sites. The
+        # deleted constant was a LOOSER prefix tuple that flagged any summary opening with a
+        # quotation mark; _looks_like_fragment requires an orphaned key/value separator, which
+        # every real leaked-fragment brief has. Restoring the tuple would reintroduce those
+        # false positives; dropping the check entirely would misclassify a genuinely
+        # fragment-brief legacy file as healthy, which is the one thing this inference exists for.
+        if not brief or _looks_like_fragment(brief):
+            return PARSE_STATUS_DEGRADED
+        return PARSE_STATUS_OK
+    except Exception:
+        # Classification can never justify losing a repository; treat the unexpected as degraded.
         return PARSE_STATUS_DEGRADED
-    if brief.startswith(_FRAGMENT_PREFIXES) or not brief:
-        return PARSE_STATUS_DEGRADED
-    return PARSE_STATUS_OK
 
 
 def regenerate_index(args):
@@ -285,7 +302,9 @@ def regenerate_index(args):
 
     # Parse metadata from each file
     repos_info = []
+    dropped = []          # files that failed to parse — each is a repository missing from INDEX
     for metadata_file in metadata_files:
+        before = len(repos_info)
         try:
             with open(metadata_file, 'r') as f:
                 content = f.read()
@@ -316,8 +335,20 @@ def regenerate_index(args):
                             'metadata_file': metadata_file.name
                         })
         except Exception as e:
+            # A repository disappearing from the index is a CORRECTNESS failure, not noise. This
+            # handler previously printed a warning and continued, so a NameError dropped 21 of 31
+            # repositories for months while the run still reported success. Keep parsing the rest,
+            # but record every drop and refuse to call a partial index a success.
+            dropped.append((metadata_file.name, str(e)))
             print(f"  {YELLOW}Warning: Could not parse {metadata_file.name}:{RESET} {e}")
             continue
+
+        # Count by OUTCOME, not by exception. A file with malformed frontmatter (no closing
+        # delimiter) falls through both `if` guards and appends nothing — no raise, no warning,
+        # no entry. That is a second silent-drop path, invisible to any except-based accounting.
+        if len(repos_info) == before:
+            dropped.append((metadata_file.name, 'no frontmatter entry produced (malformed?)'))
+            print(f"  {YELLOW}Warning: {metadata_file.name} produced no index entry{RESET}")
 
     # Sort by full name
     repos_info.sort(key=lambda x: x['full_name'])
@@ -387,4 +418,11 @@ def regenerate_index(args):
     with open(INDEX_FILE, 'w') as f:
         f.write(index_content)
 
+    if dropped:
+        total = len(repos_info) + len(dropped)
+        print(f"  {RED}✗ {len(dropped)} of {total} repositories were EXCLUDED from INDEX.md{RESET}")
+        for name, err in dropped:
+            print(f"    {RED}- {name}: {err}{RESET}")
+        print(f"  {RED}  INDEX.md is INCOMPLETE — agents cannot see the excluded repositories.{RESET}")
     print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
+    return len(dropped)

@@ -374,3 +374,59 @@ def test_structural_quick_reference_keys_are_still_flagged():
     )
     assert looks_degraded(result)
     assert any("structural" in r for r in degradation_reasons(result))
+
+
+# ── regression: the index must not drop healthy repositories ─────────────────────────────
+
+
+def test_parse_status_of_healthy_frontmatter_returns_ok():
+    """Direct regression for the NameError that silently dropped 21 of 31 repos.
+
+    _parse_status_of returns early for files with a recorded status and for Unknown
+    type/language, so ONLY a healthy file reached the fragment check — meaning the classifier
+    raised on exactly the files that were fine, and regenerate_index's broad handler dropped
+    them. The index kept the bad entries and discarded the good ones.
+    """
+    from repo_radar.metadata import PARSE_STATUS_OK, _parse_status_of
+
+    info = {
+        "brief": "A Go service that brokers eligibility checks.",
+        "type": "Backend Service",
+        "language": "Python 3.9",
+    }
+    assert _parse_status_of(info) == PARSE_STATUS_OK
+
+
+def test_parse_status_of_never_raises_on_any_input():
+    """It classifies; it must never be able to remove a repository from the index."""
+    from repo_radar.metadata import _parse_status_of
+
+    for info in ({}, {"brief": None}, {"brief": 123}, {"type": None, "language": None},
+                 {"brief": "ok", "type": "API Service", "language": "Go"},
+                 {"parse_status": "nonsense", "brief": "x", "type": "T", "language": "L"}):
+        _parse_status_of(info)  # must not raise
+
+
+def test_regenerate_index_includes_healthy_repos(tmp_path, monkeypatch):
+    """The test whose absence let a 21-repo drop ship: one healthy + one degraded, both listed."""
+    import types
+    import repo_radar.metadata as metadata
+
+    (tmp_path / "healthy-aaa1111.md").write_text(
+        "---\nrepo_name: healthy\nfull_name: org/healthy\ncache_dir: healthy-aaa1111\n"
+        "brief: A healthy repository with real analysis.\n"
+        "type: Backend Service\nlanguage: Python 3.9\nrelated_repos: []\n---\n\n# Repository\n")
+    (tmp_path / "degraded-bbb2222.md").write_text(
+        "---\nrepo_name: degraded\nfull_name: org/degraded\ncache_dir: degraded-bbb2222\n"
+        "brief: Something.\ntype: Unknown\nlanguage: Unknown\nrelated_repos: []\n---\n\n# Repository\n")
+
+    index_file = tmp_path / "INDEX.md"
+    monkeypatch.setattr(metadata, "PRISTINE_DIR", tmp_path)
+    monkeypatch.setattr(metadata, "INDEX_FILE", index_file)
+    monkeypatch.setattr(metadata, "load_cache_index", lambda: {})
+
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    content = index_file.read_text()
+    assert "**Total Repositories:** 2" in content, "a healthy repo must not be dropped"
+    assert "org/healthy" in content and "org/degraded" in content
