@@ -7,7 +7,8 @@ const fs = require('fs');
 const path = require('path');
 
 const { planReconcile, validateReceipt, qualifiesForSchedule, completionQualifies,
-        needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK } = require('../run-receipt');
+        needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK,
+        indexDroppedOf, runSucceeded } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
@@ -264,4 +265,66 @@ assert.strictEqual(completionQualifies(null), false, 'null payload');
 assert.ok(/completionQualifies\(data, runtimeChannel\)/.test(MAIN),
   'the status-server complete handler must consult the shared rule, not just the channel');
 
-console.log('run-receipt OK: production planReconcile + validation + main.js wiring landmarks');
+// ── incomplete INDEX.md must not present as a successful sync ────────────────────────────
+// Python counts index drops separately from per-repo errors so the "why was no metadata
+// generated" diagnosis stays correct. That split is only safe if EVERY success/error consumer
+// reads both — otherwise a run with errors:0 and indexDropped:3 gets a green icon, a
+// "Successfully synced" balloon, and a status file that remembers it as clean.
+{
+  const dropped = (n) => receipt({ stats: { total: 30, errors: 0, metadataGenerated: 2, indexDropped: n } });
+
+  // Validation: additive within schema 2. Absent must mean zero, not invalid — rejecting older
+  // receipts would make the app believe no sync had ever run.
+  assert.ok(validateReceipt(receipt()), 'a receipt with no indexDropped field is still valid');
+  assert.strictEqual(indexDroppedOf(receipt()), 0, 'absent indexDropped reads as zero');
+  assert.ok(validateReceipt(dropped(2)), 'an integer indexDropped is valid');
+  assert.strictEqual(indexDroppedOf(dropped(2)), 2);
+  assert.strictEqual(validateReceipt(receipt({
+    stats: { total: 1, errors: 0, indexDropped: 'two' } })), null,
+    'present-but-not-an-integer indexDropped is a corrupt receipt');
+
+  // The success rule itself.
+  assert.strictEqual(runSucceeded(receipt({ stats: { total: 1, errors: 0 } })), true,
+    'no errors and no drops is a clean run');
+  assert.strictEqual(runSucceeded(dropped(3)), false,
+    'errors:0 with an incomplete index is NOT a successful run');
+  assert.strictEqual(runSucceeded(dropped(0)), true, 'zero drops does not fail a clean run');
+  assert.strictEqual(runSucceeded(receipt()), false, 'errors:3 still fails, drops or not');
+
+  // Reconciliation must RETAIN the count. For an app-closed scheduled run the receipt is the
+  // only record the run ever happened, so a drop lost here is lost permanently.
+  const plan = planReconcile(dropped(2), { lastSync: iso(6 * 3600_000) });
+  assert.ok(plan.adopt, 'an incomplete-index run is still adopted — it did complete');
+  assert.strictEqual(plan.status.channels.stable.indexDropped, 2,
+    'the drop count must survive reconciliation into the status file');
+  assert.strictEqual(plan.status.channels.stable.errors, 0,
+    'drops must not be folded into the per-repo error count');
+  assert.strictEqual(plan.advanceLastSync, true,
+    'schedule freshness is preserved: the run completed, so do not trigger a paid catch-up');
+
+  const clean = planReconcile(receipt({ stats: { total: 1, errors: 0 } }), {});
+  assert.strictEqual(clean.status.channels.stable.indexDropped, 0,
+    'an older receipt without the field reconciles as zero, not undefined');
+}
+
+// main.js wiring landmarks for the two consumers Codex found still reporting success.
+// NOTE the key difference: the live status-server payload carries Python's raw stats dict
+// (snake_case index_dropped) while the durable receipt uses camelCase indexDropped. Both
+// spellings are asserted here so a rename on either transport fails loudly.
+assert.ok(/data\.stats\.index_dropped/.test(MAIN),
+  'the live completion handler must read the drop count off the status-server payload');
+assert.ok(/data\.stats\.errors > 0 \|\| indexDropped > 0/.test(MAIN),
+  'the icon/hasErrors decision must treat an incomplete index as a failure');
+assert.ok(/Sync Complete \(index incomplete\)/.test(MAIN),
+  'an incomplete index needs its own notification, not "Successfully synced N repositories"');
+assert.ok(/runSucceeded\(receipt\)/.test(MAIN),
+  'receipt reconciliation must consult the shared success rule');
+{
+  const fn = MAIN.slice(MAIN.indexOf('function reconcileRunReceipt()'));
+  const body = fn.slice(0, fn.indexOf('\n}'));
+  assert.ok(/hasErrors = true/.test(body),
+    'adopting a failed app-closed run must mark the tray — the receipt is its only record');
+}
+
+console.log('run-receipt OK: production planReconcile + validation + index-drop propagation'
+  + ' + main.js wiring landmarks');

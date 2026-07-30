@@ -1519,19 +1519,25 @@ Stack Trace:
 
         console.print()
 
-        # Regenerate INDEX.md
-        if not args.dry_run:
-            console.print(f"[cyan]Regenerating INDEX.md...[/cyan]")
-            # Consume the drop count. This call discarded it and printed the green line
-            # unconditionally, so a run that excluded repositories from INDEX.md still exited 0
-            # and reported success — the returned signal existed but nothing read it, which is
-            # indistinguishable from not having the signal at all.
-            stats['index_dropped'] = regenerate_index(args) or 0
-            if stats['index_dropped']:
-                console.print(f"[red]✗ INDEX.md is INCOMPLETE — {stats['index_dropped']} "
-                              f"repositories excluded (see warnings above)[/red]")
-            else:
-                console.print(f"[green]✓ INDEX.md updated[/green]")
+    # Regenerate INDEX.md. Deliberately OUTSIDE the metadata-generation block: the index is
+    # derived from the metadata files already on disk, not from the ones this run happened to
+    # write. Nested under `if repos_needing_metadata`, the common steady-state sync — every
+    # repository current, nothing to analyse — never rebuilt or even validated the index, so a
+    # corrupt one persisted indefinitely and this very fix could not self-heal the shipped
+    # 10-of-31 INDEX unless some repository coincidentally needed re-analysis.
+    if not args.dry_run:
+        console.print()
+        console.print(f"[cyan]Regenerating INDEX.md...[/cyan]")
+        # Consume the drop count. This call discarded it and printed the green line
+        # unconditionally, so a run that excluded repositories from INDEX.md still exited 0
+        # and reported success — the returned signal existed but nothing read it, which is
+        # indistinguishable from not having the signal at all.
+        stats['index_dropped'] = regenerate_index(args) or 0
+        if stats['index_dropped']:
+            console.print(f"[red]✗ INDEX.md is INCOMPLETE — {stats['index_dropped']} "
+                          f"repositories excluded (see warnings above)[/red]")
+        else:
+            console.print(f"[green]✓ INDEX.md updated[/green]")
 
     # Summary
     console.print()

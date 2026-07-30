@@ -14,7 +14,7 @@ const runtime = require('./runtime');
 const { resolveChannel, layout, cliPath } = require('./runtime/paths');
 const { detectStableManaged } = require('./runtime/quiesce');
 const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
-        EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
+        EXIT_SKIPPED_NO_WORK, indexDroppedOf, runSucceeded } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
 let appIsQuitting = false;
@@ -1013,9 +1013,23 @@ function startStatusServer() {
         console.warn('Sync warning:', data.warning);
       }
       
-      // Update icon based on success/error/warning
-      if (data.stats && data.stats.errors > 0) {
-        console.log('Sync had errors:', data.stats.errors);
+      // Repositories excluded from INDEX.md. NOTE the key: the status-server payload carries
+      // Python's raw stats dict (snake_case `index_dropped`), whereas the durable receipt uses
+      // camelCase `indexDropped`. Same concept, two spellings, one on each transport.
+      const indexDropped = (data.stats && Number.isInteger(data.stats.index_dropped))
+        ? data.stats.index_dropped : 0;
+      if (indexDropped > 0) {
+        const msg = `⚠️ INDEX.md is incomplete: ${indexDropped} repositor`
+          + `${indexDropped !== 1 ? 'ies are' : 'y is'} missing and invisible to agents.`;
+        status.errorLog = (status.errorLog || '') + '\n' + msg;
+        console.warn('Sync produced an incomplete index:', indexDropped);
+      }
+
+      // Update icon based on success/error/warning. An incomplete index counts as a failure even
+      // when errors is 0: every repository can clone and analyse cleanly while INDEX.md — the
+      // file agents actually read to decide what exists — is missing entries.
+      if (data.stats && (data.stats.errors > 0 || indexDropped > 0)) {
+        console.log('Sync had errors:', data.stats.errors, 'index drops:', indexDropped);
         showErrorIcon();
         status.hasErrors = true;
       } else if (hasWarning) {
@@ -1047,6 +1061,16 @@ function startStatusServer() {
           tray.displayBalloon({
             title: 'Sync Complete (with errors)',
             content: `${data.stats.errors} error${data.stats.errors !== 1 ? 's' : ''} occurred during sync`
+          });
+        }
+      } else if (indexDropped > 0) {
+        // Distinct from the error balloon: nothing failed to sync, but the index that agents read
+        // does not list everything that did. "Successfully synced N repositories" would be a lie.
+        if (tray.displayBalloon) {
+          tray.displayBalloon({
+            title: 'Sync Complete (index incomplete)',
+            content: `${indexDropped} repositor${indexDropped !== 1 ? 'ies' : 'y'} could not be `
+              + `added to INDEX.md and will be invisible to agents`
           });
         }
       } else if (hasWarning) {
@@ -2232,10 +2256,27 @@ function reconcileRunReceipt() {
     const before = loadStatus();
     const plan = planReconcile(receipt, before, { channel: runtimeChannel });
     if (!plan.adopt) return null;
-    saveStatus(plan.status);
+
+    // A run that finished while the app was closed has NO other record — the status server was
+    // not listening, so this receipt is the only evidence it happened. Adopting it silently meant
+    // a run that failed, or that produced an incomplete index, presented afterwards as a clean
+    // sync. Note this deliberately does not clear hasErrors on success: a prior failure the user
+    // has not looked at yet is not resolved by a later run.
+    const adopted = { ...plan.status };
+    const dropped = indexDroppedOf(receipt);
+    if (!runSucceeded(receipt)) {
+      adopted.hasErrors = true;
+      const detail = dropped > 0
+        ? `${dropped} repositor${dropped !== 1 ? 'ies' : 'y'} missing from INDEX.md`
+        : `${receipt.stats.errors} error${receipt.stats.errors !== 1 ? 's' : ''}`;
+      adopted.errorLog = (adopted.errorLog || '')
+        + `\n⚠️ ${receipt.trigger} sync finished ${receipt.finishedAt} with ${detail}.`;
+    }
+    saveStatus(adopted);
     try { updateTrayMenu(); } catch (e) { /* tray may not exist yet at startup */ }
     console.log(`Adopted ${receipt.trigger} run finished ${receipt.finishedAt}`
-      + ` (${plan.reason}; lastSync ${plan.advanceLastSync ? 'advanced' : 'unchanged'})`);
+      + ` (${plan.reason}; lastSync ${plan.advanceLastSync ? 'advanced' : 'unchanged'}`
+      + `; errors ${receipt.stats.errors}, indexDropped ${dropped})`);
     return receipt;
   } catch (e) {
     console.error('Could not reconcile run receipt:', e.message);

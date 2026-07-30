@@ -85,6 +85,30 @@ console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).l
   }
   assert.strictEqual(compared, pr.channels.length * pr.modes.length,
     'every channel x mode combination must be compared');
+
+  // Stats key names cross the language boundary too, and this one has a spelling trap: Python's
+  // in-process stats dict uses snake_case (index_dropped) while the receipt it writes uses
+  // camelCase (indexDropped). JS reads the first off the live status-server payload and the
+  // second off the receipt. Assert against a receipt Python ACTUALLY WROTE rather than a
+  // hand-built fixture, so a rename on either side fails here instead of silently reading
+  // undefined and reporting an incomplete index as a clean sync.
+  const written = JSON.parse(execFileSync(py, ['-c',
+    "import sys,json,tempfile,pathlib;sys.path.insert(0,'.');" +
+    "from repo_radar import receipts as r;" +
+    "d=pathlib.Path(tempfile.mkdtemp());" +
+    "p=r.write_receipt(d,trigger='scheduled',started_at='2026-07-30T00:00:00+00:00'," +
+    "stats={'total':1,'errors':0,'index_dropped':2},channel='stable',mode='full');" +
+    "print(p.read_text())"], { cwd: root, encoding: 'utf8' }));
+  assert.strictEqual(written.stats.indexDropped, 2,
+    'Python must write stats.indexDropped (camelCase) — JS reads exactly this key');
+  assert.strictEqual(rr.indexDroppedOf(written), 2, 'JS must read the count Python wrote');
+  assert.strictEqual(written.errorFree, false,
+    'an incomplete index must make the run not error-free, even with zero per-repo errors');
+  assert.strictEqual(rr.runSucceeded(written), false, 'JS must agree the run did not succeed');
+  assert.strictEqual(written.completed, true,
+    'the run still COMPLETED — marking it otherwise would trigger a redundant paid catch-up');
+  assert.ok(rr.validateReceipt(written), 'a real Python receipt must pass JS validation');
+
   console.log(`run-receipt parity OK: ${compared} qualification combos, ${pr.triggers.length} triggers,`
-    + ` schema ${pr.schema}, exit ${pr.exit}`);
+    + ` schema ${pr.schema}, exit ${pr.exit}, indexDropped round-trip verified`);
 }

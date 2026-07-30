@@ -40,7 +40,28 @@ function validateReceipt(receipt, { channel = SCHEDULING_CHANNEL, now = new Date
   if (new Date(receipt.finishedAt) > now) return null;         // clock skew / tampering
   const stats = receipt.stats;
   if (!stats || typeof stats !== 'object' || !Number.isInteger(stats.errors)) return null;
+  // Additive within schema 2: receipts written before indexDropped existed simply omit it, and
+  // absent must mean zero rather than invalid — rejecting those would discard every pre-existing
+  // receipt and make the app believe no sync had ever run. Present-but-not-an-integer is still a
+  // corrupt receipt.
+  if (stats.indexDropped !== undefined && !Number.isInteger(stats.indexDropped)) return null;
   return receipt;
+}
+
+/** Repositories excluded from INDEX.md by this run. Absent (older schema-2 receipt) means zero. */
+function indexDroppedOf(receipt) {
+  const n = receipt && receipt.stats ? receipt.stats.indexDropped : 0;
+  return Number.isInteger(n) ? n : 0;
+}
+
+/**
+ * Did this run leave the cache in a good state? Distinct from `completed`: an incomplete INDEX.md
+ * means repositories are invisible to agents even though every clone and analysis succeeded, so a
+ * run with errors:0 and indexDropped:3 must not be reported to the user as a clean sync.
+ */
+function runSucceeded(receipt) {
+  const errors = receipt && receipt.stats ? receipt.stats.errors : 0;
+  return (Number.isInteger(errors) ? errors : 0) === 0 && indexDroppedOf(receipt) === 0;
 }
 
 /**
@@ -107,6 +128,10 @@ function planReconcile(receipt, status, opts = {}) {
     receiptAt: valid.finishedAt,
     trigger: valid.trigger,
     errors: valid.stats.errors,
+    // Retained separately from errors. Without it, an app-closed scheduled run that produced an
+    // incomplete index reconciled into the status file as an unqualified success and the drop
+    // vanished — the one case where the receipt is the ONLY record the run ever happened.
+    indexDropped: indexDroppedOf(valid),
     mode: valid.mode,
     version: valid.version || null,   // observability: which build produced this run
     qualifies,
@@ -168,5 +193,5 @@ module.exports = {
   SCHEMA, VALID_TRIGGERS, VALID_CHANNELS, VALID_MODES, SCHEDULING_CHANNEL,
   EXIT_SKIPPED_NO_WORK,
   validateReceipt, qualifiesForSchedule, completionQualifies, planReconcile, needsCatchUp,
-  channelState,
+  channelState, indexDroppedOf, runSucceeded,
 };
