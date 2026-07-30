@@ -20,6 +20,7 @@ def print_help():
     print("  sync               Sync all configured repos (clone new, update existing, generate metadata)")
     print("  analyze            Analysis mode only (report status, no changes)")
     print("  clean              Remove cached repositories and/or metadata")
+    print("  publish            Write the corpus as an Agent Context Snapshot for cloud agents")
     print("  help               Show this help message")
     print("  get-description    Output JSON format description")
     print()
@@ -30,6 +31,9 @@ def print_help():
     print("  --repos-only           Only affect repository directories [clean only]")
     print("  --regenerate-metadata  Force regeneration of all metadata [sync only]")
     print("  --skip-metadata        Skip metadata generation [sync only]")
+    print("  --orphans              Report cache for unconfigured/excluded repos [clean only]")
+    print("  --out <dir>            Snapshot output directory [publish only]")
+    print("  --src <dir>            Corpus directory [publish only]")
     print()
     print("Environment Variables:")
     print("  GITHUB_TOKEN       GitHub Personal Access Token (required for configuration)")
@@ -46,6 +50,8 @@ def print_help():
     print(f"  {SCRIPT_NAME} sync --skip-metadata")
     print(f"  {SCRIPT_NAME} clean")
     print(f"  {SCRIPT_NAME} clean --force --metadata-only")
+    print(f"  {SCRIPT_NAME} clean --orphans")
+    print(f"  {SCRIPT_NAME} publish --out ~/context-snapshot")
 
 
 def get_description():

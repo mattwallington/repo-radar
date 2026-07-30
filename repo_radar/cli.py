@@ -12,7 +12,8 @@ def main():
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('command', nargs='?',
-                        choices=['configure', 'sync', 'analyze', 'clean', 'help', 'get-description'])
+                        choices=['configure', 'sync', 'analyze', 'clean', 'publish',
+                                 'help', 'get-description'])
     parser.add_argument('--dry-run', '-n', action='store_true')
     parser.add_argument('--force', '-f', action='store_true')
     parser.add_argument('--metadata-only', action='store_true')
@@ -25,6 +26,12 @@ def main():
     parser.add_argument('--orphans', action='store_true',
                         help='clean: report cached data for unconfigured/excluded repositories '
                              '(add --force to remove)')
+    parser.add_argument('--out', default=None,
+                        help='publish: output directory for the snapshot')
+    parser.add_argument('--src', default=None,
+                        help='publish: corpus directory (default: the configured pristine dir)')
+    parser.add_argument('--generator-version', default=None)
+    parser.add_argument('--generated-at', default=None)
     parser.add_argument('--version', '-V', action='store_true')
 
     args = parser.parse_args()
@@ -53,6 +60,12 @@ def main():
                 return 2
         from repo_radar.modes.clean import clean_mode
         return clean_mode(args)
+
+    # Publishing reads the corpus and writes a self-contained tree; it needs no LLM provider, so
+    # it deliberately skips the full dependency check that would otherwise demand API packages.
+    if args.command == 'publish':
+        from repo_radar.publish import publish_mode
+        return publish_mode(args)
 
     # Check full dependencies for other commands
     from repo_radar.dependencies import check_dependencies
