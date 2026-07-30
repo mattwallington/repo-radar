@@ -64,3 +64,44 @@ def test_save_round_trips_content(tmp_path, monkeypatch):
     payload = {"ai_model": "claude-opus-5", "repositories": [{"name": "a"}], "github_token": "t"}
     cfg.save_config(payload)
     assert json.loads(cfg.CONFIG_FILE.read_text()) == payload
+
+
+# ── repository exclusions ────────────────────────────────────────────────────────────────
+# De-configuring a repository is silent, reversible by the next `configure` run, and leaves its
+# clone and metadata on disk to be indexed forever. An exclusion is a durable statement instead.
+
+def test_exclusions_match_full_name_and_bare_name():
+    from repo_radar.config import is_excluded
+
+    assert is_excluded("ReperioHealth/reperio-nordic-fw", ["reperio-nordic-fw"])
+    assert is_excluded("ReperioHealth/reperio-nordic-fw", ["ReperioHealth/reperio-nordic-fw"])
+    assert is_excluded("ReperioHealth/reperio-nordic-fw", ["reperio-NORDIC-fw"]), "case-insensitive"
+    assert not is_excluded("ReperioHealth/reperio-web-app", ["reperio-nordic-fw"])
+
+
+def test_exclusions_are_exact_not_substring():
+    """'reperio-web-app' must not take 'reperio-web-app-legacy' with it."""
+    from repo_radar.config import is_excluded
+
+    assert not is_excluded("ReperioHealth/reperio-web-app-legacy", ["reperio-web-app"])
+    assert not is_excluded("ReperioHealth/reperio-web-app", ["web-app"])
+
+
+def test_a_qualified_exclusion_does_not_match_another_org():
+    from repo_radar.config import is_excluded
+
+    assert not is_excluded("OtherOrg/reperio-nordic-fw",
+                           ["ReperioHealth/reperio-nordic-fw"])
+    assert is_excluded("OtherOrg/reperio-nordic-fw", ["reperio-nordic-fw"]), (
+        "a BARE name is deliberately org-agnostic")
+
+
+def test_missing_or_malformed_exclusions_exclude_nothing():
+    from repo_radar.config import is_excluded, load_exclusions
+
+    assert load_exclusions({}) == []
+    assert load_exclusions({"exclusions": None}) == []
+    assert load_exclusions({"exclusions": "not-a-list"}) == [], "a string must not be iterated"
+    assert load_exclusions({"exclusions": ["  a  ", "", "  "]}) == ["a"]
+    assert not is_excluded("Org/repo", [])
+    assert not is_excluded(None, ["repo"])

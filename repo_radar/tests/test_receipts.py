@@ -33,6 +33,7 @@ def isolate_corpus(tmp_path, monkeypatch):
     corpus.mkdir()
     monkeypatch.setattr(metadata, "PRISTINE_DIR", corpus)
     monkeypatch.setattr(metadata, "INDEX_FILE", corpus / "INDEX.md")
+    monkeypatch.setattr(metadata, "load_exclusions", lambda: [])
     return corpus
 
 

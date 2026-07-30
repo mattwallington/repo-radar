@@ -199,3 +199,91 @@ def test_sync_rebuilds_the_index_on_a_genuine_steady_state_run(sync_harness):
     assert receipt['stats']['metadataGenerated'] == 0
     assert len(calls) == 2, "a steady-state run must still validate the derived index"
     assert rc == 1 and receipt['stats']['indexDropped'] == 1
+
+
+# ── orphan detection ─────────────────────────────────────────────────────────────────────
+# `clean` was all-or-nothing, so removing one stale 659 MB clone meant wiping the cache and
+# re-cloning thirty repositories. Orphans are cached data no configured repository claims.
+
+def _corpus(tmp_path, entries):
+    """entries: {cache_name: full_name_or_None}. None means a clone with no metadata."""
+    from repo_radar.config import get_cache_name
+
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    for cache_name, full_name in entries.items():
+        (pristine / cache_name).mkdir()
+        if full_name:
+            (pristine / f'{cache_name}.md').write_text(
+                f"---\nfull_name: {full_name}\ncache_dir: {cache_name}\n---\n")
+    (pristine / 'INDEX.md').write_text('# Index\n')
+    return pristine
+
+
+def _repo(full_name):
+    return {'full_name': full_name, 'clone_url': f'https://github.com/{full_name}.git'}
+
+
+def _cache(full_name):
+    from repo_radar.config import get_cache_name
+    return get_cache_name(f'https://github.com/{full_name}.git', full_name.split('/')[-1])
+
+
+def test_configured_repositories_are_never_orphans(tmp_path):
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    orphans, kept = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], "a configured repository's cache must never be reported"
+    assert len(kept) == 2, "its directory and its metadata file"
+
+
+def test_an_unconfigured_repository_is_an_orphan(tmp_path):
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept',
+                                  _cache('org/gone'): 'org/gone'})
+    orphans, _ = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    names = {p.name for p, _f, _r in orphans}
+    assert names == {_cache('org/gone'), f"{_cache('org/gone')}.md"}
+    assert all('not in configured repositories' in r for _p, _f, r in orphans)
+
+
+def test_an_excluded_repository_is_an_orphan_even_while_still_configured(tmp_path):
+    """Exclusion is durable: it must not require also editing the repositories list."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/firmware'): 'org/firmware'})
+    orphans, kept = find_orphans(pristine, {'repositories': [_repo('org/firmware')],
+                                            'exclusions': ['firmware']})
+
+    assert kept == [], "an excluded repository is not 'kept'"
+    assert len(orphans) == 2
+    assert all('excluded by configuration' in r for _p, _f, r in orphans)
+
+
+def test_a_clone_with_no_metadata_is_identified_from_its_directory_name(tmp_path):
+    """The largest orphan in practice had never been analyzed, so it had no metadata to read."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {'reperio-nordic-fw-0a10653': None})
+    orphans, _ = find_orphans(pristine, {'repositories': [],
+                                         'exclusions': ['reperio-nordic-fw']})
+
+    assert len(orphans) == 1
+    assert 'excluded by configuration (reperio-nordic-fw)' in orphans[0][2], (
+        'a clone with no metadata must still be recognisable by its cache directory name')
+
+
+def test_index_and_symlinks_are_never_reported_as_orphans(tmp_path):
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    (pristine / 'kept').symlink_to(pristine / _cache('org/kept'))
+    (pristine / '.cache-index.json').write_text('{}')
+
+    orphans, _ = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], "INDEX.md, dotfiles and stable-name symlinks are not orphans"

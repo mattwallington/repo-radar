@@ -36,6 +36,44 @@ CACHE_INDEX_FILE = PRISTINE_DIR / ".cache-index.json"
 INDEX_FILE = PRISTINE_DIR / "INDEX.md"
 
 
+def load_exclusions(config=None):
+    """Repositories that must never be cloned, analyzed, indexed or published.
+
+    Distinct from simply removing a repository from `repositories`: de-configuring is silent and
+    reversible by the next `configure` run, and it leaves any existing clone and metadata behind to
+    be indexed forever. An exclusion is a durable, visible statement that this repository is not
+    part of the corpus.
+    """
+    cfg = config if config is not None else (load_config() or {})
+    raw = cfg.get('exclusions') or []
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def is_excluded(full_name, exclusions):
+    """Match `owner/name` exactly, or a bare `name` against the name half.
+
+    Both forms are accepted because both are how people refer to these repositories, but they are
+    matched precisely rather than by substring: 'reperio-web-app' must not exclude
+    'reperio-web-app-legacy', and a bare name must not silently match a different org.
+    """
+    if not full_name or not exclusions:
+        return False
+    target = str(full_name).strip().lower()
+    bare = target.split('/')[-1]
+    for entry in exclusions:
+        candidate = str(entry).strip().lower()
+        if not candidate:
+            continue
+        if '/' in candidate:
+            if candidate == target:
+                return True
+        elif candidate == bare:
+            return True
+    return False
+
+
 def get_cache_name(clone_url, repo_name):
     """Generate cache directory name from clone URL and repo name."""
     hash_obj = hashlib.sha256(clone_url.encode())

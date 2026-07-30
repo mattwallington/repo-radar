@@ -1,5 +1,7 @@
 import types
 
+import pytest
+
 from repo_radar.metadata import (
     PARSE_STATUS_DEGRADED,
     PARSE_STATUS_OK,
@@ -8,6 +10,18 @@ from repo_radar.metadata import (
     looks_degraded,
     parse_llm_response,
 )
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_exclusions(monkeypatch):
+    """regenerate_index consults the user's real config for exclusions.
+
+    Autouse so no test in this module can depend on what happens to be excluded on the machine
+    running it — the same ambient-state hazard as reading the real ~/repos-pristine. Tests that
+    exercise exclusions override this explicitly.
+    """
+    import repo_radar.metadata as metadata
+    monkeypatch.setattr(metadata, "load_exclusions", lambda: [])
 
 
 DELIMITED_RESPONSE = """Some preamble
@@ -537,6 +551,34 @@ def test_classifier_failure_is_announced_and_the_repository_is_still_indexed(
         "an internal classifier defect must be visible, not absorbed into 'degraded'")
     assert "healthy-aaa1111.md" in out, "the message must identify which file failed"
     assert "org/healthy" in index_file.read_text()
+
+
+def test_an_excluded_repo_leaves_the_index_without_counting_as_a_drop(
+        tmp_path, monkeypatch, capsys):
+    """A decision and a defect must not look the same.
+
+    An excluded repository is deliberately absent; a dropped one is missing when it should be
+    there and fails the run. Counting an exclusion as a drop would make every sync exit 1 forever
+    for as long as any excluded repository still had a metadata file on disk.
+    """
+    metadata, index_file = _index_env(tmp_path, monkeypatch)
+    (tmp_path / "healthy-aaa1111.md").write_text(HEALTHY_FRONTMATTER)
+    (tmp_path / "firmware-eee5555.md").write_text(
+        "---\nfull_name: org/firmware\ncache_dir: firmware-eee5555\nbrief: 600MB of firmware.\n"
+        "type: Firmware\nlanguage: C\nrelated_repos: []\n---\n")
+    monkeypatch.setattr(metadata, "load_exclusions", lambda: ["firmware"])
+
+    dropped = metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+
+    assert dropped == 0, "an exclusion is a decision, not a failure"
+    content = index_file.read_text()
+    assert "org/firmware" not in content, "an excluded repo must not be indexed"
+    assert "org/healthy" in content
+    assert "**Total Repositories:** 1" in content
+    out = capsys.readouterr().out
+    assert "Excluded 1 repository" in out and "org/firmware" in out, "the omission must be visible"
+    assert "EXCLUDED from INDEX.md" not in out, "not the red incomplete-index banner"
+    assert "✓ INDEX.md updated" in out, "the run succeeded"
 
 
 def test_sync_consumes_the_index_drop_count():

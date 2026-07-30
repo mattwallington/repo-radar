@@ -6,7 +6,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from repo_radar.config import PRISTINE_DIR, INDEX_FILE, load_cache_index
+from repo_radar.config import (PRISTINE_DIR, INDEX_FILE, load_cache_index,
+                               load_exclusions, is_excluded)
 from repo_radar.constants import CYAN, GREEN, YELLOW, RED, RESET
 
 
@@ -310,9 +311,12 @@ def regenerate_index(args):
     # Parse metadata from each file
     repos_info = []
     dropped = []          # files that failed to parse — each is a repository missing from INDEX
+    excluded = []         # deliberately omitted — NOT a drop; see below
+    exclusions = load_exclusions()
     for metadata_file in metadata_files:
         before = len(repos_info)
-        reason = None     # set when we can name why this file yielded no entry
+        reason = None       # set when we can name why this file yielded no entry
+        omitted = False     # deliberately omitted rather than lost
         try:
             with open(metadata_file, 'r') as f:
                 content = f.read()
@@ -340,6 +344,12 @@ def regenerate_index(args):
                                 n for n, v in (('full_name', full_name), ('cache_dir', cache_dir))
                                 if not v)
                             reason = f'frontmatter missing required identity field(s): {missing}'
+                        elif is_excluded(full_name, exclusions):
+                            # Deliberately omitted, so it must NOT be counted as a drop: a drop
+                            # means "this should be here and is not" and fails the run. Recording
+                            # it separately keeps the distinction between a decision and a defect.
+                            excluded.append(full_name)
+                            omitted = True
                         else:
                             repos_info.append({
                                 'full_name': full_name,
@@ -369,7 +379,7 @@ def regenerate_index(args):
         # no entry. That is a second silent-drop path, invisible to any except-based accounting.
         # Every no-entry path funnels through this single check, so a new one cannot be added
         # without being counted; `reason` only supplies a better message when we know one.
-        if len(repos_info) == before:
+        if len(repos_info) == before and not omitted:
             detail = reason or 'no frontmatter entry produced (malformed?)'
             dropped.append((metadata_file.name, detail))
             print(f"  {YELLOW}Warning: {metadata_file.name} produced no index entry: "
@@ -442,6 +452,10 @@ def regenerate_index(args):
     # Write INDEX.md
     with open(INDEX_FILE, 'w') as f:
         f.write(index_content)
+
+    if excluded:
+        print(f"  {CYAN}Excluded {len(excluded)} repositor{'ies' if len(excluded) != 1 else 'y'} "
+              f"per configuration:{RESET} {', '.join(sorted(excluded))}")
 
     # A partial index must never present as a success. Printing the red block and then the green
     # checkmark anyway is what let 21 missing repositories read as a clean run for months.

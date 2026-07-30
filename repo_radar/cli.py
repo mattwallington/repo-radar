@@ -20,6 +20,11 @@ def main():
     parser.add_argument('--regenerate-metadata', action='store_true')
     parser.add_argument('--skip-metadata', action='store_true')
     parser.add_argument('--status-server', action='store_true')
+    # `clean` was all-or-nothing, so removing one stale clone meant wiping the cache and
+    # re-cloning everything. --orphans scopes it to data no configured repository claims.
+    parser.add_argument('--orphans', action='store_true',
+                        help='clean: report cached data for unconfigured/excluded repositories '
+                             '(add --force to remove)')
     parser.add_argument('--version', '-V', action='store_true')
 
     args = parser.parse_args()

@@ -1,6 +1,7 @@
 """Analyze mode: report repository status without making changes."""
 
-from repo_radar.config import load_config, load_cache_index, get_cache_name, PRISTINE_DIR
+from repo_radar.config import (load_config, load_cache_index, get_cache_name,
+                               load_exclusions, is_excluded, PRISTINE_DIR)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET
 from repo_radar.git import get_repo_status
 from repo_radar.ui import get_short_id, format_id
@@ -17,7 +18,9 @@ def analyze_mode(args):
         print(f"{RED}No configuration found. Run 'configure' first.{RESET}")
         return 1
 
-    repos = config.get('repositories', [])
+    exclusions = load_exclusions(config)
+    repos = [r for r in config.get('repositories', [])
+             if not is_excluded(r.get('full_name'), exclusions)]
     if not repos:
         print(f"{YELLOW}No repositories configured{RESET}")
         return 0

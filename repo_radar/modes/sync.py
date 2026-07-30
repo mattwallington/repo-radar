@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
+from repo_radar.config import (load_config, save_config, load_cache_index, save_cache_index,
+                               get_cache_name, load_exclusions, is_excluded,
+                               PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE)
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
                                  read_receipt, resolve_channel, resolve_trigger,
@@ -310,7 +312,16 @@ def sync_mode(args):
         console.print(f"[red]No configuration found. Run 'configure' first.[/red]")
         return 1
 
-    repos = config.get('repositories', [])
+    # Excluded repositories are dropped before anything counts them, so they never appear in the
+    # totals, never get cloned, and never cost an LLM call.
+    exclusions = load_exclusions(config)
+    configured = config.get('repositories', [])
+    repos = [r for r in configured if not is_excluded(r.get('full_name'), exclusions)]
+    if len(repos) != len(configured):
+        skipped = len(configured) - len(repos)
+        console.print(f"[dim]Excluding {skipped} configured "
+                      f"repositor{'ies' if skipped != 1 else 'y'} per config exclusions[/dim]")
+
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
         # An empty CONFIG is not an empty CORPUS. Metadata files and a stale INDEX.md remain on
