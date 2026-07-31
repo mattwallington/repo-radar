@@ -22,10 +22,13 @@ For the schema-v1 profile (ASCII keys, strings, one integer) json.dumps(sort_key
 is JCS-equivalent, which is what makes metadataSnapshotId reproducible across implementations.
 """
 import argparse
+import fcntl
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -278,10 +281,41 @@ def looks_like_snapshot(path):
         manifest = json.loads(manifest_file.read_text())
     except (OSError, ValueError) as exc:
         return False, f'manifest.json is not readable JSON ({exc})'
-    problems = validate_manifest(manifest) + verify_tree(path, manifest)
+    # Structure first, and stop there if it fails: traversing a tree against a manifest we already
+    # know is malformed produces confusing secondary errors about the wrong thing.
+    problems = validate_manifest(manifest)
+    if problems:
+        return False, problems[0]
+    problems = verify_tree(path, manifest)
     if problems:
         return False, problems[0]
     return True, 'a valid snapshot'
+
+
+def _inventory(root):
+    """Every descendant of `root` as (relpath, lstat result), never following symlinks.
+
+    lstat and a manual walk rather than rglob + is_file(): is_file() follows symlinks and reports
+    nothing at all for a FIFO or a socket, so an inventory built from it silently omitted entries
+    that would then be deleted as though the manifest had accounted for them.
+    """
+    root = Path(root)
+    found = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError as exc:
+            found.append((str(current.relative_to(root)), None, str(exc)))
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            info = entry.stat(follow_symlinks=False)
+            found.append((str(path.relative_to(root)), info, None))
+            if stat.S_ISDIR(info.st_mode) and not entry.is_symlink():
+                stack.append(path)
+    return found
 
 
 def verify_tree(root, manifest):
@@ -289,7 +323,7 @@ def verify_tree(root, manifest):
 
     Run against the tree we just wrote — the manifest describes what we *intended*, and copying
     two repositories to the same path would otherwise leave one recorded hash describing bytes
-    that are no longer there — and against an existing destination, where every file it contains
+    that are no longer there — and against an existing destination, where EVERY entry it contains
     must be one this tool put there before any of it may be deleted.
     """
     root = Path(root)
@@ -304,15 +338,37 @@ def verify_tree(root, manifest):
             continue
         if sha256_file(target) != entry.get('metadataSha256'):
             problems.append(f'{key}: {path} does not match its recorded metadataSha256')
-    actual = {str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
-    for extra in sorted(actual - declared):
-        problems.append(f'undeclared file in snapshot: {extra}')
-    for missing in sorted(declared - actual):
+
+    # The index is declared with a hash like any other file, and its CONTENT was never checked —
+    # so a snapshot whose INDEX.md had been edited still validated as ours.
+    index_path = root / 'pristine/INDEX.md'
+    index_entry = manifest.get('index') if isinstance(manifest.get('index'), dict) else {}
+    if index_path.is_file():
+        if sha256_file(index_path) != index_entry.get('sha256'):
+            problems.append('pristine/INDEX.md does not match its recorded index.sha256')
+
+    allowed_dirs = {'pristine'}
+    seen_files = set()
+    for rel, info, error in sorted(_inventory(root)):
+        if error is not None:
+            problems.append(f'cannot read {rel}: {error}')
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            problems.append(f'symlink in snapshot (rejected by the contract): {rel}')
+        elif stat.S_ISDIR(info.st_mode):
+            if rel not in allowed_dirs:
+                problems.append(f'undeclared directory in snapshot: {rel}')
+        elif stat.S_ISREG(info.st_mode):
+            if rel in declared:
+                seen_files.add(rel)
+            else:
+                problems.append(f'undeclared file in snapshot: {rel}')
+        else:
+            # FIFOs, sockets, devices. None of these can be ours, and deleting a path we cannot
+            # even classify is exactly the thing this check exists to prevent.
+            problems.append(f'special filesystem entry in snapshot: {rel}')
+    for missing in sorted(declared - seen_files):
         problems.append(f'declared file missing from snapshot: {missing}')
-    for link in root.rglob('*'):
-        if link.is_symlink():
-            problems.append(f'symlink in snapshot (rejected by the contract): '
-                            f'{link.relative_to(root)}')
     return problems
 
 
@@ -440,14 +496,53 @@ def publish_mode(args):
     # deterministic paths this code rmtree'd unconditionally, so a sibling directory that happened
     # to carry either name was destroyed by a SUCCESSFUL publish. Never delete a path we did not
     # just create; a unique directory needs no clearing.
+    if args.dry_run:
+        # Stage in the system temp directory and touch nothing near `out`: a dry run must leave
+        # the filesystem exactly as it found it, and creating out's parent hierarchy (or a lock
+        # file beside it) to have somewhere to build is still a change the user did not ask for.
+        staging = Path(tempfile.mkdtemp(prefix='repo-radar-publish-dryrun-'))
+        try:
+            return _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
+                                   published, indexed, expected, failures)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
     out.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f'.{out.name}.staging-', dir=out.parent))
-    retired = None
+    lock = None
     try:
-        return _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
-                               published, indexed, expected, failures)
+        # One publisher per destination. Without it, two concurrent runs can each move the other's
+        # freshly installed snapshot aside and delete it.
+        lock = _acquire_lock(out)
+        if lock is None:
+            print(f'{RED}✗ another repo-radar publish is already writing to {out}{RESET}')
+            return 1
+        staging = Path(tempfile.mkdtemp(prefix=f'.{out.name}.staging-', dir=out.parent))
+        try:
+            return _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
+                                   published, indexed, expected, failures)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if lock is not None:
+            _release_lock(lock)
+
+
+def _acquire_lock(out):
+    """An exclusive advisory lock for this destination, or None if another run holds it."""
+    try:
+        handle = open(out.parent / f'.{out.name}.publish.lock', 'w')
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        return None
+
+
+def _release_lock(handle):
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+    except OSError:
+        pass
 
 
 def _build_and_swap(args, out, staging, index_text, links, repos, skipped, excluded,
@@ -504,34 +599,49 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
               f'Nothing was written.')
         return 0
 
-    # Re-validate the destination immediately before touching it. It was checked before the build,
-    # which can take a while on a large corpus, and another process could have replaced it in the
-    # meantime — we would then move or delete whatever arrived.
-    if out.exists():
-        ok, why = looks_like_snapshot(out)
-        if not ok:
-            print()
-            print(f'{RED}✗ {out} changed while the snapshot was being built and is no longer a '
-                  f'valid snapshot ({why}){RESET}')
-            print(f'{YELLOW}  Nothing was published.{RESET}')
-            return 1
-
-    # Swap. Move the old tree aside under a unique name first, so the window in which `out` does
-    # not exist is as short as a rename, then delete the old one only after the new one is in
-    # place. On any failure, put the old one back rather than leaving nothing.
+    # MOVE FIRST, THEN VALIDATE. Validating `out` and then renaming it validates one object and
+    # deletes whatever happens to occupy that PATHNAME afterwards — Codex replaced the destination
+    # between the two and watched a successful publish delete an unrelated file. Moving it aside
+    # first means everything from here on concerns the exact object we are holding, and if it
+    # turns out not to be our snapshot we put it back untouched.
     retired = None
-    if out.exists():
+    if out.exists() or out.is_symlink():
+        before = os.lstat(out)
         retired = Path(tempfile.mkdtemp(prefix=f'.{out.name}.previous-', dir=out.parent))
         retired.rmdir()                  # mkdtemp reserved the name; rename needs it free
-        out.rename(retired)
+        try:
+            out.rename(retired)
+        except OSError as exc:
+            print(f'{RED}✗ could not move the existing {out} aside: {exc}{RESET}')
+            return 1
+        after = os.lstat(retired)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            retired.rename(out)
+            print(f'{RED}✗ {out} was replaced while being moved — refusing to continue{RESET}')
+            return 1
+        ok, why = looks_like_snapshot(retired)
+        if not ok:
+            retired.rename(out)          # not ours; hand it back exactly as we found it
+            print()
+            print(f'{RED}✗ {out} is not a valid snapshot ({why}){RESET}')
+            print(f'{YELLOW}  It has been left untouched and nothing was published.{RESET}')
+            return 1
+
     try:
         staging.rename(out)
-    except OSError:
+    except OSError as exc:
         if retired is not None and retired.exists():
             retired.rename(out)
-        raise
+        print(f'{RED}✗ could not install the new snapshot at {out}: {exc}{RESET}')
+        return 1
     if retired is not None:
-        shutil.rmtree(retired, ignore_errors=True)
+        try:
+            shutil.rmtree(retired)
+        except OSError as exc:
+            # Do not report an unqualified success while a full copy of the old snapshot is still
+            # on disk under a name the user has never seen.
+            print(f'{YELLOW}  Warning: the previous snapshot could not be removed ({exc}). '
+                  f'It is retained at {retired}{RESET}')
 
     print()
     print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '

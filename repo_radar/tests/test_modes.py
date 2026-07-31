@@ -424,3 +424,75 @@ def test_a_configured_repo_under_a_migrated_cache_name_is_kept(tmp_path):
 
     assert orphans == [], 'frontmatter identity must preserve a configured migrated cache'
     assert {p.name for p, _f in kept} == {'kept-oldstyle01', 'kept-oldstyle01.md'}
+
+
+def test_repository_identity_is_compared_case_insensitively(tmp_path):
+    """GitHub identities are case-insensitive, so Org/Kept and org/kept are one repository.
+    Comparing exactly classified a live clone AND its metadata as orphans."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    migrated = pristine / 'kept-oldstyle01'
+    migrated.mkdir()
+    (migrated / '.git').mkdir()
+    (pristine / 'kept-oldstyle01.md').write_text(
+        '---\nfull_name: org/kept\ncache_dir: kept-oldstyle01\n---\n')
+    (pristine / 'INDEX.md').write_text('# Index\n')
+
+    orphans, kept, _unknown = find_orphans(
+        pristine, {'repositories': [{'full_name': 'Org/Kept',
+                                     'clone_url': 'https://github.com/Org/Kept.git'}]})
+
+    assert orphans == [], 'a case-only difference is the same repository'
+    assert len(kept) == 2
+
+
+@pytest.mark.parametrize("repo", [
+    {'full_name': 'org/kept'},                                  # no clone_url at all
+    {'full_name': 'org/kept', 'clone_url': ''},                 # empty
+    {'full_name': 'org/kept', 'clone_url': '   '},              # whitespace
+    {'full_name': 'org/kept', 'clone_url': None},               # null
+    {'full_name': 'not-owner-slash-name', 'clone_url': 'x'},    # unusable identity
+])
+def test_an_unusable_configured_entry_refuses_rather_than_mislocating_its_cache(tmp_path, repo):
+    """get_cache_name('', name) happily hashes the empty string, producing a name that matches
+    nothing — so the repository's real directory looked unclaimed and became deletable."""
+    from repo_radar.modes.clean import find_orphans, UnusableConfig
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    with pytest.raises(UnusableConfig):
+        find_orphans(pristine, {'repositories': [repo]})
+
+
+@pytest.mark.parametrize("index", [
+    {'https://github.com/org/kept.git': 123},
+    {'https://github.com/org/kept.git': ''},
+    {5: 'kept-abc1234'},
+    {'https://github.com/org/kept.git': ['kept-abc1234']},
+])
+def test_a_cache_index_with_unusable_mappings_refuses(tmp_path, index):
+    """A dict at the top level is not enough: a mapping we cannot use is evidence we have lost."""
+    from repo_radar.modes.clean import find_orphans, UnusableConfig
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    with pytest.raises(UnusableConfig):
+        find_orphans(pristine, {'repositories': [_repo('org/kept')]}, index)
+
+
+def test_an_ordinary_note_containing_a_full_name_line_is_not_ours(tmp_path):
+    """Any Markdown with a `full_name:` line used to qualify as ownership evidence.
+
+    Real metadata always carries owner/name AND a cache_dir naming its own entry, so requiring
+    the pair costs nothing and stops an arbitrary note from becoming deletable.
+    """
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    (pristine / 'design-notes-abc1234.md').write_text(
+        '---\nfull_name: some/project\ntitle: my notes\n---\n\nThoughts.\n')
+
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], 'metadata that does not claim THIS entry proves nothing'
+    assert [p.name for p, _why in unknown] == ['design-notes-abc1234.md']

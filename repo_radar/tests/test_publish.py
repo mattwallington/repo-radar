@@ -5,8 +5,10 @@ every mistake here fails the review rather than degrading gracefully.
 """
 import hashlib
 import json
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import types
 
@@ -596,3 +598,94 @@ def test_a_clone_whose_origin_contradicts_the_metadata_is_refused(tmp_path, monk
 
     assert rc == 1
     assert 'identity mismatch' in capsys.readouterr().out
+
+
+def test_a_modified_index_makes_a_snapshot_unreplaceable(publish):
+    """index.sha256 was validated for SHAPE but never compared with the file's bytes, so an
+    edited INDEX.md still certified the directory as ours to delete."""
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, _m = publish({'alpha': 'Org/alpha'})
+    index = out / 'pristine/INDEX.md'
+    index.write_text(index.read_text() + '\nedited by someone else\n')
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and 'index.sha256' in why
+
+
+def test_an_undeclared_empty_directory_makes_a_snapshot_unreplaceable(publish):
+    """The inventory listed only regular files, so a directory the manifest never mentioned
+    passed validation and was then deleted with the rest of the tree."""
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, _m = publish({'alpha': 'Org/alpha'})
+    (out / 'someone-elses-folder').mkdir()
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and 'undeclared directory' in why
+
+
+def test_a_special_filesystem_entry_makes_a_snapshot_unreplaceable(publish):
+    """is_file() reports nothing at all for a FIFO, so it never appeared in the inventory."""
+    from repo_radar.publish import looks_like_snapshot
+
+    _rc, out, _m = publish({'alpha': 'Org/alpha'})
+    os.mkfifo(out / 'pipe')
+
+    ok, why = looks_like_snapshot(out)
+    assert not ok and 'special filesystem entry' in why
+
+
+def test_a_destination_replaced_after_validation_is_not_deleted(publish, tmp_path, monkeypatch,
+                                                                capsys):
+    """Validating `out` and then renaming it validates one object and deletes whatever occupies
+    that PATHNAME afterwards. Codex swapped the directory in between and watched a successful
+    publish destroy an unrelated file."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    # Replace the validated snapshot with someone else's directory at the last possible moment:
+    # after the pre-build check, immediately before the swap.
+    real_looks = pub.looks_like_snapshot
+    swapped = {'done': False}
+
+    def sneaky(path):
+        verdict = real_looks(path)
+        if not swapped['done'] and pathlib.Path(path) == out:
+            swapped['done'] = True
+            shutil.rmtree(out)
+            out.mkdir()
+            (out / 'important.txt').write_text('MINE')
+        return verdict
+    monkeypatch.setattr(pub, 'looks_like_snapshot', sneaky)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert rc == 1, 'the substituted directory must not be published over'
+    assert (out / 'important.txt').read_text() == 'MINE', 'and must survive untouched'
+
+
+def test_a_dry_run_leaves_no_trace_next_to_the_destination(publish, tmp_path, capsys):
+    """It created out's parent hierarchy and a lock file just to have somewhere to stage."""
+    rc, _o, _m = publish({'alpha': 'Org/alpha'}, dry_run=True)
+
+    assert rc == 0
+    leftovers = sorted(p.name for p in tmp_path.iterdir() if p.name != 'pristine')
+    assert leftovers == [], f'a dry run must change nothing: {leftovers}'
+
+
+def test_a_second_publisher_is_refused_while_one_holds_the_destination(publish, tmp_path):
+    """Two concurrent publishes could each move the other's freshly installed snapshot aside."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    held = pub._acquire_lock(out)
+    assert held is not None
+    try:
+        assert pub._acquire_lock(out) is None, 'the second publisher must be refused'
+    finally:
+        pub._release_lock(held)
+    assert pub._acquire_lock(out) is not None, 'and the lock must be released afterwards'
