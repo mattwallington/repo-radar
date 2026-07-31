@@ -11,10 +11,11 @@ Cloud agents reviewing a PR have none of the cross-repo knowledge a desktop agen
 consumer validates is a single generation directory, whose path this command prints:
 
     <out>/generations/<content digest>/     <- copy or ship THIS
-    <out>/current -> generations/<...>      <- convenience pointer, not part of the artifact
 
-Copying the managed root itself would include the pointer and every past generation, and fail the
-consumer. Within a generation, nothing may be present that the manifest does not declare, and
+There is deliberately no mutable `current` pointer: it was the last operation here that could
+overwrite something, and after the corpus changed it would name the previous generation while
+claiming to be current. Copying the managed root itself would include every past generation and
+fail the consumer. Within a generation, nothing may be present that the manifest does not declare, and
 nothing declared may be missing:
 
   - repo keys must match owner/name
@@ -238,6 +239,12 @@ def validate_manifest(manifest):
     generated_at = manifest.get('generatedAt')
     if not isinstance(generated_at, str) or not RFC3339_Z.fullmatch(generated_at):
         problems.append(f'generatedAt must be RFC3339 Z (got {generated_at!r})')
+    else:
+        try:
+            # Shape is not an instant: 2026-99-99T99:99:99Z and 2026-02-30T12:00:00Z both matched.
+            datetime.strptime(generated_at, '%Y-%m-%dT%H:%M:%SZ')
+        except ValueError:
+            problems.append(f'generatedAt is not a real instant (got {generated_at!r})')
     generator_version = manifest.get('generatorVersion')
     if not isinstance(generator_version, str) or not generator_version.strip():
         problems.append('generatorVersion must be a non-empty string')
@@ -483,12 +490,10 @@ def publish_mode(args):
     #
     #     <out>/.repo-radar-managed-root      ownership marker
     #     <out>/generations/<content digest>/manifest.json, pristine/...
-    #     <out>/current -> generations/<content digest>
     #
     # A generation is named by a digest of what it says about the corpus, so its path is a
     # function of its content: republishing an unchanged corpus is a no-op, and different content
-    # can never collide. The one mutation of anything pre-existing is the `current` symlink, and
-    # that only happens inside a root this tool positively owns.
+    # can never collide. NOTHING pre-existing is ever mutated, replaced or deleted.
     if args.dry_run:
         # Read-only preflight of the predicates the real run enforces. Without it a dry run passed
         # on a destination the real run refuses, which is the one thing a preview must not do.
@@ -556,6 +561,18 @@ def publish_mode(args):
             return 1
 
         if args.dry_run:
+            # The preflight covered namespace SHAPE, not occupancy: a corrupt generation at the
+            # digest path passed the preview and then failed the real run.
+            if generation.exists() or generation.is_symlink():
+                adopted, occupied_why = inspect_generation(generation, digest, projection)
+                if adopted is None:
+                    print()
+                    print(f'{RED}✗ {generation} is occupied by something that is not this '
+                          f'snapshot ({occupied_why}){RESET}')
+                    return 1
+                print()
+                print(f'{CYAN}This generation already exists — publishing would be a '
+                      f'no-op.{RESET}')
             print()
             print(f'candidate metadataSnapshotId = {snapshot_id}')
             print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree. '
@@ -582,18 +599,21 @@ def publish_mode(args):
             print(f'{CYAN}This generation already exists — corpus unchanged since it was '
                   f'published.{RESET}')
         else:
+            gen_fd = src_fd = None
             try:
                 gen_fd = _open_generations(out)
+                src_fd = os.open(staging.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             except OSError as exc:
+                for fd in (gen_fd, src_fd):
+                    if fd is not None:
+                        os.close(fd)
                 print(f'{RED}✗ could not open the generations directory ({exc}){RESET}')
                 return 1
             try:
                 # Relative to an OPENED descriptor, so the install lands in the directory we
                 # verified even if that pathname is replaced with a symlink a moment later —
                 # which put a generation inside an external target and still returned 0.
-                os.rename(staging.name, digest,
-                          src_dir_fd=os.open(staging.parent, os.O_RDONLY | os.O_DIRECTORY),
-                          dst_dir_fd=gen_fd)
+                os.rename(staging.name, digest, src_dir_fd=src_fd, dst_dir_fd=gen_fd)
                 staging = None           # installed; the finally block must not touch it
             except OSError as exc:
                 # Another publisher of the SAME content won the race. That is not a failure —
@@ -610,10 +630,12 @@ def publish_mode(args):
                 print(f'{CYAN}An identical generation was published concurrently; adopting '
                       f'it.{RESET}')
             finally:
-                try:
-                    os.close(gen_fd)
-                except OSError:
-                    pass
+                # One descriptor per install was leaked here; /dev/fd grew with every publish.
+                for fd in (gen_fd, src_fd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
             if installed is None:
                 # Validation described the STAGED tree; bind it to what actually landed. Swapping
@@ -626,11 +648,16 @@ def publish_mode(args):
                     print(f'{YELLOW}  It was left in place, unreferenced, at {generation}{RESET}')
                     return 1
 
-        pointed, why = _point_current_at(out, generation)
-        if not pointed:
-            print(f'{YELLOW}  Warning: the generation is published but `current` was not updated '
-                  f'({why}).{RESET}')
-            print(f'{YELLOW}  Use the generation path above directly.{RESET}')
+        # No mutable pointer. `current` used to be maintained here, and it was both the last
+        # destructive operation left (rename replaces a regular file planted after the type check)
+        # and actively misleading: after the corpus changed it would keep naming the previous
+        # generation, claiming freshness while being stale. The printed generation path is
+        # authoritative and is what gets shipped.
+        legacy = out / 'current'
+        if legacy.is_symlink() or legacy.exists():
+            print(f'{YELLOW}  Note: {legacy} is left over from an older layout and is NOT '
+                  f'updated. It may point at an earlier generation.{RESET}')
+            print(f'{YELLOW}  Remove it yourself when convenient; use the path above.{RESET}')
 
         # Report the manifest that is actually stored. A no-op printed the freshly staged id while
         # `current` kept the original generation, whose manifest has a different one.
@@ -648,15 +675,12 @@ def publish_mode(args):
     finally:
         # Only ever remove the staging directory this process created, and never after it has been
         # renamed away — recreating that vacated path let an unrelated directory be deleted.
-        # Bound to the inode we created. `staging = None` covered only the successful rename;
-        # substituting the staging PATHNAME during a failing run had rmtree delete a foreign
-        # directory while the command reported that nothing was published.
+        # THIS PUBLISHER NEVER RECURSIVELY DELETES. Even inode-checked cleanup left a window
+        # between the check and the rmtree, and a foreign directory was destroyed in it. A
+        # successful install renames staging away; anything else is retained and reported, and
+        # the normal temporary-directory lifecycle retires it.
         if staging is not None:
-            if _identity(staging) == staging_id:
-                shutil.rmtree(staging, ignore_errors=True)
-            else:
-                print(f'{YELLOW}  Warning: {staging} is no longer the directory this run created; '
-                      f'leaving it in place.{RESET}')
+            print(f'{YELLOW}  Staged output retained at: {staging}{RESET}')
 
 
 MANAGED_ROOT_MARKER = '.repo-radar-managed-root'
@@ -807,30 +831,6 @@ def inspect_generation(path, expected_digest, expected_projection):
         return manifest, 'valid'
     except Exception as exc:
         return None, f'it could not be inspected ({type(exc).__name__}: {exc})'
-
-
-def _point_current_at(out, generation):
-    """Atomically repoint `current` inside an owned root. Returns (ok, reason).
-
-    Never unlinks a collision and never replaces a non-symlink: the previous version deleted a
-    regular file that happened to sit at its predictable temporary name, and replaced a
-    user-created file that appeared between its check and its rename.
-    """
-    current = out / 'current'
-    try:
-        if (current.exists() or current.is_symlink()) and not current.is_symlink():
-            return False, f'{current} exists and is not a symlink'
-        # Unpredictable, exclusive: os.symlink fails with EEXIST rather than clobbering.
-        temporary = out / f'.current-{os.urandom(8).hex()}'
-        os.symlink(Path('generations') / generation.name, temporary)
-        try:
-            os.rename(temporary, current)
-        except OSError:
-            os.unlink(temporary)         # ours alone; created moments ago under a random name
-            raise
-        return True, 'updated'
-    except OSError as exc:
-        return False, str(exc)
 
 
 def main(argv=None):

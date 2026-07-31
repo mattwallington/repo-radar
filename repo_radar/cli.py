@@ -50,7 +50,8 @@ def main():
 
     # Clean command only needs inquirer (not full dependency check)
     if args.command == 'clean':
-        if not args.force and not args.dry_run:
+        # --orphans never prompts and never deletes, so it does not need the confirmation package.
+        if not args.force and not args.dry_run and not args.orphans:
             try:
                 __import__('inquirer')
             except ImportError:

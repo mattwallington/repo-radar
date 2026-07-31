@@ -60,6 +60,23 @@ def _corpus(tmp_path, repos, indexed=None):
     return pristine
 
 
+def _generations(root):
+    directory = pathlib.Path(root) / 'generations'
+    return sorted(directory.iterdir()) if directory.is_dir() else []
+
+
+def _newest_generation(root):
+    """The most recently installed generation, or a path that does not exist.
+
+    There is deliberately no `current` pointer — it was the last operation that could overwrite
+    something, and it went stale the moment the corpus changed.
+    """
+    found = _generations(root)
+    if not found:
+        return pathlib.Path(root) / '(no generation)'
+    return max(found, key=lambda q: q.stat().st_mtime)
+
+
 def _claim(root):
     """Mark `root` as a managed snapshot root, exactly as a real publish would."""
     from repo_radar.publish import MANAGED_ROOT_MARKER, MANAGED_ROOT_PAYLOAD
@@ -96,11 +113,11 @@ def publish(tmp_path, monkeypatch):
     def _invoke(args):
         rc = publish_mode(args)
         root = pathlib.Path(args.out)
-        snap = root / 'current'
+        snap = _newest_generation(root)
         try:
             manifest = json.loads((snap / 'manifest.json').read_text())
         except Exception:
-            manifest = None          # tests may deliberately corrupt it
+            manifest = None          # tests may deliberately corrupt it or none may exist
         return rc, snap, manifest
 
     run.again = lambda: _invoke(state['args'])
@@ -262,10 +279,10 @@ def test_the_generation_path_is_named_by_its_content(publish, tmp_path):
 
     from repo_radar.publish import content_id
 
-    generation = snap.resolve()
+    generation = snap
     assert generation.parent.name == 'generations'
     assert generation.name == content_id(manifest)
-    assert (tmp_path / 'snap' / 'current').is_symlink()
+    assert not (tmp_path / 'snap' / 'current').exists(), 'no mutable pointer is created'
 
 
 def test_the_generation_name_ignores_when_it_was_generated(publish, tmp_path, capsys):
@@ -273,13 +290,13 @@ def test_the_generation_name_ignores_when_it_was_generated(publish, tmp_path, ca
     directory of identical bytes on every run and they piled up forever."""
     rc, snap, first = publish({'alpha': 'Org/alpha'})
     assert rc == 0
-    before = snap.resolve()
+    before = snap
 
     rc, snap, second = publish({'alpha': 'Org/alpha'}, generated_at='2099-01-01T00:00:00Z')
 
     assert rc == 0
-    assert snap.resolve() == before, 'the same corpus must map to the same generation'
-    assert len(list((tmp_path / 'snap' / 'generations').iterdir())) == 1
+    assert snap == before, 'the same corpus must map to the same generation'
+    assert len(_generations(tmp_path / 'snap')) == 1
     assert second['generatedAt'] == first['generatedAt'], (
         'the existing generation is immutable — the later run did not rewrite it')
 
@@ -288,22 +305,22 @@ def test_republishing_an_unchanged_corpus_is_idempotent(publish, tmp_path, capsy
     """Same content means the same path, so there is nothing to overwrite."""
     rc, snap, first = publish({'alpha': 'Org/alpha'})
     assert rc == 0
-    before = snap.resolve()
+    before = snap
 
     rc, snap, second = publish.again()
 
     assert rc == 0
-    assert snap.resolve() == before
+    assert snap == before
     assert second['metadataSnapshotId'] == first['metadataSnapshotId']
     assert 'already exists' in capsys.readouterr().out
-    assert len(list((tmp_path / 'snap' / 'generations').iterdir())) == 1
+    assert len(_generations(tmp_path / 'snap')) == 1
 
 
 def test_a_changed_corpus_adds_a_generation_without_removing_the_old_one(publish, tmp_path):
     """Publishing never deletes. The previous generation stays exactly where it was."""
     rc, snap, first = publish({'alpha': 'Org/alpha'})
     assert rc == 0
-    old = snap.resolve()
+    old = snap
     old_bytes = (old / 'manifest.json').read_bytes()
 
     md = tmp_path / 'pristine' / 'alpha-abc1234.md'
@@ -311,9 +328,9 @@ def test_a_changed_corpus_adds_a_generation_without_removing_the_old_one(publish
     rc, snap, second = publish.again()
 
     assert rc == 0
-    assert snap.resolve() != old, 'different content must produce a different generation'
+    assert snap != old, 'different content must produce a different generation'
     assert (old / 'manifest.json').read_bytes() == old_bytes, 'the old generation is untouched'
-    assert len(list((tmp_path / 'snap' / 'generations').iterdir())) == 2
+    assert len(_generations(tmp_path / 'snap')) == 2
 
 
 def test_publishing_into_a_directory_full_of_unrelated_data_is_refused(publish, tmp_path,
@@ -346,14 +363,13 @@ def test_an_empty_directory_may_be_claimed_as_a_root(publish, tmp_path):
 
     assert rc == 0
     assert (tmp_path / 'snap' / '.repo-radar-managed-root').is_file()
-    assert snap.resolve().is_dir()
+    assert snap.is_dir()
 
 
-def test_a_current_that_is_a_real_directory_is_left_alone(publish, tmp_path, capsys):
-    """`current` is convenience. If something else owns that name inside our own root, the
-    generation still lands and the directory is untouched."""
+def test_a_legacy_current_is_reported_and_never_touched(publish, tmp_path, capsys):
+    """`current` was removed: it was the last operation that could overwrite something, and it
+    went stale the moment the corpus changed. An existing one is left exactly where it is."""
     root = tmp_path / 'snap'
-    root.mkdir()
     _claim(root)
     (root / 'current').mkdir()
     (root / 'current' / 'important.txt').write_text('MINE')
@@ -363,8 +379,16 @@ def test_a_current_that_is_a_real_directory_is_left_alone(publish, tmp_path, cap
     assert rc == 0
     assert (root / 'current' / 'important.txt').read_text() == 'MINE'
     report = capsys.readouterr().out
-    assert 'is not a symlink' in report and 'generation path above' in report
-    assert list((root / 'generations').iterdir()), 'the generation was still published'
+    assert 'left over from an older layout' in report and 'NOT' in report
+    assert _generations(root), 'the generation was still published'
+
+
+def test_no_mutable_pointer_is_created(publish, tmp_path):
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 0
+    names = sorted(q.name for q in (tmp_path / 'snap').iterdir())
+    assert names == ['.repo-radar-managed-root', 'generations'], names
 
 
 def test_an_occupied_generation_slot_is_validated_before_it_is_adopted(publish, tmp_path, capsys):
@@ -372,7 +396,7 @@ def test_an_occupied_generation_slot_is_validated_before_it_is_adopted(publish, 
     and the run reported success."""
     rc, snap, manifest = publish({'alpha': 'Org/alpha'})
     assert rc == 0
-    generation = snap.resolve()
+    generation = snap
     (generation / 'manifest.json').write_text('CORRUPT')
 
     rc, _snap, _m = publish.again()
@@ -464,30 +488,41 @@ def test_a_marker_symlink_is_refused_rather_than_written_through(publish, tmp_pa
     assert victim.read_text() == 'DO NOT TOUCH'
 
 
-def test_failed_run_cleanup_is_bound_to_the_staging_inode(publish, tmp_path, monkeypatch, capsys):
-    """`staging = None` covered only the successful rename; substituting the staging PATHNAME
-    during a failing run had rmtree delete a foreign directory."""
+def test_a_failed_run_never_deletes_and_reports_its_staging_path(publish, tmp_path,
+                                                                 monkeypatch, capsys):
+    """This publisher never recursively deletes. Even inode-checked cleanup left a window between
+    the check and the rmtree, and a foreign directory was destroyed in it — so automatic deletion
+    is gone entirely and the staged output is retained and reported instead."""
     import repo_radar.publish as pub
 
-    real_verify = pub.verify_tree
-    planted = {}
-
-    def swap_then_fail(root, manifest):
-        root = pathlib.Path(root)
-        if root.name.startswith('.repo-radar-staging-') and not planted:
-            shutil.rmtree(root)
-            root.mkdir()
-            (root / 'important.txt').write_text('MINE')
-            planted['at'] = root
-        return ['forced failure']
-    monkeypatch.setattr(pub, 'verify_tree', swap_then_fail)
+    monkeypatch.setattr(pub, 'verify_tree', lambda root, manifest: ['forced failure'])
 
     rc, _snap, _m = publish({'alpha': 'Org/alpha'})
 
     assert rc == 1
-    assert planted, 'precondition: staging was substituted'
-    assert (planted['at'] / 'important.txt').read_text() == 'MINE', 'a foreign tree must survive'
-    assert 'no longer the directory this run created' in capsys.readouterr().out
+    report = capsys.readouterr().out
+    assert 'Staged output retained at:' in report
+    retained = [q for q in (tmp_path / 'snap').iterdir()
+                if q.name.startswith('.repo-radar-staging-')]
+    assert retained, 'the staged tree must still be on disk for inspection'
+    assert (retained[0] / 'manifest.json').is_file()
+    assert not _generations(tmp_path / 'snap'), 'and nothing was published'
+
+
+def test_a_dry_run_rejects_a_corrupt_occupied_generation(publish, tmp_path, capsys):
+    """The preflight covered namespace shape, not occupancy: a corrupt generation at the digest
+    path passed the preview and failed the real run."""
+    rc, snap, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    (snap / 'manifest.json').write_text('CORRUPT')
+    capsys.readouterr()
+
+    rc_dry, _s, _m = publish.again_dry()
+    dry_out = capsys.readouterr().out
+    rc_real, _s, _m = publish.again()
+
+    assert rc_dry == rc_real == 1
+    assert 'is occupied by something that is not this snapshot' in dry_out
 
 
 def test_a_manifest_with_a_malformed_generated_at_is_rejected():
@@ -497,6 +532,10 @@ def test_a_manifest_with_a_malformed_generated_at_is_rejected():
             'generatorVersion': 'test/1', 'metadataSnapshotId': 'x',
             'index': {'path': 'pristine/INDEX.md', 'sha256': 'a' * 64}, 'repos': {}}
     assert any('generatedAt' in p for p in validate_manifest({**base, 'generatedAt': 'banana'}))
+    # Digit shape is not an instant: both of these previously published successfully.
+    for impossible in ('2026-99-99T99:99:99Z', '2026-02-30T12:00:00Z'):
+        assert any('generatedAt' in p
+                   for p in validate_manifest({**base, 'generatedAt': impossible})), impossible
     assert any('generatorVersion' in p
                for p in validate_manifest({**base, 'generatorVersion': ''}))
     assert not any('generatedAt' in p for p in validate_manifest(base))
