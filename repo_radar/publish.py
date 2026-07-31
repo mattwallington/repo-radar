@@ -742,6 +742,36 @@ def _open_generations(out):
     return os.open(generations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
+def _ancestor_problem(start):
+    """Walk up from `start` to the nearest LEXICALLY-present ancestor and say why mkdir would
+    fail there, or None if it would succeed. Never follows a symlink implicitly.
+
+    Path.exists() follows symlinks, so a dangling one reads as absent and the walk sailed past it;
+    os.lstat sees the link itself.
+    """
+    ancestor = start
+    while True:
+        try:
+            info = os.lstat(ancestor)
+        except OSError:
+            if ancestor.parent == ancestor:
+                return None                  # reached the root without finding anything present
+            ancestor = ancestor.parent
+            continue
+        # First ancestor that exists on disk. mkdir descends into it, so it must be a directory or
+        # a symlink that resolves to one.
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target = os.stat(ancestor)   # follows the link
+            except OSError:
+                return f'{ancestor} is a dangling symlink'
+            if not stat.S_ISDIR(target.st_mode):
+                return f'{ancestor} is a symlink to a non-directory'
+        elif not stat.S_ISDIR(info.st_mode):
+            return f'{ancestor} is not a directory'
+        return None
+
+
 def _destination_preflight(out):
     """Would the real run accept this destination? Read-only, non-blocking. Returns (ok, reason).
 
@@ -752,13 +782,14 @@ def _destination_preflight(out):
         if out.is_symlink():
             return False, 'it is a symlink'
         if not out.exists():
-            # `mkdir(parents=True)` fails with ENOTDIR if the nearest existing ancestor is not a
-            # directory, so "it does not exist yet" is not on its own a reason to approve.
-            ancestor = out.parent
-            while not ancestor.exists() and ancestor.parent != ancestor:
-                ancestor = ancestor.parent
-            if ancestor.exists() and not ancestor.is_dir():
-                return False, f'{ancestor} is not a directory'
+            # `mkdir(parents=True)` walks DOWN and fails on any intermediate component that is a
+            # file, a dangling symlink, or a symlink to a non-directory. Path.exists() FOLLOWS
+            # symlinks and reports a dangling one as absent, so a walk based on it stepped over a
+            # broken symlink ancestor and approved a creation the real run rejects with EEXIST.
+            # Inspect each ancestor lexically with lstat instead.
+            problem = _ancestor_problem(out.parent)
+            if problem is not None:
+                return False, problem
             return True, 'would be created'
         if not out.is_dir():
             return False, 'it is not a directory'

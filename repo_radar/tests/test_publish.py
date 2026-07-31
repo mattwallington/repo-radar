@@ -596,16 +596,62 @@ def test_preflight_and_real_run_agree_when_the_destination_is_below_a_file(publi
     assert blocker.read_text() == 'I am a file'
 
 
-def test_preflight_does_not_block_on_a_fifo_marker(tmp_path):
-    """read_text() on a FIFO blocks forever; the real run rejects it instantly as non-regular."""
+def test_preflight_does_not_block_on_a_fifo_marker(tmp_path, monkeypatch):
+    """read_text() on a FIFO blocks forever; the real run rejects it instantly as non-regular.
+
+    Guard read_text so a reintroduced read produces a bounded FAILURE, not a hung suite.
+    """
     import repo_radar.publish as pub
 
     root = tmp_path / 'snap'
     root.mkdir()
     os.mkfifo(root / '.repo-radar-managed-root')
 
-    ok, why = pub._destination_preflight(root)          # must return, not hang
+    real_read_text = pathlib.Path.read_text
+    def guarded(self, *a, **k):
+        if self.is_fifo():
+            raise AssertionError('the preflight must lstat a FIFO marker before read_text()')
+        return real_read_text(self, *a, **k)
+    monkeypatch.setattr(pathlib.Path, 'read_text', guarded)
+
+    ok, why = pub._destination_preflight(root)          # must return, not hang or raise
 
     assert not ok and 'not a regular file' in why
     claimed, claim_why = pub._claim_managed_root(root)
     assert not claimed and 'not a regular file' in claim_why, 'both paths must agree'
+
+
+def test_preflight_and_real_run_agree_below_a_dangling_symlink_ancestor(publish, tmp_path,
+                                                                        capsys):
+    """Path.exists() follows symlinks, so a dangling ancestor read as absent and the walk stepped
+    over it and approved a creation the real mkdir rejects with EEXIST."""
+    import repo_radar.publish as pub
+
+    dangling = tmp_path / 'dangling'
+    dangling.symlink_to(tmp_path / 'nowhere')           # target does not exist
+    target = dangling / 'snap'
+
+    ok, why = pub._destination_preflight(target)
+    assert not ok and 'dangling symlink' in why
+
+    import types as _t
+    args = _args(target, _corpus(tmp_path, {'alpha': 'Org/alpha'}))
+    dry = _t.SimpleNamespace(**{**vars(args), 'dry_run': True})
+    pub.load_config = lambda: {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+    pub.load_exclusions = lambda c=None: []
+    assert pub.publish_mode(dry) == pub.publish_mode(args) == 1
+    assert dangling.is_symlink() and not dangling.exists(), 'the symlink is untouched'
+
+
+def test_preflight_allows_a_symlink_ancestor_that_resolves_to_a_directory(tmp_path):
+    """mkdir descends through a symlink to a real directory, so the preflight must approve it —
+    matching the real run rather than rejecting every symlink in the chain."""
+    import repo_radar.publish as pub
+
+    real = tmp_path / 'real'
+    real.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+
+    ok, why = pub._destination_preflight(link / 'snap')
+    assert ok, why
