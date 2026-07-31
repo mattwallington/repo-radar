@@ -427,8 +427,12 @@ def test_a_dry_run_writes_nothing_at_all(publish, tmp_path, capsys):
     rc, _snap, _m = publish({'alpha': 'Org/alpha'}, dry_run=True)
 
     assert rc == 0
-    assert 'Nothing was written' in capsys.readouterr().out
+    report = capsys.readouterr().out
+    assert 'Nothing was published' in report
     assert not (tmp_path / 'snap').exists(), 'not even the managed root'
+    # The staged tree is retained, but in the system temp directory — nowhere near --out.
+    retained = [line for line in report.splitlines() if 'Staged output retained' in line]
+    assert retained and str(tmp_path / 'snap') not in retained[0]
 
 
 def test_a_failed_validation_publishes_no_generation(publish, tmp_path, capsys):
@@ -568,3 +572,40 @@ def test_only_the_stored_snapshot_id_is_reported(publish, capsys):
     ids = [line for line in report.splitlines() if 'metadataSnapshotId' in line]
     assert len(ids) == 1, f'exactly one authoritative id must be printed: {ids}'
     assert first['metadataSnapshotId'] in ids[0]
+
+
+def test_preflight_and_real_run_agree_when_the_destination_is_below_a_file(publish, tmp_path,
+                                                                           capsys):
+    """`not out.exists()` approved outright, but mkdir(parents=True) fails ENOTDIR when the
+    nearest existing ancestor is a regular file."""
+    import repo_radar.publish as pub
+
+    blocker = tmp_path / 'blocker'
+    blocker.write_text('I am a file')
+    target = blocker / 'deeper' / 'snap'
+
+    ok, why = pub._destination_preflight(target)
+    assert not ok and 'not a directory' in why
+
+    monkey = _args(target, _corpus(tmp_path, {'alpha': 'Org/alpha'}))
+    import types as _t
+    dry = _t.SimpleNamespace(**{**vars(monkey), 'dry_run': True})
+    pub.load_config = lambda: {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+    pub.load_exclusions = lambda c=None: []
+    assert pub.publish_mode(dry) == pub.publish_mode(monkey) == 1
+    assert blocker.read_text() == 'I am a file'
+
+
+def test_preflight_does_not_block_on_a_fifo_marker(tmp_path):
+    """read_text() on a FIFO blocks forever; the real run rejects it instantly as non-regular."""
+    import repo_radar.publish as pub
+
+    root = tmp_path / 'snap'
+    root.mkdir()
+    os.mkfifo(root / '.repo-radar-managed-root')
+
+    ok, why = pub._destination_preflight(root)          # must return, not hang
+
+    assert not ok and 'not a regular file' in why
+    claimed, claim_why = pub._claim_managed_root(root)
+    assert not claimed and 'not a regular file' in claim_why, 'both paths must agree'

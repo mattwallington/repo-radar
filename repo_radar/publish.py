@@ -576,7 +576,7 @@ def publish_mode(args):
             print()
             print(f'candidate metadataSnapshotId = {snapshot_id}')
             print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree. '
-                  f'Nothing was written.')
+                  f'Nothing was published.')
             return 0
 
         ok, why = _namespace_is_sound(out)
@@ -743,11 +743,22 @@ def _open_generations(out):
 
 
 def _destination_preflight(out):
-    """Would the real run accept this destination? Read-only. Returns (ok, reason)."""
+    """Would the real run accept this destination? Read-only, non-blocking. Returns (ok, reason).
+
+    Must reach the same verdict as _claim_managed_root for every input, or a preview approves what
+    the real run refuses — the one thing a preview must never do.
+    """
     try:
         if out.is_symlink():
             return False, 'it is a symlink'
         if not out.exists():
+            # `mkdir(parents=True)` fails with ENOTDIR if the nearest existing ancestor is not a
+            # directory, so "it does not exist yet" is not on its own a reason to approve.
+            ancestor = out.parent
+            while not ancestor.exists() and ancestor.parent != ancestor:
+                ancestor = ancestor.parent
+            if ancestor.exists() and not ancestor.is_dir():
+                return False, f'{ancestor} is not a directory'
             return True, 'would be created'
         if not out.is_dir():
             return False, 'it is not a directory'
@@ -755,6 +766,11 @@ def _destination_preflight(out):
         if marker.is_symlink():
             return False, f'{MANAGED_ROOT_MARKER} is a symlink'
         if marker.exists():
+            # lstat BEFORE reading: opening a FIFO for read blocks forever, so a preflight that
+            # read first could hang where the real run rejects the marker immediately.
+            info = os.lstat(marker)
+            if not stat.S_ISREG(info.st_mode):
+                return False, f'{MANAGED_ROOT_MARKER} is not a regular file'
             if marker.read_text().strip() != MANAGED_ROOT_PAYLOAD:
                 return False, f'{MANAGED_ROOT_MARKER} does not carry our marker payload'
         elif any(out.iterdir()):
