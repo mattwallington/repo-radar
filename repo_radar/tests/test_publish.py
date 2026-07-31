@@ -795,3 +795,183 @@ def test_a_destination_reappearing_before_installation_is_not_overwritten(publis
     assert (out / 'important.txt').read_text() == 'MINE', 'the intruder must survive'
     report = capsys.readouterr().out
     assert 'intact at' in report, 'and the quarantined snapshot must be located for the user'
+
+
+def test_content_added_to_the_quarantine_after_validation_is_not_deleted(publish, tmp_path,
+                                                                         monkeypatch, capsys):
+    """The root inode says nothing about the CONTENTS. A file added after validation was swept up
+    by rmtree, and the run still reported success."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_looks = pub.looks_like_snapshot
+    planted = {}
+
+    def plant(path):
+        verdict = real_looks(path)
+        p = pathlib.Path(path)
+        if p.name.startswith('.snap.previous-') and 'at' not in planted:
+            (p / 'important.txt').write_text('MINE')
+            planted['at'] = p / 'important.txt'
+        return verdict
+    monkeypatch.setattr(pub, 'looks_like_snapshot', plant)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert planted, 'precondition: content was added to the quarantined tree'
+    assert planted['at'].read_text() == 'MINE', 'unvalidated content must never be deleted'
+    report = capsys.readouterr().out
+    assert 'new content appeared' in report and 'retained at' in report
+
+
+def test_cleanup_refuses_a_quarantine_substituted_after_the_final_check(publish, tmp_path,
+                                                                        monkeypatch, capsys):
+    """The window between the last lstat and the deletion. Enumerated, no-follow deletion closes
+    it: we unlink the specific verified names, so a replacement's contents do not match."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_remove = pub._remove_exact
+    swapped = {}
+
+    def swap_then_remove(root, manifest):
+        root = pathlib.Path(root)
+        if 'at' not in swapped:
+            shutil.rmtree(root)
+            root.mkdir()
+            (root / 'important.txt').write_text('MINE')
+            swapped['at'] = root / 'important.txt'
+        return real_remove(root, manifest)
+    monkeypatch.setattr(pub, '_remove_exact', swap_then_remove)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert swapped, 'precondition: the quarantine was substituted'
+    assert swapped['at'].read_text() == 'MINE', 'a substituted tree must not be deleted'
+
+
+def test_restoration_refuses_a_substituted_quarantine(publish, tmp_path, monkeypatch, capsys):
+    """_restore renamed whatever answered to that path, so a substitution during validation made
+    an unrelated directory become the destination while the real snapshot stayed hidden."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    hidden = tmp_path / 'hidden'
+
+    def swap_and_fail(path):
+        p = pathlib.Path(path)
+        if p.name.startswith('.snap.previous-'):
+            shutil.move(str(p), str(hidden))       # move the real snapshot away
+            p.mkdir()
+            (p / 'important.txt').write_text('MINE')
+            return False, 'pretend it is invalid'
+        return True, 'ok'
+    monkeypatch.setattr(pub, 'looks_like_snapshot', swap_and_fail)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert rc == 1
+    report = capsys.readouterr().out
+    assert 'no longer the tree that was moved there' in report
+    assert 'quarantined :' in report and 'destination :' in report
+    assert not out.exists(), 'the substitute must not be installed as the destination'
+    assert (hidden / 'manifest.json').is_file(), 'the real snapshot is still recoverable'
+
+
+def test_an_interrupt_after_quarantine_restores_and_re_raises(publish, tmp_path, monkeypatch):
+    """`except Exception` let Ctrl-C escape with the destination absent and the old snapshot
+    stranded under a name nobody was told about."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    before = (out / 'manifest.json').read_text()
+
+    def interrupt(path):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(pub, 'looks_like_snapshot', interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert out.is_dir(), 'the destination must not be left absent'
+    assert (out / 'manifest.json').read_text() == before
+    assert not list(tmp_path.glob('.snap.previous-*')), 'nothing stranded'
+
+
+def test_the_lock_failure_path_closes_its_descriptor(publish, tmp_path):
+    """The previous test only ever acquired successfully, so removing the failure-path close
+    left it green. This one exercises the contended branch repeatedly."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    held, _why = pub._acquire_lock(out)
+    assert held is not None
+    try:
+        for _ in range(80):
+            blocked, why = pub._acquire_lock(out)
+            assert blocked is None and 'already writing' in why
+    finally:
+        pub._release_lock(held)
+
+
+def test_the_inventory_reports_a_mount_point_without_crashing(tmp_path, monkeypatch):
+    """The mount branch appended two tuples for one path, so sorted() compared an os.stat_result
+    against None and raised — the check could not fire without crashing first."""
+    from repo_radar.publish import _inventory
+
+    root = tmp_path / 'tree'
+    (root / 'pristine').mkdir(parents=True)
+    (root / 'manifest.json').write_text('{}')
+
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *a, **k):
+        return real_lstat(path, *a, **k)
+    # Present `pristine` as living on another device.
+    real_scandir = os.scandir
+
+    class FakeStat:
+        def __init__(self, info, dev):
+            self._info, self.st_dev = info, dev
+            self.st_mode = info.st_mode
+
+    def fake_scandir(target):
+        for entry in real_scandir(target):
+            yield _FakeEntry(entry, root)
+    monkeypatch.setattr(os, 'scandir', fake_scandir)
+
+    found = sorted(_inventory(root))        # must not raise
+
+    reasons = [why for _rel, _info, why in found if why]
+    assert any('mount point' in r for r in reasons), reasons
+
+
+class _FakeEntry:
+    """A scandir entry that reports `pristine` on a different device."""
+
+    def __init__(self, entry, root):
+        self._entry = entry
+        self._root = root
+        self.name = entry.name
+        self.path = entry.path
+
+    def is_symlink(self):
+        return self._entry.is_symlink()
+
+    def stat(self, follow_symlinks=True):
+        info = self._entry.stat(follow_symlinks=follow_symlinks)
+        if self._entry.name == 'pristine':
+            class Shifted:
+                st_mode = info.st_mode
+                st_dev = info.st_dev + 1
+                st_ino = info.st_ino
+                st_size = info.st_size
+            return Shifted()
+        return info

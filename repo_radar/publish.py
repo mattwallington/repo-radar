@@ -322,13 +322,16 @@ def _inventory(root):
             path = Path(entry.path)
             info = entry.stat(follow_symlinks=False)
             rel = str(path.relative_to(root))
+            is_real_dir = stat.S_ISDIR(info.st_mode) and not entry.is_symlink()
+            # A different device is a mount point. Descending would validate — and later delete —
+            # files on a filesystem that merely happens to be mounted here. Recorded as ONE entry:
+            # appending both a stat tuple and an error tuple for the same path made sorted() try
+            # to order an os.stat_result against None and raise.
+            if is_real_dir and info.st_dev != root_dev:
+                found.append((rel, None, 'crosses a filesystem boundary (mount point)'))
+                continue
             found.append((rel, info, None))
-            if stat.S_ISDIR(info.st_mode) and not entry.is_symlink():
-                # A different device is a mount point. Descending would validate — and later
-                # delete — files on a filesystem that merely happens to be mounted here.
-                if info.st_dev != root_dev:
-                    found.append((rel, None, 'crosses a filesystem boundary (mount point)'))
-                    continue
+            if is_real_dir:
                 stack.append(path)
     return found
 
@@ -545,7 +548,90 @@ def publish_mode(args):
             _release_lock(lock)
 
 
-def _restore(retired, out, why):
+def _read_manifest(root):
+    """The manifest of an already-validated tree, or None. Never raises."""
+    try:
+        return json.loads((Path(root) / 'manifest.json').read_text())
+    except Exception:
+        return None
+
+
+def _remove_exact(root, manifest):
+    """Delete EXACTLY the files this manifest declares, then the directories, if empty.
+
+    Returns None on success or a reason string. Nothing is deleted unless every step is safe.
+
+    shutil.rmtree(root) checked only the root inode, which says nothing about the contents: a file
+    added after validation was removed by a run reporting success, and a pathname substituted
+    between the final lstat and the rmtree had its contents deleted instead. Re-validating the
+    whole tree again would leave the same window, so deletion is instead descriptor-relative and
+    enumerated — we unlink the specific names we verified, refuse to follow symlinks, and rmdir
+    only what is already empty, so anything that appeared in the meantime makes cleanup fail
+    rather than get swept up.
+    """
+    declared = ['manifest.json', 'pristine/INDEX.md']
+    declared += [e.get('metadataPath', '') for e in (manifest.get('repos') or {}).values()]
+    by_dir = {}
+    for rel in declared:
+        parent, _, name = rel.rpartition('/')
+        by_dir.setdefault(parent, []).append(name)
+
+    root_fd = pristine_fd = None
+    try:
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            return f'could not open {root} ({exc})'
+        fds = {'': root_fd}
+        if 'pristine' in by_dir:
+            try:
+                pristine_fd = os.open('pristine', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                      dir_fd=root_fd)
+            except OSError as exc:
+                return f'could not open pristine/ ({exc})'
+            fds['pristine'] = pristine_fd
+
+        # Every declared name must still be the regular file we verified.
+        for parent, names in by_dir.items():
+            for name in names:
+                try:
+                    info = os.stat(name, dir_fd=fds[parent], follow_symlinks=False)
+                except OSError as exc:
+                    return f'{parent}/{name} could not be checked ({exc})'
+                if not stat.S_ISREG(info.st_mode):
+                    return f'{parent}/{name} is no longer a regular file'
+
+        # Nothing may have appeared alongside them.
+        for parent, names in by_dir.items():
+            present = {e.name for e in os.scandir(fds[parent])}
+            unexpected = present - set(names) - ({'pristine'} if parent == '' else set())
+            if unexpected:
+                return (f'new content appeared in {parent or "."}/ after validation: '
+                        f'{", ".join(sorted(unexpected))}')
+
+        for parent, names in by_dir.items():
+            for name in names:
+                os.unlink(name, dir_fd=fds[parent])
+    except OSError as exc:
+        return f'cleanup failed ({exc})'
+    finally:
+        for fd in (pristine_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    try:
+        if 'pristine' in by_dir:
+            os.rmdir(Path(root) / 'pristine')
+        os.rmdir(root)
+    except OSError as exc:
+        return f'could not remove the emptied directories ({exc})'
+    return None
+
+
+def _restore(retired, out, why, expect=None):
     """Put the quarantined tree back, or say exactly where it is. Always returns 1.
 
     Restoration is only safe while `out` is still absent: if something else has appeared there we
@@ -555,6 +641,23 @@ def _restore(retired, out, why):
     """
     print()
     print(f'{RED}✗ Nothing was published: {why}{RESET}')
+    # Restoring blindly renames whatever currently answers to `retired`. Substituting it during
+    # validation made an unrelated directory become the destination while the real snapshot stayed
+    # hidden — and the message claimed the destination had been left untouched.
+    if expect is not None:
+        try:
+            now = os.lstat(retired)
+        except OSError as exc:
+            print(f'{RED}  The quarantined snapshot could not be located ({exc}).{RESET}')
+            print(f'{YELLOW}  Look for it near: {retired}{RESET}')
+            return 1
+        if (now.st_dev, now.st_ino) != expect:
+            print(f'{RED}  {retired} is no longer the tree that was moved there, so nothing was '
+                  f'moved back.{RESET}')
+            print(f'{YELLOW}  Both objects were left in place. Recovery paths:{RESET}')
+            print(f'{YELLOW}    destination : {out}{RESET}')
+            print(f'{YELLOW}    quarantined : {retired}{RESET}')
+            return 1
     if out.exists() or out.is_symlink():
         print(f'{YELLOW}  {out} is occupied by something this run did not create, so the previous '
               f'snapshot was NOT restored over it.{RESET}')
@@ -680,48 +783,54 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
             return 1
 
         # Everything from here is a state machine with a recovery obligation: once the old tree is
-        # quarantined, every exit must either put it back or say exactly where it is. Falling out
-        # of this block on an exception used to leave `out` absent and the real snapshot stranded
-        # under a .previous-* name nobody was told about.
+        # quarantined, every exit must either put it back or say exactly where it is.
+        # BaseException, not Exception — a Ctrl-C during validation left `out` absent, the old
+        # snapshot under a .previous-* name nobody was told about, and the interrupt escaping.
         try:
             after = os.lstat(retired)
             quarantined = (after.st_dev, after.st_ino)
             if (before.st_dev, before.st_ino) != quarantined:
-                return _restore(retired, out, 'it was replaced while being moved aside')
+                return _restore(retired, out, 'it was replaced while being moved aside',
+                                expect=quarantined)
             ok, why = looks_like_snapshot(retired)
+            retired_manifest = _read_manifest(retired)
             if not ok:
-                return _restore(retired, out, f'it is not a valid snapshot ({why})')
-        except Exception as exc:
-            return _restore(retired, out, f'it could not be verified ({exc})')
+                return _restore(retired, out, f'it is not a valid snapshot ({why})',
+                                expect=quarantined)
+        except BaseException as exc:
+            _restore(retired, out, f'it could not be verified ({type(exc).__name__}: {exc})',
+                     expect=quarantined)
+            if isinstance(exc, Exception):
+                return 1
+            raise                        # KeyboardInterrupt / SystemExit, after recovering
 
     try:
         # `out` must still be absent. os.rename would silently replace an empty directory that
         # appeared here since the move, and we have proven nothing about it.
         if retired is not None and (out.exists() or out.is_symlink()):
-            return _restore(retired, out, 'something new appeared at the destination')
+            return _restore(retired, out, 'something new appeared at the destination',
+                            expect=quarantined)
         staging.rename(out)
-    except OSError as exc:
+    except BaseException as exc:
         if retired is not None:
-            return _restore(retired, out, f'the new snapshot could not be installed ({exc})')
-        print(f'{RED}✗ could not install the new snapshot at {out}: {exc}{RESET}')
-        return 1
+            _restore(retired, out, f'the new snapshot could not be installed '
+                                   f'({type(exc).__name__}: {exc})', expect=quarantined)
+            if isinstance(exc, Exception):
+                return 1
+            raise
+        if isinstance(exc, Exception):
+            print(f'{RED}✗ could not install the new snapshot at {out}: {exc}{RESET}')
+            return 1
+        raise
 
     if retired is not None:
-        # Re-confirm we are deleting the object we validated, not whatever now answers to that
-        # pathname. Codex substituted a directory here after its successful verdict and watched it
-        # be deleted.
-        try:
-            now = os.lstat(retired)
-            if (now.st_dev, now.st_ino) != quarantined:
-                print(f'{YELLOW}  Warning: {retired} is no longer the tree that was verified; '
-                      f'leaving it in place rather than deleting it.{RESET}')
-            else:
-                shutil.rmtree(retired)
-        except OSError as exc:
-            # Do not report an unqualified success while a full copy of the old snapshot is still
-            # on disk under a name the user has never seen.
-            print(f'{YELLOW}  Warning: the previous snapshot could not be removed ({exc}). '
-                  f'It is retained at {retired}{RESET}')
+        # Delete the exact entries we verified, not "whatever is under that root inode". The root
+        # inode says nothing about the contents: a file added after validation was swept up by a
+        # run reporting success.
+        failure = _remove_exact(retired, retired_manifest or {})
+        if failure:
+            print(f'{YELLOW}  Warning: the previous snapshot was not removed ({failure}).{RESET}')
+            print(f'{YELLOW}  It is retained at {retired}{RESET}')
 
     print()
     print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '
