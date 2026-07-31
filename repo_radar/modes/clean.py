@@ -1,8 +1,15 @@
-"""Clean mode: remove cached repositories and metadata."""
+"""Clean mode: remove cached repositories and metadata.
+
+`--orphans` is REPORT-ONLY: it identifies cached data no configured repository claims and
+prints the removal commands, but never deletes. Classifying a path and then deleting whatever
+occupies that name are two operations, and this review cycle found six separate ways for
+something else to arrive in between.
+"""
 
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -255,7 +262,7 @@ def _repo_radar_metadata_identity(metadata_file, expected_cache_dir):
 
 
 def _clean_orphans(args):
-    """Report — and with --force, remove — cached data for unconfigured/excluded repositories."""
+    """Report cached data for unconfigured or excluded repositories. Never removes it."""
     config = load_config()
     try:
         orphans, kept, unknown = find_orphans(PRISTINE_DIR, config, load_cache_index_strict())
@@ -302,10 +309,13 @@ def _clean_orphans(args):
     # tells you what to remove and lets you do it, which is safe by construction.
     print()
     print(f'{CYAN}Nothing was removed.{RESET} --orphans reports only; remove what you want with:')
+    # shlex.quote and `--`: a cache directory named `evil; echo PWNED` produced a line that
+    # executed that fragment the moment it was pasted. These paths come from the filesystem, so
+    # they are attacker-influenced input being rendered as a shell command.
     for path, _full_name, _reason in orphans:
-        print(f'  rm -rf {path}')
+        print(f'  rm -rf -- {shlex.quote(str(path))}')
     for link in doomed_links:
-        print(f'  rm {link}')
+        print(f'  rm -- {shlex.quote(str(link))}')
     print()
     print(f'{YELLOW}  (Deletion is not automated here: identifying a path and deleting it are two '
           f'steps, and what sits at that name can change in between.){RESET}')

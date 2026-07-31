@@ -31,7 +31,7 @@ def print_help():
     print("  --repos-only           Only affect repository directories [clean only]")
     print("  --regenerate-metadata  Force regeneration of all metadata [sync only]")
     print("  --skip-metadata        Skip metadata generation [sync only]")
-    print("  --orphans              Report cache for unconfigured/excluded repos [clean only]")
+    print("  --orphans              REPORT cache for unconfigured/excluded repos, never deletes [clean only]")
     print("  --out <dir>            Snapshot output directory [publish only]")
     print("  --src <dir>            Corpus directory [publish only]")
     print()

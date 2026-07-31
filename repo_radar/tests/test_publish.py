@@ -60,6 +60,14 @@ def _corpus(tmp_path, repos, indexed=None):
     return pristine
 
 
+def _claim(root):
+    """Mark `root` as a managed snapshot root, exactly as a real publish would."""
+    from repo_radar.publish import MANAGED_ROOT_MARKER, MANAGED_ROOT_PAYLOAD
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / MANAGED_ROOT_MARKER).write_text(MANAGED_ROOT_PAYLOAD + '\n')
+
+
 def _args(out, src, **over):
     fields = {'out': str(out), 'src': str(src), 'generator_version': 'test/1',
               'generated_at': '2026-07-30T00:00:00Z', 'dry_run': False}
@@ -346,7 +354,7 @@ def test_a_current_that_is_a_real_directory_is_left_alone(publish, tmp_path, cap
     generation still lands and the directory is untouched."""
     root = tmp_path / 'snap'
     root.mkdir()
-    (root / '.repo-radar-managed-root').write_text('{}')
+    _claim(root)
     (root / 'current').mkdir()
     (root / 'current' / 'important.txt').write_text('MINE')
 
@@ -379,7 +387,7 @@ def test_a_generations_symlink_is_refused(publish, tmp_path, capsys):
     """A pre-existing generations symlink caused a successful publish into its external target."""
     root = tmp_path / 'snap'
     root.mkdir()
-    (root / '.repo-radar-managed-root').write_text('{}')
+    _claim(root)
     elsewhere = tmp_path / 'elsewhere'
     elsewhere.mkdir()
     (root / 'generations').symlink_to(elsewhere)
@@ -409,3 +417,115 @@ def test_a_failed_validation_publishes_no_generation(publish, tmp_path, capsys):
     generations = tmp_path / 'snap' / 'generations'
     assert not generations.exists() or not list(generations.iterdir())
     assert 'Nothing was published' in capsys.readouterr().out
+
+
+def test_an_output_symlink_is_not_followed(publish, tmp_path, capsys):
+    """resolve() followed the leaf symlink, so `--out snap` where snap -> external published
+    into external and created the marker there."""
+    external = tmp_path / 'external'
+    external.mkdir()
+    (external / 'important.txt').write_text('MINE')
+    (tmp_path / 'snap').symlink_to(external)
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 1
+    assert 'is a symlink' in capsys.readouterr().out
+    assert sorted(p.name for p in external.iterdir()) == ['important.txt']
+
+
+def test_an_unrelated_directory_with_a_token_marker_is_not_adopted(publish, tmp_path, capsys):
+    """Any file named .repo-radar-managed-root was accepted, contents unchecked."""
+    root = tmp_path / 'snap'
+    root.mkdir()
+    (root / '.repo-radar-managed-root').write_text('{}')
+    (root / 'current').symlink_to(tmp_path)
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 1
+    assert 'does not carry our marker payload' in capsys.readouterr().out
+    assert (root / 'current').resolve() == tmp_path.resolve(), 'their symlink is untouched'
+
+
+def test_a_marker_symlink_is_refused_rather_than_written_through(publish, tmp_path, capsys):
+    """A marker SYMLINK planted after the emptiness check redirected write_text() onto an
+    external file and overwrote it."""
+    root = tmp_path / 'snap'
+    root.mkdir()
+    victim = tmp_path / 'DO_NOT_TOUCH.txt'
+    victim.write_text('DO NOT TOUCH')
+    (root / '.repo-radar-managed-root').symlink_to(victim)
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 1
+    assert 'is a symlink' in capsys.readouterr().out
+    assert victim.read_text() == 'DO NOT TOUCH'
+
+
+def test_failed_run_cleanup_is_bound_to_the_staging_inode(publish, tmp_path, monkeypatch, capsys):
+    """`staging = None` covered only the successful rename; substituting the staging PATHNAME
+    during a failing run had rmtree delete a foreign directory."""
+    import repo_radar.publish as pub
+
+    real_verify = pub.verify_tree
+    planted = {}
+
+    def swap_then_fail(root, manifest):
+        root = pathlib.Path(root)
+        if root.name.startswith('.repo-radar-staging-') and not planted:
+            shutil.rmtree(root)
+            root.mkdir()
+            (root / 'important.txt').write_text('MINE')
+            planted['at'] = root
+        return ['forced failure']
+    monkeypatch.setattr(pub, 'verify_tree', swap_then_fail)
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 1
+    assert planted, 'precondition: staging was substituted'
+    assert (planted['at'] / 'important.txt').read_text() == 'MINE', 'a foreign tree must survive'
+    assert 'no longer the directory this run created' in capsys.readouterr().out
+
+
+def test_a_manifest_with_a_malformed_generated_at_is_rejected():
+    from repo_radar.publish import validate_manifest
+
+    base = {'schemaVersion': 1, 'generatedAt': '2026-07-30T00:00:00Z',
+            'generatorVersion': 'test/1', 'metadataSnapshotId': 'x',
+            'index': {'path': 'pristine/INDEX.md', 'sha256': 'a' * 64}, 'repos': {}}
+    assert any('generatedAt' in p for p in validate_manifest({**base, 'generatedAt': 'banana'}))
+    assert any('generatorVersion' in p
+               for p in validate_manifest({**base, 'generatorVersion': ''}))
+    assert not any('generatedAt' in p for p in validate_manifest(base))
+
+
+def test_dry_run_and_real_publish_agree_on_an_unmanaged_destination(publish, tmp_path, capsys):
+    victim = tmp_path / 'snap'
+    victim.mkdir()
+    (victim / 'important.txt').write_text('MINE')
+
+    rc_dry, _s, _m = publish({'alpha': 'Org/alpha'}, dry_run=True)
+    dry_out = capsys.readouterr().out
+    rc_real, _s, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc_dry == rc_real == 1, 'a preview must not pass where the real run refuses'
+    assert 'cannot be used as a snapshot root' in dry_out
+    assert (victim / 'important.txt').read_text() == 'MINE'
+
+
+def test_only_the_stored_snapshot_id_is_reported(publish, capsys):
+    """Republishing printed the staged candidate first, then the stored one — parsers took the
+    discarded value."""
+    rc, _snap, first = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    capsys.readouterr()
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'}, generated_at='2099-01-01T00:00:00Z')
+
+    report = capsys.readouterr().out
+    ids = [line for line in report.splitlines() if 'metadataSnapshotId' in line]
+    assert len(ids) == 1, f'exactly one authoritative id must be printed: {ids}'
+    assert first['metadataSnapshotId'] in ids[0]

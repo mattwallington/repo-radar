@@ -48,6 +48,7 @@ from repo_radar.constants import GREEN, CYAN, YELLOW, RED, BOLD, RESET
 
 SHA40 = re.compile(r'^[0-9a-f]{40}$')
 SHA256_HEX = re.compile(r'[0-9a-f]{64}')
+RFC3339_Z = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
 REPO_KEY = re.compile(r'^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$')
 # The snapshot's own index lives at pristine/INDEX.md, so a repository whose canonical name is
 # INDEX would publish over it and the run would report success.
@@ -234,6 +235,12 @@ def validate_manifest(manifest):
         problems.append('manifest index.path must be exactly pristine/INDEX.md')
     elif not SHA256_HEX.fullmatch(str(index.get('sha256', ''))):
         problems.append('manifest index.sha256 is not 64 lowercase hex')
+    generated_at = manifest.get('generatedAt')
+    if not isinstance(generated_at, str) or not RFC3339_Z.fullmatch(generated_at):
+        problems.append(f'generatedAt must be RFC3339 Z (got {generated_at!r})')
+    generator_version = manifest.get('generatorVersion')
+    if not isinstance(generator_version, str) or not generator_version.strip():
+        problems.append('generatorVersion must be a non-empty string')
     repos = manifest.get('repos')
     if not isinstance(repos, dict):
         return problems + ['manifest.json "repos" is not an object']
@@ -384,7 +391,11 @@ def publish_mode(args):
     if not getattr(args, 'out', None):
         print(f'{RED}--out is required{RESET}')
         return 1
-    out = Path(args.out).expanduser().resolve()
+    # NOT resolved: resolve() follows a leaf symlink, so `--out snap` where snap -> /elsewhere
+    # silently published into /elsewhere while the symlink check downstream saw a real directory.
+    # The lexical path is what the user named, and it is what gets lstat-ed.
+    out = Path(args.out).expanduser()
+    out = (Path.cwd() / out) if not out.is_absolute() else out
 
     if not src.is_dir():
         print(f'{RED}error: {src} is not a directory{RESET}')
@@ -479,6 +490,12 @@ def publish_mode(args):
     # can never collide. The one mutation of anything pre-existing is the `current` symlink, and
     # that only happens inside a root this tool positively owns.
     if args.dry_run:
+        # Read-only preflight of the predicates the real run enforces. Without it a dry run passed
+        # on a destination the real run refuses, which is the one thing a preview must not do.
+        ready, why = _destination_preflight(out)
+        if not ready:
+            print(f'{RED}error: {out} cannot be used as a snapshot root ({why}){RESET}')
+            return 1
         staging_parent = None
     else:
         owned, why = _claim_managed_root(out)
@@ -490,6 +507,7 @@ def publish_mode(args):
         staging_parent = out
 
     staging = Path(tempfile.mkdtemp(prefix='.repo-radar-staging-', dir=staging_parent))
+    staging_id = _identity(staging)
     installed = None
     try:
         (staging / 'pristine').mkdir(parents=True)
@@ -522,7 +540,6 @@ def publish_mode(args):
         digest = content_id(manifest)
         generation = out / 'generations' / digest
         print(f'snapshot     : {generation}')
-        print(f'metadataSnapshotId = {snapshot_id}')
         print(f'repos        : {len(published)} published, {len(skipped)} skipped, '
               f'{len(excluded)} excluded')
         print(f'size         : {total / 1024:.0f} KB across {entries} entries')
@@ -540,6 +557,7 @@ def publish_mode(args):
 
         if args.dry_run:
             print()
+            print(f'candidate metadataSnapshotId = {snapshot_id}')
             print(f'{GREEN}✓ Validation passed{RESET} — {len(expected)} repositories agree. '
                   f'Nothing was written.')
             return 0
@@ -564,9 +582,18 @@ def publish_mode(args):
             print(f'{CYAN}This generation already exists — corpus unchanged since it was '
                   f'published.{RESET}')
         else:
-            (out / 'generations').mkdir(parents=True, exist_ok=True)
             try:
-                staging.rename(generation)
+                gen_fd = _open_generations(out)
+            except OSError as exc:
+                print(f'{RED}✗ could not open the generations directory ({exc}){RESET}')
+                return 1
+            try:
+                # Relative to an OPENED descriptor, so the install lands in the directory we
+                # verified even if that pathname is replaced with a symlink a moment later —
+                # which put a generation inside an external target and still returned 0.
+                os.rename(staging.name, digest,
+                          src_dir_fd=os.open(staging.parent, os.O_RDONLY | os.O_DIRECTORY),
+                          dst_dir_fd=gen_fd)
                 staging = None           # installed; the finally block must not touch it
             except OSError as exc:
                 # Another publisher of the SAME content won the race. That is not a failure —
@@ -582,6 +609,11 @@ def publish_mode(args):
                 print()
                 print(f'{CYAN}An identical generation was published concurrently; adopting '
                       f'it.{RESET}')
+            finally:
+                try:
+                    os.close(gen_fd)
+                except OSError:
+                    pass
 
             if installed is None:
                 # Validation described the STAGED tree; bind it to what actually landed. Swapping
@@ -602,11 +634,12 @@ def publish_mode(args):
 
         # Report the manifest that is actually stored. A no-op printed the freshly staged id while
         # `current` kept the original generation, whose manifest has a different one.
+        # ONE authoritative id, and only after we know what is actually stored. Printing the
+        # staged candidate first gave parsers a value that was then discarded on a no-op.
+        print(f'metadataSnapshotId = {installed.get("metadataSnapshotId")}')
         if installed.get('metadataSnapshotId') != snapshot_id:
-            print(f'{CYAN}stored metadataSnapshotId = '
-                  f'{installed.get("metadataSnapshotId")}{RESET}')
-            print(f'{CYAN}  (the existing generation is immutable, so it keeps its original '
-                  f'generatedAt and generatorVersion){RESET}')
+            print(f'{CYAN}  (this generation already existed and is immutable, so it keeps its '
+                  f'original generatedAt and generatorVersion){RESET}')
 
         print()
         print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '
@@ -615,34 +648,94 @@ def publish_mode(args):
     finally:
         # Only ever remove the staging directory this process created, and never after it has been
         # renamed away — recreating that vacated path let an unrelated directory be deleted.
+        # Bound to the inode we created. `staging = None` covered only the successful rename;
+        # substituting the staging PATHNAME during a failing run had rmtree delete a foreign
+        # directory while the command reported that nothing was published.
         if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+            if _identity(staging) == staging_id:
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                print(f'{YELLOW}  Warning: {staging} is no longer the directory this run created; '
+                      f'leaving it in place.{RESET}')
 
 
 MANAGED_ROOT_MARKER = '.repo-radar-managed-root'
+MANAGED_ROOT_PAYLOAD = canonical({'tool': 'repo-radar', 'layout': 'generations/v1'})
 
 
 def _claim_managed_root(out):
     """Positively own `out` before any pointer is mutated. Returns (ok, reason).
 
-    "Every symlink at `current` is ours" is not ownership, and it let an arbitrary user symlink be
-    replaced. A root is ours if it carries our marker; an empty or absent directory may be claimed;
-    anything else belongs to someone and is refused outright.
+    Ownership is proven, not assumed. Every weakening of that was exploitable: resolving the path
+    first defeated the symlink check, accepting any file named .repo-radar-managed-root let an
+    unrelated directory be adopted, and check-then-write let a marker SYMLINK planted after the
+    emptiness check redirect write_text() onto an external file and overwrite it.
     """
     try:
         if out.is_symlink():
             return False, 'it is a symlink'
+        marker = out / MANAGED_ROOT_MARKER
         if out.exists():
             if not out.is_dir():
                 return False, 'it is not a directory'
-            if (out / MANAGED_ROOT_MARKER).is_file():
+            if marker.is_symlink():
+                return False, f'{MANAGED_ROOT_MARKER} is a symlink'
+            if marker.exists():
+                info = os.lstat(marker)
+                if not stat.S_ISREG(info.st_mode):
+                    return False, f'{MANAGED_ROOT_MARKER} is not a regular file'
+                if marker.read_text().strip() != MANAGED_ROOT_PAYLOAD:
+                    return False, f'{MANAGED_ROOT_MARKER} does not carry our marker payload'
                 return True, 'already managed'
             if any(out.iterdir()):
                 return False, f'it is not empty and has no {MANAGED_ROOT_MARKER} marker'
         out.mkdir(parents=True, exist_ok=True)
-        (out / MANAGED_ROOT_MARKER).write_text(
-            canonical({'tool': 'repo-radar', 'layout': 'generations/v1'}) + '\n')
+        # O_EXCL | O_NOFOLLOW: creation fails rather than following a symlink planted between the
+        # emptiness check and this write, which is how an external file got overwritten.
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            return False, f'{MANAGED_ROOT_MARKER} appeared while the root was being claimed'
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(MANAGED_ROOT_PAYLOAD + '\n')
         return True, 'claimed'
+    except OSError as exc:
+        return False, str(exc)
+
+
+def _open_generations(out):
+    """Create if needed and open generations/ with O_NOFOLLOW, returning a descriptor.
+
+    The descriptor is the binding: a static "is it a symlink?" check says nothing about what the
+    name refers to a microsecond later, but a descriptor keeps referring to the directory that
+    was verified.
+    """
+    generations = out / 'generations'
+    try:
+        os.mkdir(generations, 0o755)
+    except FileExistsError:
+        pass
+    return os.open(generations, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _destination_preflight(out):
+    """Would the real run accept this destination? Read-only. Returns (ok, reason)."""
+    try:
+        if out.is_symlink():
+            return False, 'it is a symlink'
+        if not out.exists():
+            return True, 'would be created'
+        if not out.is_dir():
+            return False, 'it is not a directory'
+        marker = out / MANAGED_ROOT_MARKER
+        if marker.is_symlink():
+            return False, f'{MANAGED_ROOT_MARKER} is a symlink'
+        if marker.exists():
+            if marker.read_text().strip() != MANAGED_ROOT_PAYLOAD:
+                return False, f'{MANAGED_ROOT_MARKER} does not carry our marker payload'
+        elif any(out.iterdir()):
+            return False, f'it is not empty and has no {MANAGED_ROOT_MARKER} marker'
+        return _namespace_is_sound(out)
     except OSError as exc:
         return False, str(exc)
 
@@ -658,6 +751,15 @@ def _namespace_is_sound(out):
     except OSError as exc:
         return False, f'{generations} could not be checked ({exc})'
     return True, 'sound'
+
+
+def _identity(path):
+    """(st_dev, st_ino) of a path without following symlinks, or None."""
+    try:
+        info = os.lstat(path)
+        return (info.st_dev, info.st_ino)
+    except OSError:
+        return None
 
 
 def _projection(manifest):

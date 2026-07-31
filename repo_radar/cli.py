@@ -24,8 +24,8 @@ def main():
     # `clean` was all-or-nothing, so removing one stale clone meant wiping the cache and
     # re-cloning everything. --orphans scopes it to data no configured repository claims.
     parser.add_argument('--orphans', action='store_true',
-                        help='clean: report cached data for unconfigured/excluded repositories '
-                             '(add --force to remove)')
+                        help='clean: REPORT cached data for unconfigured/excluded repositories '
+                             '(reports only; never deletes)')
     parser.add_argument('--out', default=None,
                         help='publish: output directory for the snapshot')
     parser.add_argument('--src', default=None,
