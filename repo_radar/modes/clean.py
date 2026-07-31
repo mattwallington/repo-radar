@@ -294,30 +294,22 @@ def _clean_orphans(args):
         print(f"  {YELLOW}{link.name}{RESET} — symlink to a removed entry")
     print(f"\nTotal reclaimable: {YELLOW}{format_size(total)}{RESET}")
 
-    if args.dry_run or not args.force:
-        print()
-        print(f"{CYAN}Nothing removed.{RESET} Re-run with {BOLD}--force{RESET} to delete these "
-              f"{len(orphans) + len(doomed_links)} items.")
-        return 0
-
-    deleted = failed = 0
-    for path, _full_name, _reason in list(orphans) + [(l, None, None) for l in doomed_links]:
-        try:
-            if path.is_symlink() or path.is_file():
-                path.unlink()
-            else:
-                shutil.rmtree(path)
-            deleted += 1
-            print(f"  {GREEN}✓{RESET} Removed {path.name}")
-        except Exception as e:
-            failed += 1
-            print(f"  {RED}✗{RESET} Failed to remove {path.name}: {e}")
-
+    # REPORT ONLY. Deleting by a previously-classified PATHNAME is the same defect class that
+    # this review cycle found six times over in the publisher: classification and removal are two
+    # operations, and anything can occupy that name in between — reproduced by moving a classified
+    # orphan away, planting a foreign directory, and watching it be deleted and reported as the
+    # orphan. Rather than build another identity-binding deletion state machine, --orphans now
+    # tells you what to remove and lets you do it, which is safe by construction.
     print()
-    print(f"  Removed: {GREEN}{deleted}{RESET}   Failed: {RED}{failed}{RESET}   "
-          f"Freed: {GREEN}{format_size(total)}{RESET}")
-    print(f"{CYAN}Run a sync to regenerate INDEX.md without these entries.{RESET}")
-    return 0 if failed == 0 else 1
+    print(f'{CYAN}Nothing was removed.{RESET} --orphans reports only; remove what you want with:')
+    for path, _full_name, _reason in orphans:
+        print(f'  rm -rf {path}')
+    for link in doomed_links:
+        print(f'  rm {link}')
+    print()
+    print(f'{YELLOW}  (Deletion is not automated here: identifying a path and deleting it are two '
+          f'steps, and what sits at that name can change in between.){RESET}')
+    return 0
 
 
 def _link_target(link):

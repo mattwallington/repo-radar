@@ -7,8 +7,15 @@ Cloud agents reviewing a PR have none of the cross-repo knowledge a desktop agen
     <out>/pristine/INDEX.md
     <out>/pristine/<repo>.md          one per repo, canonical names, never symlinks
 
-The consumer's contract is fixed and it validates the tree as an EXACT SET, so nothing may be
-written into <out> that the manifest does not declare, and nothing declared may be missing:
+`--out` is a MANAGED ROOT that accumulates immutable generations; the exact-set artifact the
+consumer validates is a single generation directory, whose path this command prints:
+
+    <out>/generations/<content digest>/     <- copy or ship THIS
+    <out>/current -> generations/<...>      <- convenience pointer, not part of the artifact
+
+Copying the managed root itself would include the pointer and every past generation, and fail the
+consumer. Within a generation, nothing may be present that the manifest does not declare, and
+nothing declared may be missing:
 
   - repo keys must match owner/name
   - metadataPath must be a direct child of pristine/, and never pristine/INDEX.md
@@ -460,23 +467,30 @@ def publish_mode(args):
     for stem, why in skipped:
         failures.append(f'skipped {stem}: {why}')
 
-    # IMMUTABLE GENERATIONS. Everything destructive in this publisher came from replacing a
-    # directory in place, and six consecutive review rounds found a fresh way for that to delete
-    # something it did not own — quarantine substitution, same-shaped foreign trees, rollback
-    # overwriting new content, pathname-vs-inode races. None of those failure modes exist here,
-    # because nothing is ever replaced or deleted:
+    # IMMUTABLE GENERATIONS. Everything destructive in the previous publisher came from replacing
+    # a directory that already existed. Nothing here is replaced or deleted:
     #
-    #     <out>/generations/<snapshot id>/manifest.json, pristine/...
-    #     <out>/current -> generations/<snapshot id>
+    #     <out>/.repo-radar-managed-root      ownership marker
+    #     <out>/generations/<content digest>/manifest.json, pristine/...
+    #     <out>/current -> generations/<content digest>
     #
-    # A generation is named by its own metadataSnapshotId, so its path is a function of its
-    # content: two runs over identical corpora produce the same path, and a different corpus can
-    # never collide with an existing generation. The only mutation of anything pre-existing is one
-    # atomic symlink flip, and `current` is convenience — the generation path printed below is the
-    # authoritative result. Retention is deliberately NOT this command's job.
-    staging = Path(tempfile.mkdtemp(
-        prefix='repo-radar-publish-',
-        dir=None if args.dry_run else _staging_parent(out)))
+    # A generation is named by a digest of what it says about the corpus, so its path is a
+    # function of its content: republishing an unchanged corpus is a no-op, and different content
+    # can never collide. The one mutation of anything pre-existing is the `current` symlink, and
+    # that only happens inside a root this tool positively owns.
+    if args.dry_run:
+        staging_parent = None
+    else:
+        owned, why = _claim_managed_root(out)
+        if not owned:
+            print(f'{RED}error: {out} cannot be used as a snapshot root ({why}){RESET}')
+            print(f'{YELLOW}  Nothing was written. Choose an empty or previously-published '
+                  f'path.{RESET}')
+            return 1
+        staging_parent = out
+
+    staging = Path(tempfile.mkdtemp(prefix='.repo-radar-staging-', dir=staging_parent))
+    installed = None
     try:
         (staging / 'pristine').mkdir(parents=True)
         (staging / 'pristine/INDEX.md').write_text(index_text, encoding='utf-8', newline='\n')
@@ -497,15 +511,16 @@ def publish_mode(args):
             problems.append(f'total {total}B > {MAX_TOTAL}')
         if entries > MAX_ENTRIES:
             problems.append(f'{entries} entries > {MAX_ENTRIES}')
+        # validate_manifest had no production caller: the staged path checked the tree but never
+        # the manifest's own shape.
+        problems.extend(validate_manifest(manifest))
         problems.extend(verify_tree(staging, manifest))
         for problem in problems:
             failures.append(f'LIMIT VIOLATION: {problem}')
 
-        # Named by CONTENT, not by metadataSnapshotId: that id covers the whole manifest
-        # including generatedAt, so every run would mint a new generation of identical bytes and
-        # they would pile up forever. This digest covers only what the snapshot actually says
-        # about the corpus, which is what makes republishing an unchanged corpus a no-op.
-        generation = out / 'generations' / content_id(manifest)
+        projection = _projection(manifest)
+        digest = content_id(manifest)
+        generation = out / 'generations' / digest
         print(f'snapshot     : {generation}')
         print(f'metadataSnapshotId = {snapshot_id}')
         print(f'repos        : {len(published)} published, {len(skipped)} skipped, '
@@ -529,19 +544,55 @@ def publish_mode(args):
                   f'Nothing was written.')
             return 0
 
-        if generation.exists():
-            # Same id means byte-identical content, so there is nothing to do and nothing to
-            # overwrite. Publishing is idempotent rather than destructive.
+        ok, why = _namespace_is_sound(out)
+        if not ok:
+            print(f'{RED}✗ {why}{RESET}')
+            return 1
+
+        # Existing occupancy is never trusted just because something is there: a corrupt
+        # directory, a symlink or a foreign tree at the digest path was activated as `current` and
+        # reported complete. Inspect it, and only adopt it if it IS this snapshot.
+        if generation.exists() or generation.is_symlink():
+            adopted, why = inspect_generation(generation, digest, projection)
+            if adopted is None:
+                print(f'{RED}✗ {generation} is occupied by something that is not this snapshot '
+                      f'({why}){RESET}')
+                print(f'{YELLOW}  It was left untouched and nothing was published.{RESET}')
+                return 1
+            installed = adopted
             print()
             print(f'{CYAN}This generation already exists — corpus unchanged since it was '
                   f'published.{RESET}')
         else:
-            generation.parent.mkdir(parents=True, exist_ok=True)
+            (out / 'generations').mkdir(parents=True, exist_ok=True)
             try:
                 staging.rename(generation)
+                staging = None           # installed; the finally block must not touch it
             except OSError as exc:
-                print(f'{RED}✗ could not install the generation at {generation}: {exc}{RESET}')
-                return 1
+                # Another publisher of the SAME content won the race. That is not a failure —
+                # inspect its result and adopt it.
+                adopted, adopt_why = inspect_generation(generation, digest, projection)
+                if adopted is None:
+                    print(f'{RED}✗ could not install the generation at {generation}: '
+                          f'{exc}{RESET}')
+                    if adopt_why:
+                        print(f'{YELLOW}  What is there now: {adopt_why}{RESET}')
+                    return 1
+                installed = adopted
+                print()
+                print(f'{CYAN}An identical generation was published concurrently; adopting '
+                      f'it.{RESET}')
+
+            if installed is None:
+                # Validation described the STAGED tree; bind it to what actually landed. Swapping
+                # staging as the rename began installed a directory containing only MINE and
+                # printed success.
+                installed, why = inspect_generation(generation, digest, projection)
+                if installed is None:
+                    print(f'{RED}✗ the installed generation is not the tree that was validated '
+                          f'({why}){RESET}')
+                    print(f'{YELLOW}  It was left in place, unreferenced, at {generation}{RESET}')
+                    return 1
 
         pointed, why = _point_current_at(out, generation)
         if not pointed:
@@ -549,46 +600,132 @@ def publish_mode(args):
                   f'({why}).{RESET}')
             print(f'{YELLOW}  Use the generation path above directly.{RESET}')
 
+        # Report the manifest that is actually stored. A no-op printed the freshly staged id while
+        # `current` kept the original generation, whose manifest has a different one.
+        if installed.get('metadataSnapshotId') != snapshot_id:
+            print(f'{CYAN}stored metadataSnapshotId = '
+                  f'{installed.get("metadataSnapshotId")}{RESET}')
+            print(f'{CYAN}  (the existing generation is immutable, so it keeps its original '
+                  f'generatedAt and generatorVersion){RESET}')
+
         print()
         print(f'{GREEN}✓ Snapshot complete{RESET} — configured, INDEX and manifest all agree on '
               f'{len(expected)} repositories')
         return 0
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        # Only ever remove the staging directory this process created, and never after it has been
+        # renamed away — recreating that vacated path let an unrelated directory be deleted.
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+MANAGED_ROOT_MARKER = '.repo-radar-managed-root'
+
+
+def _claim_managed_root(out):
+    """Positively own `out` before any pointer is mutated. Returns (ok, reason).
+
+    "Every symlink at `current` is ours" is not ownership, and it let an arbitrary user symlink be
+    replaced. A root is ours if it carries our marker; an empty or absent directory may be claimed;
+    anything else belongs to someone and is refused outright.
+    """
+    try:
+        if out.is_symlink():
+            return False, 'it is a symlink'
+        if out.exists():
+            if not out.is_dir():
+                return False, 'it is not a directory'
+            if (out / MANAGED_ROOT_MARKER).is_file():
+                return True, 'already managed'
+            if any(out.iterdir()):
+                return False, f'it is not empty and has no {MANAGED_ROOT_MARKER} marker'
+        out.mkdir(parents=True, exist_ok=True)
+        (out / MANAGED_ROOT_MARKER).write_text(
+            canonical({'tool': 'repo-radar', 'layout': 'generations/v1'}) + '\n')
+        return True, 'claimed'
+    except OSError as exc:
+        return False, str(exc)
+
+
+def _namespace_is_sound(out):
+    """generations/ must be a real directory of ours, not a symlink pointing elsewhere."""
+    generations = out / 'generations'
+    try:
+        if generations.is_symlink():
+            return False, f'{generations} is a symlink; refusing to publish through it'
+        if generations.exists() and not generations.is_dir():
+            return False, f'{generations} exists and is not a directory'
+    except OSError as exc:
+        return False, f'{generations} could not be checked ({exc})'
+    return True, 'sound'
+
+
+def _projection(manifest):
+    """What a snapshot says about the corpus, ignoring when it was generated."""
+    return {'schemaVersion': manifest.get('schemaVersion'),
+            'index': manifest.get('index'),
+            'repos': manifest.get('repos')}
 
 
 def content_id(manifest):
-    """A digest of what the snapshot says about the corpus, ignoring when it was generated."""
-    return hashlib.sha256(canonical({
-        'schemaVersion': manifest.get('schemaVersion'),
-        'index': manifest.get('index'),
-        'repos': manifest.get('repos'),
-    }).encode('utf-8')).hexdigest()
+    """A digest of the corpus projection. Deliberately NOT metadataSnapshotId, which covers
+    generatedAt — naming generations by that minted a fresh directory of identical bytes on
+    every run."""
+    return hashlib.sha256(canonical(_projection(manifest)).encode('utf-8')).hexdigest()
 
 
-def _staging_parent(out):
-    """Stage beside the generations directory so installing it is a rename, not a copy."""
-    parent = out / 'generations'
-    parent.mkdir(parents=True, exist_ok=True)
-    return parent
+def inspect_generation(path, expected_digest, expected_projection):
+    """Is `path` exactly this snapshot? Returns (manifest, reason) or (None, reason).
+
+    Fail-closed, and used for all three questions that were previously answered by mere existence:
+    an already-occupied slot, a concurrently-installed winner, and the tree that actually landed
+    after our own rename.
+    """
+    path = Path(path)
+    try:
+        if path.is_symlink():
+            return None, 'it is a symlink'
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode):
+            return None, 'it is not a directory'
+        manifest_file = path / 'manifest.json'
+        if not manifest_file.is_file():
+            return None, 'it has no manifest.json'
+        try:
+            manifest = json.loads(manifest_file.read_text())
+        except (OSError, ValueError) as exc:
+            return None, f'its manifest.json is not readable JSON ({exc})'
+        problems = validate_manifest(manifest) or verify_tree(path, manifest)
+        if problems:
+            return None, problems[0]
+        if content_id(manifest) != expected_digest:
+            return None, 'its content does not match the directory it is stored in'
+        if _projection(manifest) != expected_projection:
+            return None, 'it describes a different corpus'
+        return manifest, 'valid'
+    except Exception as exc:
+        return None, f'it could not be inspected ({type(exc).__name__}: {exc})'
 
 
 def _point_current_at(out, generation):
-    """Atomically repoint `current`. Returns (ok, reason). Never deletes a directory.
+    """Atomically repoint `current` inside an owned root. Returns (ok, reason).
 
-    A symlink is created under a unique name and renamed over `current`, which is atomic. If
-    `current` exists and is NOT a symlink it is left completely alone: it is not ours, and this
-    command no longer removes anything it did not create.
+    Never unlinks a collision and never replaces a non-symlink: the previous version deleted a
+    regular file that happened to sit at its predictable temporary name, and replaced a
+    user-created file that appeared between its check and its rename.
     """
     current = out / 'current'
     try:
         if (current.exists() or current.is_symlink()) and not current.is_symlink():
             return False, f'{current} exists and is not a symlink'
-        temporary = out / f'.current-{os.getpid()}-{generation.name[:8]}'
-        if temporary.is_symlink() or temporary.exists():
-            os.unlink(temporary)
+        # Unpredictable, exclusive: os.symlink fails with EEXIST rather than clobbering.
+        temporary = out / f'.current-{os.urandom(8).hex()}'
         os.symlink(Path('generations') / generation.name, temporary)
-        os.rename(temporary, current)
+        try:
+            os.rename(temporary, current)
+        except OSError:
+            os.unlink(temporary)         # ours alone; created moments ago under a random name
+            raise
         return True, 'updated'
     except OSError as exc:
         return False, str(exc)

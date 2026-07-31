@@ -89,8 +89,10 @@ def publish(tmp_path, monkeypatch):
         rc = publish_mode(args)
         root = pathlib.Path(args.out)
         snap = root / 'current'
-        manifest = json.loads((snap / 'manifest.json').read_text()) if (
-            snap / 'manifest.json').is_file() else None
+        try:
+            manifest = json.loads((snap / 'manifest.json').read_text())
+        except Exception:
+            manifest = None          # tests may deliberately corrupt it
         return rc, snap, manifest
 
     run.again = lambda: _invoke(state['args'])
@@ -306,26 +308,46 @@ def test_a_changed_corpus_adds_a_generation_without_removing_the_old_one(publish
     assert len(list((tmp_path / 'snap' / 'generations').iterdir())) == 2
 
 
-def test_publishing_into_a_directory_full_of_unrelated_data_destroys_nothing(publish, tmp_path):
-    """The whole class of defects this replaced: --out pointing somewhere with real files."""
+def test_publishing_into_a_directory_full_of_unrelated_data_is_refused(publish, tmp_path,
+                                                                        capsys):
+    """The class of defect this design replaced: --out pointing somewhere with real files.
+
+    Ownership is positive rather than assumed. "Every symlink at current is ours" let an arbitrary
+    user symlink be replaced, so a root must carry our marker — or be empty enough to claim.
+    """
     victim = tmp_path / 'snap'
     victim.mkdir()
     (victim / 'important.txt').write_text('MINE')
     (victim / 'notes').mkdir()
     (victim / 'notes' / 'more.txt').write_text('ALSO MINE')
 
-    rc, snap, _manifest = publish({'alpha': 'Org/alpha'})
+    rc, _snap, _manifest = publish({'alpha': 'Org/alpha'})
 
-    assert rc == 0
+    assert rc == 1
+    assert 'cannot be used as a snapshot root' in capsys.readouterr().out
     assert (victim / 'important.txt').read_text() == 'MINE'
     assert (victim / 'notes' / 'more.txt').read_text() == 'ALSO MINE'
-    assert snap.resolve().is_dir(), 'and the generation is still published'
+    assert sorted(p.name for p in victim.iterdir()) == ['important.txt', 'notes'], \
+        'nothing was added either'
+
+
+def test_an_empty_directory_may_be_claimed_as_a_root(publish, tmp_path):
+    (tmp_path / 'snap').mkdir()
+
+    rc, snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 0
+    assert (tmp_path / 'snap' / '.repo-radar-managed-root').is_file()
+    assert snap.resolve().is_dir()
 
 
 def test_a_current_that_is_a_real_directory_is_left_alone(publish, tmp_path, capsys):
-    """`current` is convenience. If something else owns that name, the generation still lands."""
+    """`current` is convenience. If something else owns that name inside our own root, the
+    generation still lands and the directory is untouched."""
     root = tmp_path / 'snap'
-    (root / 'current').mkdir(parents=True)
+    root.mkdir()
+    (root / '.repo-radar-managed-root').write_text('{}')
+    (root / 'current').mkdir()
     (root / 'current' / 'important.txt').write_text('MINE')
 
     rc, _snap, _m = publish({'alpha': 'Org/alpha'})
@@ -335,6 +357,38 @@ def test_a_current_that_is_a_real_directory_is_left_alone(publish, tmp_path, cap
     report = capsys.readouterr().out
     assert 'is not a symlink' in report and 'generation path above' in report
     assert list((root / 'generations').iterdir()), 'the generation was still published'
+
+
+def test_an_occupied_generation_slot_is_validated_before_it_is_adopted(publish, tmp_path, capsys):
+    """Existence was treated as proof: a corrupt directory at the digest path became `current`
+    and the run reported success."""
+    rc, snap, manifest = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    generation = snap.resolve()
+    (generation / 'manifest.json').write_text('CORRUPT')
+
+    rc, _snap, _m = publish.again()
+
+    assert rc == 1
+    report = capsys.readouterr().out
+    assert 'occupied by something that is not this snapshot' in report
+    assert (generation / 'manifest.json').read_text() == 'CORRUPT', 'left untouched'
+
+
+def test_a_generations_symlink_is_refused(publish, tmp_path, capsys):
+    """A pre-existing generations symlink caused a successful publish into its external target."""
+    root = tmp_path / 'snap'
+    root.mkdir()
+    (root / '.repo-radar-managed-root').write_text('{}')
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    (root / 'generations').symlink_to(elsewhere)
+
+    rc, _snap, _m = publish({'alpha': 'Org/alpha'})
+
+    assert rc == 1
+    assert 'is a symlink' in capsys.readouterr().out
+    assert not list(elsewhere.iterdir()), 'nothing was written outside the chosen root'
 
 
 def test_a_dry_run_writes_nothing_at_all(publish, tmp_path, capsys):
