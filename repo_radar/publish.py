@@ -259,6 +259,50 @@ def validate_manifest(manifest):
     return problems
 
 
+def inspect_snapshot(path):
+    """Validate `path` and return (ok, why, plan).
+
+    The plan is the ONLY authorization cleanup ever gets: the manifest as validated, plus the
+    (st_dev, st_ino) of every declared file at the moment it was verified. Re-reading manifest.json
+    later meant cleanup was authorized by a second, unvalidated read — a swapped manifest could
+    name a planted file and have it deleted.
+    """
+    path = Path(path)
+    try:
+        manifest_file = path / 'manifest.json'
+        if not manifest_file.is_file():
+            return False, 'no manifest.json', None
+        try:
+            manifest = json.loads(manifest_file.read_text())
+        except (OSError, ValueError) as exc:
+            return False, f'manifest.json is not readable JSON ({exc})', None
+        # Structure first, and stop there if it fails: traversing a tree against a manifest we
+        # already know is malformed produces confusing secondary errors about the wrong thing.
+        problems = validate_manifest(manifest)
+        if problems:
+            return False, problems[0], None
+        problems = verify_tree(path, manifest)
+        if problems:
+            return False, problems[0], None
+
+        identities = {}
+        for rel in _declared_files(manifest):
+            info = os.lstat(path / rel)
+            identities[rel] = (info.st_dev, info.st_ino)
+        return True, 'a valid snapshot', {'manifest': manifest, 'identities': identities}
+    except Exception as exc:
+        # Total, like every other question whose answer decides whether to delete something.
+        # "We could not tell" must resolve to "do not touch it", never an escaping traceback.
+        return False, f'it could not be inspected ({type(exc).__name__}: {exc})', None
+
+
+def _declared_files(manifest):
+    """Every file path the manifest declares, index first."""
+    files = ['manifest.json', 'pristine/INDEX.md']
+    files += [e.get('metadataPath', '') for e in (manifest.get('repos') or {}).values()]
+    return files
+
+
 def looks_like_snapshot(path):
     """Is `path` a tree this tool produced? Returns (ok, reason).
 
@@ -273,28 +317,8 @@ def looks_like_snapshot(path):
     tolerating extras, and it no longer holds. A valid manifest sitting beside unrelated files is
     not evidence that those files are ours to delete.
     """
-    path = Path(path)
-    try:
-        manifest_file = path / 'manifest.json'
-        if not manifest_file.is_file():
-            return False, 'no manifest.json'
-        try:
-            manifest = json.loads(manifest_file.read_text())
-        except (OSError, ValueError) as exc:
-            return False, f'manifest.json is not readable JSON ({exc})'
-        # Structure first, and stop there if it fails: traversing a tree against a manifest we
-        # already know is malformed produces confusing secondary errors about the wrong thing.
-        problems = validate_manifest(manifest)
-        if problems:
-            return False, problems[0]
-        problems = verify_tree(path, manifest)
-        if problems:
-            return False, problems[0]
-        return True, 'a valid snapshot'
-    except Exception as exc:
-        # Total, like every other question whose answer decides whether to delete something.
-        # "We could not tell" must resolve to "do not touch it", never to an escaping traceback.
-        return False, f'it could not be inspected ({type(exc).__name__}: {exc})'
+    ok, why, _plan = inspect_snapshot(path)
+    return ok, why
 
 
 def _inventory(root):
@@ -556,66 +580,99 @@ def _read_manifest(root):
         return None
 
 
-def _remove_exact(root, manifest):
-    """Delete EXACTLY the files this manifest declares, then the directories, if empty.
+def _remove_exact(root, plan, expect_root):
+    """Delete exactly the objects that were validated. Returns None, or a reason string.
 
-    Returns None on success or a reason string. Nothing is deleted unless every step is safe.
+    Enumerating NAMES is not identity: a foreign tree carrying the same filenames was deleted,
+    and a file swapped between its stat and its unlink was deleted too. Names are also not
+    authorization: cleanup used to re-read manifest.json, so a manifest swapped after validation
+    could nominate a planted file for deletion.
 
-    shutil.rmtree(root) checked only the root inode, which says nothing about the contents: a file
-    added after validation was removed by a run reporting success, and a pathname substituted
-    between the final lstat and the rmtree had its contents deleted instead. Re-validating the
-    whole tree again would leave the same window, so deletion is instead descriptor-relative and
-    enumerated — we unlink the specific names we verified, refuse to follow symlinks, and rmdir
-    only what is already empty, so anything that appeared in the meantime makes cleanup fail
-    rather than get swept up.
+    So the plan — manifest and per-file (st_dev, st_ino) — is captured at validation time and
+    carried here immutably, and removal happens in two phases:
+
+      ISOLATION (reversible): rename each declared entry into a private directory inside the
+      quarantine, then confirm the moved object is the exact inode that was verified. Anything
+      that fails is rolled back and nothing is deleted. Because the object is moved before it is
+      checked, a later swap of the original name cannot reach it.
+
+      DELETION (irreversible): only once every entry is isolated and nothing unexpected remains.
     """
-    declared = ['manifest.json', 'pristine/INDEX.md']
-    declared += [e.get('metadataPath', '') for e in (manifest.get('repos') or {}).values()]
+    declared = _declared_files(plan['manifest'])
+    identities = plan['identities']
     by_dir = {}
     for rel in declared:
         parent, _, name = rel.rpartition('/')
-        by_dir.setdefault(parent, []).append(name)
+        by_dir.setdefault(parent, []).append((name, rel))
 
-    root_fd = pristine_fd = None
+    root_fd = pristine_fd = iso_fd = None
+    moved = []
     try:
         try:
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError as exc:
-            return f'could not open {root} ({exc})'
+            return f'could not open the quarantined tree ({exc})'
+        info = os.fstat(root_fd)
+        if (info.st_dev, info.st_ino) != expect_root:
+            return 'the quarantined tree is not the one that was verified'
+
         fds = {'': root_fd}
         if 'pristine' in by_dir:
-            try:
-                pristine_fd = os.open('pristine', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                      dir_fd=root_fd)
-            except OSError as exc:
-                return f'could not open pristine/ ({exc})'
+            pristine_fd = os.open('pristine', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=root_fd)
             fds['pristine'] = pristine_fd
 
-        # Every declared name must still be the regular file we verified.
+        os.mkdir('.rr-cleanup', 0o700, dir_fd=root_fd)
+        iso_fd = os.open('.rr-cleanup', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=root_fd)
+
+        failure = None
         for parent, names in by_dir.items():
-            for name in names:
+            for name, rel in names:
+                held = rel.replace('/', '__')
                 try:
-                    info = os.stat(name, dir_fd=fds[parent], follow_symlinks=False)
+                    os.rename(name, held, src_dir_fd=fds[parent], dst_dir_fd=iso_fd)
                 except OSError as exc:
-                    return f'{parent}/{name} could not be checked ({exc})'
-                if not stat.S_ISREG(info.st_mode):
-                    return f'{parent}/{name} is no longer a regular file'
+                    failure = f'{rel} could not be isolated ({exc})'
+                    break
+                moved.append((parent, name, held))
+                seen = os.stat(held, dir_fd=iso_fd, follow_symlinks=False)
+                if not stat.S_ISREG(seen.st_mode) or (seen.st_dev, seen.st_ino) != identities[rel]:
+                    failure = f'{rel} is not the file that was verified'
+                    break
+            if failure:
+                break
 
-        # Nothing may have appeared alongside them.
-        for parent, names in by_dir.items():
-            present = {e.name for e in os.scandir(fds[parent])}
-            unexpected = present - set(names) - ({'pristine'} if parent == '' else set())
-            if unexpected:
-                return (f'new content appeared in {parent or "."}/ after validation: '
-                        f'{", ".join(sorted(unexpected))}')
+        if failure is None:
+            for parent in by_dir:
+                remaining = {e.name for e in os.scandir(fds[parent])}
+                remaining -= {'.rr-cleanup'} if parent == '' else set()
+                remaining -= {'pristine'} if parent == '' else set()
+                if remaining:
+                    failure = (f'new content appeared in {parent or "."}/ after validation: '
+                               f'{", ".join(sorted(remaining))}')
+                    break
 
-        for parent, names in by_dir.items():
-            for name in names:
-                os.unlink(name, dir_fd=fds[parent])
+        if failure is not None:
+            for parent, name, held in reversed(moved):
+                try:
+                    os.rename(held, name, src_dir_fd=iso_fd, dst_dir_fd=fds[parent])
+                except OSError:
+                    pass                 # best effort; the tree is reported as retained below
+            try:
+                os.rmdir('.rr-cleanup', dir_fd=root_fd)
+            except OSError:
+                pass
+            return failure
+
+        # Point of no return: everything is isolated and identity-checked.
+        for _parent, _name, held in moved:
+            os.unlink(held, dir_fd=iso_fd)
+        os.rmdir('.rr-cleanup', dir_fd=root_fd)
     except OSError as exc:
         return f'cleanup failed ({exc})'
     finally:
-        for fd in (pristine_fd, root_fd):
+        for fd in (iso_fd, pristine_fd, root_fd):
             if fd is not None:
                 try:
                     os.close(fd)
@@ -778,9 +835,17 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
         retired.rmdir()                  # mkdtemp reserved the name; rename needs it free
         try:
             out.rename(retired)
-        except OSError as exc:
-            print(f'{RED}✗ could not move the existing {out} aside: {exc}{RESET}')
-            return 1
+        except BaseException as exc:
+            # An interrupt delivered as the rename returns leaves an ambiguous state, so the
+            # postcondition is checked rather than assumed: if the move happened, recover.
+            moved_anyway = retired.exists() and not out.exists()
+            if moved_anyway:
+                _restore(retired, out, f'the move was interrupted ({type(exc).__name__})')
+            if isinstance(exc, Exception):
+                if not moved_anyway:
+                    print(f'{RED}✗ could not move the existing {out} aside: {exc}{RESET}')
+                return 1
+            raise
 
         # Everything from here is a state machine with a recovery obligation: once the old tree is
         # quarantined, every exit must either put it back or say exactly where it is.
@@ -792,8 +857,7 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
             if (before.st_dev, before.st_ino) != quarantined:
                 return _restore(retired, out, 'it was replaced while being moved aside',
                                 expect=quarantined)
-            ok, why = looks_like_snapshot(retired)
-            retired_manifest = _read_manifest(retired)
+            ok, why, retired_plan = inspect_snapshot(retired)
             if not ok:
                 return _restore(retired, out, f'it is not a valid snapshot ({why})',
                                 expect=quarantined)
@@ -812,6 +876,15 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
                             expect=quarantined)
         staging.rename(out)
     except BaseException as exc:
+        # If the install actually landed, the new snapshot is live and restoring the old one over
+        # it would be wrong; say where the old one is instead.
+        if out.exists() and not staging.exists():
+            if retired is not None:
+                print(f'{YELLOW}  The new snapshot was installed before the interruption; the '
+                      f'previous one is retained at {retired}{RESET}')
+            if isinstance(exc, Exception):
+                return 1
+            raise
         if retired is not None:
             _restore(retired, out, f'the new snapshot could not be installed '
                                    f'({type(exc).__name__}: {exc})', expect=quarantined)
@@ -827,7 +900,7 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
         # Delete the exact entries we verified, not "whatever is under that root inode". The root
         # inode says nothing about the contents: a file added after validation was swept up by a
         # run reporting success.
-        failure = _remove_exact(retired, retired_manifest or {})
+        failure = _remove_exact(retired, retired_plan, quarantined)
         if failure:
             print(f'{YELLOW}  Warning: the previous snapshot was not removed ({failure}).{RESET}')
             print(f'{YELLOW}  It is retained at {retired}{RESET}')

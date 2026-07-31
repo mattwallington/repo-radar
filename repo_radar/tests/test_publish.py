@@ -648,18 +648,20 @@ def test_a_destination_replaced_after_validation_is_not_deleted(publish, tmp_pat
 
     # Replace the validated snapshot with someone else's directory at the last possible moment:
     # after the pre-build check, immediately before the swap.
-    real_looks = pub.looks_like_snapshot
+    real_inspect = pub.inspect_snapshot
     swapped = {'done': False}
 
     def sneaky(path):
-        verdict = real_looks(path)
+        verdict = real_inspect(path)
         if not swapped['done'] and pathlib.Path(path) == out:
             swapped['done'] = True
             shutil.rmtree(out)
             out.mkdir()
             (out / 'important.txt').write_text('MINE')
         return verdict
-    monkeypatch.setattr(pub, 'looks_like_snapshot', sneaky)
+    monkeypatch.setattr(pub, 'inspect_snapshot', sneaky)
+    monkeypatch.setattr(pub, 'looks_like_snapshot',
+                        lambda path: sneaky(path)[:2])
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -727,11 +729,11 @@ def test_a_quarantined_snapshot_substituted_after_validation_is_not_deleted(
     rc, out, _m = publish({'alpha': 'Org/alpha'})
     assert rc == 0
 
-    real_looks = pub.looks_like_snapshot
+    real_inspect = pub.inspect_snapshot
     swapped = {}
 
     def sneaky(path):
-        verdict = real_looks(path)
+        verdict = real_inspect(path)
         p = pathlib.Path(path)
         if p != out and p.name.startswith('.snap.previous-') and not swapped:
             shutil.rmtree(p)
@@ -739,7 +741,7 @@ def test_a_quarantined_snapshot_substituted_after_validation_is_not_deleted(
             (p / 'important.txt').write_text('MINE')
             swapped['at'] = p
         return verdict
-    monkeypatch.setattr(pub, 'looks_like_snapshot', sneaky)
+    monkeypatch.setattr(pub, 'inspect_snapshot', sneaky)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -760,7 +762,7 @@ def test_a_failure_after_quarantine_restores_the_previous_snapshot(publish, tmp_
 
     def boom(path):
         raise OSError('verification exploded')
-    monkeypatch.setattr(pub, 'looks_like_snapshot', boom)
+    monkeypatch.setattr(pub, 'inspect_snapshot', boom)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -779,15 +781,15 @@ def test_a_destination_reappearing_before_installation_is_not_overwritten(publis
     rc, out, _m = publish({'alpha': 'Org/alpha'})
     assert rc == 0
 
-    real_looks = pub.looks_like_snapshot
+    real_inspect = pub.inspect_snapshot
 
     def recreate(path):
-        verdict = real_looks(path)
+        verdict = real_inspect(path)
         if not out.exists():
             out.mkdir()
             (out / 'important.txt').write_text('MINE')
         return verdict
-    monkeypatch.setattr(pub, 'looks_like_snapshot', recreate)
+    monkeypatch.setattr(pub, 'inspect_snapshot', recreate)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -806,17 +808,17 @@ def test_content_added_to_the_quarantine_after_validation_is_not_deleted(publish
     rc, out, _m = publish({'alpha': 'Org/alpha'})
     assert rc == 0
 
-    real_looks = pub.looks_like_snapshot
+    real_inspect = pub.inspect_snapshot
     planted = {}
 
     def plant(path):
-        verdict = real_looks(path)
+        verdict = real_inspect(path)
         p = pathlib.Path(path)
         if p.name.startswith('.snap.previous-') and 'at' not in planted:
             (p / 'important.txt').write_text('MINE')
             planted['at'] = p / 'important.txt'
         return verdict
-    monkeypatch.setattr(pub, 'looks_like_snapshot', plant)
+    monkeypatch.setattr(pub, 'inspect_snapshot', plant)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -838,14 +840,14 @@ def test_cleanup_refuses_a_quarantine_substituted_after_the_final_check(publish,
     real_remove = pub._remove_exact
     swapped = {}
 
-    def swap_then_remove(root, manifest):
+    def swap_then_remove(root, plan, expect_root):
         root = pathlib.Path(root)
         if 'at' not in swapped:
             shutil.rmtree(root)
             root.mkdir()
             (root / 'important.txt').write_text('MINE')
             swapped['at'] = root / 'important.txt'
-        return real_remove(root, manifest)
+        return real_remove(root, plan, expect_root)
     monkeypatch.setattr(pub, '_remove_exact', swap_then_remove)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
@@ -869,9 +871,10 @@ def test_restoration_refuses_a_substituted_quarantine(publish, tmp_path, monkeyp
             shutil.move(str(p), str(hidden))       # move the real snapshot away
             p.mkdir()
             (p / 'important.txt').write_text('MINE')
-            return False, 'pretend it is invalid'
-        return True, 'ok'
-    monkeypatch.setattr(pub, 'looks_like_snapshot', swap_and_fail)
+            return False, 'pretend it is invalid', None
+        return pub.inspect_snapshot.__wrapped__(path) if False else (True, 'ok', {
+            'manifest': {'repos': {}}, 'identities': {}})
+    monkeypatch.setattr(pub, 'inspect_snapshot', swap_and_fail)
 
     rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
 
@@ -894,7 +897,7 @@ def test_an_interrupt_after_quarantine_restores_and_re_raises(publish, tmp_path,
 
     def interrupt(path):
         raise KeyboardInterrupt()
-    monkeypatch.setattr(pub, 'looks_like_snapshot', interrupt)
+    monkeypatch.setattr(pub, 'inspect_snapshot', interrupt)
 
     with pytest.raises(KeyboardInterrupt):
         pub.publish_mode(_args(out, tmp_path / 'pristine'))
@@ -975,3 +978,99 @@ class _FakeEntry:
                 st_size = info.st_size
             return Shifted()
         return info
+
+
+def test_a_same_shaped_foreign_tree_is_not_deleted(publish, tmp_path, monkeypatch, capsys):
+    """The dangerous substitution: identical FILENAMES, different bytes.
+
+    Enumerating names is not identity. The previous substitution test used a replacement whose
+    names did not match, so it never exercised this — and this is the case that got a foreign
+    tree deleted with a green success.
+    """
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_inspect = pub.inspect_snapshot
+    swapped = {}
+
+    def swap_same_shape(path):
+        verdict = real_inspect(path)
+        p = pathlib.Path(path)
+        if p.name.startswith('.snap.previous-') and not swapped:
+            # A tree with exactly the declared names but foreign contents.
+            shutil.rmtree(p)
+            (p / 'pristine').mkdir(parents=True)
+            (p / 'manifest.json').write_text('IMPOSTOR')
+            (p / 'pristine/INDEX.md').write_text('IMPOSTOR')
+            (p / 'pristine/alpha.md').write_text('IMPOSTOR')
+            swapped['at'] = p
+        return verdict
+    monkeypatch.setattr(pub, 'inspect_snapshot', swap_same_shape)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert swapped, 'precondition: a same-shaped tree replaced the quarantine'
+    survivor = swapped['at']
+    assert (survivor / 'manifest.json').read_text() == 'IMPOSTOR', \
+        'matching names must not authorise deletion — identity must'
+    assert (survivor / 'pristine/alpha.md').read_text() == 'IMPOSTOR'
+    assert 'retained at' in capsys.readouterr().out
+
+
+def test_cleanup_is_authorised_only_by_the_validated_plan(publish, tmp_path, monkeypatch):
+    """Cleanup used to re-read manifest.json, so a manifest swapped after validation could
+    nominate a planted file for deletion. The plan is captured at validation and carried."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_inspect = pub.inspect_snapshot
+    planted = {}
+
+    def swap_manifest(path):
+        verdict = real_inspect(path)
+        p = pathlib.Path(path)
+        if p.name.startswith('.snap.previous-') and not planted:
+            victim = p / 'pristine/important.txt'
+            victim.write_text('MINE')
+            (p / 'manifest.json').write_text(json.dumps({
+                'schemaVersion': 1, 'metadataSnapshotId': 'sha256:x',
+                'index': {'path': 'pristine/INDEX.md', 'sha256': 'x'},
+                'repos': {'Org/x': {'metadataPath': 'pristine/important.txt',
+                                    'metadataSha256': 'x', 'sourceCommit': 'a' * 40}}}))
+            planted['at'] = victim
+        return verdict
+    monkeypatch.setattr(pub, 'inspect_snapshot', swap_manifest)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert planted, 'precondition: a manifest was swapped in after validation'
+    assert planted['at'].read_text() == 'MINE', \
+        'a post-validation manifest must never authorise a deletion'
+
+
+def test_the_lock_failure_path_actually_closes_its_descriptor(publish, tmp_path, monkeypatch):
+    """Counting iterations proved nothing: removing the production close left it green.
+
+    Observe os.close directly instead.
+    """
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    held, _why = pub._acquire_lock(out)
+    assert held is not None
+
+    closed = []
+    real_close = os.close
+    monkeypatch.setattr(os, 'close', lambda fd: (closed.append(fd), real_close(fd))[1])
+    try:
+        blocked, why = pub._acquire_lock(out)
+        assert blocked is None and 'already writing' in why
+        assert closed, 'the descriptor opened before the failed flock must be closed'
+    finally:
+        monkeypatch.undo()
+        pub._release_lock(held)
