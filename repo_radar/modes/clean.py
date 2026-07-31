@@ -93,16 +93,21 @@ def find_orphans(pristine_dir, config, cache_index=None):
             raise UnusableConfig(f'configured repository {full_name!r} is not owner/name')
         if is_excluded(full_name, exclusions):
             continue                      # configured but excluded: its cache is an orphan
-        clone_url = repo.get('clone_url')
-        if not isinstance(clone_url, str) or not clone_url.strip():
+        raw_url = repo.get('clone_url')
+        if not isinstance(raw_url, str) or not raw_url.strip():
             # get_cache_name('' , name) happily hashes the empty string, producing a cache name
             # that matches nothing — so the repository's real directory looked unclaimed.
             raise UnusableConfig(f'configured repository {full_name} has no clone_url — cannot '
                                  f'determine which cache directory belongs to it')
+        # Normalise once and use the SAME value for hashing and lookup. Checking `.strip()` while
+        # hashing the padded original produced a cache name matching nothing, so a live cache for
+        # a configured repository was classified as an orphan.
+        clone_url = raw_url.strip()
         configured_names.add(full_name.casefold())
-        # The recorded mapping wins; the deterministic name is only the fallback.
-        cache_name = cache_index.get(clone_url) or get_cache_name(clone_url,
-                                                                  full_name.split('/')[-1])
+        # The recorded mapping wins; the deterministic name is only the fallback. Both spellings
+        # are tried because an existing index may have been keyed with the unnormalised URL.
+        cache_name = (cache_index.get(clone_url) or cache_index.get(raw_url)
+                      or get_cache_name(clone_url, full_name.split('/')[-1]))
         configured[cache_name.casefold()] = full_name
 
     # Any name the cache index maps to is a repo-radar artifact, even if its repo is gone.
@@ -142,20 +147,22 @@ def find_orphans(pristine_dir, config, cache_index=None):
         # Ownership evidence, in descending strength. A filename SHAPE is not evidence on its own:
         # `meeting-deadbee.md` matches `<name>-<7hex>` and is not ours, and neither is an ordinary
         # note that happens to contain a `full_name:` line.
-        inferred = _repo_name_from_cache_dir(name)
+        # POSITIVE evidence only, and a cache-shaped name plus a .git directory is not it: an
+        # ordinary personal checkout called `personal-project-deadbee` satisfied exactly that and
+        # became deletable. The three things that actually prove ownership are an authoritative
+        # cache-index mapping, metadata we wrote that claims this entry, or a readable origin
+        # remote. The 659 MB firmware clone is still covered — by its verified origin.
         if name.casefold() in known_cache_names:
             recognised = True
         elif full_name:
             recognised = True            # metadata naming owner/name AND its own cache_dir
-        elif item.is_dir():
-            recognised = (inferred is not None and (item / '.git').exists()) or bool(origin)
         else:
-            recognised = False
+            recognised = bool(origin)
         if not recognised:
             unknown.append((item, 'cannot identify as a repo-radar cache entry'))
             continue
 
-        identity = full_name or origin or inferred
+        identity = full_name or origin or _repo_name_from_cache_dir(name)
         if identity and is_excluded(identity, exclusions):
             reason = f'excluded by configuration ({identity})'
         elif full_name:

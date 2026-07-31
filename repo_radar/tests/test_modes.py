@@ -265,17 +265,60 @@ def test_an_excluded_repository_is_an_orphan_even_while_still_configured(tmp_pat
     assert all('excluded by configuration' in r for _p, _f, r in orphans)
 
 
-def test_a_clone_with_no_metadata_is_identified_from_its_directory_name(tmp_path):
-    """The largest orphan in practice had never been analyzed, so it had no metadata to read."""
+def test_a_clone_with_no_metadata_is_identified_by_its_origin_remote(tmp_path):
+    """The largest orphan in practice had never been analyzed, so it had no metadata to read.
+
+    Its origin remote is what identified it — the same evidence used to confirm the real 659 MB
+    firmware clone before deleting it. A cache-shaped name plus a .git directory is deliberately
+    NOT enough, because an ordinary personal checkout satisfies exactly that.
+    """
     from repo_radar.modes.clean import find_orphans
 
-    pristine = _corpus(tmp_path, {'reperio-nordic-fw-0a10653': None})
-    orphans, _kept, _unknown = find_orphans(pristine, {'repositories': [],
-                                                       'exclusions': ['reperio-nordic-fw']})
+    pristine = tmp_path / 'pristine'
+    pristine.mkdir()
+    clone = pristine / 'reperio-nordic-fw-0a10653'
+    clone.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=clone, check=True)
+    subprocess.run(['git', 'remote', 'add', 'origin',
+                    'git@github.com:ReperioHealth/reperio-nordic-fw.git'], cwd=clone, check=True)
+    (pristine / 'INDEX.md').write_text('# Index\n')
+
+    orphans, _kept, _unknown = find_orphans(
+        pristine, {'repositories': [], 'exclusions': ['reperio-nordic-fw']})
 
     assert len(orphans) == 1
-    assert 'excluded by configuration (reperio-nordic-fw)' in orphans[0][2], (
-        'a clone with no metadata must still be recognisable by its cache directory name')
+    assert 'excluded by configuration' in orphans[0][2]
+    assert 'reperio-nordic-fw' in orphans[0][2]
+
+
+def test_a_personal_checkout_with_a_cache_shaped_name_is_not_ours(tmp_path):
+    """`personal-project-deadbee/.git` matched the old evidence rule and became deletable."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    mine = pristine / 'personal-project-deadbee'
+    mine.mkdir()
+    (mine / '.git').mkdir()          # a checkout, but nothing identifies it as repo-radar's
+
+    orphans, _kept, unknown = find_orphans(pristine, {'repositories': [_repo('org/kept')]})
+
+    assert orphans == [], 'a name shape plus .git is not positive ownership evidence'
+    assert [p.name for p, _why in unknown] == ['personal-project-deadbee']
+
+
+def test_a_padded_clone_url_still_locates_its_cache(tmp_path):
+    """`.strip()` was checked but the padded original was hashed, so the live cache for a
+    configured repository was classified as an orphan."""
+    from repo_radar.modes.clean import find_orphans
+
+    pristine = _corpus(tmp_path, {_cache('org/kept'): 'org/kept'})
+    padded = {'full_name': 'org/kept',
+              'clone_url': '  https://github.com/org/kept.git  '}
+
+    orphans, kept, _unknown = find_orphans(pristine, {'repositories': [padded]})
+
+    assert orphans == [], 'whitespace in a configured URL must not orphan its cache'
+    assert len(kept) == 2
 
 
 def test_index_and_symlinks_are_never_reported_as_orphans(tmp_path):

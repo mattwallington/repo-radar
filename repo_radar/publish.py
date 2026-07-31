@@ -274,22 +274,27 @@ def looks_like_snapshot(path):
     not evidence that those files are ours to delete.
     """
     path = Path(path)
-    manifest_file = path / 'manifest.json'
-    if not manifest_file.is_file():
-        return False, 'no manifest.json'
     try:
-        manifest = json.loads(manifest_file.read_text())
-    except (OSError, ValueError) as exc:
-        return False, f'manifest.json is not readable JSON ({exc})'
-    # Structure first, and stop there if it fails: traversing a tree against a manifest we already
-    # know is malformed produces confusing secondary errors about the wrong thing.
-    problems = validate_manifest(manifest)
-    if problems:
-        return False, problems[0]
-    problems = verify_tree(path, manifest)
-    if problems:
-        return False, problems[0]
-    return True, 'a valid snapshot'
+        manifest_file = path / 'manifest.json'
+        if not manifest_file.is_file():
+            return False, 'no manifest.json'
+        try:
+            manifest = json.loads(manifest_file.read_text())
+        except (OSError, ValueError) as exc:
+            return False, f'manifest.json is not readable JSON ({exc})'
+        # Structure first, and stop there if it fails: traversing a tree against a manifest we
+        # already know is malformed produces confusing secondary errors about the wrong thing.
+        problems = validate_manifest(manifest)
+        if problems:
+            return False, problems[0]
+        problems = verify_tree(path, manifest)
+        if problems:
+            return False, problems[0]
+        return True, 'a valid snapshot'
+    except Exception as exc:
+        # Total, like every other question whose answer decides whether to delete something.
+        # "We could not tell" must resolve to "do not touch it", never to an escaping traceback.
+        return False, f'it could not be inspected ({type(exc).__name__}: {exc})'
 
 
 def _inventory(root):
@@ -301,6 +306,10 @@ def _inventory(root):
     """
     root = Path(root)
     found = []
+    try:
+        root_dev = os.lstat(root).st_dev
+    except OSError as exc:
+        return [('', None, str(exc))]
     stack = [root]
     while stack:
         current = stack.pop()
@@ -312,8 +321,14 @@ def _inventory(root):
         for entry in entries:
             path = Path(entry.path)
             info = entry.stat(follow_symlinks=False)
-            found.append((str(path.relative_to(root)), info, None))
+            rel = str(path.relative_to(root))
+            found.append((rel, info, None))
             if stat.S_ISDIR(info.st_mode) and not entry.is_symlink():
+                # A different device is a mount point. Descending would validate — and later
+                # delete — files on a filesystem that merely happens to be mounted here.
+                if info.st_dev != root_dev:
+                    found.append((rel, None, 'crosses a filesystem boundary (mount point)'))
+                    continue
                 stack.append(path)
     return found
 
@@ -408,7 +423,10 @@ def publish_mode(args):
     # Only a directory we can positively identify as a previous snapshot may be replaced. Checked
     # on dry runs too: "would publish" is worthless if the real run refuses the destination.
     if out.exists():
-        ok, why = looks_like_snapshot(out)
+        try:
+            ok, why = looks_like_snapshot(out)
+        except Exception as exc:         # a monkeypatched or future implementation may still raise
+            ok, why = False, f'{type(exc).__name__}: {exc}'
         if not ok:
             print(f'{RED}error: {out} exists and is not a valid previous snapshot ({why}){RESET}')
             print(f'{YELLOW}  Refusing to delete it. Choose an empty path or remove it '
@@ -512,9 +530,9 @@ def publish_mode(args):
     try:
         # One publisher per destination. Without it, two concurrent runs can each move the other's
         # freshly installed snapshot aside and delete it.
-        lock = _acquire_lock(out)
+        lock, why = _acquire_lock(out)
         if lock is None:
-            print(f'{RED}✗ another repo-radar publish is already writing to {out}{RESET}')
+            print(f'{RED}✗ cannot lock {out}: {why}{RESET}')
             return 1
         staging = Path(tempfile.mkdtemp(prefix=f'.{out.name}.staging-', dir=out.parent))
         try:
@@ -527,20 +545,65 @@ def publish_mode(args):
             _release_lock(lock)
 
 
+def _restore(retired, out, why):
+    """Put the quarantined tree back, or say exactly where it is. Always returns 1.
+
+    Restoration is only safe while `out` is still absent: if something else has appeared there we
+    must not overwrite it, because we have proven nothing about it. In that case the old snapshot
+    stays quarantined and its path is printed — stranding it silently is what turned a failed
+    publish into a lost snapshot.
+    """
+    print()
+    print(f'{RED}✗ Nothing was published: {why}{RESET}')
+    if out.exists() or out.is_symlink():
+        print(f'{YELLOW}  {out} is occupied by something this run did not create, so the previous '
+              f'snapshot was NOT restored over it.{RESET}')
+        print(f'{YELLOW}  It is intact at: {retired}{RESET}')
+        return 1
+    try:
+        retired.rename(out)
+        print(f'{YELLOW}  The existing {out} was left untouched.{RESET}')
+    except OSError as exc:
+        print(f'{RED}  The previous snapshot could not be restored ({exc}).{RESET}')
+        print(f'{YELLOW}  It is intact at: {retired}{RESET}')
+    return 1
+
+
 def _acquire_lock(out):
-    """An exclusive advisory lock for this destination, or None if another run holds it."""
+    """An exclusive advisory lock for this destination, or None if it cannot be taken safely.
+
+    open(path, 'w') follows symlinks and TRUNCATES before any lock is held, so pointing the
+    predictable lock name at a real file emptied it — a successful publish that destroyed data it
+    never even looked at. O_NOFOLLOW refuses to open through a symlink and no truncation flag is
+    passed, so the worst case is failing to lock rather than destroying the target.
+    """
+    path = out.parent / f'.{out.name}.publish.lock'
+    fd = None
     try:
-        handle = open(out.parent / f'.{out.name}.publish.lock', 'w')
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return handle
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            return None, f'{path} is not a regular file'
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)         # the old code leaked the handle here
+            return None, 'another repo-radar publish is already writing to this destination'
+        return fd, 'acquired'
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        return None, f'could not open {path} safely ({exc})'
+
+
+def _release_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
-        return None
-
-
-def _release_lock(handle):
+        pass
     try:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-        handle.close()
+        os.close(fd)
     except OSError:
         pass
 
@@ -605,6 +668,7 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
     # first means everything from here on concerns the exact object we are holding, and if it
     # turns out not to be our snapshot we put it back untouched.
     retired = None
+    quarantined = None          # (st_dev, st_ino) of the object we validated
     if out.exists() or out.is_symlink():
         before = os.lstat(out)
         retired = Path(tempfile.mkdtemp(prefix=f'.{out.name}.previous-', dir=out.parent))
@@ -614,29 +678,45 @@ def _build_and_swap(args, out, staging, index_text, links, repos, skipped, exclu
         except OSError as exc:
             print(f'{RED}✗ could not move the existing {out} aside: {exc}{RESET}')
             return 1
-        after = os.lstat(retired)
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-            retired.rename(out)
-            print(f'{RED}✗ {out} was replaced while being moved — refusing to continue{RESET}')
-            return 1
-        ok, why = looks_like_snapshot(retired)
-        if not ok:
-            retired.rename(out)          # not ours; hand it back exactly as we found it
-            print()
-            print(f'{RED}✗ {out} is not a valid snapshot ({why}){RESET}')
-            print(f'{YELLOW}  It has been left untouched and nothing was published.{RESET}')
-            return 1
+
+        # Everything from here is a state machine with a recovery obligation: once the old tree is
+        # quarantined, every exit must either put it back or say exactly where it is. Falling out
+        # of this block on an exception used to leave `out` absent and the real snapshot stranded
+        # under a .previous-* name nobody was told about.
+        try:
+            after = os.lstat(retired)
+            quarantined = (after.st_dev, after.st_ino)
+            if (before.st_dev, before.st_ino) != quarantined:
+                return _restore(retired, out, 'it was replaced while being moved aside')
+            ok, why = looks_like_snapshot(retired)
+            if not ok:
+                return _restore(retired, out, f'it is not a valid snapshot ({why})')
+        except Exception as exc:
+            return _restore(retired, out, f'it could not be verified ({exc})')
 
     try:
+        # `out` must still be absent. os.rename would silently replace an empty directory that
+        # appeared here since the move, and we have proven nothing about it.
+        if retired is not None and (out.exists() or out.is_symlink()):
+            return _restore(retired, out, 'something new appeared at the destination')
         staging.rename(out)
     except OSError as exc:
-        if retired is not None and retired.exists():
-            retired.rename(out)
+        if retired is not None:
+            return _restore(retired, out, f'the new snapshot could not be installed ({exc})')
         print(f'{RED}✗ could not install the new snapshot at {out}: {exc}{RESET}')
         return 1
+
     if retired is not None:
+        # Re-confirm we are deleting the object we validated, not whatever now answers to that
+        # pathname. Codex substituted a directory here after its successful verdict and watched it
+        # be deleted.
         try:
-            shutil.rmtree(retired)
+            now = os.lstat(retired)
+            if (now.st_dev, now.st_ino) != quarantined:
+                print(f'{YELLOW}  Warning: {retired} is no longer the tree that was verified; '
+                      f'leaving it in place rather than deleting it.{RESET}')
+            else:
+                shutil.rmtree(retired)
         except OSError as exc:
             # Do not report an unqualified success while a full copy of the old snapshot is still
             # on disk under a name the user has never seen.

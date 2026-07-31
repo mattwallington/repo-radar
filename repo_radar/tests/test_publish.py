@@ -682,10 +682,116 @@ def test_a_second_publisher_is_refused_while_one_holds_the_destination(publish, 
 
     rc, out, _m = publish({'alpha': 'Org/alpha'})
     assert rc == 0
-    held = pub._acquire_lock(out)
+    held, _why = pub._acquire_lock(out)
     assert held is not None
     try:
-        assert pub._acquire_lock(out) is None, 'the second publisher must be refused'
+        blocked, why = pub._acquire_lock(out)
+        assert blocked is None and 'already writing' in why
     finally:
         pub._release_lock(held)
-    assert pub._acquire_lock(out) is not None, 'and the lock must be released afterwards'
+    regained, _why = pub._acquire_lock(out)
+    assert regained is not None, 'the lock must be released afterwards'
+    pub._release_lock(regained)
+
+
+def test_the_lock_never_truncates_what_it_opens(publish, tmp_path):
+    """open(path, 'w') follows symlinks and TRUNCATES before any lock is held, so pointing the
+    predictable lock name at a real file emptied it — during a SUCCESSFUL publish."""
+    victim = tmp_path / 'important.txt'
+    victim.write_text('DO NOT TRUNCATE')
+    (tmp_path / '.snap.publish.lock').symlink_to(victim)
+
+    rc, _out, _m = publish({'alpha': 'Org/alpha'})
+
+    assert victim.read_text() == 'DO NOT TRUNCATE', 'the lock must never write through a symlink'
+    assert rc == 1, 'and a lock it cannot take safely must stop the publish'
+
+
+def test_the_lock_is_released_even_when_it_cannot_be_taken(publish, tmp_path):
+    """The failure path used to leak the open handle."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    for _ in range(50):
+        held, why = pub._acquire_lock(out)
+        assert held is not None, f'descriptors must not leak across attempts ({why})'
+        pub._release_lock(held)
+
+
+def test_a_quarantined_snapshot_substituted_after_validation_is_not_deleted(
+        publish, tmp_path, monkeypatch, capsys):
+    """The move bound validation to one object; deletion then trusted the pathname again."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_looks = pub.looks_like_snapshot
+    swapped = {}
+
+    def sneaky(path):
+        verdict = real_looks(path)
+        p = pathlib.Path(path)
+        if p != out and p.name.startswith('.snap.previous-') and not swapped:
+            shutil.rmtree(p)
+            p.mkdir()
+            (p / 'important.txt').write_text('MINE')
+            swapped['at'] = p
+        return verdict
+    monkeypatch.setattr(pub, 'looks_like_snapshot', sneaky)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert swapped, 'precondition: the quarantined tree was substituted'
+    assert (swapped['at'] / 'important.txt').read_text() == 'MINE', \
+        'deletion must be bound to the object that was validated'
+
+
+def test_a_failure_after_quarantine_restores_the_previous_snapshot(publish, tmp_path,
+                                                                   monkeypatch, capsys):
+    """An exception after the move used to leave `out` absent and the real snapshot stranded
+    under a .previous-* name nobody was told about."""
+    import repo_radar.publish as pub
+
+    rc, out, manifest = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+    before = (out / 'manifest.json').read_text()
+
+    def boom(path):
+        raise OSError('verification exploded')
+    monkeypatch.setattr(pub, 'looks_like_snapshot', boom)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert rc == 1
+    assert out.is_dir(), 'the destination must not be left absent'
+    assert (out / 'manifest.json').read_text() == before, 'the snapshot must be restored intact'
+    assert not list(tmp_path.glob('.snap.previous-*')), 'and nothing stranded'
+
+
+def test_a_destination_reappearing_before_installation_is_not_overwritten(publish, tmp_path,
+                                                                          monkeypatch, capsys):
+    """os.rename silently replaces an empty directory, and we have proven nothing about one that
+    appeared after the move."""
+    import repo_radar.publish as pub
+
+    rc, out, _m = publish({'alpha': 'Org/alpha'})
+    assert rc == 0
+
+    real_looks = pub.looks_like_snapshot
+
+    def recreate(path):
+        verdict = real_looks(path)
+        if not out.exists():
+            out.mkdir()
+            (out / 'important.txt').write_text('MINE')
+        return verdict
+    monkeypatch.setattr(pub, 'looks_like_snapshot', recreate)
+
+    rc = pub.publish_mode(_args(out, tmp_path / 'pristine'))
+
+    assert rc == 1
+    assert (out / 'important.txt').read_text() == 'MINE', 'the intruder must survive'
+    report = capsys.readouterr().out
+    assert 'intact at' in report, 'and the quarantined snapshot must be located for the user'
