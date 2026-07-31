@@ -753,13 +753,25 @@ def _ancestor_problem(start):
     while True:
         try:
             info = os.lstat(ancestor)
-        except OSError:
+        except FileNotFoundError:
             if ancestor.parent == ancestor:
                 return None                  # reached the root without finding anything present
             ancestor = ancestor.parent
             continue
+        except NotADirectoryError:
+            # A non-directory component is in the path. Climb to reach it directly; lstat on the
+            # component itself succeeds and the non-directory branch below names it.
+            if ancestor.parent == ancestor:
+                return f'{ancestor} cannot be traversed'
+            ancestor = ancestor.parent
+            continue
+        except OSError as exc:
+            # A permission (or similar) failure is NOT absence — the real mkdir hits it too, so
+            # the walk must not step over it and approve.
+            return f'{ancestor} is not accessible ({exc.strerror or exc})'
         # First ancestor that exists on disk. mkdir descends into it, so it must be a directory or
-        # a symlink that resolves to one.
+        # a symlink that resolves to one — AND it must be writable and searchable, or makedirs
+        # fails EACCES where the preview approved.
         if stat.S_ISLNK(info.st_mode):
             try:
                 target = os.stat(ancestor)   # follows the link
@@ -769,6 +781,8 @@ def _ancestor_problem(start):
                 return f'{ancestor} is a symlink to a non-directory'
         elif not stat.S_ISDIR(info.st_mode):
             return f'{ancestor} is not a directory'
+        if not os.access(ancestor, os.W_OK | os.X_OK):
+            return f'{ancestor} is not writable and searchable'
         return None
 
 

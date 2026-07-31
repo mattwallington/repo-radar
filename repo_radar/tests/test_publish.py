@@ -655,3 +655,50 @@ def test_preflight_allows_a_symlink_ancestor_that_resolves_to_a_directory(tmp_pa
 
     ok, why = pub._destination_preflight(link / 'snap')
     assert ok, why
+
+
+@pytest.mark.parametrize('mode', [0o555, 0o500, 0o000])
+def test_preflight_and_real_run_agree_on_an_unwritable_ancestor(publish, tmp_path, mode):
+    """os.lstat OSErrors were all treated as absence, so a permission failure was stepped over,
+    and a found directory's own writability was never checked. Real makedirs hits EACCES."""
+    import types as _t
+    import repo_radar.publish as pub
+
+    parent = tmp_path / 'locked'
+    parent.mkdir()
+    target = parent / 'snap'
+    os.chmod(parent, mode)
+    try:
+        ok, _why = pub._destination_preflight(target)
+        assert not ok, f'mode {mode:o} must be refused'
+
+        args = _args(target, _corpus(tmp_path, {'alpha': 'Org/alpha'}))
+        dry = _t.SimpleNamespace(**{**vars(args), 'dry_run': True})
+        pub.load_config = lambda: {'repositories': [{'full_name': 'Org/alpha'}], 'exclusions': []}
+        pub.load_exclusions = lambda c=None: []
+        assert pub.publish_mode(dry) == pub.publish_mode(args) == 1, (
+            f'preview and real run must agree for mode {mode:o}')
+    finally:
+        os.chmod(parent, 0o700)
+
+
+def test_preflight_rejects_a_symlink_to_an_unwritable_directory(tmp_path):
+    import repo_radar.publish as pub
+
+    real = tmp_path / 'real'
+    real.mkdir()
+    (tmp_path / 'link').symlink_to(real)
+    os.chmod(real, 0o555)
+    try:
+        ok, why = pub._destination_preflight(tmp_path / 'link' / 'snap')
+        assert not ok and 'writable' in why
+    finally:
+        os.chmod(real, 0o700)
+
+
+def test_preflight_still_approves_a_writable_ancestor(tmp_path):
+    """The boundary: an ordinary writable parent must still pass, or the fix over-rejects."""
+    import repo_radar.publish as pub
+
+    ok, why = pub._destination_preflight(tmp_path / 'deeper' / 'snap')
+    assert ok, why
