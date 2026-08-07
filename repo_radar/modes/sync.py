@@ -22,7 +22,7 @@ from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, RE
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking_threshold,
-    count_tokens_accurate, count_tokens_for_budget, chunk_repo_files, get_fallback_model,
+    count_tokens_accurate, chunk_repo_files, repo_needs_chunking, get_fallback_model,
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt)
 from repo_radar.metadata import (
@@ -887,19 +887,15 @@ Stack Trace:
                 threshold = get_chunking_threshold(model)
                 context_window = get_model_context_window(model)
 
-                # The chunk DECISION is made on the FINISHED single-repo prompt, not a sum of
-                # file-content tokens: the template + per-file framing add real tokens, and for
-                # Claude 4.7+ the count is inflated to cover litellm's undercounting tokenizer.
-                # Fast path first — the per-file budget sum is a lower bound, so if it already
-                # exceeds the threshold we chunk without assembling the (huge) whole-repo prompt.
-                content_budget_sum = sum(count_tokens_for_budget(f['content'], model).count for f in files)
-                if content_budget_sum > threshold:
-                    needs_chunk, single_budget = True, content_budget_sum
-                else:
-                    single_budget = count_tokens_for_budget(_build_full_repo_prompt(full_name, files), model).count
-                    needs_chunk = single_budget > threshold
+                # ONE authoritative decision helper, so production decides on the same finished
+                # prompt the tests exercise (it used to reimplement the decision inline). Returns
+                # whether to chunk, the value it decided on, and whether that value is the exact
+                # finished-prompt count or a lower bound.
+                needs_chunk, decision_value, decision_exact = repo_needs_chunking(
+                    full_name, files, model, threshold)
 
-                budget_note = f" / {single_budget:,} prompt-budget" if single_budget != total_tokens else ""
+                budget_label = "prompt-budget" if decision_exact else "content lower bound"
+                budget_note = f" / {decision_value:,} {budget_label}" if decision_value != total_tokens else ""
                 meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
 
                 total_api_cost = 0.0

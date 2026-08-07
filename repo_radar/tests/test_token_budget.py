@@ -157,30 +157,73 @@ def test_repack_splits_a_component_overshoot_chunk():
         assert got <= budget, f"chunk {i} real prompt {got} > {budget} — repack did not split it"
 
 
-def test_the_decision_counts_the_finished_prompt_not_bare_content():
-    """A repo can look small by file content yet assemble into a prompt that overflows once the
-    template + framing are added. repo_fits_single_prompt must measure the finished prompt."""
+def test_repo_needs_chunking_decides_on_the_finished_prompt():
+    """repo_needs_chunking is the production decision (sync calls it). It must decide on the
+    FINISHED whole-repo prompt, not a sum of file-content tokens — a repo can look small by
+    content yet overflow once template + framing are added."""
     model = "claude-opus-5"
     files = _files(6, 5)
     finished = llm.count_tokens_for_budget(llm._build_full_repo_prompt("o/r", files), model).count
     content_only = sum(llm.count_tokens_for_budget(f["content"], model).count for f in files)
-
     assert finished > content_only, "template + framing must add real tokens"
-    # A budget above the finished prompt fits; a budget between content-only and finished does NOT
-    # — deciding on content-only (the old behaviour) would have wrongly chosen the single path.
-    assert llm.repo_fits_single_prompt("o/r", files, model, finished)
-    assert not llm.repo_fits_single_prompt("o/r", files, model, content_only)
+
+    # Budget above the finished prompt -> single path, exact count reported.
+    needs, value, exact = llm.repo_needs_chunking("o/r", files, model, finished)
+    assert (needs, value, exact) == (False, finished, True)
+    # Budget between content-only and finished -> must chunk (deciding on content-only, the old
+    # bug, would have wrongly kept it single).
+    needs, _value, exact = llm.repo_needs_chunking("o/r", files, model, content_only)
+    assert needs and exact
+    # Fast path: content lower bound alone over budget -> chunk without the exact count.
+    needs, value, exact = llm.repo_needs_chunking("o/r", files, model, content_only - 1)
+    assert (needs, value, exact) == (True, content_only, False)
 
 
-def test_sync_routes_through_the_shared_prompt_builders():
-    """Production must SEND the prompt the chunker/decision MEASURED. It used to build both the
-    chunk prompt and the whole-repo prompt inline, so the validated builders and the sent strings
-    were two sources of truth that drifted (the inline chunk header always emitted "(chunk N/M)",
-    the helper omitted it for a single chunk)."""
+def test_wide_header_verification_upper_bounds_any_real_header():
+    """The chunker verifies with a fixed wide "(chunk 999999/999999)" header, so the number it
+    checks is >= the real "(chunk i/N)" header for any N. A narrow synthetic header (the old
+    999/999) under-bounded once a repo split into >999 chunks and sent prompts over budget."""
+    model = "claude-opus-5"
+    chunk = _files(3, 5)
+    wide = llm._analysis_prompt_budget("o/r", chunk, model)
+    for i, n in [(1, 1), (5, 10), (500, 1500), (999999, 999999)]:
+        real = llm.count_tokens_for_budget(llm._build_analysis_prompt("o/r", chunk, i, n), model).count
+        assert real <= wide, (i, n, real, wide)
+
+
+def test_repack_splits_a_large_overshoot_into_few_chunks_not_per_file():
+    """The paid-call explosion Codex flagged, tested directly on the repack pass. Feed _repack_to_fit
+    ONE chunk of 100 files whose REAL assembled prompt is ~2x budget. The greedy packer can't deliver
+    such a chunk (pass 2 bounds every chunk to ~threshold, so through chunk_repo_files pass 3 only
+    ever sees a seam-sized overshoot — which is why routing this through chunk_repo_files can't tell
+    peel-one from binary-search). Calling the repack directly makes the guarantee observable: the
+    largest-prefix binary search splits it into a couple of maximally-full chunks; peeling one file
+    at a time emits ~51 singleton (paid) calls. This test FAILS if _repack_to_fit reverts to peeling.
+    """
+    model = "claude-opus-5"
+    body = "def f_0(x):\n    return x + compute(x)  # note\n" * 4
+    files = [{"path": f"m{i}.py", "size": len(body), "content": body} for i in range(100)]
+    budget = llm._analysis_prompt_budget("o/r", files[:50], model)  # fits ~half the files
+    assert llm._analysis_prompt_budget("o/r", files, model) > 1.8 * budget, \
+        "the single chunk must run well over budget for this to exercise the split"
+
+    chunks = llm._repack_to_fit([files], budget, model, "o/r")
+    assert len(chunks) <= 5, f"largest-prefix split must stay tiny, got {len(chunks)} (peel-one gives ~51)"
+    assert sum(len(c) for c in chunks) == 100, "no files lost or duplicated across the split"
+    for c in chunks:
+        assert llm._analysis_prompt_budget("o/r", c, model) <= budget
+
+
+def test_sync_routes_through_the_shared_prompt_builders_and_decision():
+    """Production must SEND the prompt the chunker/decision MEASURED, and DECIDE with the one
+    authoritative helper. It used to build both prompts inline and reimplement the decision, so the
+    validated code and the real code were separate and could drift."""
     src = pathlib.Path(__file__).resolve().parents[1] / "modes" / "sync.py"
     text = src.read_text()
     assert "_build_analysis_prompt(full_name, chunk" in text
     assert "_build_full_repo_prompt(full_name, files)" in text
-    # The inline prompt literals must be gone — they now live only in llm.py's builders.
+    assert "repo_needs_chunking(" in text, "decision must go through the authoritative helper"
+    # The inline prompt literals and the inline decision reimplementation must be gone.
     assert "Analyze this portion of the repository" not in text
     assert "Analyze this repository:" not in text
+    assert "content_budget_sum" not in text

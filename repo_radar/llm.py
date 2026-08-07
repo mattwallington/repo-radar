@@ -501,32 +501,88 @@ Repository files:
 """
 
 
-def repo_fits_single_prompt(full_name, files, model, budget):
-    """True if the WHOLE-REPO prompt's conservative budget count fits `budget`.
+# The "(chunk i/N)" header is verified with a FIXED wide count, so the number we check
+# upper-bounds every real header (i <= N < this). That removes count-dependence — no fixpoint as
+# splitting changes N — and closes the gap where a real i/N header tokenized wider than a narrow
+# synthetic proxy and a chunk verified as fitting was actually sent over budget.
+_WIDE_CHUNK_HEADER = 999999
 
-    Deciding on the finished prompt — not a sum of file-content tokens — is the point: a repo can
-    look small by content and still assemble into a prompt that overflows once the template and
-    per-file framing are included.
+
+def _analysis_prompt_budget(full_name, chunk, model):
+    """Conservative budget count of the analysis prompt for `chunk`, using the widest header."""
+    return _budget_tokens(
+        _build_analysis_prompt(full_name, chunk, _WIDE_CHUNK_HEADER, _WIDE_CHUNK_HEADER), model)
+
+
+def repo_needs_chunking(full_name, files, model, budget):
+    """THE chunk decision, called by production. Returns (needs_chunk, value, exact).
+
+    Decides on the FINISHED whole-repo prompt, not a sum of file-content tokens: the template and
+    per-file framing add real tokens. Fast path: the per-file content-budget sum is a lower bound
+    on the finished prompt, so if it already exceeds `budget` we chunk without assembling the huge
+    whole-repo string, and `value` is that lower bound (exact=False). Otherwise count the actual
+    finished prompt (exact=True). A loose lower bound can only over-chunk, never wrongly pick the
+    single path.
     """
-    return _budget_tokens(_build_full_repo_prompt(full_name, files), model) <= budget
+    lower_bound = sum(count_tokens_for_budget(f['content'], model).count for f in files)
+    if lower_bound > budget:
+        return True, lower_bound, False
+    finished = _budget_tokens(_build_full_repo_prompt(full_name, files), model)
+    return finished > budget, finished, True
+
+
+def _repack_to_fit(chunks, threshold, model, full_name):
+    """Split any packed chunk whose REAL assembled prompt (widest header) exceeds `threshold`.
+
+    Emits the LARGEST prefix that fits (binary search on the split point) and re-queues the
+    remainder, so an oversized chunk becomes a few maximally-full chunks — NOT one paid call per
+    file. Peeling a single file at a time turns a chunk that runs K files over budget into ~K
+    singleton (paid) analysis calls; the largest-prefix split makes it O(log k) measurements and a
+    handful of chunks (empirically: a 100-file chunk at ~2x budget splits to 2, where peel-one
+    emits 51). Singletons are COUNTED, never exempted: a lone file still over budget is the
+    irreducible floor (budget < template), impossible for a real 0.75x-window budget.
+
+    The greedy packer (chunk_repo_files pass 2) bounds every chunk to ~threshold, so through that
+    path this only ever sees a seam-sized overshoot; the guarantee matters for any caller that hands
+    the repack a genuinely oversized chunk, and it costs the same as peeling in the common case.
+    """
+    verified, queue = [], list(chunks)
+    while queue:
+        chunk = queue.pop(0)
+        if len(chunk) <= 1 or _analysis_prompt_budget(full_name, chunk, model) <= threshold:
+            verified.append(chunk)
+            continue
+        lo, hi = 1, len(chunk)          # largest prefix length whose prompt fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _analysis_prompt_budget(full_name, chunk[:mid], model) <= threshold:
+                lo = mid
+            else:
+                hi = mid - 1
+        verified.append(chunk[:lo])
+        queue.insert(0, chunk[lo:])
+    return verified
 
 
 def _truncate_file_to_prompt_budget(file_info, budget_tokens, model, full_name):
     """Trim one file so its OWN one-file analysis prompt (template + framing + notice) fits budget.
 
-    Measures the actual assembled prompt, not a per-file estimate, because tokenizer seams are not
-    additive — a component estimate can say "fits" for a prompt that does not.
+    Measures the actual assembled prompt with the widest header. Returns the smallest content it
+    can; if even one character still overflows (only when the budget is smaller than the fixed
+    template itself, which never happens for a real 0.75x-window budget) the caller treats it as
+    the irreducible floor.
     """
     original = file_info['content']
     raw = count_tokens_accurate(original, model)
     notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
               f"{budget_tokens:,}-token chunk budget)")
     keep = len(original)
-    for _ in range(12):
+    for _ in range(14):
         candidate = {**file_info, 'content': original[:keep] + notice}
-        prompt = _build_analysis_prompt(full_name, [candidate], 999, 999)
-        if keep <= 1 or _budget_tokens(prompt, model) <= budget_tokens:
+        if _analysis_prompt_budget(full_name, [candidate], model) <= budget_tokens:
             return candidate
+        if keep <= 1:
+            break
         keep = max(int(keep * 0.7), 1)
     return {**file_info, 'content': original[:1] + notice}
 
@@ -535,25 +591,27 @@ def chunk_repo_files(files, model, max_tokens=None, full_name=""):
     """Chunk files so each chunk's FINISHED analysis prompt fits the model's budget.
 
     Correctness over speed: tokenizer seams are NOT additive, so a chunk whose per-file component
-    counts sum under the budget can still overflow once assembled. Two-phase:
-      1. Greedy pack by a fast per-file component estimate (a lower bound).
-      2. Measure each packed chunk's REAL assembled prompt and split any that overflows.
-    Files whose own one-file prompt exceeds the budget are truncated first, so a peeled single
-    file always fits. Everything is counted through count_tokens_for_budget, so Claude 4.7+ (whose
-    litellm tokenizer undercounts ~1.6x) is bounded by an inflated, fail-closed estimate.
+    counts sum under budget can still overflow once assembled. Three phases:
+      1. Truncate any single file whose OWN one-file prompt would overflow.
+      2. Greedy pack by a fast per-file component estimate (a lower bound).
+      3. Measure each packed chunk's REAL assembled prompt (widest header) and split any that
+         overflows at its LARGEST fitting prefix (_repack_to_fit) — keeps chunks maximally full and
+         order-preserving, where peeling one file at a time turned one over-budget chunk into
+         hundreds of singleton (paid) analysis calls.
+    Everything is counted through count_tokens_for_budget, so Claude 4.7+ (whose litellm tokenizer
+    undercounts ~1.6x) is bounded by an inflated, fail-closed estimate. A lone file that still
+    overflows is the irreducible floor (budget < template), impossible for a real window.
     """
     threshold = get_chunking_threshold(model) if max_tokens is None else max_tokens
-    # Header sized for a large chunk count so a many-chunk repo can't overflow by its width.
-    template_overhead = _budget_tokens(_build_analysis_prompt(full_name, [], 999, 999), model)
+    template_overhead = _analysis_prompt_budget(full_name, [], model)
     content_budget = max(threshold - template_overhead, 1)
 
-    # Pass 1: per-file component estimate; truncate any file whose OWN prompt would overflow. The
-    # expensive assembled-prompt measurement is only taken for files near the ceiling.
+    # Pass 1: truncate any file whose OWN prompt would overflow (measured only near the ceiling).
     entries = []  # (file_info, framed_component_tokens)
     for file_info in files:
         framed = _budget_tokens(_frame_file(file_info) + "\n", model)
         if framed + template_overhead > threshold:
-            if _budget_tokens(_build_analysis_prompt(full_name, [file_info], 999, 999), model) > threshold:
+            if _analysis_prompt_budget(full_name, [file_info], model) > threshold:
                 file_info = _truncate_file_to_prompt_budget(file_info, threshold, model, full_name)
                 framed = _budget_tokens(_frame_file(file_info) + "\n", model)
         entries.append((file_info, framed))
@@ -569,19 +627,10 @@ def chunk_repo_files(files, model, max_tokens=None, full_name=""):
     if current:
         packed.append(current)
 
-    # Pass 3: verify each chunk's REAL assembled prompt, splitting any that overflows. Peel from
-    # the end (order preserved) and re-test the head; component packing is close, so this is 0-1
-    # peels per chunk in practice.
-    verified, queue = [], list(packed)
-    while queue:
-        chunk = queue.pop(0)
-        if len(chunk) <= 1 or _budget_tokens(
-                _build_analysis_prompt(full_name, chunk, 999, 999), model) <= threshold:
-            verified.append(chunk)
-        else:
-            queue.insert(0, [chunk[-1]])
-            queue.insert(0, chunk[:-1])
-    return verified
+    # Pass 3: verify each packed chunk's REAL assembled prompt (widest header) and split any that
+    # overflows with the largest-prefix binary search (see _repack_to_fit — NOT one-file peeling,
+    # which would fragment a badly-packed chunk into hundreds of singleton paid calls).
+    return _repack_to_fit(packed, threshold, model, full_name)
 
 
 def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
