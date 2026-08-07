@@ -504,10 +504,11 @@ Repository files:
 # The "(chunk i/N)" header is the only text that varies with the (evolving) chunk count, and BPE
 # token counts are NOT monotonic in the numerals — a real "(chunk 531/531)" tokenizes to MORE
 # tokens than a wider "(chunk 999999/999999)". So no synthetic numeral can upper-bound the header.
-# Instead we pack the header-LESS content against `threshold - reserve` and reserve a length-proven
+# Instead we pack the header-LESS content against `threshold - reserve` and reserve a length-based
 # token allowance for whatever real header the final split yields: token_count never exceeds
-# char_count for a BPE tokenizer, so an allowance >= the widest possible header substring's
-# character length bounds the marginal cost of ANY (i, N). No fixpoint over N is needed.
+# char_count for a BPE tokenizer, so an allowance >= the widest header substring's character length
+# bounds the substring's own cost, plus a small empirical margin for seam retokenization. No
+# fixpoint over N is needed.
 
 
 def _content_prompt_budget(full_name, chunk, model):
@@ -519,12 +520,14 @@ def _content_prompt_budget(full_name, chunk, model):
 
 
 def _header_token_reserve(model, max_chunks):
-    """A PROVEN upper bound (budget tokens) on what a "(chunk i/N)" header can add, for any
+    """A conservative upper bound (budget tokens) on what a "(chunk i/N)" header adds, for any
     i <= N <= max_chunks. The header inserts only the substring " (chunk {i}/{N})"; an all-9s probe
     of the same digit width is at least as long as any real substring, and token_count(s) <= len(s)
-    for a BPE tokenizer, so len(probe) (times the model's budget multiplier, +8 for boundary
-    retokenization) can never be exceeded by a real header. We bound by LENGTH, never by a chosen
-    numeral, precisely because BPE is non-monotonic in the digits.
+    for a BPE tokenizer, so len(probe) * factor rigorously bounds the substring's OWN budget cost.
+    The +8 is an empirically-calibrated margin for retokenization at the insertion seam (validated
+    across thousands of real-header chunks with double-digit token slack to spare) — not a
+    closed-form seam proof; Branch 2's server-side token count will remove the estimate entirely.
+    We bound by LENGTH, never by a chosen numeral, precisely because BPE is non-monotonic in digits.
     """
     d = len(str(max(int(max_chunks), 1)))
     probe = f" (chunk {'9' * d}/{'9' * d})"
@@ -614,7 +617,7 @@ def chunk_repo_files(files, model, max_tokens=None, full_name=""):
         can overflow once assembled — so every packed chunk's REAL content prompt is measured.
       * BPE is NOT monotonic in the header numerals, so we never embed a synthetic count to bound
         the header; we pack the header-LESS content against `threshold - reserve` and reserve a
-        length-proven token allowance (_header_token_reserve) for whatever real header the final
+        length-based token allowance (_header_token_reserve) for whatever real header the final
         split yields.
     Phases:
       1. Truncate any single file whose own content prompt would overflow `content_budget`.
