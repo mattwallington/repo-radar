@@ -501,17 +501,35 @@ Repository files:
 """
 
 
-# The "(chunk i/N)" header is verified with a FIXED wide count, so the number we check
-# upper-bounds every real header (i <= N < this). That removes count-dependence — no fixpoint as
-# splitting changes N — and closes the gap where a real i/N header tokenized wider than a narrow
-# synthetic proxy and a chunk verified as fitting was actually sent over budget.
-_WIDE_CHUNK_HEADER = 999999
+# The "(chunk i/N)" header is the only text that varies with the (evolving) chunk count, and BPE
+# token counts are NOT monotonic in the numerals — a real "(chunk 531/531)" tokenizes to MORE
+# tokens than a wider "(chunk 999999/999999)". So no synthetic numeral can upper-bound the header.
+# Instead we pack the header-LESS content against `threshold - reserve` and reserve a length-proven
+# token allowance for whatever real header the final split yields: token_count never exceeds
+# char_count for a BPE tokenizer, so an allowance >= the widest possible header substring's
+# character length bounds the marginal cost of ANY (i, N). No fixpoint over N is needed.
 
 
-def _analysis_prompt_budget(full_name, chunk, model):
-    """Conservative budget count of the analysis prompt for `chunk`, using the widest header."""
-    return _budget_tokens(
-        _build_analysis_prompt(full_name, chunk, _WIDE_CHUNK_HEADER, _WIDE_CHUNK_HEADER), model)
+def _content_prompt_budget(full_name, chunk, model):
+    """Conservative budget count of `chunk`'s analysis prompt WITHOUT the "(chunk i/N)" header
+    (total_chunks=1 renders no header). The header allowance is reserved separately, so this is the
+    part of the budget the file content must fit inside — the SAME content string the model receives.
+    """
+    return _budget_tokens(_build_analysis_prompt(full_name, chunk, 1, 1), model)
+
+
+def _header_token_reserve(model, max_chunks):
+    """A PROVEN upper bound (budget tokens) on what a "(chunk i/N)" header can add, for any
+    i <= N <= max_chunks. The header inserts only the substring " (chunk {i}/{N})"; an all-9s probe
+    of the same digit width is at least as long as any real substring, and token_count(s) <= len(s)
+    for a BPE tokenizer, so len(probe) (times the model's budget multiplier, +8 for boundary
+    retokenization) can never be exceeded by a real header. We bound by LENGTH, never by a chosen
+    numeral, precisely because BPE is non-monotonic in the digits.
+    """
+    d = len(str(max(int(max_chunks), 1)))
+    probe = f" (chunk {'9' * d}/{'9' * d})"
+    factor = count_tokens_for_budget("reserve probe", model).factor
+    return math.ceil(len(probe) * factor) + 8
 
 
 def repo_needs_chunking(full_name, files, model, budget):
@@ -531,43 +549,43 @@ def repo_needs_chunking(full_name, files, model, budget):
     return finished > budget, finished, True
 
 
-def _repack_to_fit(chunks, threshold, model, full_name):
-    """Split any packed chunk whose REAL assembled prompt (widest header) exceeds `threshold`.
+def _repack_to_fit(chunks, content_budget, model, full_name):
+    """Split any chunk whose REAL header-less content prompt exceeds `content_budget`, emitting the
+    LARGEST prefix that fits (binary search on the split point) and MERGING the remainder into the
+    next chunk — never emitting the remainder as its own small chunk.
 
-    Emits the LARGEST prefix that fits (binary search on the split point) and re-queues the
-    remainder, so an oversized chunk becomes a few maximally-full chunks — NOT one paid call per
-    file. Peeling a single file at a time turns a chunk that runs K files over budget into ~K
-    singleton (paid) analysis calls; the largest-prefix split makes it O(log k) measurements and a
-    handful of chunks (empirically: a 100-file chunk at ~2x budget splits to 2, where peel-one
-    emits 51). Singletons are COUNTED, never exempted: a lone file still over budget is the
-    irreducible floor (budget < template), impossible for a real 0.75x-window budget.
-
-    The greedy packer (chunk_repo_files pass 2) bounds every chunk to ~threshold, so through that
-    path this only ever sees a seam-sized overshoot; the guarantee matters for any caller that hands
-    the repack a genuinely oversized chunk, and it costs the same as peeling in the common case.
+    Merging the tail forward is what stops a run of seam-overshooting chunks from doubling into
+    big/tiny/big/tiny paid calls: with per-file component packing, EVERY packed chunk can overshoot
+    the real prompt by a seam, so tail-emitting turned 20 packed chunks into 40 (alternating ~49 and
+    1 file). Absorbing each tail into the next chunk keeps the count near optimal (20 -> 21). A lone
+    file still over budget is the irreducible floor (budget < template), impossible for a real
+    0.75x-window budget, and is emitted as-is.
     """
     verified, queue = [], list(chunks)
     while queue:
         chunk = queue.pop(0)
-        if len(chunk) <= 1 or _analysis_prompt_budget(full_name, chunk, model) <= threshold:
+        if len(chunk) <= 1 or _content_prompt_budget(full_name, chunk, model) <= content_budget:
             verified.append(chunk)
             continue
-        lo, hi = 1, len(chunk)          # largest prefix length whose prompt fits
+        lo, hi = 1, len(chunk)          # largest prefix length whose content prompt fits
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if _analysis_prompt_budget(full_name, chunk[:mid], model) <= threshold:
+            if _content_prompt_budget(full_name, chunk[:mid], model) <= content_budget:
                 lo = mid
             else:
                 hi = mid - 1
         verified.append(chunk[:lo])
-        queue.insert(0, chunk[lo:])
+        remainder = chunk[lo:]
+        if queue:
+            queue[0] = remainder + queue[0]   # absorb the tail into the next chunk, not a tiny chunk
+        else:
+            queue.append(remainder)
     return verified
 
 
 def _truncate_file_to_prompt_budget(file_info, budget_tokens, model, full_name):
-    """Trim one file so its OWN one-file analysis prompt (template + framing + notice) fits budget.
-
-    Measures the actual assembled prompt with the widest header. Returns the smallest content it
+    """Trim one file so its OWN one-file content prompt (template + framing + notice, no header) fits
+    `budget_tokens`. Measures the real header-less content prompt. Returns the smallest content it
     can; if even one character still overflows (only when the budget is smaller than the fixed
     template itself, which never happens for a real 0.75x-window budget) the caller treats it as
     the irreducible floor.
@@ -579,7 +597,7 @@ def _truncate_file_to_prompt_budget(file_info, budget_tokens, model, full_name):
     keep = len(original)
     for _ in range(14):
         candidate = {**file_info, 'content': original[:keep] + notice}
-        if _analysis_prompt_budget(full_name, [candidate], model) <= budget_tokens:
+        if _content_prompt_budget(full_name, [candidate], model) <= budget_tokens:
             return candidate
         if keep <= 1:
             break
@@ -588,35 +606,43 @@ def _truncate_file_to_prompt_budget(file_info, budget_tokens, model, full_name):
 
 
 def chunk_repo_files(files, model, max_tokens=None, full_name=""):
-    """Chunk files so each chunk's FINISHED analysis prompt fits the model's budget.
+    """Chunk files so each chunk's FINISHED analysis prompt (content + "(chunk i/N)" header) fits
+    the model's budget.
 
-    Correctness over speed: tokenizer seams are NOT additive, so a chunk whose per-file component
-    counts sum under budget can still overflow once assembled. Three phases:
-      1. Truncate any single file whose OWN one-file prompt would overflow.
-      2. Greedy pack by a fast per-file component estimate (a lower bound).
-      3. Measure each packed chunk's REAL assembled prompt (widest header) and split any that
-         overflows at its LARGEST fitting prefix (_repack_to_fit) — keeps chunks maximally full and
-         order-preserving, where peeling one file at a time turned one over-budget chunk into
-         hundreds of singleton (paid) analysis calls.
+    Correctness over speed on two axes:
+      * Tokenizer seams are NOT additive — a chunk whose per-file component counts sum under budget
+        can overflow once assembled — so every packed chunk's REAL content prompt is measured.
+      * BPE is NOT monotonic in the header numerals, so we never embed a synthetic count to bound
+        the header; we pack the header-LESS content against `threshold - reserve` and reserve a
+        length-proven token allowance (_header_token_reserve) for whatever real header the final
+        split yields.
+    Phases:
+      1. Truncate any single file whose own content prompt would overflow `content_budget`.
+      2. Greedy-pack by a fast per-file component lower bound.
+      3. Measure each packed chunk's real content prompt; split any overflow at its largest fitting
+         prefix and MERGE the remainder forward (_repack_to_fit) so seam overshoot never fragments
+         a run of chunks into big/tiny paid calls.
     Everything is counted through count_tokens_for_budget, so Claude 4.7+ (whose litellm tokenizer
     undercounts ~1.6x) is bounded by an inflated, fail-closed estimate. A lone file that still
     overflows is the irreducible floor (budget < template), impossible for a real window.
     """
     threshold = get_chunking_threshold(model) if max_tokens is None else max_tokens
-    template_overhead = _analysis_prompt_budget(full_name, [], model)
-    content_budget = max(threshold - template_overhead, 1)
+    # Reserve for the real "(chunk i/N)" header: N can be at most one chunk per file.
+    reserve = _header_token_reserve(model, max(len(files), 1))
+    content_budget = max(threshold - reserve, 1)
+    template_overhead = _content_prompt_budget(full_name, [], model)
 
-    # Pass 1: truncate any file whose OWN prompt would overflow (measured only near the ceiling).
+    # Pass 1: truncate any file whose OWN content prompt would overflow content_budget.
     entries = []  # (file_info, framed_component_tokens)
     for file_info in files:
         framed = _budget_tokens(_frame_file(file_info) + "\n", model)
-        if framed + template_overhead > threshold:
-            if _analysis_prompt_budget(full_name, [file_info], model) > threshold:
-                file_info = _truncate_file_to_prompt_budget(file_info, threshold, model, full_name)
+        if framed + template_overhead > content_budget:
+            if _content_prompt_budget(full_name, [file_info], model) > content_budget:
+                file_info = _truncate_file_to_prompt_budget(file_info, content_budget, model, full_name)
                 framed = _budget_tokens(_frame_file(file_info) + "\n", model)
         entries.append((file_info, framed))
 
-    # Pass 2: greedy pack by the component lower bound.
+    # Pass 2: greedy pack by the component lower bound (a fast under-estimate of the real prompt).
     packed, current, running = [], [], 0
     for file_info, framed in entries:
         if current and running + framed > content_budget:
@@ -627,10 +653,8 @@ def chunk_repo_files(files, model, max_tokens=None, full_name=""):
     if current:
         packed.append(current)
 
-    # Pass 3: verify each packed chunk's REAL assembled prompt (widest header) and split any that
-    # overflows with the largest-prefix binary search (see _repack_to_fit — NOT one-file peeling,
-    # which would fragment a badly-packed chunk into hundreds of singleton paid calls).
-    return _repack_to_fit(packed, threshold, model, full_name)
+    # Pass 3: verify each packed chunk's REAL content prompt and split/merge to fit content_budget.
+    return _repack_to_fit(packed, content_budget, model, full_name)
 
 
 def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):

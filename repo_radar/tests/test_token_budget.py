@@ -125,12 +125,13 @@ import pathlib
 import pytest
 
 
-@pytest.mark.parametrize("budget", [1000, 1200, 1600, 2500])
+@pytest.mark.parametrize("budget", [1100, 1200, 1600, 2500])
 def test_every_chunk_real_prompt_fits_even_at_tight_budgets(budget):
     """Component-sum packing under-counts the assembled prompt because tokenizer seams are not
     additive — a chunk that summed under budget can measure over. The repack pass must guarantee
-    every REAL assembled prompt fits. Tight budgets pack several files per chunk, so the seams
-    actually bite (this is the class Codex reproduced at 917 -> 934)."""
+    every REAL (i, N) prompt — actual header included — fits. Tight budgets pack several files per
+    chunk (2/3/5 here), so the seams actually bite (this is the class Codex reproduced at 917 ->
+    934). Budgets stay above the header reserve + one file so packing isn't forced to singletons."""
     model = "claude-opus-5"
     chunks = llm.chunk_repo_files(_files(50, 8), model, max_tokens=budget, full_name="Org/repo")
     assert any(len(c) > 1 for c in chunks), "budget should pack multiple files per chunk"
@@ -179,39 +180,50 @@ def test_repo_needs_chunking_decides_on_the_finished_prompt():
     assert (needs, value, exact) == (True, content_only, False)
 
 
-def test_wide_header_verification_upper_bounds_any_real_header():
-    """The chunker verifies with a fixed wide "(chunk 999999/999999)" header, so the number it
-    checks is >= the real "(chunk i/N)" header for any N. A narrow synthetic header (the old
-    999/999) under-bounded once a repo split into >999 chunks and sent prompts over budget."""
+def test_header_reserve_bounds_every_real_header_and_the_old_proxy_undercounted():
+    """Finding 1 (Codex round 3): BPE token counts are NOT monotonic in the header numerals, so the
+    old fixed "(chunk 999999/999999)" proxy did NOT upper-bound the real header — "(chunk 531/531)"
+    and "(chunk 436/872)" tokenize to MORE tokens than it, and a chunk verified against the proxy
+    was sent over budget. The fix packs the header-LESS content and reserves a length-proven
+    allowance. Assert (a) the reserve is a true upper bound on the marginal cost of EVERY real
+    header, and (b) the discredited proxy actually under-counted the non-monotone numerals — so this
+    regression cannot silently pass on the old proxy-based code."""
     model = "claude-opus-5"
-    chunk = _files(3, 5)
-    wide = llm._analysis_prompt_budget("o/r", chunk, model)
-    for i, n in [(1, 1), (5, 10), (500, 1500), (999999, 999999)]:
+    chunk = [{"path": "a.py", "size": 4, "content": "x=1\n"}]
+    headerless = llm._content_prompt_budget("o/r", chunk, model)
+    reserve = llm._header_token_reserve(model, 10 ** 7)          # covers up to 7-digit chunk counts
+    proxy = llm.count_tokens_for_budget(
+        llm._build_analysis_prompt("o/r", chunk, 999999, 999999), model).count
+    proxy_undercounts = []
+    for i, n in [(1, 1), (5, 10), (531, 531), (436, 872), (500, 1500), (777, 777), (999999, 999999)]:
         real = llm.count_tokens_for_budget(llm._build_analysis_prompt("o/r", chunk, i, n), model).count
-        assert real <= wide, (i, n, real, wide)
+        assert real - headerless <= reserve, f"reserve {reserve} < marginal {real - headerless} at ({i},{n})"
+        if real > proxy:
+            proxy_undercounts.append((i, n, real, proxy))
+    assert proxy_undercounts, "(531/531)/(436/872) must exceed the 999999 proxy — proves BPE non-monotonicity"
 
 
-def test_repack_splits_a_large_overshoot_into_few_chunks_not_per_file():
-    """The paid-call explosion Codex flagged, tested directly on the repack pass. Feed _repack_to_fit
-    ONE chunk of 100 files whose REAL assembled prompt is ~2x budget. The greedy packer can't deliver
-    such a chunk (pass 2 bounds every chunk to ~threshold, so through chunk_repo_files pass 3 only
-    ever sees a seam-sized overshoot — which is why routing this through chunk_repo_files can't tell
-    peel-one from binary-search). Calling the repack directly makes the guarantee observable: the
-    largest-prefix binary search splits it into a couple of maximally-full chunks; peeling one file
-    at a time emits ~51 singleton (paid) calls. This test FAILS if _repack_to_fit reverts to peeling.
-    """
-    model = "claude-opus-5"
-    body = "def f_0(x):\n    return x + compute(x)  # note\n" * 4
-    files = [{"path": f"m{i}.py", "size": len(body), "content": body} for i in range(100)]
-    budget = llm._analysis_prompt_budget("o/r", files[:50], model)  # fits ~half the files
-    assert llm._analysis_prompt_budget("o/r", files, model) > 1.8 * budget, \
-        "the single chunk must run well over budget for this to exercise the split"
+def test_chunking_absorbs_seam_tails_instead_of_doubling_the_paid_calls():
+    """Finding 2 (Codex round 3): per-file component packing (pass 2) makes EVERY packed chunk
+    overshoot the real prompt by a seam, so emitting each split remainder as its OWN chunk turned 20
+    packed chunks into 40 — alternating ~48-file and 1-file paid calls, reachable straight through
+    chunk_repo_files (contrary to the prior test's premise). _repack_to_fit now merges each tail into
+    the NEXT chunk, keeping the count near optimal (~21). This runs through the production entry
+    point, asserts file identity AND order are preserved with no drops/duplicates, and that every
+    REAL (i, N) prompt fits. It FAILS if the repack emits tails as their own chunks (~40) — the exact
+    reproduction Codex gave (1,000 files at budget 2,838)."""
+    model, budget = "claude-opus-5", 2838
+    body = "def f_0(x):\n    return x + compute(x)  # note\n"
+    files = [{"path": f"m{i}.py", "size": len(body), "content": body} for i in range(1000)]
+    chunks = llm.chunk_repo_files(files, model, max_tokens=budget, full_name="o/r")
 
-    chunks = llm._repack_to_fit([files], budget, model, "o/r")
-    assert len(chunks) <= 5, f"largest-prefix split must stay tiny, got {len(chunks)} (peel-one gives ~51)"
-    assert sum(len(c) for c in chunks) == 100, "no files lost or duplicated across the split"
-    for c in chunks:
-        assert llm._analysis_prompt_budget("o/r", c, model) <= budget
+    assert [f["path"] for c in chunks for f in c] == [f["path"] for f in files], \
+        "files must be preserved in order with no drops or duplicates"
+    assert len(chunks) <= 25, f"tail-merge must keep the count near optimal, got {len(chunks)} (tail-emit gives ~40)"
+    assert min(len(c) for c in chunks) > 1, "no starved 1-file tail chunks"
+    for i, c in enumerate(chunks, 1):
+        real = llm.count_tokens_for_budget(llm._build_analysis_prompt("o/r", c, i, len(chunks)), model).count
+        assert real <= budget, f"chunk {i}: real (i,N) prompt {real} > {budget}"
 
 
 def test_sync_routes_through_the_shared_prompt_builders_and_decision():
