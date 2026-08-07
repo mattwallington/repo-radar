@@ -21,7 +21,7 @@ from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses
+from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, count_tokens_for_budget, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
     PARSE_STATUS_DEGRADED,
@@ -881,20 +881,25 @@ Stack Trace:
                 # Get model and calculate accurate token count
                 model = get_ai_model()
                 total_tokens = sum(count_tokens_accurate(f['content'], model) for f in files)
+                # Budget count drives the CHUNK DECISION; raw count is only for display. For Claude
+                # 4.7+ the raw count undercounts by ~1.6x, so deciding on it sent whole repos that
+                # actually needed chunking as one prompt the server then rejected.
+                budget_total = sum(count_tokens_for_budget(f['content'], model).count for f in files)
                 threshold = get_chunking_threshold(model)
                 context_window = get_model_context_window(model)
 
-                meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
+                budget_note = f" / {budget_total:,} budgeted" if budget_total != total_tokens else ""
+                meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
 
                 total_api_cost = 0.0
 
-                # Check if we need to chunk
-                if total_tokens > threshold:
+                # Check if we need to chunk — on the conservative budget count, not the raw one.
+                if budget_total > threshold:
                     # Calculate expected chunks
-                    expected_chunks = max(1, (total_tokens // threshold) + 1)
+                    expected_chunks = max(1, (budget_total // threshold) + 1)
 
-                    # Create chunks using model-aware chunking
-                    chunks = chunk_repo_files(files, model, threshold)
+                    # Create chunks using model-aware chunking (budgets the FINISHED prompt)
+                    chunks = chunk_repo_files(files, model, threshold, full_name=full_name)
                     meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
 
                     # Send status update

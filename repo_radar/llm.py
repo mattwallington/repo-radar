@@ -1,7 +1,9 @@
 """LLM integration, model configuration, and rate limiting."""
 
+import math
 import os
 import re
+from collections import namedtuple
 from datetime import datetime
 
 from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
@@ -63,8 +65,12 @@ KNOWN_LIMITS = {
     # GPT-5.x
     "gpt-5.4": 1050000,
     "gpt-5.4-pro": 1050000,
-    "gpt-5.4-mini": 1050000,
-    "gpt-5.4-nano": 1050000,
+    # 272K INPUT, not 1.05M. OpenAI documents both mini and nano at 400K total context with 128K
+    # max output; 400K - 128K = 272K, which is litellm's max_input_tokens for each. The 1.05M
+    # entries were the wrong-direction table error (over-reporting the usable input window), so the
+    # chunker packed ~787K-token prompts against a 272K ceiling. This table stores input windows.
+    "gpt-5.4-mini": 272000,
+    "gpt-5.4-nano": 272000,
     # 272K INPUT, not the 400K total context. OpenAI documents 400K total with a 128K maximum
     # output, and 400000 - 128000 = 272000 exactly, which is litellm's max_input_tokens. This
     # table stores input windows (see the header), so 400K was the total misfiled as an input
@@ -291,6 +297,45 @@ def count_tokens_accurate(text, model):
         return int(len(text) / 3.5)
 
 
+# Claude 4.7 and later ship a NEWER tokenizer than the one litellm bundles. litellm maps every
+# Claude generation to the same bundled anthropic_tokenizer.json, so it counts 4.7+ text with the
+# 4.5/4.6 tokenizer and UNDERCOUNTS: three observed production failures ran 1.596x, 1.600x and
+# 1.617x below the server's own count (e.g. our 745,509 -> Anthropic's 1,189,532), which is what
+# pushed 1M-window Claude prompts past the ceiling while Gemini (a genuinely different, accurate
+# tokenizer) never overflowed. Until the Count Tokens endpoint preflight lands (the durable fix),
+# budget these models as if every prompt were this factor larger than litellm reports.
+NEW_TOKENIZER_MODELS = frozenset({
+    "claude-opus-4-7", "claude-opus-4-8", "claude-fable-5",
+    "claude-sonnet-5", "claude-opus-5",
+})
+CLAUDE_UNDERCOUNT_FACTOR = 1.7  # covers the 1.617x worst case observed; the 25% window reserve adds
+                                # headroom. Deliberately NOT applied to 4.5/4.6 (accurate tokenizer).
+
+BudgetCount = namedtuple("BudgetCount", "count raw strategy factor")
+
+
+def count_tokens_for_budget(text, model):
+    """Conservative token count for BUDGETING — deliberately distinct from count_tokens_accurate.
+
+    Never surface this as a token 'count' in progress, cost, or diagnostic displays: for Claude
+    4.7+ it intentionally inflates the raw estimate to compensate for litellm's stale bundled
+    tokenizer. A rejected multi-hundred-thousand-token generation costs real money and wall-clock;
+    over-reserving does not. Returns the adjusted count alongside the raw count, the strategy, and
+    the factor, so callers/diagnostics can keep both figures and future server discrepancies stay
+    measurable.
+    """
+    raw = count_tokens_accurate(text, model)
+    if model in NEW_TOKENIZER_MODELS:
+        return BudgetCount(math.ceil(raw * CLAUDE_UNDERCOUNT_FACTOR), raw,
+                           "claude-4.7+-conservative", CLAUDE_UNDERCOUNT_FACTOR)
+    return BudgetCount(raw, raw, "litellm", 1.0)
+
+
+def _budget_tokens(text, model):
+    """The conservative budget token count as a bare int, for the bounding math in this module."""
+    return count_tokens_for_budget(text, model).count
+
+
 class RateLimitTracker:
     """Track API rate limits across requests."""
     def __init__(self):
@@ -374,80 +419,18 @@ class RateLimitTracker:
 rate_limit_tracker = RateLimitTracker()
 
 
-def chunk_repo_files(files, model, max_tokens=None):
-    """Chunk repository files intelligently based on model context window.
-
-    Args:
-        files: List of file dictionaries with 'path' and 'content'
-        model: Model name for accurate token counting
-        max_tokens: Maximum tokens per chunk (defaults to model's threshold)
-
-    Returns:
-        List of file chunks, with oversized files truncated
-    """
-    if max_tokens is None:
-        max_tokens = get_chunking_threshold(model)
-
-    # First pass: Truncate individual files that are too large
-    # This prevents one massive file from creating excessive chunks
-    SINGLE_FILE_TOKEN_LIMIT = 100000  # 100K tokens max per file
-    processed_files = []
-
-    for file_info in files:
-        file_tokens = count_tokens_accurate(file_info['content'], model)
-
-        if file_tokens > SINGLE_FILE_TOKEN_LIMIT:
-            # Truncate to limit
-            char_limit = int(SINGLE_FILE_TOKEN_LIMIT * 3.5)  # Approximate chars for 100K tokens
-            truncated_content = file_info['content'][:char_limit]
-
-            # Add truncation notice
-            truncation_notice = f"\n\n... (File truncated: original {file_tokens:,} tokens exceeds {SINGLE_FILE_TOKEN_LIMIT:,} token limit)"
-
-            processed_files.append({
-                **file_info,
-                'content': truncated_content + truncation_notice
-            })
-        else:
-            processed_files.append(file_info)
-
-    # Second pass: Create chunks based on accurate token counts
-    chunks = []
-    current_chunk = []
-    current_tokens = 0
-
-    for file_info in processed_files:
-        file_tokens = count_tokens_accurate(file_info['content'], model)
-
-        # If adding this file would exceed limit, start new chunk
-        if current_chunk and (current_tokens + file_tokens > max_tokens):
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_tokens = 0
-
-        current_chunk.append(file_info)
-        current_tokens += file_tokens
-
-    # Add remaining files
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
+def _frame_file(file_info):
+    """Exactly how the analysis prompt renders one file. Single source of truth so the chunker
+    budgets the SAME string the model will actually receive."""
+    return f"=== {file_info['path']} ({file_info['size']} bytes) ===\n{file_info['content']}\n"
 
 
-def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
-    """Analyze a chunk of repository files."""
-    # Format files for prompt
-    files_content = []
-    for file_info in chunk:
-        files_content.append(f"=== {file_info['path']} ({file_info['size']} bytes) ===\n{file_info['content']}\n")
-
-    combined_content = "\n".join(files_content)
-
+def _build_analysis_prompt(full_name, chunk, chunk_num, total_chunks):
+    """The assembled chunk-analysis prompt. Shared by the chunker (to budget the finished prompt)
+    and analyze_repo_chunk (to send it), so the budgeted text and the sent text can never drift."""
+    combined_content = "\n".join(_frame_file(f) for f in chunk)
     chunk_info = f" (chunk {chunk_num}/{total_chunks})" if total_chunks > 1 else ""
-
-    # Create prompt for chunk analysis
-    prompt = f"""Analyze this portion of the repository and provide analysis.
+    return f"""Analyze this portion of the repository and provide analysis.
 
 Repository: {full_name}{chunk_info}
 
@@ -465,6 +448,76 @@ Repository files:
 
 {combined_content}
 """
+
+
+def _truncate_file_to_budget(file_info, budget_tokens, model):
+    """Trim one file so its FRAMED budget count (including a truncation notice) fits budget_tokens.
+
+    Fail-closed: shrinks until it actually fits rather than trusting a single chars-per-token
+    estimate, because the estimate is exactly what undercounts Claude 4.7+.
+    """
+    original = file_info['content']
+    raw = count_tokens_accurate(original, model)
+    notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
+              f"{budget_tokens:,}-token per-file budget)")
+    keep = len(original)
+    for _ in range(10):
+        candidate = {**file_info, 'content': original[:keep] + notice}
+        if keep <= 1 or _budget_tokens(_frame_file(candidate) + "\n", model) <= budget_tokens:
+            return candidate
+        keep = max(int(keep * 0.7), 1)
+    return {**file_info, 'content': original[:1] + notice}
+
+
+def chunk_repo_files(files, model, max_tokens=None, full_name=""):
+    """Chunk files so each chunk's FINISHED analysis prompt fits the model's budget.
+
+    Two fixes over the previous version, which counted raw file bytes against the window:
+    - It budgets the assembled prompt — the instruction template plus every file's "=== path (N
+      bytes) ===" framing — so the number checked is the number the server will see.
+    - It counts through count_tokens_for_budget, so Claude 4.7+ (whose litellm tokenizer
+      undercounts by ~1.6x) is packed against an inflated, fail-closed estimate.
+    Together these stop a chunk that "fit" locally from assembling into a prompt the server rejects.
+    """
+    threshold = get_chunking_threshold(model) if max_tokens is None else max_tokens
+
+    # Fixed overhead on every prompt: the instruction template PLUS the "(chunk N/M)" header. Size
+    # the header for a large chunk count so a many-chunk repo can't overflow by the header's width.
+    template_overhead = _budget_tokens(_build_analysis_prompt(full_name, [], 999, 999), model)
+    content_budget = max(threshold - template_overhead, 1)
+    # Keep the original per-file cap intent (don't let one huge file dominate) but never above the
+    # room a chunk actually has.
+    single_file_budget = min(100000, content_budget)
+
+    # Each file's framed form ends in "\n" and "\n".join adds another between files; count the
+    # extra separator per file so a packed chunk's real prompt can't drift over the budget.
+    def framed_budget(file_info):
+        return _budget_tokens(_frame_file(file_info) + "\n", model)
+
+    processed_files = []
+    for file_info in files:
+        if framed_budget(file_info) > single_file_budget:
+            processed_files.append(_truncate_file_to_budget(file_info, single_file_budget, model))
+        else:
+            processed_files.append(file_info)
+
+    chunks, current_chunk, current_tokens = [], [], 0
+    for file_info in processed_files:
+        framed_tokens = framed_budget(file_info)
+        if current_chunk and current_tokens + framed_tokens > content_budget:
+            chunks.append(current_chunk)
+            current_chunk, current_tokens = [], 0
+        current_chunk.append(file_info)
+        current_tokens += framed_tokens
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
+    """Analyze a chunk of repository files."""
+    prompt = _build_analysis_prompt(full_name, chunk, chunk_num, total_chunks)
 
     # Retry logic
     max_retries = 3
@@ -534,14 +587,14 @@ def _batch_by_budget(full_name, analyses, budget, model):
     the repository's chunk order after any number of rounds. An analysis too large even alone
     lands in a batch by itself, for the caller to handle.
     """
-    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    overhead = _budget_tokens(_build_synthesis_prompt(full_name, []), model)
     batches, current, current_tokens = [], [], 0
     for analysis in analyses:
-        tokens = count_tokens_accurate(_framed(analysis, len(current) + 1), model)
+        tokens = _budget_tokens(_framed(analysis, len(current) + 1), model)
         if current and overhead + current_tokens + tokens > budget:
             batches.append(current)
             current, current_tokens = [], 0
-            tokens = count_tokens_accurate(_framed(analysis, 1), model)
+            tokens = _budget_tokens(_framed(analysis, 1), model)
         current.append(analysis)
         current_tokens += tokens
     if current:
@@ -555,24 +608,24 @@ def _truncate_to_tokens(text, max_tokens, model):
     Appending the marker after sizing overshoots by the marker's own length, which is how a
     1,000-token request came back as 1,009 tokens. Last resort only.
     """
-    if max_tokens <= 0 or count_tokens_accurate(text, model) <= max_tokens:
+    if max_tokens <= 0 or _budget_tokens(text, model) <= max_tokens:
         return text
-    room = max(max_tokens - count_tokens_accurate(_TRUNCATION_MARKER, model), 1)
+    room = max(max_tokens - _budget_tokens(_TRUNCATION_MARKER, model), 1)
     # Start from a proportional guess, then walk down until it genuinely fits.
-    cut = max(int(len(text) * (room / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    cut = max(int(len(text) * (room / max(_budget_tokens(text, model), 1)) * 0.95), 1)
     candidate = text[:cut]
-    while cut > 1 and count_tokens_accurate(candidate, model) > room:
+    while cut > 1 and _budget_tokens(candidate, model) > room:
         cut = int(cut * 0.9)
         candidate = text[:cut]
     return candidate + _TRUNCATION_MARKER
 
 
 def _total_tokens(analyses, model):
-    return sum(count_tokens_accurate(a, model) for a in analyses)
+    return sum(_budget_tokens(a, model) for a in analyses)
 
 
 def _fits(full_name, parts, budget, model):
-    return count_tokens_accurate(_build_synthesis_prompt(full_name, parts), model) <= budget
+    return _budget_tokens(_build_synthesis_prompt(full_name, parts), model) <= budget
 
 
 def _truncate_all_to_fit(full_name, analyses, budget, model):
@@ -593,9 +646,9 @@ def _truncate_all_to_fit(full_name, analyses, budget, model):
     """
     if not analyses:
         return []
-    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-    framing = count_tokens_accurate(_framed('', 1), model)
-    marker = count_tokens_accurate(_TRUNCATION_MARKER, model)
+    overhead = _budget_tokens(_build_synthesis_prompt(full_name, []), model)
+    framing = _budget_tokens(_framed('', 1), model)
+    marker = _budget_tokens(_TRUNCATION_MARKER, model)
 
     share = max((budget - overhead) // len(analyses) - framing, 1)
     trimmed = [_truncate_to_tokens(a, share, model) for a in analyses]
@@ -623,11 +676,11 @@ def _hard_truncate(text, max_tokens, model):
     """
     if max_tokens <= 0:
         return ''
-    if count_tokens_accurate(text, model) <= max_tokens:
+    if _budget_tokens(text, model) <= max_tokens:
         return text
-    cut = max(int(len(text) * (max_tokens / max(count_tokens_accurate(text, model), 1)) * 0.95), 1)
+    cut = max(int(len(text) * (max_tokens / max(_budget_tokens(text, model), 1)) * 0.95), 1)
     candidate = text[:cut]
-    while cut > 1 and count_tokens_accurate(candidate, model) > max_tokens:
+    while cut > 1 and _budget_tokens(candidate, model) > max_tokens:
         cut = int(cut * 0.9)
         candidate = text[:cut]
     return candidate
@@ -646,15 +699,15 @@ def _compact_every_part(full_name, analyses, budget, model):
     carry at least MIN_EXCERPT_TOKENS, this returns [] and the caller degrades locally, which
     is honest, rather than emitting a confident synthesis of a fraction of the repository.
     """
-    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
-    framing = count_tokens_accurate(_framed('', 1), model)
+    overhead = _budget_tokens(_build_synthesis_prompt(full_name, []), model)
+    framing = _budget_tokens(_framed('', 1), model)
     warning = (f"[repo-radar: all {len(analyses)} analysis parts below are excerpted to fit "
                f"the model's context window; detail within each part is lost]\n")
     separators = [f"\n[{i}] " for i in range(1, len(analyses) + 1)]
 
     room = budget - overhead - framing
-    fixed = count_tokens_accurate(warning, model) + sum(
-        count_tokens_accurate(s, model) for s in separators)
+    fixed = _budget_tokens(warning, model) + sum(
+        _budget_tokens(s, model) for s in separators)
     share = (room - fixed) // max(len(analyses), 1)
     if share < MIN_EXCERPT_TOKENS:
         return []
@@ -717,7 +770,7 @@ def _synthesis_budget(full_name, model):
     """
     budget = min(get_chunking_threshold(m) for m in _fallback_chain(model)) \
         - SYNTHESIS_OUTPUT_TOKENS
-    overhead = count_tokens_accurate(_build_synthesis_prompt(full_name, []), model)
+    overhead = _budget_tokens(_build_synthesis_prompt(full_name, []), model)
     # Always leave workable room for content beyond the template itself.
     return max(budget, overhead + 1000)
 
@@ -775,7 +828,7 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     while True:
         # A single analysis larger than one whole request cannot be reduced by regrouping —
         # nothing to combine it with. Truncation is the only remaining move, and it is loud.
-        if len(level) == 1 and count_tokens_accurate(
+        if len(level) == 1 and _budget_tokens(
                 _build_synthesis_prompt(full_name, level), model) > budget:
             print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
                   f"truncating it to fit (some detail from this section is lost){RESET}")
