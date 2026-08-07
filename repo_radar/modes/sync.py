@@ -21,7 +21,10 @@ from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
 from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import get_ai_model, get_model_context_window, get_chunking_threshold, count_tokens_accurate, count_tokens_for_budget, chunk_repo_files, get_fallback_model, rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses
+from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking_threshold,
+    count_tokens_accurate, count_tokens_for_budget, chunk_repo_files, get_fallback_model,
+    rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
+    _build_analysis_prompt, _build_full_repo_prompt)
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
     PARSE_STATUS_DEGRADED,
@@ -881,25 +884,30 @@ Stack Trace:
                 # Get model and calculate accurate token count
                 model = get_ai_model()
                 total_tokens = sum(count_tokens_accurate(f['content'], model) for f in files)
-                # Budget count drives the CHUNK DECISION; raw count is only for display. For Claude
-                # 4.7+ the raw count undercounts by ~1.6x, so deciding on it sent whole repos that
-                # actually needed chunking as one prompt the server then rejected.
-                budget_total = sum(count_tokens_for_budget(f['content'], model).count for f in files)
                 threshold = get_chunking_threshold(model)
                 context_window = get_model_context_window(model)
 
-                budget_note = f" / {budget_total:,} budgeted" if budget_total != total_tokens else ""
+                # The chunk DECISION is made on the FINISHED single-repo prompt, not a sum of
+                # file-content tokens: the template + per-file framing add real tokens, and for
+                # Claude 4.7+ the count is inflated to cover litellm's undercounting tokenizer.
+                # Fast path first — the per-file budget sum is a lower bound, so if it already
+                # exceeds the threshold we chunk without assembling the (huge) whole-repo prompt.
+                content_budget_sum = sum(count_tokens_for_budget(f['content'], model).count for f in files)
+                if content_budget_sum > threshold:
+                    needs_chunk, single_budget = True, content_budget_sum
+                else:
+                    single_budget = count_tokens_for_budget(_build_full_repo_prompt(full_name, files), model).count
+                    needs_chunk = single_budget > threshold
+
+                budget_note = f" / {single_budget:,} prompt-budget" if single_budget != total_tokens else ""
                 meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
 
                 total_api_cost = 0.0
 
-                # Check if we need to chunk — on the conservative budget count, not the raw one.
-                if budget_total > threshold:
-                    # Calculate expected chunks
-                    expected_chunks = max(1, (budget_total // threshold) + 1)
-
-                    # Create chunks using model-aware chunking (budgets the FINISHED prompt)
+                if needs_chunk:
+                    # Create chunks that each bound the FINISHED analysis prompt
                     chunks = chunk_repo_files(files, model, threshold, full_name=full_name)
+                    expected_chunks = len(chunks)
                     meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
 
                     # Send status update
@@ -948,27 +956,9 @@ Stack Trace:
                         for retry in range(max_retries):
                             try:
                                 import litellm
-                                files_content = [f"=== {f['path']} ({f['size']} bytes) ===\n{f['content']}\n" for f in chunk]
-                                combined_content = "\n".join(files_content)
-
-                                prompt = f"""Analyze this portion of the repository and provide analysis.
-
-Repository: {full_name} (chunk {i}/{len(chunks)})
-
-Analyze these files and provide:
-
-1. **Overview**: What functionality is covered in these files?
-2. **Technology Stack**: Languages, frameworks, and libraries used.
-3. **Key Components**: Important files and what they do.
-4. **API Endpoints/Interfaces**: Any APIs, exported functions, or public interfaces.
-5. **Dependencies**: External services, databases, or systems referenced (list specific service names).
-
-Be specific and technical. Focus on what's present in these files.
-
-Repository files:
-
-{combined_content}
-"""
+                                # Route through the shared builder the chunker budgets, so the
+                                # prompt sent is exactly the one measured to fit.
+                                prompt = _build_analysis_prompt(full_name, chunk, i, len(chunks))
 
                                 analysis, api_cost, response = call_llm(
                                     current_model, prompt, max_tokens=8192
@@ -1162,50 +1152,9 @@ Repository files:
                     for retry in range(max_retries):
                         try:
                             import litellm
-                            files_content = [f"=== {f['path']} ({f['size']} bytes) ===\n{f['content']}\n" for f in files]
-                            combined_content = "\n".join(files_content)
-
-                            prompt = f"""Analyze this repository: {full_name}
-
-Provide a comprehensive analysis in the following format:
-
-IMPORTANT: Start with these structured sections using the EXACT markers:
-
-QUICK_REFERENCE_START
-Type: [API Service|Frontend App|Backend Service|Library|Infrastructure|Database|Mobile App|CLI Tool]
-Language: [Primary language and version]
-Framework: [Main framework or "None"]
-Database: [Database type and name or "None"]
-APIs: [Brief description of exposed APIs or "None"]
-Port: [Port number or "N/A"]
-Dependencies: [Comma-separated list of key external services/systems]
-QUICK_REFERENCE_END
-
-ONE_LINE_SUMMARY_START
-[Single sentence: what it does + key technologies]
-ONE_LINE_SUMMARY_END
-
-RELATED_REPOS_START
-[Comma-separated list of OTHER repository names this integrates with, or leave empty]
-RELATED_REPOS_END
-
-After the structured sections above, provide comprehensive markdown analysis with these sections:
-
-1. **Overview**: Overall purpose and features of the repository
-2. **Technology Stack**: All languages, frameworks, and major libraries
-3. **Architecture**: Overall architecture patterns and structure
-4. **Key Components**: Most important directories/files across the entire repo
-5. **API Endpoints/Interfaces**: All exposed APIs or public interfaces
-6. **Dependencies**: All external services and systems (be specific with service names)
-7. **Database Schema**: Database structure if present
-8. **Configuration**: Required environment variables and configuration
-
-Format in clean markdown. Be thorough but avoid redundancy.
-
-Repository files:
-
-{combined_content}
-"""
+                            # Route through the shared builder the decision measured, so the
+                            # prompt sent is exactly the one checked to fit.
+                            prompt = _build_full_repo_prompt(full_name, files)
 
                             meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
 

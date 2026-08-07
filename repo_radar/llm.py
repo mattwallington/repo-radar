@@ -450,20 +450,82 @@ Repository files:
 """
 
 
-def _truncate_file_to_budget(file_info, budget_tokens, model):
-    """Trim one file so its FRAMED budget count (including a truncation notice) fits budget_tokens.
+def _build_full_repo_prompt(full_name, files):
+    """The single-shot whole-repository analysis prompt (used when the repo fits without chunking).
 
-    Fail-closed: shrinks until it actually fits rather than trusting a single chars-per-token
-    estimate, because the estimate is exactly what undercounts Claude 4.7+.
+    The one authoritative builder, so the string the decision COUNTS is the string sync SENDS —
+    the previous code built this inline and decided on file-content tokens alone, ignoring the
+    template, paths, sizes and framing, then sent a prompt far larger than it had measured.
+    """
+    combined_content = "\n".join(_frame_file(f) for f in files)
+    return f"""Analyze this repository: {full_name}
+
+Provide a comprehensive analysis in the following format:
+
+IMPORTANT: Start with these structured sections using the EXACT markers:
+
+QUICK_REFERENCE_START
+Type: [API Service|Frontend App|Backend Service|Library|Infrastructure|Database|Mobile App|CLI Tool]
+Language: [Primary language and version]
+Framework: [Main framework or "None"]
+Database: [Database type and name or "None"]
+APIs: [Brief description of exposed APIs or "None"]
+Port: [Port number or "N/A"]
+Dependencies: [Comma-separated list of key external services/systems]
+QUICK_REFERENCE_END
+
+ONE_LINE_SUMMARY_START
+[Single sentence: what it does + key technologies]
+ONE_LINE_SUMMARY_END
+
+RELATED_REPOS_START
+[Comma-separated list of OTHER repository names this integrates with, or leave empty]
+RELATED_REPOS_END
+
+After the structured sections above, provide comprehensive markdown analysis with these sections:
+
+1. **Overview**: Overall purpose and features of the repository
+2. **Technology Stack**: All languages, frameworks, and major libraries
+3. **Architecture**: Overall architecture patterns and structure
+4. **Key Components**: Most important directories/files across the entire repo
+5. **API Endpoints/Interfaces**: All exposed APIs or public interfaces
+6. **Dependencies**: All external services and systems (be specific with service names)
+7. **Database Schema**: Database structure if present
+8. **Configuration**: Required environment variables and configuration
+
+Format in clean markdown. Be thorough but avoid redundancy.
+
+Repository files:
+
+{combined_content}
+"""
+
+
+def repo_fits_single_prompt(full_name, files, model, budget):
+    """True if the WHOLE-REPO prompt's conservative budget count fits `budget`.
+
+    Deciding on the finished prompt — not a sum of file-content tokens — is the point: a repo can
+    look small by content and still assemble into a prompt that overflows once the template and
+    per-file framing are included.
+    """
+    return _budget_tokens(_build_full_repo_prompt(full_name, files), model) <= budget
+
+
+def _truncate_file_to_prompt_budget(file_info, budget_tokens, model, full_name):
+    """Trim one file so its OWN one-file analysis prompt (template + framing + notice) fits budget.
+
+    Measures the actual assembled prompt, not a per-file estimate, because tokenizer seams are not
+    additive — a component estimate can say "fits" for a prompt that does not.
     """
     original = file_info['content']
     raw = count_tokens_accurate(original, model)
     notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
-              f"{budget_tokens:,}-token per-file budget)")
+              f"{budget_tokens:,}-token chunk budget)")
     keep = len(original)
-    for _ in range(10):
+    for _ in range(12):
         candidate = {**file_info, 'content': original[:keep] + notice}
-        if keep <= 1 or _budget_tokens(_frame_file(candidate) + "\n", model) <= budget_tokens:
+        prompt = _build_analysis_prompt(full_name, [candidate], 999, 999)
+        if keep <= 1 or _budget_tokens(prompt, model) <= budget_tokens:
             return candidate
         keep = max(int(keep * 0.7), 1)
     return {**file_info, 'content': original[:1] + notice}
@@ -472,47 +534,54 @@ def _truncate_file_to_budget(file_info, budget_tokens, model):
 def chunk_repo_files(files, model, max_tokens=None, full_name=""):
     """Chunk files so each chunk's FINISHED analysis prompt fits the model's budget.
 
-    Two fixes over the previous version, which counted raw file bytes against the window:
-    - It budgets the assembled prompt — the instruction template plus every file's "=== path (N
-      bytes) ===" framing — so the number checked is the number the server will see.
-    - It counts through count_tokens_for_budget, so Claude 4.7+ (whose litellm tokenizer
-      undercounts by ~1.6x) is packed against an inflated, fail-closed estimate.
-    Together these stop a chunk that "fit" locally from assembling into a prompt the server rejects.
+    Correctness over speed: tokenizer seams are NOT additive, so a chunk whose per-file component
+    counts sum under the budget can still overflow once assembled. Two-phase:
+      1. Greedy pack by a fast per-file component estimate (a lower bound).
+      2. Measure each packed chunk's REAL assembled prompt and split any that overflows.
+    Files whose own one-file prompt exceeds the budget are truncated first, so a peeled single
+    file always fits. Everything is counted through count_tokens_for_budget, so Claude 4.7+ (whose
+    litellm tokenizer undercounts ~1.6x) is bounded by an inflated, fail-closed estimate.
     """
     threshold = get_chunking_threshold(model) if max_tokens is None else max_tokens
-
-    # Fixed overhead on every prompt: the instruction template PLUS the "(chunk N/M)" header. Size
-    # the header for a large chunk count so a many-chunk repo can't overflow by the header's width.
+    # Header sized for a large chunk count so a many-chunk repo can't overflow by its width.
     template_overhead = _budget_tokens(_build_analysis_prompt(full_name, [], 999, 999), model)
     content_budget = max(threshold - template_overhead, 1)
-    # Keep the original per-file cap intent (don't let one huge file dominate) but never above the
-    # room a chunk actually has.
-    single_file_budget = min(100000, content_budget)
 
-    # Each file's framed form ends in "\n" and "\n".join adds another between files; count the
-    # extra separator per file so a packed chunk's real prompt can't drift over the budget.
-    def framed_budget(file_info):
-        return _budget_tokens(_frame_file(file_info) + "\n", model)
-
-    processed_files = []
+    # Pass 1: per-file component estimate; truncate any file whose OWN prompt would overflow. The
+    # expensive assembled-prompt measurement is only taken for files near the ceiling.
+    entries = []  # (file_info, framed_component_tokens)
     for file_info in files:
-        if framed_budget(file_info) > single_file_budget:
-            processed_files.append(_truncate_file_to_budget(file_info, single_file_budget, model))
+        framed = _budget_tokens(_frame_file(file_info) + "\n", model)
+        if framed + template_overhead > threshold:
+            if _budget_tokens(_build_analysis_prompt(full_name, [file_info], 999, 999), model) > threshold:
+                file_info = _truncate_file_to_prompt_budget(file_info, threshold, model, full_name)
+                framed = _budget_tokens(_frame_file(file_info) + "\n", model)
+        entries.append((file_info, framed))
+
+    # Pass 2: greedy pack by the component lower bound.
+    packed, current, running = [], [], 0
+    for file_info, framed in entries:
+        if current and running + framed > content_budget:
+            packed.append(current)
+            current, running = [], 0
+        current.append(file_info)
+        running += framed
+    if current:
+        packed.append(current)
+
+    # Pass 3: verify each chunk's REAL assembled prompt, splitting any that overflows. Peel from
+    # the end (order preserved) and re-test the head; component packing is close, so this is 0-1
+    # peels per chunk in practice.
+    verified, queue = [], list(packed)
+    while queue:
+        chunk = queue.pop(0)
+        if len(chunk) <= 1 or _budget_tokens(
+                _build_analysis_prompt(full_name, chunk, 999, 999), model) <= threshold:
+            verified.append(chunk)
         else:
-            processed_files.append(file_info)
-
-    chunks, current_chunk, current_tokens = [], [], 0
-    for file_info in processed_files:
-        framed_tokens = framed_budget(file_info)
-        if current_chunk and current_tokens + framed_tokens > content_budget:
-            chunks.append(current_chunk)
-            current_chunk, current_tokens = [], 0
-        current_chunk.append(file_info)
-        current_tokens += framed_tokens
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
+            queue.insert(0, [chunk[-1]])
+            queue.insert(0, chunk[:-1])
+    return verified
 
 
 def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):

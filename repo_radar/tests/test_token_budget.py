@@ -117,3 +117,70 @@ def test_no_synthesis_prompt_exceeds_the_budget_for_claude_47(monkeypatch):
     for prompt, m in seen:
         got = llm.count_tokens_for_budget(prompt, m).count
         assert got <= budget, f"synthesis prompt budget {got} > {budget}"
+
+
+# ── the fixes for Codex round 1: real-prompt bounding, finished-prompt decision, no drift ──
+
+import pathlib
+import pytest
+
+
+@pytest.mark.parametrize("budget", [1000, 1200, 1600, 2500])
+def test_every_chunk_real_prompt_fits_even_at_tight_budgets(budget):
+    """Component-sum packing under-counts the assembled prompt because tokenizer seams are not
+    additive — a chunk that summed under budget can measure over. The repack pass must guarantee
+    every REAL assembled prompt fits. Tight budgets pack several files per chunk, so the seams
+    actually bite (this is the class Codex reproduced at 917 -> 934)."""
+    model = "claude-opus-5"
+    chunks = llm.chunk_repo_files(_files(50, 8), model, max_tokens=budget, full_name="Org/repo")
+    assert any(len(c) > 1 for c in chunks), "budget should pack multiple files per chunk"
+    for i, chunk in enumerate(chunks, 1):
+        prompt = llm._build_analysis_prompt("Org/repo", chunk, i, len(chunks))
+        got = llm.count_tokens_for_budget(prompt, model).count
+        assert got <= budget, f"budget {budget}: chunk {i} real prompt {got}"
+
+
+def test_repack_splits_a_component_overshoot_chunk():
+    """The exact seam class Codex reproduced. With this config, per-file-component packing yields a
+    chunk whose REAL assembled prompt is 1094 tokens against a 1090 budget — the seams add tokens
+    the component sum misses. The repack pass must split it so every real prompt fits. Pinned to
+    litellm 1.93.0's tokenizer (a version the suite already asserts). This test FAILS if pass 3 is
+    removed, unlike the invariant sweep above."""
+    model, budget = "claude-opus-5", 1090
+    body = "def f_0(x):\n    return x + compute(x)  # note\n" * 6
+    files = [{"path": f"m{i}.py", "size": len(body), "content": body} for i in range(60)]
+    chunks = llm.chunk_repo_files(files, model, max_tokens=budget, full_name="Org/repo")
+    assert len(chunks) > 1
+    for i, chunk in enumerate(chunks, 1):
+        prompt = llm._build_analysis_prompt("Org/repo", chunk, i, len(chunks))
+        got = llm.count_tokens_for_budget(prompt, model).count
+        assert got <= budget, f"chunk {i} real prompt {got} > {budget} — repack did not split it"
+
+
+def test_the_decision_counts_the_finished_prompt_not_bare_content():
+    """A repo can look small by file content yet assemble into a prompt that overflows once the
+    template + framing are added. repo_fits_single_prompt must measure the finished prompt."""
+    model = "claude-opus-5"
+    files = _files(6, 5)
+    finished = llm.count_tokens_for_budget(llm._build_full_repo_prompt("o/r", files), model).count
+    content_only = sum(llm.count_tokens_for_budget(f["content"], model).count for f in files)
+
+    assert finished > content_only, "template + framing must add real tokens"
+    # A budget above the finished prompt fits; a budget between content-only and finished does NOT
+    # — deciding on content-only (the old behaviour) would have wrongly chosen the single path.
+    assert llm.repo_fits_single_prompt("o/r", files, model, finished)
+    assert not llm.repo_fits_single_prompt("o/r", files, model, content_only)
+
+
+def test_sync_routes_through_the_shared_prompt_builders():
+    """Production must SEND the prompt the chunker/decision MEASURED. It used to build both the
+    chunk prompt and the whole-repo prompt inline, so the validated builders and the sent strings
+    were two sources of truth that drifted (the inline chunk header always emitted "(chunk N/M)",
+    the helper omitted it for a single chunk)."""
+    src = pathlib.Path(__file__).resolve().parents[1] / "modes" / "sync.py"
+    text = src.read_text()
+    assert "_build_analysis_prompt(full_name, chunk" in text
+    assert "_build_full_repo_prompt(full_name, files)" in text
+    # The inline prompt literals must be gone — they now live only in llm.py's builders.
+    assert "Analyze this portion of the repository" not in text
+    assert "Analyze this repository:" not in text
