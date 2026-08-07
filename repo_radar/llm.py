@@ -35,9 +35,6 @@ KNOWN_LIMITS = {
     "claude-sonnet-4-5-20250929": 200000,
     "claude-haiku-4-5": 200000,
     "claude-haiku-4-5-20251001": 200000,
-    # Claude 4.x
-    "claude-opus-4-1": 200000,
-    "claude-opus-4-1-20250805": 200000,
 
     # ── Google Gemini ─────────────────────────────────────────────────
     # Gemini 3.x
@@ -112,6 +109,8 @@ MODEL_MIGRATIONS = {
     "claude-3-opus-20240229": "claude-opus-4-8",
     "claude-opus-4-20250514": "claude-opus-4-8",
     "claude-4-opus-20250514": "claude-opus-4-8",
+    "claude-opus-4-1": "claude-opus-4-8",
+    "claude-opus-4-1-20250805": "claude-opus-4-8",
     "claude-sonnet-4-20250514": "claude-sonnet-5",
     "claude-4-sonnet-20250514": "claude-sonnet-5",
     # OpenAI

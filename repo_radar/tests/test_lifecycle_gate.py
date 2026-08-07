@@ -5,7 +5,9 @@ from scripts import check_model_lifecycle as gate
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "repo_radar" / "model_lifecycle.json"
-JUL23 = datetime.date(2026, 7, 23)
+JUL23 = datetime.date(2026, 7, 23)   # arbitrary reference date for the synthetic fixtures below
+RELEASE = datetime.date(2026, 8, 7)  # the real release target — BUMP each release so the gate is
+                                     # checked against the date the build actually ships
 OK = "https://example.com/x"
 
 def _tmp(rows):
@@ -24,7 +26,7 @@ def test_real_manifest_exact_set_and_passes_at_release():
     ids = [r["id"] for r in rows]
     assert len(ids) == len(set(ids)), "duplicate ids in manifest"
     assert set(ids) == set(llm.KNOWN_LIMITS) | set(llm.MODEL_MIGRATIONS)
-    assert gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS), JUL23) == []
+    assert gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS), RELEASE) == []
 
 def test_happy_row_passes():
     assert _run(

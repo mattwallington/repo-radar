@@ -12,6 +12,8 @@ const MODEL_MIGRATIONS = {
   'claude-3-opus-20240229': 'claude-opus-4-8',
   'claude-opus-4-20250514': 'claude-opus-4-8',
   'claude-4-opus-20250514': 'claude-opus-4-8',
+  'claude-opus-4-1': 'claude-opus-4-8',
+  'claude-opus-4-1-20250805': 'claude-opus-4-8',
   'claude-sonnet-4-20250514': 'claude-sonnet-5',
   'claude-4-sonnet-20250514': 'claude-sonnet-5',
   // OpenAI
@@ -39,8 +41,6 @@ const KNOWN_MODEL_IDS = new Set([
   'claude-fable-5',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
-  'claude-opus-4-1',
-  'claude-opus-4-1-20250805',
   'claude-opus-4-5',
   'claude-opus-4-5-20251101',
   'claude-opus-4-6',
