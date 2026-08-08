@@ -1,138 +1,144 @@
 # Count-Tokens Preflight — Design Spec (Branch 2)
 
 - **Date:** 2026-08-07
-- **Status:** Draft for review (user-approved architecture; pending Codex spec review)
+- **Status:** Draft, revision 2 (after Codex spec-review round 1 — 6 findings incorporated)
 - **Branch:** `feat/count-tokens-preflight`, cut from `dev` @ `cc3888c`
 - **Supersedes the stop-gap in:** v1.0.29 (Branch 1 — conservative 1.7× budgeting)
 
 ## 1. Background
 
-Branch 1 (shipped in v1.0.29) stopped Claude 4.7+ metadata syncs from overflowing by **guessing conservatively**: it multiplies litellm's local token count by `1.7×` for a fixed set of Claude models and reserves a char-length header allowance. It fails closed, but it is an estimate — it can over-chunk, and Anthropic states the 4.7+ tokenizer increase is **content- and workload-dependent**, so a single factor is not a guaranteed bound and needs re-tuning as tokenizers change.
+Branch 1 (shipped in v1.0.29) stopped Claude 4.7+ metadata syncs from overflowing by **guessing conservatively**: multiply litellm's local token count by `1.7×` for a fixed set of Claude models, reserve a char-length header allowance, and pack against a `0.75×` window threshold. It fails closed, but it is an estimate — Anthropic states the 4.7+ tokenizer increase is **content- and workload-dependent**, so a single factor is not a guaranteed bound.
 
-Branch 2 replaces the guess with the **authoritative server count** for the exact prompt about to be sent, and hardens the model catalog so token-window errors are caught at release time.
+Branch 2 replaces the guess with the **authoritative server count** for the exact prompt about to be sent, and hardens the model catalog so token-window errors are caught at release. Every path is designed so Branch 2 is **never less safe than Branch 1**.
 
 ## 2. Goals / Non-goals
 
 **Goals**
-- For every Claude prompt actually sent (each chunk-analysis prompt and each synthesis prompt), budget against the **exact** token count of that exact payload, obtained from Anthropic's count-tokens endpoint via `litellm.acount_tokens`.
-- Never ship a result **less safe than Branch 1**: when an authoritative count is unavailable, fall back to the complete Branch 1 conservative path.
-- Make catalog token-window errors (the gpt-5.4-mini/nano input-vs-total class) a **release gate**, with vendor docs as the source of truth.
+- For every Claude prompt actually sent — each chunk-analysis prompt, the unchunked whole-repo prompt, and each synthesis prompt — budget against the **exact** token count of that exact payload from Anthropic's count-tokens endpoint via `litellm.acount_tokens`.
+- **Never less safe than Branch 1:** when an authoritative count is unavailable, use the *complete, unchanged* Branch 1 path (not a hybrid).
+- Make catalog token-window errors a **release gate**, vendor docs canonical.
 - Fail closed on uncatalogued models.
 
 **Non-goals**
-- No global/per-model/per-repo "ratio" is derived or cached (that was the rejected calibrate-once design — a ratio measured on one payload does not bound another). The only reuse is exact-payload memoization (§5).
-- No new runtime dependency: the count call rides the already-locked `litellm==1.93.0` (`acount_tokens`), keyed off the existing `ANTHROPIC_API_KEY` env var. The `anthropic` SDK is **not** added (avoids regenerating the 10-cell pydeps lock).
-- OpenAI/Gemini counting is unchanged (Branch 1 found their local counts accurate); the catalog's `count_strategy` field leaves the door open to add `openai_api` later without code changes to callers.
+- No global/per-model/per-repo ratio is derived or cached (rejected calibrate-once design). The only reuse is exact-request memoization (§5).
+- No new runtime dependency: rides the locked `litellm==1.93.0` (`acount_tokens`), keyed off `ANTHROPIC_API_KEY`. The `anthropic` SDK is **not** added.
+- OpenAI/Gemini counting unchanged (Branch 1 found their local counts accurate); catalog `count_strategy` leaves room to add `openai_api` later.
 
-## 3. Architecture overview
+## 3. Two explicit budget regimes (the core safety invariant)
 
-```
-sync (per repo)
-  └─ reject_if_unknown(model)                      # §7 fail closed, before any expensive work
-  └─ acceptance_budget(model, requested_output)    # §4 precise, from catalog fields
-  └─ preflight_count(payload)  ──► authoritative?  # §5 acount_tokens + gate + timeout + memo
-       ├─ yes → budget against exact count + headroom
-       └─ no  → Branch 1 conservative estimate (this exact payload only)
-  └─ chunk/synthesis loop: build final set → count every final payload →
-       split & REBUILD & RECOUNT the whole set until a full pass fits   # §6 fixpoint
-```
+There are exactly two regimes; a prompt is budgeted under one or the other, never a mixture:
 
-The authoritative count is **per exact (model, transport payload)**. It replaces the `1.7×` estimate **only** for that payload. It is never turned into a factor and never applied to a different prompt.
+- **Authoritative regime** — a valid provider count (§5) exists for the exact payload. Budget against the §4 acceptance budget (≈99% of the usable window).
+- **Fallback regime** — no valid provider count. Budget against the **complete Branch 1 path, unchanged**: `0.75×` window threshold, `1.7×`/header-reserve conservative counting, component packing, truncation, and the Branch 1 synthesis budget.
 
-## 4. Acceptance budget (precise)
+**Never compare a `1.7×` fallback estimate against the ≈99% authoritative ceiling** — that would be looser than Branch 1 and violate "never less safe." If authoritative counting fails **during** a fixpoint (§6), abandon the authoritative pass and **repack from the original inputs under the full Branch 1 path**, not the authoritative ceiling.
 
-### 4.1 Catalog fields (replaces the bare `KNOWN_LIMITS` integer)
+## 4. Acceptance budget (authoritative regime only)
 
-Each model gets an explicit capability record:
+### 4.1 Catalog capability record (replaces the bare `KNOWN_LIMITS` integer)
 
 | field | meaning |
 | --- | --- |
-| `total_context` | vendor's total context window (input **and** output share it, for Anthropic) |
-| `max_input` | vendor's maximum input tokens |
-| `max_output` | vendor's maximum output tokens |
+| `total_context` | vendor total context window (input **and** output share it, for Anthropic) |
+| `max_input` | vendor maximum **input** tokens (for Claude 5 this equals `total_context` = 1,000,000 — output is **not** pre-subtracted) |
+| `max_output` | vendor maximum output tokens |
 | `count_strategy` | `"anthropic_api"` \| `"local"` (extensible: `"openai_api"`) |
 | `source_url` | vendor documentation URL |
-| `source_date` | date the values were last vendor-verified (YYYY-MM-DD) |
+| `source_date` | date the values were last vendor-verified (YYYY-MM-DD); **stale after 90 days** → §8 flags for re-verification |
 
-**Vendor documentation is canonical.** litellm is a cross-check only (§8), never the source of truth.
+**Vendor documentation is canonical.** litellm is drift evidence only (§8), never the source of truth. Verified against litellm 1.93.0 `get_model_info`: `claude-opus-5` reports `max_input_tokens=1_000_000`, `max_output_tokens=128_000` — i.e. `max_input == total_context`, confirming output is not pre-subtracted.
 
 ### 4.2 The budget formula
 
-For a send that requests `requested_output` completion tokens (the `max_tokens` passed to `call_llm`, default 8192):
+For a send requesting `requested_output` completion tokens:
 
 ```
 acceptance_budget = min(max_input, total_context - requested_output) - HEADROOM
 ```
 
-- The `min(...)` is the tighter (fail-closed) of two ceilings: the vendor's hard `max_input`, and "whatever the shared context leaves after we reserve room for the output we asked for." For Anthropic where `max_input = total_context - max_output` and `requested_output (8192) ≤ max_output`, this resolves to `max_input - HEADROOM`.
-- `requested_output` is the **actual** `max_tokens` for that call site, not a constant — the spec threads it through rather than assuming 8192.
+- `requested_output` is threaded from the **actual** call site, not assumed: **chunk analysis = 8192; unchunked full-repo = 16384; synthesis = 16384** (`SYNTHESIS_OUTPUT_TOKENS`). Verified against `call_llm` sites in `sync.py`/`llm.py`.
+- `max_input` is the vendor's actual maximum input; do **not** pre-subtract `max_output`. The formula subtracts only the *actual* requested output once. For Claude 5 with 8192 output: `min(1_000_000, 991_808) − HEADROOM`.
 
 ### 4.3 Headroom (exact)
 
-`HEADROOM = ceil(0.01 × min(max_input, total_context - requested_output))` — **1% of the input ceiling**, retained **even for an authoritative count**. Anthropic documents that count-tokens is a close estimate, not guaranteed bit-identical to the creation-time count; 1% absorbs that drift and minor tokenizer-version skew while being negligible against real windows (≈1–2k tokens at a 200k window, ≈10k at 1M). This value is pinned here and centralized as a named constant so it is tunable in one place.
+`HEADROOM = ceil(0.01 × min(max_input, total_context − requested_output))` — **1% of the input ceiling**, retained even in the authoritative regime. This is **headroom around a provider *estimate***: Anthropic documents count-tokens as a close estimate, not a bit-exact guarantee of the creation-time count. 1% absorbs that drift and tokenizer-version skew; negligible against real windows (≈2k at 200k, ≈10k at 1M). Centralized as one named constant.
 
 ## 5. The preflight count (`repo_radar/llm.py`)
 
-`preflight_count(model, prompt, *, timeout_s) -> PreflightResult`
+`preflight_count(model, prompt, requested_output, *, loop, timeout_s) -> PreflightResult`
 
-1. **Payload parity:** build the exact structure `call_llm` sends for this model — for the completion path that is `messages=[{"role": "user", "content": prompt}]`. The count MUST count the same message structure the send uses (a shared `_completion_messages(prompt)` helper is the single source of truth for both).
-2. **Strategy gate:** only models whose catalog `count_strategy == "anthropic_api"` take the server path; others go straight to the Branch 1 local path.
-3. **Call + timeout:** `await asyncio.wait_for(litellm.acount_tokens(model=model, messages=…, api_key=…), timeout_s)`. `acount_tokens` has **no** timeout argument, so the coroutine is wrapped. The sync flow is synchronous, so the call site uses `asyncio.run` (or a cached loop) around this coroutine.
-4. **Authoritative gate:** accept the result as authoritative **only** when `not resp.error and resp.tokenizer_type == "anthropic_api"`. litellm 1.93.0's `acount_tokens` catches provider-count exceptions (auth, rate-limit, network) and silently returns a **local** count with `tokenizer_type == "local_tokenizer"` and no raise — that must be treated as **non-authoritative** (otherwise a failed call reads as `ratio ≈ 1`, dropping all safety). `asyncio.TimeoutError` and any raise are likewise non-authoritative.
-5. **Result:** `PreflightResult(tokens, authoritative: bool)`. Authoritative → `tokens` is the exact server count. Non-authoritative → caller uses the **complete Branch 1 conservative estimate for this exact payload** (`count_tokens_for_budget`, unchanged), never a value derived from any other prompt.
+1. **Payload parity:** build the exact structure `call_llm` sends — for the completion path (all `anthropic_api` models), `messages=[{"role":"user","content":prompt}]` via a shared `_completion_messages(prompt)` helper used by *both* the counter and the sender, so they can never drift.
+2. **Strategy gate:** only `count_strategy == "anthropic_api"` models take the server path; others go straight to the Branch 1 fallback regime.
+3. **Call + timeout:** `await asyncio.wait_for(litellm.acount_tokens(model=model, messages=…, api_key=…), timeout_s)` — `acount_tokens` has no timeout arg, so the coroutine is wrapped. Runs on the single shared sync loop (§5a), not a per-call `asyncio.run`.
+4. **Authoritative gate — ALL of:** `resp.tokenizer_type == "anthropic_api"`; `resp.error is False`; `isinstance(resp.total_tokens, int) and not isinstance(resp.total_tokens, bool)`; `resp.total_tokens > 0`; request/model identity consistent (`resp.request_model`/`model_used` match what we sent). litellm 1.93.0 silently returns a **local** count (`tokenizer_type="local_tokenizer"`) with no raise on provider-count exceptions, and constructs the anthropic path with `result.get("input_tokens", 0)` — so a malformed response could yield an **authoritative zero** that disables the guardrail. The `> 0` and type checks close that. Anything failing any clause → **not authoritative**.
+5. **Result:** `PreflightResult(tokens, authoritative: bool)`. Non-authoritative → caller switches this payload to the **fallback regime** (§3), never a value derived from another prompt.
 
-**Memoization (the only reuse):** an in-process cache keyed by `(model, sha256(payload))` stores authoritative results only. Identical payloads (e.g., a chunk whose `(i/N)` header did not change across a recount pass) are not re-sent. Caching by model or by repository is explicitly forbidden — it would reuse one prompt's count for a different prompt.
+### 5a. Async integration + circuit breaker (production-critical)
 
-## 6. Chunking & synthesis with per-prompt counting (fixpoint)
+- **One long-lived event loop per sync.** litellm globally caches its Anthropic `AsyncHTTPHandler`; repeated `asyncio.run()` would create/destroy loops while reusing that cached client, risking closed/foreign-loop failures. Create one loop at sync start, reuse for every preflight, close at sync end. Must run on **Python 3.10** (pydeps matrix includes cp310), so `asyncio.Runner` (3.11+) cannot be required — manage the loop manually.
+- **Operation-scoped circuit breaker.** With authoritative-only memoization, an Anthropic outage would make every prompt *and every recount pass* independently wait out the timeout. After the **first** timeout/provider-fallback for a model in a sync, switch that model to the Branch 1 fallback regime for the **remainder of the sync** and log the downgrade **once**.
 
-Local packing still runs first (using the Branch 1 conservative estimate) to produce a candidate set cheaply. Then:
+### 5b. Memoization (the only reuse)
 
-1. Build the **complete final set** with real `(chunk i/N)` headers.
-2. `preflight_count` **every** final payload against `acceptance_budget`.
-3. If any payload exceeds budget, split the offending chunk(s). Splitting changes `N`, so **every** `(i/N)` header changes, and BPE token counts are **non-monotonic** in the header numerals — a previously-fitting chunk can now overflow. Therefore **rebuild the whole set and recount from scratch**; do not trust the prior pass.
-4. Repeat until a **full pass fits with zero overflows** (or a chunk reaches the single-file irreducible floor). `N` only grows and is bounded by the file count, so this converges. Memoization (§5) keeps unchanged payloads from re-hitting the network.
+In-process cache keyed by `sha256` of the **canonical serialization of the complete count request** — `messages`, `system`, `tools`, and relevant transport options — **not** prompt text alone. Stores authoritative results only. Caching by model or repository is forbidden.
 
-**Synthesis batches** get the identical discipline: splitting a batch changes the batch count/headers, so rebuild and recount the full batch set until a pass fits.
+## 6. Send-path algorithms (three distinct topologies)
+
+Local packing (Branch 1 conservative estimate) still runs first to produce cheap candidates; the authoritative count then governs. **No path ever sends an over-budget request.**
+
+**6.1 Unchunked full-repo send** (`max_tokens=16384`). Preflight-count the single whole-repo prompt. If it exceeds the acceptance budget, fall through to the chunked analysis path (6.2).
+
+**6.2 Chunked analysis** (`max_tokens=8192`; prompts contain real `(chunk i/N)` headers). Build the **complete** final set; preflight-count every payload; split any overflow. Splitting changes `N`, so every `(i/N)` header changes and BPE is non-monotone — a previously-fitting chunk can overflow. Therefore **rebuild the whole set and recount from scratch** each pass, until one full pass fits with zero overflows. `N` only grows and is bounded by file count → converges. Memoization (§5b) skips genuinely-identical payloads.
+
+**6.3 Synthesis** (`max_tokens=16384`; hierarchical map-reduce). `_build_synthesis_prompt` numbers only "Analysis Part i" **within** a batch — there is **no** global batch header, and later levels do not exist until earlier API calls return. So: for the **current** level, build and preflight that level's candidate batches before sending; if splitting changes grouping/part numbering, rebuild and recount the **unsent current level only** (never future levels, which don't exist yet). Send, collect results into the next level, repeat.
+
+**6.4 Terminal behavior (all paths).** A "single-file irreducible floor" must never mean sending an over-budget request. An overflowing singleton is **truncated and authoritatively recounted until it fits**. If even the fixed template alone cannot fit the budget, emit the existing Branch 1 local **degraded result** rather than an over-budget send.
 
 ## 7. Fail-closed unknown-model rejection
 
-Today `get_model_context_window` returns `128000` for an uncatalogued model — not a guaranteed floor (an unknown model could be smaller). Instead, **reject** an uncatalogued model **before any expensive sync work** (before file collection / any API call) with an actionable message naming the model and pointing at the catalog. Rejection — not a guessed ceiling — is the durable rule.
+Today `get_model_context_window` returns `128000` for an uncatalogued model — not a guaranteed floor. Instead, **reject** an uncatalogued model **before the network-wait / git clone-pull phase**, whenever the selected mode can generate metadata (production performs the network wait and all git work *before* file collection, so "before file collection" is too late). Modes that make no LLM request (`--skip-metadata`, repos-only) remain usable. The error names the model and points at the catalog.
 
 ## 8. Release-time catalog validation
 
-A new stdlib gate `scripts/check_model_windows.py`, wired into `release.sh` alongside `check_model_lifecycle.py`:
+New stdlib gate `scripts/check_model_windows.py`, wired into `release.sh` alongside `check_model_lifecycle.py`:
 
-- For every catalog model, compare declared `max_input`/`max_output`/`total_context` against litellm's `get_model_info`.
-- **Vendor values are canonical.** The gate **reports every mismatch** (collects all, never stops at the first) and **flags dangerous over-reporting** (litellm value **>** vendor value — the direction that would let us over-budget and overflow). It never overwrites or defers to litellm.
-- Each catalog record's `source_url` + `source_date` make the vendor provenance auditable.
+- Compare only **normalized, same-semantics** fields: catalog `max_input` vs litellm `max_input_tokens`, catalog `max_output` vs litellm `max_output_tokens`. **Do not** compare `total_context` — litellm exposes no equivalent field, and summing input+output is wrong for Anthropic's shared window.
+- **Vendor is canonical; litellm is drift evidence.** Direction-specific behavior, defined by runtime danger (runtime reads the *catalog*, so the hazard is the catalog claiming more room than truly exists):
+  - **catalog `max_input` > litellm `max_input_tokens`` → BLOCK** (the over-budget direction; this is exactly how the gpt-5.4-mini/nano defect appeared: catalog 1.05M vs litellm 272k).
+  - **catalog `max_input` < litellm → WARN** (safe; possibly under-utilizing).
+  - Report **every** mismatch, never stop at the first.
+- **`source_date` freshness rule:** a record older than 90 days at release **warns and requires re-verification** — otherwise provenance is decorative.
+- **Migrate every direct `KNOWN_LIMITS` consumer** to the new record shape: the lifecycle gate (`llm.KNOWN_LIMITS`), the JS drift mirror (`menubar/model-policy.js` + `__tests__/drift-check.js`), `test_litellm_matrix`, and the packaged `menubar/scripts/upgrade-smoke.sh`.
 
 ## 9. Production wiring (no dead code)
 
-Every production analysis send and every synthesis send MUST pass through the preflight path. Branch 1 already caught the "validated helper bypassed by an inline call site" failure mode; Branch 2 adds **call-site/behavioral tests** (landmark tests asserting `sync.py`/synthesis route through the preflight, plus behavioral tests that a stubbed non-authoritative count forces the fallback) so the preflight cannot silently become dead code.
+Every production analysis send (chunked **and** unchunked) and every synthesis send MUST pass through the preflight. Add landmark tests (assert `sync.py`/synthesis route through the preflight) **and** behavioral tests asserting the **exact payload digest was preflighted before `call_llm`** for all three send paths — so the preflight cannot become dead code (the Branch 1 failure mode).
 
 ## 10. Testing
 
-Mandatory (all with `acount_tokens` **mocked** — no live API in tests, keeps CI/pydeps runs deterministic):
+All with `acount_tokens` **mocked** (no live API; deterministic CI/pydeps):
 
-1. Provider failure returns `tokenizer_type="local_tokenizer"` **without raising** → detected non-authoritative → Branch 1 fallback used.
-2. A successful authoritative count below `1.7×` cannot weaken safety: authoritative → exact count used; non-authoritative → full `1.7×` floor, never a reduced factor.
-3. Two repositories using one model cannot share content calibration — no model/repo-keyed cache; only exact `(model, payload digest)` memoization.
-4. Source-code vs synthesis prompts (materially different true ratios) are each counted on their own payload.
-5. `asyncio.wait_for` timeout → non-authoritative → fallback.
-6. Unknown-model rejection fires before expensive work with an actionable message.
-7. Release gate reports **every** catalog mismatch (not only the first) and flags over-reporting.
-8. Fixpoint: after a split changes `N`, the whole set is recounted and the final emitted set fits under real `(i/N)` headers.
-9. Landmark/behavioral: production analysis + synthesis sends both go through the preflight (no dead code).
+1. Provider failure returns `tokenizer_type="local_tokenizer"` without raising → non-authoritative → **full Branch 1 regime** (0.75× threshold), not the authoritative ceiling.
+2. An authoritative count below `1.7×` cannot weaken safety; a non-authoritative one uses the complete Branch 1 path.
+3. Malformed/zero/`bool` `total_tokens`, missing `input_tokens`, or identity mismatch → non-authoritative (no authoritative zero).
+4. Two repos/one model cannot share content calibration — only exact-request digest memoization.
+5. Source-code vs synthesis prompts (different true ratios) each counted on their own payload.
+6. `asyncio.wait_for` timeout → non-authoritative → fallback; and the circuit breaker downgrades the rest of the sync after the first timeout, logging once.
+7. Unknown-model rejection fires **before** the network/git phase; `--skip-metadata` still runs.
+8. Release gate: reports every mismatch; **blocks** on catalog > litellm `max_input`; warns on the reverse and on stale `source_date`.
+9. Fixpoint: after a split changes `N`, the whole analysis set is recounted and the emitted set fits under real `(i/N)` headers; synthesis rebuilds only the unsent current level; overflowing singleton is truncated-and-recounted, never sent over budget.
+10. All three send paths (chunk, unchunked full-repo, synthesis) assert the exact payload digest was preflighted before `call_llm`.
 
-Falsifiability: every guard must fail when neutered (same discipline as Branch 1).
+Falsifiability: every guard must fail when neutered (Branch 1 discipline).
 
 ## 11. Rollout & review
 
-- Implement on `feat/count-tokens-preflight` (off `dev` @ `cc3888c`), per-commit Codex review, phase-checkpoint review — same discipline as Branch 1.
-- This spec is committed and sent to Codex for review **before** the implementation plan is written.
+- Implement on `feat/count-tokens-preflight` (off `dev` @ `cc3888c`), per-commit + phase-checkpoint Codex review.
+- Spec committed and Codex-reviewed **before** the implementation plan (writing-plans).
 
-## 12. Open questions (to close in review)
+## 12. Settled decisions (from Codex round 1)
 
-- **`requested_output` source of truth:** confirm every analysis/synthesis call site's `max_tokens` so §4.2 uses the real value, not the 8192 default, everywhere.
-- **Headroom value:** 1% is pinned; confirm it's comfortable at the 1M window (≈10k tokens) and the 200k window (≈2k).
-- **Async integration:** `asyncio.run` per call vs a single reused loop for the sync — pick the simpler that doesn't fight the existing sync structure.
+- `requested_output`: chunk=8192, full-repo=16384, synthesis=16384 — threaded per prepared prompt.
+- Headroom: 1% pinned, framed as headroom around a provider estimate.
+- Async: one reused event loop per sync (Python 3.10-safe), plus per-model circuit breaker.
+- Catalog gate compares same-semantics fields only; litellm is drift evidence; block direction = catalog over-reports vs litellm.
