@@ -1,7 +1,7 @@
 # Count-Tokens Preflight — Design Spec (Branch 2)
 
 - **Date:** 2026-08-07
-- **Status:** Draft, revision 4 (after Codex spec-review rounds 1–3 — 6 + 4 + 3 findings incorporated)
+- **Status:** Draft, revision 5 (after Codex spec-review rounds 1–4 — 6 + 4 + 3 + 2 findings incorporated)
 - **Branch:** `feat/count-tokens-preflight`, cut from `dev` @ `cc3888c`
 - **Supersedes the stop-gap in:** v1.0.29 (Branch 1 — conservative 1.7× budgeting)
 
@@ -92,11 +92,15 @@ In-process cache keyed by **`(model, sha256(canonical_count_request))`**. The ca
 
 Local packing (Branch 1 conservative estimate) still runs first to produce cheap candidates; the authoritative count then governs. **The authoritative path verifies each send fits within the acceptance budget (including headroom); the fallback path preserves Branch 1's proven risk envelope (its `0.75×`/`1.7×` margins) — a strong safety posture, not an absolute mathematical guarantee, since the `1.7×` factor is a stop-gap bound, not a proof.**
 
-**6.1 Unchunked full-repo send** (`max_tokens=16384`). Preflight-count the single whole-repo prompt. If it exceeds the acceptance budget, fall through to the chunked analysis path (6.2).
+**6.1 Single-vs-chunk decision (monotonic — authoritative counting may only *tighten* Branch 1's partition).** Run Branch 1's `repo_needs_chunking` decision first (its `0.75×` threshold + conservative estimate):
+- Branch 1 says **chunk** → go directly to §6.2. An authoritative count must **never** reverse this or merge candidates.
+- Branch 1 says **single** → authoritative-count the whole-repo prompt (`max_tokens=16384`); if the provider count fits the acceptance budget, send single; otherwise **tighten** to the chunked path (§6.2).
 
-**6.2 Chunked analysis** (`max_tokens=8192`; prompts contain real `(chunk i/N)` headers). Build the **complete** final set; preflight-count every payload; split any overflow. Splitting changes `N`, so every `(i/N)` header changes and BPE is non-monotone — a previously-fitting chunk can overflow. Therefore **rebuild the whole set and recount from scratch** each pass, until one full pass fits with zero overflows. `N` only grows and is bounded by file count → converges. Memoization (§5b) skips genuinely-identical payloads.
+Authoritative counting may only move single→chunk (or split further) — never chunk→single or any coarser partition. This makes "never less safe than Branch 1" and "no capacity reclamation" **mechanically** true, not merely descriptive.
 
-**6.3 Synthesis** (`max_tokens=16384`; hierarchical map-reduce). `_build_synthesis_prompt` numbers only "Analysis Part i" **within** a batch — there is **no** global batch header, and later levels do not exist until earlier API calls return. So: for the **current** level, build and preflight that level's candidate batches before sending; if splitting changes grouping/part numbering, rebuild and recount the **unsent current level only** (never future levels, which don't exist yet). Send, collect results into the next level, repeat.
+**6.2 Chunked analysis** (`max_tokens=8192`; prompts contain real `(chunk i/N)` headers). Build the **complete** final set; preflight-count every payload; split any overflow. Splitting changes `N`, so every `(i/N)` header changes and BPE is non-monotone — a previously-fitting chunk can overflow. Therefore **rebuild the whole set and recount from scratch** each pass, until one full pass fits with zero overflows. `N` only grows and is bounded by file count → converges. The candidate set is **Branch 1's packing**; authoritative counting only **splits** it further, never merges. Memoization (§5b) skips genuinely-identical payloads.
+
+**6.3 Synthesis** (`max_tokens=16384`; hierarchical map-reduce). `_build_synthesis_prompt` numbers only "Analysis Part i" **within** a batch — there is **no** global batch header, and later levels do not exist until earlier API calls return. So: for the **current** level, build and preflight that level's candidate batches before sending; if splitting changes grouping/part numbering, rebuild and recount the **unsent current level only** (never future levels, which don't exist yet). Send, collect results into the next level, repeat. Branch 1's synthesis budget establishes the **largest** candidate batches; authoritative preflight may only **split** them, never coalesce.
 
 **6.4 Terminal behavior (per path).** The authoritative path truncates-and-recounts until within budget; the fallback path applies Branch 1's truncation (its risk envelope — a strong posture, not a mathematical guarantee).
 - *Analysis singleton:* truncate the single file's content (`_truncate_file_to_prompt_budget`) and authoritatively recount until it fits. If even the fixed analysis template alone exceeds the budget (impossible for a real `0.75×`-window budget), emit a **clear failure/degraded metadata record for that repo with no API send** — an explicit analysis-path degradation defined here, *not* a call into the synthesis-only helper.
@@ -135,11 +139,12 @@ All with `acount_tokens` **mocked** (no live API; deterministic CI/pydeps):
 5. Source-code vs synthesis prompts (different true ratios) each counted on their own payload.
 6. `asyncio.wait_for` timeout → non-authoritative → fallback. The circuit breaker opens on **any** first non-authoritative outcome (timeout, `local_tokenizer`, or malformed/zero/identity), downgrading the model for the rest of the sync and logging once; the loop closes in `finally`; `KeyboardInterrupt`/`SystemExit` propagate.
 7. Unknown-model rejection fires **before** the network/git phase; `--skip-metadata` still runs.
-8. Release gate: reports every mismatch; **blocks** on catalog > litellm for **both** `max_input` and `max_output`, warns on the reverse; a checked-in override clears a stale-litellm block while its absence keeps it blocked; stale `source_date` (>90d) blocks absent an override; every schema invariant (positive int-not-bool, known strategy, `max_input<=total_context`, `requested_output<=max_output`, non-future date, https source) is enforced.
+8. Release gate: reports every mismatch; **blocks** on catalog > litellm for **both** `max_input` and `max_output`, warns on the reverse; a checked-in override clears a stale-litellm block while its absence keeps it blocked; stale `source_date` (>90d) blocks until that catalog record is vendor-re-verified and its own date updated (not via an override); every schema invariant (positive int-not-bool, known strategy, `max_input<=total_context`, `requested_output<=max_output`, non-future date, https source) is enforced.
 9. Fixpoint: after a split changes `N`, the whole analysis set is recounted and the emitted set fits under real `(i/N)` headers; synthesis rebuilds only the unsent current level; an overflowing singleton is truncated-and-recounted; and when even the template exceeds budget the **analysis path emits a degraded metadata record with no API send** (distinct from the synthesis-only degradation).
 10. All three send paths (chunk, unchunked full-repo, synthesis) assert the exact payload digest was preflighted before `call_llm`.
 11. **Concurrency:** two simultaneous identical requests → exactly **one** provider call (single-flight; memo re-checked under the lock); when the first of two simultaneous requests fails, the breaker opens and logs **once** and the later request uses the fallback with **no second provider call**; shutdown cancels/drains pending tasks.
 12. **Override binding:** an override is invalidated by a changed `catalog_value`, a changed `litellm_value`, a changed `field`, or an expired `verified_at` (>90d) — each re-blocks the release.
+13. **Monotonic partition:** a whole-repo prompt **above** Branch 1's `0.75×` threshold but **below** the authoritative ceiling stays **chunked** — authoritative counting never reverses Branch 1's chunk decision, merges candidates, or reclaims capacity.
 
 Falsifiability: every guard must fail when neutered (Branch 1 discipline).
 
@@ -157,4 +162,4 @@ Falsifiability: every guard must fail when neutered (Branch 1 discipline).
 - Memoization key includes `model`: `(model, sha256(canonical_request))`.
 - Catalog gate: same-semantics fields only; litellm is drift evidence; block when catalog over-claims vs litellm for `max_input` **and** `max_output`. A stale-litellm block is cleared only by an override **bound to the exact `{model, field, catalog_value, litellm_value, verified_at}` tuple** (auto-invalidated on any value/field change; 90-day expiry); a stale catalog `source_date` is fixed by re-verifying that record, not by an override. Schema invariants enforced.
 - Terminal degradation is per-path: analysis emits a no-send degraded record when the template can't fit; synthesis keeps its existing local degradation.
-- **Capacity reclamation (coalescing conservative chunks to cut paid calls) is a non-goal** for this branch — correctness only.
+- **Capacity reclamation (coalescing conservative chunks to cut paid calls) is a non-goal** for this branch — correctness only. Enforced **mechanically**: Branch 1's `repo_needs_chunking`/synthesis partition is the coarsest allowed; authoritative counting may only split/tighten, never merge or reverse single→chunk.
