@@ -25,6 +25,7 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     count_tokens_accurate, chunk_repo_files, repo_needs_chunking, get_fallback_model,
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt)
+from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
     PARSE_STATUS_DEGRADED,
@@ -195,6 +196,24 @@ def sync_mode(args):
             return result
 
         console.print = wrapped_print
+
+    # Fail-closed: reject an uncatalogued model before any network wait or git work. A
+    # metadata-capable run (not skip_metadata, not repos_only) will eventually call the LLM, so an
+    # unknown model must be caught here -- at the very top, before the 5-minute network wait and
+    # before any repo is touched -- rather than surfacing as an opaque API error deep into the run.
+    # dry_run is intentionally NOT exempted: a dry run with a misconfigured model should still fail
+    # loudly, surfacing the misconfiguration early, instead of silently succeeding just because a
+    # dry run never actually talks to the LLM.
+    metadata_capable = not getattr(args, 'skip_metadata', False) and not getattr(args, 'repos_only', False)
+    if metadata_capable:
+        model = get_ai_model()
+        if not is_known_model(model):
+            console.print(
+                f"[red]Unknown model '{model}' is not in the model catalog. "
+                f"Add it to repo_radar/model_catalog.py (MODEL_CAPS) before running sync, "
+                f"or pass --skip-metadata / --repos-only to skip metadata generation.[/red]"
+            )
+            return 1
 
     console.print(f"[bold]Repository Sync[/bold]")
     console.print()
