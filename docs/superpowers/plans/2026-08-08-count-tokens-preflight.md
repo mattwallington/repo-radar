@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is self-contained — do NOT reconstruct any step from git history.
 
-**Status:** revision 6 (after Codex plan-review rounds 1–5). Architecture settled since rev 4; this pass is falsifiable/runnable Phase-C test bodies + bounded waits.
+**Status:** revision 7 (after Codex plan-review rounds 1–6). Architecture settled since rev 4; remaining passes are Task 10–11 integration precision (worker seam, patch targets, result contract, guard test, event log).
 
 **Goal:** Budget every Claude prompt actually sent against Anthropic's authoritative count (`litellm.acount_tokens`), falling back to the complete Branch 1 conservative path when that count is unavailable, and harden the model catalog with explicit windows + a release-time validation gate.
 
@@ -579,25 +579,27 @@ def test_over_budget_batch_splits_into_more_batches(monkeypatch):
     for b in out:
         assert _StubSession(table).count("claude-opus-5", llm._build_synthesis_prompt("o/r", b), 16384).tokens <= budget
 
-def test_max_calls_charges_the_authoritative_post_split_batch_count(monkeypatch):
-    """Branch 1 would batch [A0..A3] into ONE batch, but authoritative counting splits into 4.
-    combine_chunk_analyses must issue one synthesize call per authoritative batch (4), proving the
-    post-split count — not Branch 1's single batch — drives sends (and thus feeds the max_calls
-    guard). Falsifiable: an impl still using Branch 1's batches issues 1 synthesize call at this
-    level, not 4."""
+def test_max_calls_guard_uses_the_authoritative_post_split_count(monkeypatch):
+    """The guard `calls + len(batches) + 1 > max_calls` must charge the AUTHORITATIVE (post-split)
+    batch count. authoritative_synthesis_level splits the level into 4 batches; with max_calls=4 the
+    correct guard (0+4+1=5 > 4) TRIPS -> the single truncated-shot path (exactly 1 send). An impl that
+    fed the guard a smaller/stale count would NOT trip and would instead send all 4 authoritative
+    batches (4 sends). Asserting `len(sends) == 1` (not 4) tests the guard, not merely that
+    authoritative batches drive sending."""
     import repo_radar.llm as llm
-    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda s, fn, a, m: [[x] for x in a])  # split 4 -> 4 singletons
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda s, fn, a, m: [[x] for x in a])  # -> 4 batches
     sends = []
     def synth(prompt, model):
         sends.append(prompt); return ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, model)
-    llm.combine_chunk_analyses("o/r", ["A0","A1","A2","A3"], model="claude-opus-5",
-                               synthesize=synth, session=_StubSession(lambda p: PreflightResult(1, True)))
-    first_level = [p for p in sends if p.count("Analysis Part") == 1]   # 4 singleton-batch sends at the first level
-    assert len(first_level) == 4
+    llm.combine_chunk_analyses("o/r", ["A0","A1","A2","A3"], model="claude-opus-5", synthesize=synth,
+                               session=_StubSession(lambda p: PreflightResult(1, True)), max_calls=4)
+    assert len(sends) == 1     # guard tripped on the authoritative count of 4 -> single-shot, NOT 4 batch sends
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** the level splitter (largest-prefix on the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; singleton via the same binary-truncate helper as Task 9, generalized to a text list). In `combine_chunk_analyses`, replace the current level's Branch 1 `batches` with `authoritative_synthesis_level(...)`'s result **before** the `calls + len(batches) + 1 > max_calls` guard (`llm.py:994`), so `max_calls` charges the authoritative (post-split) count. On `DegradedSynthesis`, stop and return the local degraded synthesis result (prior chunk work preserved).
+- [ ] **Step 3: Implement** the level splitter (largest-prefix on the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; singleton via the same binary-truncate helper as Task 9, generalized to a text list). In `combine_chunk_analyses`, replace the current level's Branch 1 `batches` with `authoritative_synthesis_level(...)`'s result **before** the `calls + len(batches) + 1 > max_calls` guard (`llm.py:994`), so `max_calls` charges the authoritative (post-split) count.
+
+  **Preserve the return contract (finding — cost accounting):** `combine_chunk_analyses` today returns `(text, cost)` and `sync.py:1095` destructures `analysis, combine_cost = ...`. Keep the 2-tuple: on `DegradedSynthesis`, return `(DegradedSynthesis(reason), accumulated_cost_so_far)` — the synthesis result slot carries the degraded sentinel while the **already-incurred cost is still returned**. The caller checks `isinstance(analysis, DegradedSynthesis)`; every existing `(text, cost)` caller keeps working.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(llm): synthesis level split-only + singleton terminal + max_calls from authoritative count"`
 
@@ -605,65 +607,83 @@ def test_max_calls_charges_the_authoritative_post_split_batch_count(monkeypatch)
 
 **Files:** Modify `repo_radar/modes/sync.py`, `repo_radar/llm.py` (`combine_chunk_analyses(..., session=None)`); Test `repo_radar/tests/test_send_paths.py`.
 
-**Required refactor (finding #2, testability):** the per-repo generator is currently the nested `generate_metadata_task` inside `sync_mode` (`sync.py:807`). Extract it to a module-level, behavior-preserving `generate_repo_metadata(task_data, session, args)` in `sync.py` (the nested function becomes a thin `lambda td: generate_repo_metadata(td, session, args)` passed to the executor). This is the explicit seam the integration tests drive.
+**Required refactor (finding #1, testability + closure state):** the per-repo generator is the nested `generate_metadata_task` inside `sync_mode` (`sync.py:807`), which closes over `args`, `meta_progress`, `meta_tasks`, `stats`, `stats_lock`, `sync_logger`, and `console`. Extract it to a module-level, behavior-preserving `generate_repo_metadata(task_data, session, args, ctx)` in `sync.py`, where `ctx` is a `SyncContext = namedtuple("SyncContext", "meta_progress meta_tasks stats stats_lock sync_logger console")` bundling that closure state. The nested call becomes `lambda td: generate_repo_metadata(td, session, args, ctx)`.
+
+**Patch seam (finding #2 — avoid real paid calls):** `sync.py` binds `call_llm` and the authoritative helpers with `from repo_radar.llm import (...)`, so tests MUST patch the names **in the `sync` namespace** — `sync.call_llm`, `sync.authoritative_partition`, `sync.authoritative_chunks`, `sync.combine_chunk_analyses` — NOT `llm.*` (patching `llm.call_llm` would not intercept the bare name and could make a real call). Add the authoritative helpers to sync's import list. Every test also wraps in `patch("litellm.acount_tokens", _boom)` (raises) as a hard guard, and passes a `_StubSession` — no real `PreflightSession`/network in the suite.
 
 **Degradation contracts (distinct — finding #5):**
-- **Analysis-partition degradation** (`PartitionResult.degraded_reason`): the repo is degraded **before any send** — write ONE degraded record and make **zero** `call_llm` for that repo.
+- **Analysis-partition degradation** (`PartitionResult.degraded_reason`): the repo is degraded **before any send** — write ONE degraded record and make **zero** `call_llm`.
 - **Synthesis degradation** (`DegradedSynthesis`): chunk-analysis sends already happened and are preserved; make **no** final synthesis send and return the local degraded synthesis result.
 
 **Degraded record shape (reuse `metadata.py:39` `PARSE_STATUS_DEGRADED='degraded'`; INDEX includes degraded rows at `metadata.py:327`):** the written frontmatter carries `full_name`, `cache_dir`, the **current** `last_commit` (= `commit_hash` from `task_data`), `parse_status: degraded`, and a `degraded_reason`. Recording the current commit stops infinite retry; `parse_status: degraded` keeps it in INDEX.
 
-**Interfaces:** `generate_repo_metadata(task_data, session, args) -> None` (writes the metadata file under the cache dir); `combine_chunk_analyses(..., session=None) -> str | DegradedSynthesis`.
+**Interfaces:** `generate_repo_metadata(task_data, session, args, ctx) -> None` (writes the metadata file); `SyncContext(meta_progress, meta_tasks, stats, stats_lock, sync_logger, console)`; `combine_chunk_analyses(..., session=None) -> (str | DegradedSynthesis, cost)`.
 
-- [ ] **Step 1: Failing tests** (integration tests point the pristine/cache dirs at `tmp_path` and monkeypatch `collect_repo_files` to return an in-memory file list, so no real git repo is needed):
+- [ ] **Step 1: Failing tests.** Fixture helpers `_fake_task_data(tmp_path, commit)`, `_fake_args()`, `_fake_ctx()` (no-op progress/stats/logger/console), `_read_frontmatter(tmp_path)`, and `_boom` (an `async def _boom(**kw): raise AssertionError("real acount_tokens")`) are written to match the extracted signature + cache layout. `_run_repo` monkeypatches `sync.collect_repo_files`, `sync.call_llm`, `sync.authoritative_partition`, `sync.authoritative_chunks`, `sync.authoritative_synthesis_level`, passes a `_StubSession`, and drives `sync.generate_repo_metadata`, returning the written frontmatter.
 
 ```python
-def test_combine_synthesis_degradation_makes_no_send_and_returns_degraded(monkeypatch):
-    """Unit: combine_chunk_analyses only owns SYNTHESIS. A DegradedSynthesis level must yield no
-    synthesize call and a degraded return."""
+def test_combine_synthesis_degradation_makes_no_send_and_keeps_cost(monkeypatch):
+    """Unit: combine_chunk_analyses owns only SYNTHESIS. A DegradedSynthesis level yields no
+    synthesize call, and the (result, cost) contract is preserved with the accumulated cost."""
     import repo_radar.llm as llm
     monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda *a, **k: llm.DegradedSynthesis("floor"))
     sends = []
     def synth(p, m): sends.append(p); return ("x", 0.0, m)
-    out = llm.combine_chunk_analyses("o/r", ["A0","A1"], model="claude-opus-5", synthesize=synth,
-                                     session=_StubSession(lambda p: PreflightResult(1, True)))
-    assert sends == [] and isinstance(out, llm.DegradedSynthesis)
+    result, cost = llm.combine_chunk_analyses("o/r", ["A0","A1"], model="claude-opus-5", synthesize=synth,
+                                              session=_StubSession(lambda p: PreflightResult(1, True)))
+    assert sends == [] and isinstance(result, llm.DegradedSynthesis) and isinstance(cost, float)
+
+def test_exact_payload_counted_before_send_for_chunk_and_synthesis(monkeypatch, tmp_path):
+    """Dead-code guard: every payload call_llm sends must have been authoritatively counted FIRST
+    (same digest). Runs the REAL authoritative_chunks + combine_chunk_analyses (not mocked) via the
+    extracted worker; the session logs ('count', digest) and sync.call_llm logs ('send', digest)."""
+    import hashlib, repo_radar.modes.sync as sync
+    events = []
+    def dig(p): return hashlib.sha256(p.encode()).hexdigest()
+    class _LogSession:
+        def count(self, model, prompt, ro): events.append(("count", dig(prompt))); return PreflightResult(1, True)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+    monkeypatch.setattr(sync, "call_llm",
+        lambda model, prompt, max_tokens=8192: events.append(("send", dig(prompt))) or
+        ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
+    with patch("litellm.acount_tokens", _boom):               # hard guard: no real count
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), _LogSession(), _fake_args(), _fake_ctx())
+    sends = [d for k, d in events if k == "send"]
+    assert sends                                              # at least the chunk + synthesis sends happened
+    for d in sends:                                           # each sent payload was counted first, same digest
+        assert ("count", d) in events and events.index(("count", d)) < events.index(("send", d))
 
 def _run_repo(monkeypatch, tmp_path, files, chunks_result, synth_level, records):
-    """Drive the extracted generate_repo_metadata with an in-memory repo. `records` collects each
-    call_llm's max_tokens in order."""
-    import repo_radar.llm as llm, repo_radar.modes.sync as sync
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
     monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: files)
-    monkeypatch.setattr(llm, "call_llm", lambda model, prompt, max_tokens=8192: records.append(max_tokens) or ("A", 0.0, None))
-    monkeypatch.setattr(llm, "authoritative_partition", lambda *a, **k: "chunk")
-    monkeypatch.setattr(llm, "authoritative_chunks", lambda *a, **k: chunks_result)
-    monkeypatch.setattr(llm, "authoritative_synthesis_level", synth_level)
-    task_data = _fake_task_data(tmp_path, commit="abc1234")     # (repo_config, cache_name, commit_hash, ...)
-    with __import__("repo_radar.preflight", fromlist=["PreflightSession"]).PreflightSession() as s:
-        sync.generate_repo_metadata(task_data, s, _fake_args())
-    return _read_frontmatter(tmp_path)                          # dict of the written metadata frontmatter
+    monkeypatch.setattr(sync, "call_llm", lambda model, prompt, max_tokens=8192: records.append(max_tokens) or ("A", 0.0, None))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **k: chunks_result)
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", synth_level)   # combine_chunk_analyses resolves it in llm
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), _StubSession(lambda p: PreflightResult(1, True)),
+                                    _fake_args(), _fake_ctx())
+    return _read_frontmatter(tmp_path)
 
 def test_analysis_degradation_never_calls_llm_and_persists_degraded_record(monkeypatch, tmp_path):
     import repo_radar.llm as llm
     records = []
-    fm = _run_repo(monkeypatch, tmp_path, _files(2),
-                   chunks_result=llm.PartitionResult([], "template floor"),
+    fm = _run_repo(monkeypatch, tmp_path, _files(2), llm.PartitionResult([], "template floor"),
                    synth_level=lambda *a, **k: [], records=records)
-    assert records == []                                        # zero LLM calls
+    assert records == []                                       # zero LLM calls
     assert fm["parse_status"] == "degraded" and fm["last_commit"] == "abc1234" and fm.get("degraded_reason")
 
 def test_synthesis_degradation_keeps_chunk_sends_then_persists_degraded(monkeypatch, tmp_path):
     import repo_radar.llm as llm
     records = []
-    fm = _run_repo(monkeypatch, tmp_path, _files(2),
-                   chunks_result=llm.PartitionResult([_files(1), _files(1)], None),   # two chunk-analysis sends
+    fm = _run_repo(monkeypatch, tmp_path, _files(2), llm.PartitionResult([_files(1), _files(1)], None),
                    synth_level=lambda *a, **k: llm.DegradedSynthesis("floor"), records=records)
-    assert 8192 in records and 16384 not in records             # chunk sends happened; no synthesis send
+    assert 8192 in records and 16384 not in records            # chunk sends happened; no synthesis send
     assert fm["parse_status"] == "degraded" and fm["last_commit"] == "abc1234"
 ```
 
 - [ ] **Step 2: Run** → FAIL. (Write the `_fake_task_data`/`_fake_args`/`_read_frontmatter` helpers to match the extracted signature + the cache layout.)
-- [ ] **Step 3: Implement** — extract `generate_repo_metadata`; wrap the metadata executor in `with PreflightSession() as session:`; branch on `authoritative_partition`; on `PartitionResult.degraded_reason` write the degraded frontmatter (shape above) and make no send; on the chunked path send each chunk (8192) then `combine_chunk_analyses(session=session)`, which returns a `DegradedSynthesis` (persist a degraded record, chunk work already done) or the synthesized text.
+- [ ] **Step 3: Implement** — (1) extract `generate_repo_metadata(task_data, session, args, ctx)` from the nested worker, moving the closure state into `SyncContext`; the nested lambda passes the same `session`/`args`/`ctx`. (2) In `sync_mode`, wrap the metadata executor in `with PreflightSession() as session:` and build `ctx` once. (3) Branch on `authoritative_partition`; on `PartitionResult.degraded_reason` write the degraded frontmatter (shape above) and make no send; on the chunked path send each chunk (8192), then `analysis, combine_cost = combine_chunk_analyses(session=session)` — if `isinstance(analysis, DegradedSynthesis)` persist a degraded record (chunk work + `combine_cost` already accounted), else persist the synthesized text. The single path counts the full-repo prompt (16384) then sends it.
 - [ ] **Step 4: Run** full `python3 -m pytest repo_radar/tests/ -q` → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(sync): thread PreflightSession; honor analysis vs synthesis degradation"`
 
