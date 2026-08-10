@@ -7,6 +7,8 @@ from collections import namedtuple
 from datetime import datetime
 
 from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
+from repo_radar import model_catalog
+from repo_radar.model_catalog import get_caps, is_known_model
 
 # TODO: refactor sync_mode to use analyze_repo_chunk and combine_chunk_analyses
 
@@ -15,86 +17,9 @@ DEFAULT_MODEL = 'claude-sonnet-5'
 # Maximum input context window for each supported model.
 #
 # These are INPUT context windows, not output token limits.
-# Based on litellm model cost map as of March 2026.
-KNOWN_LIMITS = {
-    # ── Anthropic Claude ──────────────────────────────────────────────
-    # Claude 5.x / newest 4.x (latest)
-    "claude-opus-5": 1000000,
-    "claude-sonnet-5": 1000000,
-    "claude-opus-4-8": 1000000,
-    "claude-opus-4-7": 1000000,
-    "claude-fable-5": 1000000,
-    # Claude 4.6
-    "claude-opus-4-6": 1000000,
-    "claude-opus-4-6-20260205": 1000000,
-    "claude-sonnet-4-6": 1000000,
-    # Claude 4.5
-    "claude-opus-4-5": 200000,
-    "claude-opus-4-5-20251101": 200000,
-    "claude-sonnet-4-5": 200000,
-    "claude-sonnet-4-5-20250929": 200000,
-    "claude-haiku-4-5": 200000,
-    "claude-haiku-4-5-20251001": 200000,
-
-    # ── Google Gemini ─────────────────────────────────────────────────
-    # Gemini 3.x
-    "gemini/gemini-3.6-flash": 1048576,
-    "gemini/gemini-3.5-flash": 1048576,
-    "gemini/gemini-3.1-pro-preview": 1048576,
-    "gemini/gemini-3.1-flash-lite": 1048576,
-    "gemini/gemini-3-flash-preview": 1048576,
-    # Gemini 2.5
-    "gemini/gemini-2.5-pro": 1048576,
-    "gemini/gemini-2.5-flash": 1048576,
-    "gemini/gemini-2.5-flash-lite": 1048576,
-    # Convenience aliases
-    "gemini/gemini-pro-latest": 1048576,
-    "gemini/gemini-flash-latest": 1048576,
-    "gemini/gemini-flash-lite-latest": 1048576,
-
-    # ── OpenAI ────────────────────────────────────────────────────────
-    # GPT-5.6 / 5.5 (latest)
-    "gpt-5.6-sol": 1050000,
-    "gpt-5.6-terra": 1050000,
-    "gpt-5.6-luna": 1050000,
-    "gpt-5.5": 1050000,
-    "gpt-5.5-pro": 1050000,
-    # GPT-5.x
-    "gpt-5.4": 1050000,
-    "gpt-5.4-pro": 1050000,
-    # 272K INPUT, not 1.05M. OpenAI documents both mini and nano at 400K total context with 128K
-    # max output; 400K - 128K = 272K, which is litellm's max_input_tokens for each. The 1.05M
-    # entries were the wrong-direction table error (over-reporting the usable input window), so the
-    # chunker packed ~787K-token prompts against a 272K ceiling. This table stores input windows.
-    "gpt-5.4-mini": 272000,
-    "gpt-5.4-nano": 272000,
-    # 272K INPUT, not the 400K total context. OpenAI documents 400K total with a 128K maximum
-    # output, and 400000 - 128000 = 272000 exactly, which is litellm's max_input_tokens. This
-    # table stores input windows (see the header), so 400K was the total misfiled as an input
-    # limit — and since the chunking threshold is 75% of this value, it produced 300K-token
-    # chunks against a 272K input ceiling. https://developers.openai.com/api/docs/models/gpt-5.3-codex
-    "gpt-5.3-codex": 272000,
-    "gpt-5.2": 272000,
-    "gpt-5.2-pro": 272000,
-    "gpt-5.1": 272000,
-    "gpt-5": 272000,
-    "gpt-5-mini": 272000,
-    "gpt-5-nano": 272000,
-    # GPT-4.x
-    "gpt-4.1": 1047576,
-    "gpt-4.1-mini": 1047576,
-    "gpt-4.1-nano": 1047576,
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-4-turbo": 128000,
-    # Reasoning models
-    "o4-mini": 200000,
-    "o3": 200000,
-    "o3-mini": 200000,
-    "o3-pro": 200000,
-    "o1": 200000,
-    "o1-pro": 200000,
-}
+# Derived from repo_radar.model_catalog.MODEL_CAPS (the verified per-model capability table);
+# see that module for source_url/source_date provenance per model.
+KNOWN_LIMITS = {m: c.max_input for m, c in model_catalog.MODEL_CAPS.items()}
 
 # Retired model ids -> their current replacement. Keys must never overlap
 # with KNOWN_LIMITS (a model is either live or migrated, not both).
