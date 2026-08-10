@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is self-contained — do NOT reconstruct any step from git history.
 
-**Status:** revision 7 (after Codex plan-review rounds 1–6). Architecture settled since rev 4; remaining passes are Task 10–11 integration precision (worker seam, patch targets, result contract, guard test, event log).
+**Status:** revision 8 (after Codex plan-review rounds 1–7). Architecture settled since rev 4; remaining passes are the Task 10–11 "every send is counted" guarantee (run() choke-point preflight) + load-bearing coverage of all three shapes and accumulated cost.
 
 **Goal:** Budget every Claude prompt actually sent against Anthropic's authoritative count (`litellm.acount_tokens`), falling back to the complete Branch 1 conservative path when that count is unavailable, and harden the model catalog with explicit windows + a release-time validation gate.
 
@@ -561,7 +561,9 @@ def test_non_authoritative_falls_back_to_branch1(monkeypatch):
 ### Task 10: `authoritative_synthesis_level` — split-only + synthesis singleton terminal (§6.3)
 
 **Files:** Modify `repo_radar/llm.py`; Test `repo_radar/tests/test_send_paths.py`.
-**Interfaces:** `DegradedSynthesis(reason)`; `authoritative_synthesis_level(session, full_name, analyses, model) -> list[list[str]] | DegradedSynthesis`. Split-only from Branch 1's largest batches; a single over-budget analysis that cannot split is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis(reason)`. Non-authoritative ⇒ return Branch 1's current-level batches unchanged. **`SYNTHESIS_MAX_CALLS` interaction:** `combine_chunk_analyses` must compute the max-calls guard from the **authoritative (post-split) batch count** of the current level before issuing sends.
+**Interfaces:** `DegradedSynthesis(reason)`; `authoritative_synthesis_level(session, full_name, analyses, model) -> list[list[str]] | DegradedSynthesis`. Split-only from Branch 1's largest batches; a single over-budget analysis that cannot split is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis(reason)`. Non-authoritative ⇒ return Branch 1's current-level batches unchanged.
+
+**Every synthesis send is preflighted at the `run()` choke point (finding — terminal/recovery prompts).** In `combine_chunk_analyses`, ALL sends go through the single nested `run(batch)` (`llm.py:950`) — the ordinary batch sends (`llm.py:988`), the max-calls/max-depth **terminal** `run(trimmed)` (`llm.py:1003`), and the mid-round trimmed sends. So `run(batch)` itself gains the authoritative step: count `_build_synthesis_prompt(full_name, batch)`; if authoritative and it exceeds `acceptance_budget(model, 16384)`, authoritatively truncate this batch's combined text (binary search + recount) until it fits **before** calling `synthesize`; if non-authoritative, fall back to Branch 1 (send as-is). This guarantees the exact sent prompt was counted for every path — ordinary and terminal — not just the ordinary batches. Separately, line 985's `_batch_by_budget(...)` is replaced by `authoritative_synthesis_level(...)` so the `max_calls` guard (`llm.py:994`) charges the authoritative batch count.
 
 - [ ] **Step 1: Failing tests**
 
@@ -579,27 +581,31 @@ def test_over_budget_batch_splits_into_more_batches(monkeypatch):
     for b in out:
         assert _StubSession(table).count("claude-opus-5", llm._build_synthesis_prompt("o/r", b), 16384).tokens <= budget
 
-def test_max_calls_guard_uses_the_authoritative_post_split_count(monkeypatch):
-    """The guard `calls + len(batches) + 1 > max_calls` must charge the AUTHORITATIVE (post-split)
-    batch count. authoritative_synthesis_level splits the level into 4 batches; with max_calls=4 the
-    correct guard (0+4+1=5 > 4) TRIPS -> the single truncated-shot path (exactly 1 send). An impl that
-    fed the guard a smaller/stale count would NOT trip and would instead send all 4 authoritative
-    batches (4 sends). Asserting `len(sends) == 1` (not 4) tests the guard, not merely that
-    authoritative batches drive sending."""
-    import repo_radar.llm as llm
+def test_max_calls_trips_on_authoritative_count_and_terminal_prompt_is_counted(monkeypatch):
+    """Two guarantees: (a) the guard `calls + len(batches) + 1 > max_calls` charges the AUTHORITATIVE
+    post-split count (4) -> with max_calls=4 it trips to a single terminal shot (1 send, not 4); and
+    (b) that terminal run(trimmed) prompt is itself authoritatively COUNTED before it is sent (via the
+    run() choke point). A stale-count guard sends 4 batches; a run() that skips preflight on the
+    terminal path sends an uncounted prompt."""
+    import repo_radar.llm as llm, hashlib
     monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda s, fn, a, m: [[x] for x in a])  # -> 4 batches
-    sends = []
+    counted, sends = [], []
+    class _Rec:
+        def count(self, model, prompt, ro):
+            counted.append(hashlib.sha256(prompt.encode()).hexdigest()); return PreflightResult(1, True)
     def synth(prompt, model):
-        sends.append(prompt); return ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, model)
+        sends.append(hashlib.sha256(prompt.encode()).hexdigest())
+        return ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, model)
     llm.combine_chunk_analyses("o/r", ["A0","A1","A2","A3"], model="claude-opus-5", synthesize=synth,
-                               session=_StubSession(lambda p: PreflightResult(1, True)), max_calls=4)
-    assert len(sends) == 1     # guard tripped on the authoritative count of 4 -> single-shot, NOT 4 batch sends
+                               session=_Rec(), max_calls=4)
+    assert len(sends) == 1                 # guard tripped on the authoritative count of 4 -> single terminal shot
+    assert sends[0] in counted             # the terminal prompt was authoritatively counted before it was sent
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** the level splitter (largest-prefix on the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; singleton via the same binary-truncate helper as Task 9, generalized to a text list). In `combine_chunk_analyses`, replace the current level's Branch 1 `batches` with `authoritative_synthesis_level(...)`'s result **before** the `calls + len(batches) + 1 > max_calls` guard (`llm.py:994`), so `max_calls` charges the authoritative (post-split) count.
+- [ ] **Step 3: Implement** — (a) `authoritative_synthesis_level`: largest-prefix split of the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; a singleton over-budget analysis is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis`; non-authoritative ⇒ Branch 1's batches. (b) Replace `_batch_by_budget(...)` at `llm.py:985` with `authoritative_synthesis_level(...)` so the `max_calls` guard (`llm.py:994`) charges the authoritative count. (c) Make the nested `run(batch)` (`llm.py:950`) authoritatively preflight its EXACT prompt before `synthesize`: count `_build_synthesis_prompt(full_name, batch)`; if authoritative and over `acceptance_budget(model, 16384)`, authoritatively truncate the batch text (binary + recount) until it fits, then send the fitting prompt; non-authoritative ⇒ Branch 1 as-is. Every send site (ordinary `run(batches[0])`, terminal `run(trimmed)`, mid-round) flows through `run()`, so all are counted.
 
-  **Preserve the return contract (finding — cost accounting):** `combine_chunk_analyses` today returns `(text, cost)` and `sync.py:1095` destructures `analysis, combine_cost = ...`. Keep the 2-tuple: on `DegradedSynthesis`, return `(DegradedSynthesis(reason), accumulated_cost_so_far)` — the synthesis result slot carries the degraded sentinel while the **already-incurred cost is still returned**. The caller checks `isinstance(analysis, DegradedSynthesis)`; every existing `(text, cost)` caller keeps working.
+  **Preserve the return contract (finding — cost accounting):** `combine_chunk_analyses` today returns `(text, cost)` and `sync.py:1095` destructures `analysis, combine_cost = ...`. Keep the 2-tuple: on `DegradedSynthesis`, return `(DegradedSynthesis(reason), accumulated_cost_so_far)` — the result slot carries the degraded sentinel while the **already-incurred cost is still returned**. The caller checks `isinstance(analysis, DegradedSynthesis)`.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(llm): synthesis level split-only + singleton terminal + max_calls from authoritative count"`
 
@@ -622,36 +628,50 @@ def test_max_calls_guard_uses_the_authoritative_post_split_count(monkeypatch):
 - [ ] **Step 1: Failing tests.** Fixture helpers `_fake_task_data(tmp_path, commit)`, `_fake_args()`, `_fake_ctx()` (no-op progress/stats/logger/console), `_read_frontmatter(tmp_path)`, and `_boom` (an `async def _boom(**kw): raise AssertionError("real acount_tokens")`) are written to match the extracted signature + cache layout. `_run_repo` monkeypatches `sync.collect_repo_files`, `sync.call_llm`, `sync.authoritative_partition`, `sync.authoritative_chunks`, `sync.authoritative_synthesis_level`, passes a `_StubSession`, and drives `sync.generate_repo_metadata`, returning the written frontmatter.
 
 ```python
-def test_combine_synthesis_degradation_makes_no_send_and_keeps_cost(monkeypatch):
-    """Unit: combine_chunk_analyses owns only SYNTHESIS. A DegradedSynthesis level yields no
-    synthesize call, and the (result, cost) contract is preserved with the accumulated cost."""
+def test_combine_returns_accumulated_cost_when_a_later_level_degrades(monkeypatch):
+    """Load-bearing cost preservation: level 1 makes two synthesis calls (cost 0.5 each), THEN level 2
+    degrades. combine must return (DegradedSynthesis, 1.0) — the pre-degradation cost, not 0.0. A first-
+    level degrade (the old test) would trivially pass with 0.0."""
     import repo_radar.llm as llm
-    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda *a, **k: llm.DegradedSynthesis("floor"))
-    sends = []
-    def synth(p, m): sends.append(p); return ("x", 0.0, m)
-    result, cost = llm.combine_chunk_analyses("o/r", ["A0","A1"], model="claude-opus-5", synthesize=synth,
-                                              session=_StubSession(lambda p: PreflightResult(1, True)))
-    assert sends == [] and isinstance(result, llm.DegradedSynthesis) and isinstance(cost, float)
+    def level(s, fn, a, m):                                    # 4 analyses -> 2 batches; the 2 results -> degrade
+        return [["A0","A1"], ["A2","A3"]] if len(a) == 4 else llm.DegradedSynthesis("floor")
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", level)
+    def synth(p, m): return ("part", 0.5, m)                   # each level-1 send costs 0.5
+    result, cost = llm.combine_chunk_analyses("o/r", ["A0","A1","A2","A3"], model="claude-opus-5",
+                                              synthesize=synth, session=_StubSession(lambda p: PreflightResult(1, True)))
+    assert isinstance(result, llm.DegradedSynthesis) and cost == 1.0
 
-def test_exact_payload_counted_before_send_for_chunk_and_synthesis(monkeypatch, tmp_path):
-    """Dead-code guard: every payload call_llm sends must have been authoritatively counted FIRST
-    (same digest). Runs the REAL authoritative_chunks + combine_chunk_analyses (not mocked) via the
-    extracted worker; the session logs ('count', digest) and sync.call_llm logs ('send', digest)."""
+def test_exact_payload_counted_before_send_all_three_shapes(monkeypatch, tmp_path):
+    """Dead-code guard across ALL THREE shapes. Run 1 forces the CHUNK branch (real authoritative_chunks
+    + real combine_chunk_analyses) and proves an 8192 chunk payload AND a 16384 synthesis payload were
+    each authoritatively counted before their identical-digest send. Run 2 forces the SINGLE branch and
+    proves the 16384 full-repo payload was counted first. Events record (kind, requested_output, digest)
+    so all three shapes are proven present."""
     import hashlib, repo_radar.modes.sync as sync
-    events = []
     def dig(p): return hashlib.sha256(p.encode()).hexdigest()
-    class _LogSession:
-        def count(self, model, prompt, ro): events.append(("count", dig(prompt))); return PreflightResult(1, True)
-    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
-    monkeypatch.setattr(sync, "call_llm",
-        lambda model, prompt, max_tokens=8192: events.append(("send", dig(prompt))) or
-        ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
-    with patch("litellm.acount_tokens", _boom):               # hard guard: no real count
-        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), _LogSession(), _fake_args(), _fake_ctx())
-    sends = [d for k, d in events if k == "send"]
-    assert sends                                              # at least the chunk + synthesis sends happened
-    for d in sends:                                           # each sent payload was counted first, same digest
-        assert ("count", d) in events and events.index(("count", d)) < events.index(("send", d))
+    def harness():
+        ev = []
+        class _LogSession:
+            def count(self, model, prompt, ro): ev.append(("count", ro, dig(prompt))); return PreflightResult(1, True)
+        monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+        monkeypatch.setattr(sync, "call_llm",
+            lambda model, prompt, max_tokens=8192: ev.append(("send", max_tokens, dig(prompt))) or
+            ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
+        return ev, _LogSession()
+    def assert_counted_before_send(ev):
+        for k, ro, d in ev:
+            if k == "send":
+                assert ("count", ro, d) in ev and ev.index(("count", ro, d)) < ev.index(("send", ro, d))
+    ev, sess = harness()                                       # Run 1: chunk branch
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "chunk")
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), sess, _fake_args(), _fake_ctx())
+    assert {ro for k, ro, _ in ev if k == "send"} >= {8192, 16384}; assert_counted_before_send(ev)
+    ev2, sess2 = harness()                                     # Run 2: single branch
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "single")
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path / "b", "def5678"), sess2, _fake_args(), _fake_ctx())
+    assert {ro for k, ro, _ in ev2 if k == "send"} == {16384}; assert_counted_before_send(ev2)
 
 def _run_repo(monkeypatch, tmp_path, files, chunks_result, synth_level, records):
     import repo_radar.modes.sync as sync, repo_radar.llm as llm
