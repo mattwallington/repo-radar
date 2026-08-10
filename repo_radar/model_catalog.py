@@ -3,6 +3,7 @@ release-time drift cross-check. Values verified 2026-08-08. total_context == max
 models; the OpenAI 272K-input split family vendor-documents 400,000 total (llm.py:71). total_context feeds
 acceptance_budget only for anthropic_api models; for local models it is documentation + the
 max_input<=total_context invariant."""
+import math
 from collections import namedtuple
 ModelCaps = namedtuple("ModelCaps", "total_context max_input max_output count_strategy source_url source_date")
 _ANT = "https://platform.claude.com/docs/en/about-claude/models/overview"
@@ -63,5 +64,10 @@ MODEL_CAPS = {
     "o1": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o1-pro": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
 }
+HEADROOM_FRACTION = 0.01
 def get_caps(model): return MODEL_CAPS.get(model)
 def is_known_model(model): return model in MODEL_CAPS
+def acceptance_budget(model, requested_output):
+    caps = MODEL_CAPS[model]
+    ceiling = min(caps.max_input, caps.total_context - requested_output)
+    return ceiling - math.ceil(HEADROOM_FRACTION * ceiling)

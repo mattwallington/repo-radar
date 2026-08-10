@@ -1,3 +1,4 @@
+import math
 import repo_radar.model_catalog as mc
 def test_record_invariants():
     for m, c in mc.MODEL_CAPS.items():
@@ -13,3 +14,7 @@ def test_shared_window_models_total_equals_max_input():
         assert mc.get_caps(m).total_context == mc.get_caps(m).max_input, m
 def test_unknown_absent():
     assert mc.is_known_model("no-such") is False and mc.get_caps("no-such") is None
+def test_budget_subtracts_requested_output_and_1pct():
+    ceiling = min(1_000_000, 1_000_000 - 8192)
+    assert mc.acceptance_budget("claude-opus-5", 8192) == ceiling - math.ceil(0.01 * ceiling)
+    assert mc.acceptance_budget("claude-opus-5", 8192) > 900_000
