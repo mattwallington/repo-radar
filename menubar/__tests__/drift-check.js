@@ -2,7 +2,7 @@ const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { MODEL_MIGRATIONS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel, MODEL_SUGGESTIONS } = require('../model-policy');
+const { MODEL_MIGRATIONS, MODEL_CAPS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel, MODEL_SUGGESTIONS } = require('../model-policy');
 const root = path.join(__dirname, '..', '..');
 const py = process.platform === 'win32' ? 'python' : 'python3';
 
@@ -11,10 +11,11 @@ const FIXTURES = ['anthropic/claude-x', 'openai/gpt-x', 'chatgpt/foo', 'chatgpt-
                   'o3', 'o4-mini', 'codex-mini-latest', 'gemini/gemini-x', 'gemini-x', 'mystery', ''];
 
 const out = execFileSync(py, ['-c',
-  "import sys,json;sys.path.insert(0,'.');from repo_radar import llm;" +
+  "import sys,json;sys.path.insert(0,'.');from repo_radar import llm;from repo_radar import model_catalog;" +
   "fx=json.loads(sys.argv[1]);" +
   "ids=sorted(set(llm.KNOWN_LIMITS)|set(llm.MODEL_MIGRATIONS)|set(fx));" +
   "print(json.dumps({'d':llm.DEFAULT_MODEL,'m':llm.MODEL_MIGRATIONS,'k':sorted(llm.KNOWN_LIMITS)," +
+  "'caps':{m:{'max_input':c.max_input,'max_output':c.max_output} for m,c in model_catalog.MODEL_CAPS.items()}," +
   "'prov':{i:llm.provider_for_model(i) for i in ids}}))",
   JSON.stringify(FIXTURES)],
   { cwd: root, encoding: 'utf8' });
@@ -25,12 +26,20 @@ assert.deepStrictEqual(Object.keys(MODEL_MIGRATIONS).sort(), Object.keys(p.m).so
 for (const k of Object.keys(MODEL_MIGRATIONS)) assert.strictEqual(MODEL_MIGRATIONS[k], p.m[k], `migration value drift ${k}`);
 assert.deepStrictEqual([...KNOWN_MODEL_IDS].sort(), p.k, 'KNOWN_MODEL_IDS drift');
 
+// MODEL_CAPS parity: every known model's {max_input, max_output} must match Python exactly.
+assert.deepStrictEqual(Object.keys(MODEL_CAPS).sort(), Object.keys(p.caps).sort(), 'MODEL_CAPS key drift');
+for (const m of Object.keys(p.caps)) {
+  assert.strictEqual(MODEL_CAPS[m].max_input, p.caps[m].max_input, `MODEL_CAPS max_input drift ${m}`);
+  assert.strictEqual(MODEL_CAPS[m].max_output, p.caps[m].max_output, `MODEL_CAPS max_output drift ${m}`);
+}
+
 // Provider parity over KNOWN ∪ MIGRATIONS ∪ synthetic fixtures.
 for (const [id, pyProv] of Object.entries(p.prov)) {
   const jsProv = providerForModel(id);
   assert.strictEqual(jsProv === undefined ? null : jsProv, pyProv, `provider drift for ${JSON.stringify(id)}: js=${jsProv} py=${pyProv}`);
 }
-console.log('drift OK:', p.k.length, 'known,', Object.keys(p.m).length, 'migrations,', Object.keys(p.prov).length, 'provider fixtures');
+console.log('drift OK:', p.k.length, 'known,', Object.keys(p.m).length, 'migrations,',
+  Object.keys(p.caps).length, 'caps,', Object.keys(p.prov).length, 'provider fixtures');
 
 // Parse the selectable ai-model dropdown values from settings.html.
 const _html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');

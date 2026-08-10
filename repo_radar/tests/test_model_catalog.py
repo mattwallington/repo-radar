@@ -18,3 +18,6 @@ def test_budget_subtracts_requested_output_and_1pct():
     ceiling = min(1_000_000, 1_000_000 - 8192)
     assert mc.acceptance_budget("claude-opus-5", 8192) == ceiling - math.ceil(0.01 * ceiling)
     assert mc.acceptance_budget("claude-opus-5", 8192) > 900_000
+def test_gpt_4_turbo_removed_and_every_model_serves_16384():
+    assert mc.get_caps("gpt-4-turbo") is None
+    assert all(c.max_output >= 16384 for c in mc.MODEL_CAPS.values())

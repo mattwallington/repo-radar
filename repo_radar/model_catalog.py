@@ -56,7 +56,6 @@ MODEL_CAPS = {
     "gpt-4.1-nano": ModelCaps(1047576, 1047576, 32768, "local", _OPE, "2026-08-08"),
     "gpt-4o": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
     "gpt-4o-mini": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
-    "gpt-4-turbo": ModelCaps(128000, 128000, 4096, "local", _OPE, "2026-08-08"),  # removed atomically in Task 3
     "o4-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),

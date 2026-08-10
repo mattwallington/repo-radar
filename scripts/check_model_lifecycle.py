@@ -80,14 +80,16 @@ def main():
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
     from repo_radar import llm
+    from repo_radar import model_catalog
     failures = check(str(root / "repo_radar" / "model_lifecycle.json"),
-                     set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS), target)
+                     set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), target)
     if failures:
         print("MODEL LIFECYCLE GATE FAILED:", file=sys.stderr)
         for f in failures:
             print("  -", f, file=sys.stderr)
         return 1
-    print(f"model lifecycle gate OK ({len(llm.KNOWN_LIMITS)} known, {len(llm.MODEL_MIGRATIONS)} migrations) for {target}")
+    print(f"model lifecycle gate OK ({len(model_catalog.MODEL_CAPS)} known, "
+          f"{len(llm.MODEL_MIGRATIONS)} migrations) for {target}")
     return 0
 
 
