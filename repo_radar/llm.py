@@ -140,6 +140,12 @@ def _needs_responses_api(model):
     return any(marker in bare for marker in ('-codex', '-pro', '-deep-research', 'codex-mini'))
 
 
+def _completion_messages(prompt):
+    """Exact messages structure call_llm sends on the completion path — one source of truth for
+    the sender AND the preflight counter."""
+    return [{"role": "user", "content": prompt}]
+
+
 def call_llm(model, prompt, max_tokens=8192):
     """Call an LLM and return (text, api_cost, raw_response).
 
@@ -169,7 +175,7 @@ def call_llm(model, prompt, max_tokens=8192):
     else:
         response = litellm.completion(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=_completion_messages(prompt),
             max_tokens=max_tokens,
         )
         try:

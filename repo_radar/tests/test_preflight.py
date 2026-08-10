@@ -1,4 +1,23 @@
 import asyncio, threading, pytest, repo_radar.preflight as pf
+from unittest.mock import patch
+from types import SimpleNamespace
+def _resp(total, tt="anthropic_api", error=False, rm="claude-opus-5", mu="claude-opus-5"):
+    return SimpleNamespace(total_tokens=total, tokenizer_type=tt, error=error, request_model=rm, model_used=mu)
+def test_gate_all_conditions():
+    assert pf._is_authoritative(_resp(1234), "claude-opus-5") is True
+    for bad in (_resp(1234, tt="local_tokenizer"), _resp(0), _resp(True), _resp(5, error=True),
+                _resp(5, rm="wrong", mu="wrong"), SimpleNamespace(total_tokens=5, tokenizer_type="anthropic_api", error=False)):
+        assert pf._is_authoritative(bad, "claude-opus-5") is False
+def test_count_once_timeout_and_error_and_fatal():
+    loop = pf.PreflightLoop(); loop.start()
+    async def slow(**kw): await asyncio.sleep(1); return _resp(5)
+    with patch("litellm.acount_tokens", slow): assert loop.submit(pf._count_once("claude-opus-5","x",0.01)).authoritative is False
+    async def boom(**kw): raise RuntimeError()
+    with patch("litellm.acount_tokens", boom): assert loop.submit(pf._count_once("claude-opus-5","x",5)).authoritative is False
+    async def ki(**kw): raise KeyboardInterrupt()
+    with patch("litellm.acount_tokens", ki):
+        out = loop.submit(pf._count_once("claude-opus-5","x",5)); assert isinstance(out, pf._Fatal)
+    loop.close()
 def test_runs_and_closes():
     loop = pf.PreflightLoop(); loop.start()
     async def v(): await asyncio.sleep(0); return 42

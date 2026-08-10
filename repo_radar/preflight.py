@@ -6,8 +6,16 @@ asyncio.new_event_loop() plus a daemon thread running run_forever().
 """
 
 import asyncio, threading, hashlib, json, logging
+from collections import namedtuple
+
+import litellm
+
+from repo_radar.llm import _completion_messages
 
 logger = logging.getLogger("repo_radar.preflight")
+
+PreflightResult = namedtuple("PreflightResult", "tokens authoritative")
+_Fatal = namedtuple("_Fatal", "exc")
 
 
 class PreflightLoop:
@@ -51,3 +59,40 @@ class PreflightLoop:
 
     def is_closed(self):
         return self._closed
+
+
+def _is_authoritative(resp, model):
+    """True only if every one of litellm's own signals says this count is trustworthy: the
+    Anthropic Count Tokens API actually answered (not a local/estimated tokenizer), it reported
+    no error, total_tokens is a genuine positive int (not a bool — bool is a subclass of int, so
+    True/False must be excluded explicitly), and both the requested and served model match the
+    model we're budgeting for. Any missing attribute or mismatch means "don't trust this," not
+    an exception — getattr defaults make a malformed/partial response fail closed."""
+    tt = getattr(resp, "total_tokens", None)
+    return (getattr(resp, "tokenizer_type", None) == "anthropic_api"
+            and getattr(resp, "error", True) is False
+            and isinstance(tt, int) and not isinstance(tt, bool) and tt > 0
+            and getattr(resp, "request_model", None) == model
+            and getattr(resp, "model_used", None) == model)
+
+
+async def _count_once(model, prompt, timeout_s):
+    """One bounded attempt at an authoritative token count via litellm's Count Tokens API.
+
+    Uses _completion_messages so the counted message structure is EXACTLY what call_llm will
+    send on the completion path — counting a different shape than what's sent would make the
+    count meaningless. Timeouts and provider/network errors are expected, routine fallback
+    triggers (PreflightResult(None, False) lets the caller fall back to the estimate); only
+    KeyboardInterrupt/SystemExit are enveloped rather than swallowed, so an operator-initiated
+    interrupt during the background loop's call still propagates as a distinguishable outcome
+    instead of silently degrading to "not authoritative."
+    """
+    try:
+        resp = await asyncio.wait_for(
+            litellm.acount_tokens(model=model, messages=_completion_messages(prompt)), timeout_s
+        )
+    except (KeyboardInterrupt, SystemExit) as e:
+        return _Fatal(e)
+    except Exception:
+        return PreflightResult(None, False)
+    return PreflightResult(resp.total_tokens, True) if _is_authoritative(resp, model) else PreflightResult(None, False)
