@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is self-contained — do NOT reconstruct any step from git history.
 
-**Status:** revision 8 (after Codex plan-review rounds 1–7). Architecture settled since rev 4; remaining passes are the Task 10–11 "every send is counted" guarantee (run() choke-point preflight) + load-bearing coverage of all three shapes and accumulated cost.
+**Status:** revision 9 (after Codex plan-review rounds 1–8). Architecture settled since rev 4. Rev 9 corrects the last production-contract item (ordinary synthesis sends consume the authoritative coverage-preserving batches; truncation only for singletons/terminal) — Codex marked the plan executable after this.
 
 **Goal:** Budget every Claude prompt actually sent against Anthropic's authoritative count (`litellm.acount_tokens`), falling back to the complete Branch 1 conservative path when that count is unavailable, and harden the model catalog with explicit windows + a release-time validation gate.
 
@@ -563,7 +563,9 @@ def test_non_authoritative_falls_back_to_branch1(monkeypatch):
 **Files:** Modify `repo_radar/llm.py`; Test `repo_radar/tests/test_send_paths.py`.
 **Interfaces:** `DegradedSynthesis(reason)`; `authoritative_synthesis_level(session, full_name, analyses, model) -> list[list[str]] | DegradedSynthesis`. Split-only from Branch 1's largest batches; a single over-budget analysis that cannot split is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis(reason)`. Non-authoritative ⇒ return Branch 1's current-level batches unchanged.
 
-**Every synthesis send is preflighted at the `run()` choke point (finding — terminal/recovery prompts).** In `combine_chunk_analyses`, ALL sends go through the single nested `run(batch)` (`llm.py:950`) — the ordinary batch sends (`llm.py:988`), the max-calls/max-depth **terminal** `run(trimmed)` (`llm.py:1003`), and the mid-round trimmed sends. So `run(batch)` itself gains the authoritative step: count `_build_synthesis_prompt(full_name, batch)`; if authoritative and it exceeds `acceptance_budget(model, 16384)`, authoritatively truncate this batch's combined text (binary search + recount) until it fits **before** calling `synthesize`; if non-authoritative, fall back to Branch 1 (send as-is). This guarantees the exact sent prompt was counted for every path — ordinary and terminal — not just the ordinary batches. Separately, line 985's `_batch_by_budget(...)` is replaced by `authoritative_synthesis_level(...)` so the `max_calls` guard (`llm.py:994`) charges the authoritative batch count.
+**The send loop consumes the authoritative, coverage-preserving batches (finding — no truncation of ordinary batches).** Two distinct concerns:
+- **Ordinary sends preserve coverage.** `authoritative_synthesis_level(...)` replaces `_batch_by_budget(...)` at `llm.py:985` **and** the mid-round send loop (`llm.py:1011`, which today recomputes `_batch_by_budget` on the shrinking `pending`) must **iterate the authoritative batch plan directly** — never re-batch with `_batch_by_budget` and never truncate a multi-analysis batch (that would silently drop repository coverage, violating split-only). If the serving model changes mid-round (`run()` re-derived a smaller budget), **replan only the unsent remainder** with the new model via `authoritative_synthesis_level` before the next send. The `max_calls` guard charges `len(authoritative batches)`.
+- **`run()` preflight is the final invariant + the *legitimate* truncation sites.** Every send funnels through `run(batch)` (`llm.py:950`) — ordinary (`:988`), max-calls/depth **terminal** `run(trimmed)` (`:1003`), mid-round. `run()` authoritatively counts `_build_synthesis_prompt(full_name, batch)` before `synthesize`, guaranteeing the exact sent prompt was counted. Truncation inside `run()` is allowed **only** for an unsplittable **singleton** batch (one analysis that alone overflows) or an explicit **terminal** batch (already the coverage-loss path); an overflowing ordinary multi-item batch must instead be **replanned/split** by the loop, never truncated. Non-authoritative → Branch 1 as-is.
 
 - [ ] **Step 1: Failing tests**
 
@@ -600,10 +602,33 @@ def test_max_calls_trips_on_authoritative_count_and_terminal_prompt_is_counted(m
                                session=_Rec(), max_calls=4)
     assert len(sends) == 1                 # guard tripped on the authoritative count of 4 -> single terminal shot
     assert sends[0] in counted             # the terminal prompt was authoritatively counted before it was sent
+
+def test_ordinary_synthesis_is_coverage_preserving_not_truncated(monkeypatch):
+    """The provider permits <=2 analyses per prompt. combine must send TWO coverage-preserving level-1
+    batches whose analyses together are A0,A1,A2,A3 (no omission, in order, NO truncation) — NOT one
+    truncated [A0..A3]. Falsifiable: an impl that re-batches Branch-1's [A0..A3] and truncates in run()
+    drops coverage / leaves the truncation marker. Each sent prompt was counted first."""
+    import repo_radar.llm as llm, hashlib
+    budget = llm.acceptance_budget("claude-opus-5", 16384)
+    counted, sent = [], []
+    class _Rec:
+        def count(self, model, prompt, ro):
+            counted.append(hashlib.sha256(prompt.encode()).hexdigest())
+            return PreflightResult(budget + 1 if prompt.count("--- Analysis Part") > 2 else budget - 1, True)
+    def synth(prompt, model):
+        sent.append((hashlib.sha256(prompt.encode()).hexdigest(), prompt)); return ("R", 0.0, model)
+    llm.combine_chunk_analyses("o/r", ["A0","A1","A2","A3"], model="claude-opus-5", synthesize=synth, session=_Rec())
+    level1 = [p for _d, p in sent if any(a in p for a in ("A0","A1","A2","A3"))]   # the batches carrying originals
+    assert len(level1) == 2                                       # two coverage-preserving batches, not one truncated
+    joined = "".join(level1)
+    assert all(a in joined for a in ("A0","A1","A2","A3"))        # no omission
+    assert [joined.index(a) for a in ("A0","A1","A2","A3")] == sorted(joined.index(a) for a in ("A0","A1","A2","A3"))  # in order
+    assert llm._TRUNCATION_MARKER not in joined                  # no truncation
+    for d, _p in sent: assert d in counted                       # each sent prompt was counted first
 ```
 
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** — (a) `authoritative_synthesis_level`: largest-prefix split of the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; a singleton over-budget analysis is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis`; non-authoritative ⇒ Branch 1's batches. (b) Replace `_batch_by_budget(...)` at `llm.py:985` with `authoritative_synthesis_level(...)` so the `max_calls` guard (`llm.py:994`) charges the authoritative count. (c) Make the nested `run(batch)` (`llm.py:950`) authoritatively preflight its EXACT prompt before `synthesize`: count `_build_synthesis_prompt(full_name, batch)`; if authoritative and over `acceptance_budget(model, 16384)`, authoritatively truncate the batch text (binary + recount) until it fits, then send the fitting prompt; non-authoritative ⇒ Branch 1 as-is. Every send site (ordinary `run(batches[0])`, terminal `run(trimmed)`, mid-round) flows through `run()`, so all are counted.
+- [ ] **Step 3: Implement** — (a) `authoritative_synthesis_level`: largest-prefix split of the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; a singleton over-budget analysis is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis`; non-authoritative ⇒ Branch 1's batches. (b) Replace `_batch_by_budget(...)` at `llm.py:985` **and** the mid-round send loop's re-batching (`llm.py:1011`) with the authoritative plan — the loop **iterates `authoritative_synthesis_level`'s batches**; the `max_calls` guard (`llm.py:994`) charges `len(authoritative batches)`. If `run()` reports the serving model changed (smaller budget), **replan only the unsent remainder** with the new model before the next send. (c) `run(batch)` (`llm.py:950`) authoritatively counts `_build_synthesis_prompt(full_name, batch)` before `synthesize` (so every send is counted); on overflow it **truncates only for a singleton or the terminal `run(trimmed)` path** — an overflowing ordinary multi-item batch is **replanned/split by the loop, never truncated** (coverage-preserving). Non-authoritative ⇒ Branch 1 as-is.
 
   **Preserve the return contract (finding — cost accounting):** `combine_chunk_analyses` today returns `(text, cost)` and `sync.py:1095` destructures `analysis, combine_cost = ...`. Keep the 2-tuple: on `DegradedSynthesis`, return `(DegradedSynthesis(reason), accumulated_cost_so_far)` — the result slot carries the degraded sentinel while the **already-incurred cost is still returned**. The caller checks `isinstance(analysis, DegradedSynthesis)`.
 - [ ] **Step 4: Run** → PASS.
