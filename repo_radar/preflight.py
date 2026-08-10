@@ -11,6 +11,7 @@ from collections import namedtuple
 import litellm
 
 from repo_radar.llm import _completion_messages
+from repo_radar.model_catalog import get_caps
 
 logger = logging.getLogger("repo_radar.preflight")
 
@@ -96,3 +97,89 @@ async def _count_once(model, prompt, timeout_s):
     except Exception:
         return PreflightResult(None, False)
     return PreflightResult(resp.total_tokens, True) if _is_authoritative(resp, model) else PreflightResult(None, False)
+
+
+class PreflightSession:
+    """One sync's worth of authoritative token-count preflight, owned by a single background loop.
+
+    All mutable state (memo, per-model breaker, log-once set) lives behind ONE asyncio.Lock held on
+    the loop thread, so `_guarded` is the sole critical section and callers on any number of worker
+    threads observe a single, serialized, single-flight decision per (model, prompt):
+
+      * Strategy gate first — a model that isn't in the catalog, or whose count_strategy isn't
+        "anthropic_api", degrades to Branch 1 (the local estimate) with NO provider call, NO breaker
+        mutation and NO log: for those models the Count Tokens API doesn't apply, so touching it or
+        the breaker would be meaningless.
+      * Per-model circuit breaker — the first non-authoritative answer for a model opens the breaker,
+        so the rest of the sync skips the (already-known-degraded) provider call for that model and
+        the downgrade is logged exactly once. Other models are unaffected.
+      * Memo — an authoritative count is cached under (model, sha256(canonical_request)) so an
+        identical later request (and a concurrent caller that blocked on the lock) reuses it rather
+        than making a second, redundant provider call. The model is part of the key because the same
+        prompt counts differently per model.
+      * Fatal envelope — an operator interrupt surfaced by `_count_once` as `_Fatal` is returned up
+        without mutating memo/breaker and re-raised on the CALLER's thread by `count`, so Ctrl-C is
+        never silently downgraded to "not authoritative".
+    """
+
+    def __init__(self, timeout_s=10.0):
+        self._loop = PreflightLoop()
+        self._timeout = timeout_s
+        self._memo = {}
+        self._downgraded = set()
+        self._logged = set()
+        self._lock = None
+
+    def __enter__(self):
+        self._loop.start()
+        # Create the Lock ON the loop thread: an asyncio.Lock binds to the running loop, so it must
+        # be constructed inside the loop it will be awaited on.
+        self._lock = self._loop.submit(self._mklock())
+        return self
+
+    def __exit__(self, *exc):
+        self._loop.close()
+        return False
+
+    async def _mklock(self):
+        return asyncio.Lock()
+
+    @staticmethod
+    def _key(model, prompt):
+        """Memo key: the model plus a sha256 of the CANONICAL request litellm would count. Including
+        the model matters because the same prompt tokenizes and counts differently per model; the
+        message shape comes from _completion_messages so the key tracks exactly what _count_once
+        sends. Canonical json (sorted keys, tight separators) makes the digest stable."""
+        req = json.dumps(
+            {"model": model, "messages": _completion_messages(prompt)},
+            sort_keys=True, separators=(",", ":"),
+        )
+        return (model, hashlib.sha256(req.encode()).hexdigest())
+
+    async def _guarded(self, model, prompt):
+        async with self._lock:
+            caps = get_caps(model)
+            if caps is None or caps.count_strategy != "anthropic_api":
+                return PreflightResult(None, False)
+            if model in self._downgraded:
+                return PreflightResult(None, False)
+            key = self._key(model, prompt)
+            if key in self._memo:
+                return self._memo[key]
+            out = await _count_once(model, prompt, self._timeout)
+            if isinstance(out, _Fatal):
+                return out
+            if out.authoritative:
+                self._memo[key] = out
+            else:
+                self._downgraded.add(model)
+                if model not in self._logged:
+                    self._logged.add(model)
+                    logger.warning("preflight: %s downgraded to Branch 1 for this sync", model)
+            return out
+
+    def count(self, model, prompt, requested_output):
+        out = self._loop.submit(self._guarded(model, prompt))
+        if isinstance(out, _Fatal):
+            raise out.exc
+        return out
