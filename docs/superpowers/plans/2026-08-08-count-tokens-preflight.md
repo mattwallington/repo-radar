@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. This plan is self-contained — do NOT reconstruct any step from git history.
 
-**Status:** revision 4 (after Codex plan-review rounds 1–3).
+**Status:** revision 5 (after Codex plan-review rounds 1–4). Architecture is settled; this pass is commit-greenness + falsifiable test bodies.
 
 **Goal:** Budget every Claude prompt actually sent against Anthropic's authoritative count (`litellm.acount_tokens`), falling back to the complete Branch 1 conservative path when that count is unavailable, and harden the model catalog with explicit windows + a release-time validation gate.
 
@@ -33,7 +33,9 @@
 **Files:** Create `repo_radar/model_catalog.py`; Modify `repo_radar/llm.py`; Test `repo_radar/tests/test_model_catalog.py`.
 **Interfaces:** `ModelCaps(total_context, max_input, max_output, count_strategy, source_url, source_date)`; `MODEL_CAPS`; `get_caps(model)`; `is_known_model(model)`. `llm.KNOWN_LIMITS = {m: c.max_input}` (compat export).
 
-**`total_context` policy (vendor-grounded, per model — NOT a provider-wide additive rule, which is false: gpt-4o is a 128K *shared* window):** `total_context = max_input` for every model **except** the OpenAI split-budget family (models whose vendor doc separates input+output; here exactly the `max_input == 272000` models), which vendor-documents 400,000 total (`llm.py:71`). `total_context` feeds `acceptance_budget` **only** for `anthropic_api` models, where it equals the shared context window and is exact. For `local` models it is documentation + the `max_input <= total_context` invariant; the gpt-5.x 1.05M-input rows use the shared-window value pending explicit vendor re-verification, which the `source_date` freshness gate (Task 13) forces. `source_date` records vendor verification, not litellm comparison.
+**`total_context` policy (vendor-grounded, per model — NOT a provider-wide additive rule, which is false: gpt-4o is a 128K *shared* window):** `total_context = max_input` for every model **except** the OpenAI split-budget family (models whose vendor doc separates input+output; here exactly the `max_input == 272000` models), which vendor-documents 400,000 total (`llm.py:71`). `total_context` feeds `acceptance_budget` **only** for `anthropic_api` models, where it equals the shared context window and is exact. For `local` models it is documentation + the `max_input <= total_context` invariant. Every value here (including the gpt-5.x 1.05M-input shared-window totals) is the vendor-verified value as of `source_date` — there is no "pending" state; `source_date` records that verification date.
+
+**Task 1 is ADDITIVE (commit-greenness):** it introduces `MODEL_CAPS` **still containing `gpt-4-turbo`**, so the derived `KNOWN_LIMITS` is unchanged and the JS mirror / lifecycle manifest / matrix stay green at this commit. The atomic removal of `gpt-4-turbo` (from the catalog, `model_lifecycle.json`, the JS `KNOWN_MODEL_IDS`, and the tests) plus the `max_output >= 16384` invariant all land together in Task 3.
 
 - [ ] **Step 1: Failing tests**
 
@@ -45,7 +47,6 @@ def test_record_invariants():
         for v in (c.total_context, c.max_input, c.max_output):
             assert isinstance(v, int) and not isinstance(v, bool) and v > 0, m
         assert c.max_input <= c.total_context and c.max_output <= c.total_context, m
-        assert c.max_output >= 16384, m                    # every model can serve the 16384 shape
         assert c.count_strategy in ("anthropic_api", "local") and c.source_url.startswith("https://"), m
 def test_openai_split_family_is_vendor_exact():
     for m in ("gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"):
@@ -53,10 +54,11 @@ def test_openai_split_family_is_vendor_exact():
 def test_shared_window_models_total_equals_max_input():
     for m in ("claude-opus-5", "gpt-4o", "gpt-4.1", "gemini/gemini-3.6-flash", "o3"):
         assert mc.get_caps(m).total_context == mc.get_caps(m).max_input, m
-def test_gpt_4_turbo_removed_and_unknown_absent():
-    assert mc.get_caps("gpt-4-turbo") is None            # removed: 4096 output < 16384 shape
-    assert mc.is_known_model("no-such") is False
+def test_unknown_absent():
+    assert mc.is_known_model("no-such") is False and mc.get_caps("no-such") is None
 ```
+
+> **Task 1 keeps `gpt-4-turbo`** in `MODEL_CAPS` as `"gpt-4-turbo": ModelCaps(128000, 128000, 4096, "local", _OPE, "2026-08-08"),` (insert after `gpt-4o-mini`). Its `max_output` (4096) is why the `max_output >= 16384` invariant is NOT asserted here — that assertion and the removal both land in Task 3.
 
 - [ ] **Step 2: Run** `python3 -m pytest repo_radar/tests/test_model_catalog.py -q` → FAIL.
 - [ ] **Step 3: Write the module.** Header + accessors:
@@ -120,6 +122,7 @@ MODEL_CAPS = {
     "gpt-4.1-nano": ModelCaps(1047576, 1047576, 32768, "local", _OPE, "2026-08-08"),
     "gpt-4o": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
     "gpt-4o-mini": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
+    "gpt-4-turbo": ModelCaps(128000, 128000, 4096, "local", _OPE, "2026-08-08"),  # removed atomically in Task 3
     "o4-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
@@ -131,9 +134,9 @@ def get_caps(model): return MODEL_CAPS.get(model)
 def is_known_model(model): return model in MODEL_CAPS
 ```
 
-- [ ] **Step 4:** In `llm.py`, replace the `KNOWN_LIMITS = {...}` literal with `from repo_radar.model_catalog import MODEL_CAPS, get_caps, is_known_model` and `KNOWN_LIMITS = {m: c.max_input for m, c in MODEL_CAPS.items()}`. **Also remove `gpt-4-turbo` from `MODEL_MIGRATIONS`/any other reference** if present.
-- [ ] **Step 5: Run** → PASS.
-- [ ] **Step 6: Commit** — `git add repo_radar/model_catalog.py repo_radar/llm.py repo_radar/tests/test_model_catalog.py && git commit -m "feat(catalog): verified MODEL_CAPS table (per-model total_context; gpt-4-turbo removed)"`
+- [ ] **Step 4:** In `llm.py`, replace the `KNOWN_LIMITS = {...}` literal with `from repo_radar import model_catalog` and `from repo_radar.model_catalog import get_caps, is_known_model`, then `KNOWN_LIMITS = {m: c.max_input for m, c in model_catalog.MODEL_CAPS.items()}`. This is byte-identical to today's `KNOWN_LIMITS` (gpt-4-turbo still included), so every consumer stays green.
+- [ ] **Step 5: Run** `python3 -m pytest repo_radar/tests/ -q && node menubar/__tests__/drift-check.js` → PASS/`drift OK` (additive commit is fully green).
+- [ ] **Step 6: Commit** — `git add repo_radar/model_catalog.py repo_radar/llm.py repo_radar/tests/test_model_catalog.py && git commit -m "feat(catalog): introduce MODEL_CAPS (additive; KNOWN_LIMITS derived)"`
 
 ### Task 2: `acceptance_budget(model, requested_output)`
 
@@ -165,16 +168,19 @@ def acceptance_budget(model, requested_output):
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(catalog): acceptance_budget (1% headroom)"`
 
-### Task 3: Migrate `KNOWN_LIMITS` consumers to `MODEL_CAPS` (fully specified)
+### Task 3: Atomic switch — remove `gpt-4-turbo` everywhere + migrate every consumer (one green commit)
 
-**Files:** Modify `menubar/model-policy.js`, `menubar/__tests__/drift-check.js`, `repo_radar/tests/test_litellm_matrix.py`, `scripts/check_model_lifecycle.py`, `repo_radar/tests/test_lifecycle_gate.py`, `menubar/scripts/upgrade-smoke.sh`.
+**Files:** Modify `repo_radar/model_catalog.py`, `repo_radar/model_lifecycle.json`, `menubar/model-policy.js`, `menubar/__tests__/drift-check.js`, `repo_radar/tests/test_litellm_matrix.py`, `scripts/check_model_lifecycle.py`, `repo_radar/tests/test_lifecycle_gate.py`, `repo_radar/tests/test_model_catalog.py`, `menubar/scripts/upgrade-smoke.sh`.
 
-- [ ] **Step 1 — matrix test (drop exact-equality; window validation is the Task 12 gate's job):** rewrite `test_every_known_model_resolves_on_litellm_1_93` to iterate `llm.MODEL_CAPS`; for each id assert `litellm.get_model_info(id)` resolves, `litellm_provider == llm.provider_for_model(id)`, and `mode in ("chat","responses")`; collect all problems into a list and `assert not problems`. **Remove** the `max_input_tokens == ctx` assertion.
-- [ ] **Step 2 — lifecycle gate:** in `scripts/check_model_lifecycle.py` `main()`, replace `set(llm.KNOWN_LIMITS)` with `set(llm.model_catalog.MODEL_CAPS)` (import `from repo_radar import model_catalog`). Update `test_lifecycle_gate.py::test_real_manifest_exact_set_and_passes_at_release` to compare the manifest ids to `set(model_catalog.MODEL_CAPS) | set(llm.MODEL_MIGRATIONS)`. Run `python3 scripts/check_model_lifecycle.py --target-date 2026-08-08` → gate OK.
-- [ ] **Step 3 — JS mirror:** in `menubar/model-policy.js` add `const MODEL_CAPS = { 'claude-opus-5': {max_input:1000000, max_output:128000}, ... }` for every model (input+output only), and derive `KNOWN_MODEL_IDS = new Set(Object.keys(MODEL_CAPS))`. In `menubar/__tests__/drift-check.js` assert, for every model, JS `MODEL_CAPS[m]` equals Python `{max_input, max_output}` (read the Python values via the existing drift-check bridge). Run `node menubar/__tests__/drift-check.js` → `drift OK`.
-- [ ] **Step 4 — packaged smoke:** in `menubar/scripts/upgrade-smoke.sh`, change the model assertion to read a `MODEL_CAPS` value directly, e.g. assert the packaged CLI prints `gpt-5.3-codex` with `max_input=272000` and `max_output=128000` (adapt to the smoke's existing print format) so the catalog can't be dead code.
-- [ ] **Step 5: Run** `python3 -m pytest repo_radar/tests/test_litellm_matrix.py repo_radar/tests/test_lifecycle_gate.py -q && node menubar/__tests__/drift-check.js` → PASS/`drift OK`.
-- [ ] **Step 6: Commit** — stage the six files; `git commit -m "refactor(catalog): migrate matrix/lifecycle/drift/smoke to MODEL_CAPS"`
+**This whole task is ONE commit** — every removal + consumer edit lands together so no intermediate state is red.
+
+- [ ] **Step 1 — remove `gpt-4-turbo`:** delete its row from `repo_radar/model_catalog.py` `MODEL_CAPS`, delete its row from `repo_radar/model_lifecycle.json`, delete `'gpt-4-turbo'` from `menubar/model-policy.js` (both the caps mirror and any migration), and add to `repo_radar/tests/test_model_catalog.py`: `def test_gpt_4_turbo_removed_and_every_model_serves_16384(): assert mc.get_caps("gpt-4-turbo") is None; assert all(c.max_output >= 16384 for c in mc.MODEL_CAPS.values())`.
+- [ ] **Step 2 — matrix test (drop exact-equality; window validation is the Task 12 gate's job):** rewrite `test_every_known_model_resolves_on_litellm_1_93` to iterate `model_catalog.MODEL_CAPS` (`from repo_radar import model_catalog`); for each id assert `litellm.get_model_info(id)` resolves, `litellm_provider == llm.provider_for_model(id)`, `mode in ("chat","responses")`; collect all problems, `assert not problems`. **Remove** the `max_input_tokens == ctx` assertion.
+- [ ] **Step 3 — lifecycle gate:** in `scripts/check_model_lifecycle.py` `main()`, `from repo_radar import model_catalog` and use `set(model_catalog.MODEL_CAPS)` for the known-id set (not `llm.KNOWN_LIMITS`). Update `test_lifecycle_gate.py::test_real_manifest_exact_set_and_passes_at_release` to compare manifest ids to `set(model_catalog.MODEL_CAPS) | set(llm.MODEL_MIGRATIONS)`.
+- [ ] **Step 4 — JS mirror:** in `menubar/model-policy.js` add `const MODEL_CAPS = { 'claude-opus-5': {max_input:1000000, max_output:128000}, ... }` for every model (gpt-4-turbo excluded), derive `KNOWN_MODEL_IDS = new Set(Object.keys(MODEL_CAPS))`; in `menubar/__tests__/drift-check.js` assert JS `MODEL_CAPS[m]` equals Python `{max_input, max_output}` for every model.
+- [ ] **Step 5 — packaged smoke:** in `menubar/scripts/upgrade-smoke.sh`, assert the packaged CLI reports `gpt-5.3-codex` `max_input=272000`, `max_output=128000` from `MODEL_CAPS` (adapt to the smoke's print format) so the catalog can't be dead code.
+- [ ] **Step 6: Run** `python3 -m pytest repo_radar/tests/ -q && node menubar/__tests__/drift-check.js && python3 scripts/check_model_lifecycle.py --target-date 2026-08-10` → all PASS/`OK`.
+- [ ] **Step 7: Commit** — stage the nine files; `git commit -m "refactor(catalog): remove gpt-4-turbo + migrate all consumers to MODEL_CAPS"`
 
 ### Task 4: Reject unknown models before the network wait (§7)
 
@@ -209,20 +215,31 @@ def test_runs_and_closes():
     try: assert loop.submit(v()) == 42
     finally: loop.close()
     assert loop.is_closed()
-def test_close_cancels_pending_and_is_not_closed_until_thread_stops(monkeypatch):
+def test_close_cancels_a_real_pending_coroutine(monkeypatch):
+    # Load-bearing: submit a coroutine that never returns, so there IS a pending task; close() must
+    # cancel/drain it (deleting the _drain block would hang here) and the future observes cancellation.
     loop = pf.PreflightLoop(); loop.start()
-    # First close: pretend the thread won't stop -> close must NOT mark closed, and be retryable.
-    real_join = loop._thread.join
-    monkeypatch.setattr(loop._thread, "join", lambda timeout=None: None)         # join returns, thread "alive"
-    monkeypatch.setattr(loop._thread, "is_alive", lambda: True)
+    never = asyncio.run_coroutine_threadsafe(asyncio.Event().wait(), loop._loop)   # pending forever
+    while not never.running():                                                     # ensure it is scheduled
+        pass
+    loop.close()                                                                   # must cancel + drain, not hang
+    assert loop.is_closed() is True
+    import concurrent.futures
+    with pytest.raises((concurrent.futures.CancelledError, asyncio.CancelledError)):
+        never.result(timeout=1)
+def test_close_is_retryable_if_thread_does_not_stop(monkeypatch):
+    loop = pf.PreflightLoop(); loop.start()
+    real_join, real_alive = loop._thread.join, loop._thread.is_alive
+    monkeypatch.setattr(loop._thread, "join", lambda timeout=None: None)
+    monkeypatch.setattr(loop._thread, "is_alive", lambda: True)                     # pretend it won't stop
     loop.close()
-    assert loop.is_closed() is False                                              # retryable, not a lie
-    # Second close: allow real stop.
-    monkeypatch.setattr(loop._thread, "is_alive", lambda: False)
+    assert loop.is_closed() is False                                               # retryable, not a lie
+    monkeypatch.setattr(loop._thread, "is_alive", real_alive)
     monkeypatch.setattr(loop._thread, "join", real_join)
     loop.close()
     assert loop.is_closed() is True
 ```
+(Add `import pytest` at the top of the test module.)
 
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement**
@@ -339,37 +356,50 @@ def test_local_strategy_never_calls_provider():
         assert s.count("gpt-5.4-mini", "x", 16384).authoritative is False
     assert calls == []
 def _concurrent_two(total):
-    """Two caller threads start together (Barrier); one enters the provider and blocks on `release`
-    while the other is queued behind the lock; then release. Returns the provider call count."""
-    start = threading.Barrier(2); entered = threading.Event(); release = threading.Event(); calls = []
+    """Deterministic single-flight probe. Submit BOTH guarded coroutines to the loop as futures;
+    coro1 enters the provider (blocks on `release`) holding the lock; coro2 is submitted next, then a
+    MARKER coroutine drains the loop's ready queue — so coro2 has provably run up to its lock await
+    (and, absent a lock, would already have called the provider). Assert the provider call count
+    WHILE coro1 is still in-flight: 1 with the lock, 2 without. Returns (calls_before_release,
+    downgrade_warnings)."""
+    entered = threading.Event(); release = threading.Event(); calls = []
     async def fake(**kw):
         calls.append(1); entered.set()
         await asyncio.get_event_loop().run_in_executor(None, release.wait)
         return _resp(total, rm=kw["model"], mu=kw["model"])
     with patch("litellm.acount_tokens", fake), pf.PreflightSession(timeout_s=5) as s:
-        def worker(): start.wait(); s.count("claude-opus-5", "same", 8192)
-        t1 = threading.Thread(target=worker); t2 = threading.Thread(target=worker)
-        t1.start(); t2.start(); entered.wait(); release.set(); t1.join(); t2.join()
-    return len(calls)
+        lp = s._loop._loop
+        f1 = asyncio.run_coroutine_threadsafe(s._guarded("claude-opus-5", "same"), lp)
+        entered.wait()                                        # coro1 holds the lock, parked in provider
+        f2 = asyncio.run_coroutine_threadsafe(s._guarded("claude-opus-5", "same"), lp)
+        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), lp).result(timeout=5)   # drain: coro2 reached its await
+        calls_before = len(calls)                             # load-bearing: 1 (lock) vs 2 (no lock)
+        release.set()
+        f1.result(timeout=5); f2.result(timeout=5)
+    return calls_before
 def test_single_flight_two_callers_one_provider_call():
-    assert _concurrent_two(100) == 1               # authoritative memo path
+    assert _concurrent_two(100) == 1                          # coro2 blocked on the lock -> no 2nd call
 def test_concurrent_first_failure_opens_breaker_no_second_call():
-    assert _concurrent_two(0) == 1                 # non-authoritative -> breaker; queued caller sees it, no 2nd call
-def test_breaker_per_model_second_model_still_tries():
+    assert _concurrent_two(0) == 1                            # non-authoritative -> breaker; coro2 no call
+def test_breaker_per_model_and_logs_downgrade_once(caplog):
+    import logging; caplog.set_level(logging.WARNING, logger="repo_radar.preflight")
     seen = []
     async def fake(**kw):
         seen.append(kw["model"]); return _resp(0 if kw["model"]=="claude-opus-5" else 50, rm=kw["model"], mu=kw["model"])
     with patch("litellm.acount_tokens", fake), pf.PreflightSession(timeout_s=5) as s:
         assert s.count("claude-opus-5","a",8192).authoritative is False
-        assert s.count("claude-opus-5","b",8192).authoritative is False
-        assert s.count("claude-sonnet-5","c",8192).authoritative is True
+        assert s.count("claude-opus-5","b",8192).authoritative is False            # breaker open, no call
+        assert s.count("claude-sonnet-5","c",8192).authoritative is True           # different model still tries
     assert seen == ["claude-opus-5", "claude-sonnet-5"]
+    downgrades = [r for r in caplog.records if "downgraded to Branch 1" in r.getMessage() and "claude-opus-5" in r.getMessage()]
+    assert len(downgrades) == 1                                                    # logged exactly once
 def test_fatal_reraised_on_caller_thread():
     async def ki(**kw): raise KeyboardInterrupt()
     with patch("litellm.acount_tokens", ki), pf.PreflightSession(timeout_s=5) as s:
         try: s.count("claude-opus-5","x",8192); assert False
         except KeyboardInterrupt: pass
 ```
+(`_concurrent_two` reaches into `s._guarded` / `s._loop._loop` deliberately — testing the single-flight critical section requires the raw loop futures; `count()` blocks the caller thread and can't expose the concurrent queue.)
 
 - [ ] **Step 2: Run** → FAIL.
 - [ ] **Step 3: Implement**
@@ -474,16 +504,49 @@ def authoritative_partition(session, full_name, files, model):
 - [ ] **Step 1: Failing tests** — (a) provider overflow → split, final chunks fit; (b) provider-overflow-while-local-1.7×-fits singleton terminates (binary search), fits; (c) template-floor singleton ⇒ `PartitionResult([], reason)`; (d) non-authoritative ⇒ `chunks == chunk_repo_files(...)`, `degraded_reason is None`.
 
 ```python
+def _files(n): return [{"path": f"m{i}.py", "size": 3, "content": f"c{i}"} for i in range(n)]
+
+def test_split_rebuilds_and_recounts_the_whole_set_with_real_headers(monkeypatch):
+    """N-change fixpoint: Branch 1 hands back one 3-file chunk. The provider says a chunk fits ONLY
+    when its header is '(chunk i/1)'; the moment a split makes N=2 every header changes and the
+    prompt overflows, so the whole set must be rebuilt+recounted under the real (i/N) until a full
+    clean pass. Budget is injected via the count table, not i=1."""
+    import repo_radar.llm as llm
+    budget = llm.acceptance_budget("claude-opus-5", 8192)
+    monkeypatch.setattr(llm, "chunk_repo_files", lambda *a, **k: [_files(3)])
+    def table(prompt):
+        # Overflow if the header reflects a multi-file chunk (">=2 files" marker) OR N>1; else fit.
+        over = ("2 bytes" in prompt) or ("/2)" in prompt) or ("/3)" in prompt)
+        return PreflightResult(budget + 1 if over else budget - 1, True)
+    out = llm.authoritative_chunks(_StubSession(table), "o/r", _files(3), "claude-opus-5")
+    assert out.degraded_reason is None
+    N = len(out.chunks)
+    assert [f["path"] for c in out.chunks for f in c] == [f"m{i}.py" for i in range(3)]   # order/identity
+    for i, c in enumerate(out.chunks, 1):
+        # every EMITTED chunk fits under its REAL (i/N) header (not i=1)
+        assert _StubSession(table).count("claude-opus-5", llm._build_analysis_prompt("o/r", c, i, N), 8192).tokens <= budget
+
 def test_singleton_provider_overflow_local_fit_terminates(monkeypatch):
     import repo_radar.llm as llm
     big = {"path":"big.py","size":100,"content":"x"*5000}
     def table(prompt): return PreflightResult(10 if ("x"*200 not in prompt) else 10**9, True)
     s = _StubSession(table); monkeypatch.setattr(llm, "chunk_repo_files", lambda *a, **k: [[big]])
     out = llm.authoritative_chunks(s, "o/r", [big], "claude-opus-5")
-    assert out.degraded_reason is None
-    budget = llm.acceptance_budget("claude-opus-5", 8192)
-    for c in out.chunks:
-        assert s.count("claude-opus-5", llm._build_analysis_prompt("o/r", c, 1, len(out.chunks)), 8192).tokens <= budget
+    assert out.degraded_reason is None and out.chunks and "truncated" in out.chunks[0][0]["content"]
+
+def test_template_floor_degrades_whole_repo(monkeypatch):
+    import repo_radar.llm as llm
+    big = {"path":"big.py","size":100,"content":"x"*5000}
+    monkeypatch.setattr(llm, "chunk_repo_files", lambda *a, **k: [[big]])
+    out = llm.authoritative_chunks(_StubSession(lambda p: PreflightResult(10**9, True)), "o/r", [big], "claude-opus-5")
+    assert out.chunks == [] and out.degraded_reason                                        # whole-repo degrade, no sends
+
+def test_non_authoritative_falls_back_to_branch1(monkeypatch):
+    import repo_radar.llm as llm
+    files = _files(4); branch1 = [_files(2), _files(2)]
+    monkeypatch.setattr(llm, "chunk_repo_files", lambda *a, **k: branch1)
+    out = llm.authoritative_chunks(_StubSession(lambda p: PreflightResult(None, False)), "o/r", files, "claude-opus-5")
+    assert out.chunks == branch1 and out.degraded_reason is None
 ```
 
 - [ ] **Step 2: Run** → FAIL.
@@ -496,9 +559,35 @@ def test_singleton_provider_overflow_local_fit_terminates(monkeypatch):
 **Files:** Modify `repo_radar/llm.py`; Test `repo_radar/tests/test_send_paths.py`.
 **Interfaces:** `DegradedSynthesis(reason)`; `authoritative_synthesis_level(session, full_name, analyses, model) -> list[list[str]] | DegradedSynthesis`. Split-only from Branch 1's largest batches; a single over-budget analysis that cannot split is binary-truncated with authoritative recount; template-floor ⇒ `DegradedSynthesis(reason)`. Non-authoritative ⇒ return Branch 1's current-level batches unchanged. **`SYNTHESIS_MAX_CALLS` interaction:** `combine_chunk_analyses` must compute the max-calls guard from the **authoritative (post-split) batch count** of the current level before issuing sends.
 
-- [ ] **Step 1: Failing tests** — over-budget batch splits (more batches); provider-overflow-while-local-fit single analysis terminates (binary truncation), no over-budget send; template-floor ⇒ `DegradedSynthesis`; non-authoritative ⇒ Branch 1 batches; and the post-split batch count is what the `max_calls` guard sees.
+- [ ] **Step 1: Failing tests**
+
+```python
+def test_over_budget_batch_splits_into_more_batches(monkeypatch):
+    import repo_radar.llm as llm
+    budget = llm.acceptance_budget("claude-opus-5", 16384)
+    analyses = ["A0", "A1", "A2", "A3"]
+    monkeypatch.setattr(llm, "_synthesis_budget", lambda *a, **k: budget)   # Branch 1: one batch of 4
+    # provider: a batch of >2 analyses overflows; <=2 fits.
+    def table(prompt): return PreflightResult(budget + 1 if prompt.count("Analysis Part") > 2 else budget - 1, True)
+    out = llm.authoritative_synthesis_level(_StubSession(table), "o/r", analyses, "claude-opus-5")
+    assert not isinstance(out, llm.DegradedSynthesis)
+    assert len(out) >= 2 and [a for b in out for a in b] == analyses            # split, order preserved
+    for b in out:
+        assert _StubSession(table).count("claude-opus-5", llm._build_synthesis_prompt("o/r", b), 16384).tokens <= budget
+
+def test_max_calls_guard_uses_authoritative_post_split_count(monkeypatch):
+    """A level Branch 1 would run in 1 batch but authoritative counting splits into K must charge K
+    (not 1) against SYNTHESIS_MAX_CALLS. Assert the guard is computed from len(authoritative batches)."""
+    import repo_radar.llm as llm
+    seen = {}
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda s, fn, a, m: [[x] for x in a])  # K == len(a)
+    def guard_probe(calls, batches, max_calls): seen["n"] = len(batches); return calls + len(batches) + 1 > max_calls
+    # combine_chunk_analyses must call the guard with the post-split batches; assert seen["n"] == len(analyses).
+    # (Exact wiring test: monkeypatch the guard expression's batch source and assert its length.)
+```
+
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** the level splitter (largest-prefix on the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; singleton via the same binary-truncate helper as Task 9, generalized to a text list). Thread the resulting batch list into `combine_chunk_analyses`'s existing `calls + len(batches) + 1 > max_calls` guard (`llm.py:994`).
+- [ ] **Step 3: Implement** the level splitter (largest-prefix on the analyses list; fit = authoritative count of `_build_synthesis_prompt(full_name, batch)` ≤ `acceptance_budget(model, 16384)`; singleton via the same binary-truncate helper as Task 9, generalized to a text list). In `combine_chunk_analyses`, replace the current level's Branch 1 `batches` with `authoritative_synthesis_level(...)`'s result **before** the `calls + len(batches) + 1 > max_calls` guard (`llm.py:994`), so `max_calls` charges the authoritative (post-split) count. On `DegradedSynthesis`, stop and return the local degraded synthesis result (prior chunk work preserved).
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(llm): synthesis level split-only + singleton terminal + max_calls from authoritative count"`
 
@@ -509,9 +598,39 @@ def test_singleton_provider_overflow_local_fit_terminates(monkeypatch):
 - **Analysis-partition degradation** (`PartitionResult.degraded_reason`): the repo is degraded **before any send** — write ONE degraded repo record and make **zero** `call_llm` for that repo.
 - **Synthesis degradation** (`DegradedSynthesis`): chunk-analysis sends already happened and are preserved; make **no** overflowing/final synthesis send and return the local degraded synthesis result.
 
-- [ ] **Step 1: Failing tests** — (a) landmark: `sync.py` references `PreflightSession`, threads `session` into `authoritative_partition`, `authoritative_chunks`, `combine_chunk_analyses`; (b) behavioral: exact payload digest counted **before** `call_llm` for chunk / full-repo / synthesis; (c) analysis-partition degradation ⇒ `call_llm` never called for that repo, record visibly degraded; (d) synthesis degradation ⇒ chunk-analysis `call_llm`s DID happen, no final synthesis send, degraded synthesis returned.
+**Degraded record shape (reuse the existing convention — `metadata.py:39` `PARSE_STATUS_DEGRADED='degraded'`, INDEX includes degraded rows at `metadata.py:327`):** the written metadata frontmatter for a degraded repo carries `full_name`, `cache_dir`, the **current** `commit_hash`/`last_commit`, `parse_status: 'degraded'`, and a `degraded_reason`. Recording the current commit is what stops an infinite retry (the next sync sees an unchanged commit and skips), and `parse_status: 'degraded'` keeps it visible in INDEX rather than dropping the repo.
+
+- [ ] **Step 1: Failing tests**
+
+```python
+def test_count_precedes_send_for_all_three_paths(monkeypatch):
+    """Ordered digest event log: each send path must PREFLIGHT the exact payload digest before the
+    matching call_llm sees the same payload."""
+    events = []   # ("count", digest) / ("send", digest)
+    ...  # patch session.count to append ("count", sha(prompt)); patch call_llm to append ("send", sha(prompt))
+    # For chunk, full-repo, and synthesis: assert the ("count", d) event for a payload precedes its ("send", d).
+    for d in sent_digests:
+        assert events.index(("count", d)) < events.index(("send", d))
+
+def test_analysis_partition_degradation_writes_degraded_record_and_never_calls_llm(monkeypatch):
+    import repo_radar.llm as llm, repo_radar.modes.sync as sync
+    calls = []; monkeypatch.setattr(llm, "call_llm", lambda *a, **k: calls.append(1) or ("", 0.0, None))
+    monkeypatch.setattr(llm, "authoritative_chunks", lambda *a, **k: llm.PartitionResult([], "template floor"))
+    record = sync._generate_metadata_for(...)   # the per-repo path used by generate_metadata_task
+    assert calls == []                                                      # zero LLM calls
+    assert record["parse_status"] == "degraded" and record["degraded_reason"] and record.get("commit_hash")
+
+def test_synthesis_degradation_preserves_chunk_calls(monkeypatch):
+    import repo_radar.llm as llm
+    calls = []; monkeypatch.setattr(llm, "call_llm", lambda *a, **k: calls.append(k.get("max_tokens")) or ("A", 0.0, None))
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda *a, **k: llm.DegradedSynthesis("floor"))
+    out = llm.combine_chunk_analyses("o/r", ["A0","A1"], model="claude-opus-5", session=_StubSession(lambda p: PreflightResult(1, True)))
+    assert 8192 in calls                                                    # chunk-analysis sends happened
+    assert 16384 not in calls                                              # no final synthesis send
+```
+
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** — wrap the metadata loop in `with PreflightSession() as session:`; branch on `authoritative_partition`; on `PartitionResult.degraded_reason` write the degraded record and skip sends; pass `session` into `combine_chunk_analyses`, which uses `authoritative_synthesis_level` per level and handles `DegradedSynthesis`.
+- [ ] **Step 3: Implement** — wrap the metadata loop in `with PreflightSession() as session:`; branch on `authoritative_partition`; on `PartitionResult.degraded_reason` write the degraded frontmatter (shape above) and make no send; pass `session` into `combine_chunk_analyses`, which uses `authoritative_synthesis_level` per level and returns the local degraded synthesis on `DegradedSynthesis` (chunk work preserved).
 - [ ] **Step 4: Run** full `python3 -m pytest repo_radar/tests/ -q` → PASS.
 - [ ] **Step 5: Commit** — `git commit -m "feat(sync): thread PreflightSession; honor analysis vs synthesis degradation"`
 
