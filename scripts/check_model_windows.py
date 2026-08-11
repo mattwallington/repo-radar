@@ -55,7 +55,10 @@ def check(caps_map, litellm_info, overrides, target_date, send_outputs=(8192, 16
             findings.append(Finding(model, "max_input",
                                      f"max_input {max_input} > total_context {total_context}", True))
 
-        if caps.count_strategy not in KNOWN_COUNT_STRATEGIES:
+        if not isinstance(caps.count_strategy, str):
+            findings.append(Finding(model, "count_strategy",
+                                     f"count_strategy must be a string, got {caps.count_strategy!r}", True))
+        elif caps.count_strategy not in KNOWN_COUNT_STRATEGIES:
             findings.append(Finding(model, "count_strategy",
                                      f"count_strategy {caps.count_strategy!r} not in known set "
                                      f"{sorted(KNOWN_COUNT_STRATEGIES)}", True))

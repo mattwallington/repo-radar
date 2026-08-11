@@ -61,6 +61,19 @@ def test_count_strategy_must_be_known():
     assert any(f.model == "m" and f.field == "count_strategy" and f.blocking for f in findings), findings
 
 
+def test_count_strategy_unhashable_value_blocks_instead_of_raising():
+    # A list is unhashable -- a naive `x not in known_set` membership test raises TypeError
+    # instead of yielding a Finding. Must be caught by a type guard and reported, not raised.
+    caps_map = {
+        "bad": GOOD_CAPS._replace(count_strategy=["not", "a", "string"]),
+        "good": GOOD_CAPS,
+    }
+    findings = gate.check(caps_map, _info_for({"bad": GOOD_LITELLM, "good": GOOD_LITELLM}), [], TARGET)
+    bad_findings = [f for f in findings if f.model == "bad" and f.field == "count_strategy"]
+    assert bad_findings and all(f.blocking for f in bad_findings), findings
+    assert [f for f in findings if f.model == "good"] == []  # collect-all still holds
+
+
 def test_source_url_must_be_nonempty_https():
     for bad_url in ("http://example.com/docs", "", None):
         caps = GOOD_CAPS._replace(source_url=bad_url)
