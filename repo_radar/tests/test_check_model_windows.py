@@ -163,12 +163,182 @@ def test_reports_all_findings_two_bad_rows_two_findings():
     assert models_with_findings == {"a", "b"}, findings  # proves no early return -- both rows surfaced
 
 
-def test_overrides_param_accepted_but_not_yet_consumed():
-    caps_map = {"m": GOOD_CAPS}
-    info = _info_for({"m": GOOD_LITELLM})
-    with_empty = gate.check(caps_map, info, [], TARGET)
-    with_nonempty = gate.check(caps_map, info, [{"model": "m", "field": "max_output", "reason": "ignored for now"}], TARGET)
-    assert with_empty == with_nonempty == []
+# ---------------------------------------------------------------------------
+# Task 13: mismatch-bound overrides + source_date freshness (fail closed)
+# ---------------------------------------------------------------------------
+
+# A caps row that produces a single max_output directional-compare BLOCK against litellm
+# (catalog 65536 > litellm 65535), mirroring the real Gemini drift the overrides clear.
+MISMATCH_CAPS = GOOD_CAPS._replace(max_output=65536)
+MISMATCH_LITELLM = {"max_input_tokens": 200000, "max_output_tokens": 65535}
+
+
+def _override(**over):
+    """A fully-matching override for the MISMATCH_CAPS max_output block; kwargs mutate one field."""
+    base = {
+        "model": "m",
+        "field": "max_output",
+        "catalog_value": 65536,
+        "litellm_value": 65535,
+        "vendor_url": URL,            # == MISMATCH_CAPS.source_url
+        "verified_at": "2026-08-08",  # 2 days before TARGET (2026-08-10) -> within 90
+        "justification": "vendor-verified: docs say 65536, litellm bundles a stale 65535",
+    }
+    base.update(over)
+    return base
+
+
+def _max_output_blocked(findings):
+    return any(f.model == "m" and f.field == "max_output" and f.blocking for f in findings)
+
+
+def test_max_output_directional_block_without_override():
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_matching_override_clears_max_output_block():
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [_override()], TARGET)
+    assert findings == [], findings
+
+
+def test_matching_override_clears_max_input_block():
+    caps = GOOD_CAPS._replace(max_input=200000, total_context=200000)
+    litellm = {"max_input_tokens": 199999, "max_output_tokens": 64000}  # catalog > litellm -> block
+    ov = _override(field="max_input", catalog_value=200000, litellm_value=199999)
+    findings = gate.check({"m": caps}, _info_for({"m": litellm}), [ov], TARGET)
+    assert findings == [], findings
+
+
+def test_override_with_changed_catalog_value_does_not_clear():
+    ov = _override(catalog_value=99999)  # != actual catalog max_output (65536)
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_changed_litellm_value_does_not_clear():
+    ov = _override(litellm_value=12345)  # != actual litellm max_output (65535)
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_changed_field_does_not_clear():
+    ov = _override(field="max_input")  # targets a field with no live mismatch
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_wrong_vendor_url_does_not_clear():
+    ov = _override(vendor_url="https://not-the-catalog-source.example.com/x")
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_expired_verified_at_does_not_clear():
+    ov = _override(verified_at="2026-01-01")  # >90 days before TARGET (2026-08-10)
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_future_verified_at_does_not_clear():
+    ov = _override(verified_at="2026-12-01")  # after TARGET -> negative delta, fail closed
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_empty_justification_does_not_clear():
+    ov = _override(justification="")
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_missing_key_is_malformed_and_blocks():
+    ov = _override()
+    del ov["justification"]  # missing required key -> malformed
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert any("malformed override" in f.message and f.blocking for f in findings), findings
+    assert _max_output_blocked(findings), findings  # malformed clears nothing
+
+
+def test_override_with_wrong_type_is_malformed_and_blocks():
+    ov = _override(catalog_value="65536")  # str, not int -> malformed
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert any("malformed override" in f.message and f.blocking for f in findings), findings
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_with_unparseable_verified_at_is_malformed_and_blocks():
+    ov = _override(verified_at="not-a-date")
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), [ov], TARGET)
+    assert any("malformed override" in f.message and f.blocking for f in findings), findings
+    assert _max_output_blocked(findings), findings
+
+
+def test_override_non_dict_row_is_malformed_and_blocks():
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}), ["not-a-dict"], TARGET)
+    assert any("malformed override" in f.message and f.blocking for f in findings), findings
+    assert _max_output_blocked(findings), findings
+
+
+def test_duplicate_override_model_field_blocks_and_does_not_clear():
+    findings = gate.check({"m": MISMATCH_CAPS}, _info_for({"m": MISMATCH_LITELLM}),
+                          [_override(), _override()], TARGET)
+    assert any("duplicate" in f.message.lower() and f.blocking for f in findings), findings
+    assert _max_output_blocked(findings), findings  # ambiguous -> fail closed, block persists
+
+
+def test_stale_source_date_blocks():
+    stale = GOOD_CAPS._replace(source_date="2026-01-01")  # >90 days before TARGET (2026-08-10)
+    findings = gate.check({"m": stale}, _info_for({"m": GOOD_LITELLM}), [], TARGET)
+    assert any(f.model == "m" and f.field == "source_date" and f.blocking
+               and "stale" in f.message.lower() for f in findings), findings
+
+
+def test_stale_source_date_not_cleared_by_override_only_by_fresh_date():
+    # Row has BOTH a stale source_date AND a max_output directional mismatch; a matching
+    # override clears the directional block but must NOT touch the stale source_date block.
+    stale = MISMATCH_CAPS._replace(source_date="2026-01-01")
+    findings = gate.check({"m": stale}, _info_for({"m": MISMATCH_LITELLM}), [_override()], TARGET)
+    assert not _max_output_blocked(findings), findings          # directional cleared
+    assert any(f.field == "source_date" and f.blocking for f in findings), findings  # stale remains
+
+    # Refreshing the record's own source_date is the only thing that clears it.
+    fresh = MISMATCH_CAPS._replace(source_date="2026-08-08")
+    findings2 = gate.check({"m": fresh}, _info_for({"m": MISMATCH_LITELLM}), [_override()], TARGET)
+    assert findings2 == [], findings2
+
+
+def test_override_cannot_clear_send_output_block():
+    caps = GOOD_CAPS._replace(max_output=8000)  # below nominals -> send_output block (non-directional)
+    litellm = {"max_input_tokens": 200000, "max_output_tokens": 8000}  # matches -> no directional block
+    ov = _override(field="max_output", catalog_value=8000, litellm_value=8000)
+    findings = gate.check({"m": caps}, _info_for({"m": litellm}), [ov], TARGET, send_outputs=(8192, 16384))
+    assert any(f.field == "send_output" and f.blocking for f in findings), findings
+
+
+def test_override_cannot_clear_count_strategy_block():
+    caps = MISMATCH_CAPS._replace(count_strategy="bogus_strategy")
+    findings = gate.check({"m": caps}, _info_for({"m": MISMATCH_LITELLM}), [_override()], TARGET)
+    assert not _max_output_blocked(findings), findings                     # directional cleared
+    assert any(f.field == "count_strategy" and f.blocking for f in findings), findings  # NOT cleared
+
+
+def test_real_overrides_file_is_eight_wellformed_dicts():
+    import json
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    data = json.loads((root / "repo_radar" / "model_window_overrides.json").read_text())
+    assert isinstance(data, list) and len(data) == 8, data
+    required = {"model", "field", "catalog_value", "litellm_value", "vendor_url", "verified_at", "justification"}
+    for ov in data:
+        assert isinstance(ov, dict) and required <= set(ov), ov
+        assert ov["field"] == "max_output", ov
+        assert ov["catalog_value"] == 65536 and ov["litellm_value"] == 65535, ov
+        assert ov["vendor_url"] == "https://ai.google.dev/gemini-api/docs/models", ov
+        assert ov["verified_at"] == "2026-08-08", ov
+        assert isinstance(ov["justification"], str) and ov["justification"].strip(), ov
+    models = {ov["model"] for ov in data}
+    assert len(models) == 8, "override (model, field) pairs must be unique"
 
 
 def test_cli_requires_iso_date():
