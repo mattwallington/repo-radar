@@ -208,6 +208,19 @@ def check(caps_map, litellm_info, overrides, target_date, send_outputs=(8192, 16
                                      f"{info!r}", True))
             continue
 
+        if not _is_positive_int(litellm_max_input) or not _is_positive_int(litellm_max_output):
+            # A present-but-malformed litellm window value must fail CLOSED, not reach the directional
+            # comparison. A string/container would raise TypeError (defeating collect-all); worse, a
+            # float("nan") makes BOTH `catalog > litellm` and `catalog < litellm` False, so the gate
+            # would return zero findings and PASS malformed drift evidence. Emit a blocking finding and
+            # continue -- this is NOT override-clearable (overrides are only consulted in the directional
+            # branches below, which we skip).
+            findings.append(Finding(model, "litellm",
+                                     f"litellm_info({model!r}) window values must be positive ints: "
+                                     f"max_input_tokens={litellm_max_input!r}, "
+                                     f"max_output_tokens={litellm_max_output!r}", True))
+            continue
+
         if field_ok["max_input"]:
             if max_input > litellm_max_input:
                 ov = override_map.get((model, "max_input"))

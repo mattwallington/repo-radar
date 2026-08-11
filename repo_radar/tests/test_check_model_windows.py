@@ -152,6 +152,43 @@ def test_litellm_info_missing_field_blocks():
     assert any(f.model == "m" and f.blocking for f in findings), findings
 
 
+def test_litellm_present_but_malformed_value_blocks_never_raises():
+    # A present-but-malformed litellm window value must fail CLOSED with a blocking Finding, never
+    # raise (TypeError on a string/container defeats collect-all) and never silently pass. Covers
+    # strings, non-numeric containers, booleans, zero/negative, and floats INCLUDING NaN -- for both
+    # window fields.
+    for bad in ("200000", [], {}, True, 0, -5, float("nan"), 64000.0):
+        for field in ("max_input_tokens", "max_output_tokens"):
+            info = dict(GOOD_LITELLM)
+            info[field] = bad
+            findings = gate.check({"m": GOOD_CAPS}, _info_for({"m": info}), [], TARGET)
+            litellm_blocks = [f for f in findings
+                              if f.model == "m" and f.field == "litellm" and f.blocking]
+            assert litellm_blocks, f"{field}={bad!r} must yield a blocking litellm finding, got {findings}"
+
+
+def test_litellm_nan_does_not_pass_open_and_later_model_still_checked():
+    # The dangerous case: NaN makes BOTH `catalog > litellm` and `catalog < litellm` False, so a naive
+    # gate returns [] and PASSES malformed drift evidence. It must block; and a later, independently
+    # broken model must still be checked (collect-all survives the malformed row).
+    caps_map = {"a": GOOD_CAPS, "b": GOOD_CAPS._replace(max_output=70000)}
+    litellm = {"a": {"max_input_tokens": float("nan"), "max_output_tokens": float("nan")},
+               "b": {"max_input_tokens": 200000, "max_output_tokens": 64000}}
+    findings = gate.check(caps_map, _info_for(litellm), [], TARGET)
+    assert any(f.model == "a" and f.field == "litellm" and f.blocking for f in findings), findings
+    assert any(f.model == "b" and f.field == "max_output" and f.blocking for f in findings), findings
+
+
+def test_malformed_litellm_finding_is_not_override_clearable():
+    # A malformed litellm value is not the max_input/max_output over-report direction, so no override
+    # may clear it (fail closed). Even a well-formed override for (m, max_output) must not suppress it.
+    ov = [{"model": "m", "field": "max_output", "catalog_value": 64000, "litellm_value": 64000,
+           "vendor_url": URL, "verified_at": "2026-08-08", "justification": "test"}]
+    info = {"max_input_tokens": 200000, "max_output_tokens": float("nan")}
+    findings = gate.check({"m": GOOD_CAPS}, _info_for({"m": info}), ov, TARGET)
+    assert any(f.model == "m" and f.field == "litellm" and f.blocking for f in findings), findings
+
+
 def test_reports_all_findings_two_bad_rows_two_findings():
     caps_map = {
         "a": GOOD_CAPS._replace(count_strategy="nonsense"),
