@@ -1,3 +1,10 @@
+import threading
+import types
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
 from repo_radar.preflight import PreflightResult
 
 
@@ -153,3 +160,128 @@ def test_combine_returns_accumulated_cost_when_a_later_level_degrades(monkeypatc
                                            synthesize=synth, session=_Rec(), max_calls=32)
     assert isinstance(out, llm.DegradedSynthesis)
     assert cost == 1.0
+
+
+# --- Task 11: thread PreflightSession through sync.generate_repo_metadata; honor both degradations ---
+
+async def _boom(**kw):
+    raise AssertionError("real acount_tokens")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_metadata_io(monkeypatch, tmp_path):
+    """Keep generate_repo_metadata's real-world side effects out of the suite: point PRISTINE_DIR at
+    the test's tmp dir (contains the metadata file, symlink and degraded-response dir), give the
+    api-key gate a deterministic non-empty key, and neutralize the staggering sleeps. Harmless to the
+    llm-only tests above (they never touch sync, PRISTINE_DIR, the key, or sleep)."""
+    import repo_radar.modes.sync as sync
+    monkeypatch.setattr(sync, "PRISTINE_DIR", tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)
+
+
+def _fake_args():
+    # dry_run False and no status_server -> exercises the real generate/degrade path with no UI I/O.
+    return types.SimpleNamespace(dry_run=False, status_server=None)
+
+
+def _fake_ctx():
+    import repo_radar.modes.sync as sync
+    class _NoOp:
+        def update(self, *a, **k): pass
+        def print(self, *a, **k): pass
+    return sync.SyncContext(
+        meta_progress=_NoOp(),
+        meta_tasks={"o/r": (0, "cyan")},
+        stats={"metadata_generated": 0, "api_cost": 0.0, "errors": 0},
+        stats_lock=threading.Lock(),
+        sync_logger=None,
+        console=_NoOp(),
+    )
+
+
+def _fake_task_data(tmp_path, commit):
+    # task_data = (repo_config, cache_name, commit_hash, short_id, color, _). An absolute cache_name
+    # makes PRISTINE_DIR / f"{cache_name}.md" resolve to <tmp_path>/repo.md regardless of PRISTINE_DIR,
+    # so the written metadata file is exactly where _read_frontmatter looks.
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cache_name = str(tmp_path / "repo")
+    repo_config = {"full_name": "o/r", "clone_url": "https://example.com/o/r.git"}
+    return (repo_config, cache_name, commit, "shortid", "cyan", None)
+
+
+def _read_frontmatter(tmp_path):
+    text = (Path(tmp_path) / "repo.md").read_text()
+    parts = text.split("---", 2)
+    body = parts[1] if len(parts) >= 3 else ""
+    fm = {}
+    for line in body.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fm[key.strip()] = value.strip()
+    return fm
+
+
+def test_exact_payload_counted_before_send_all_three_shapes(monkeypatch, tmp_path):
+    """Dead-code guard across ALL THREE shapes. Run 1 forces the CHUNK branch (real authoritative_chunks
+    + real combine_chunk_analyses) and proves an 8192 chunk payload AND a 16384 synthesis payload were
+    each authoritatively counted before their identical-digest send. Run 2 forces the SINGLE branch and
+    proves the 16384 full-repo payload was counted first. Events record (kind, requested_output, digest)
+    so all three shapes are proven present."""
+    import hashlib, repo_radar.modes.sync as sync
+    def dig(p): return hashlib.sha256(p.encode()).hexdigest()
+    def harness():
+        ev = []
+        class _LogSession:
+            def count(self, model, prompt, ro): ev.append(("count", ro, dig(prompt))); return PreflightResult(1, True)
+        monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+        monkeypatch.setattr(sync, "call_llm",
+            lambda model, prompt, max_tokens=8192: ev.append(("send", max_tokens, dig(prompt))) or
+            ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
+        return ev, _LogSession()
+    def assert_counted_before_send(ev):
+        for k, ro, d in ev:
+            if k == "send":
+                assert ("count", ro, d) in ev and ev.index(("count", ro, d)) < ev.index(("send", ro, d))
+    ev, sess = harness()                                       # Run 1: chunk branch
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "chunk")
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), sess, _fake_args(), _fake_ctx())
+    assert {ro for k, ro, _ in ev if k == "send"} >= {8192, 16384}; assert_counted_before_send(ev)
+    ev2, sess2 = harness()                                     # Run 2: single branch
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "single")
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path / "b", "def5678"), sess2, _fake_args(), _fake_ctx())
+    assert {ro for k, ro, _ in ev2 if k == "send"} == {16384}; assert_counted_before_send(ev2)
+
+
+def _run_repo(monkeypatch, tmp_path, files, chunks_result, synth_level, records):
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: files)
+    monkeypatch.setattr(sync, "call_llm", lambda model, prompt, max_tokens=8192: records.append(max_tokens) or ("A", 0.0, None))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **k: chunks_result)
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", synth_level)   # combine_chunk_analyses resolves it in llm
+    with patch("litellm.acount_tokens", _boom):
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "abc1234"), _StubSession(lambda p: PreflightResult(1, True)),
+                                    _fake_args(), _fake_ctx())
+    return _read_frontmatter(tmp_path)
+
+
+def test_analysis_degradation_never_calls_llm_and_persists_degraded_record(monkeypatch, tmp_path):
+    import repo_radar.llm as llm
+    records = []
+    fm = _run_repo(monkeypatch, tmp_path, _files(2), llm.PartitionResult([], "template floor"),
+                   synth_level=lambda *a, **k: [], records=records)
+    assert records == []                                       # zero LLM calls
+    assert fm["parse_status"] == "degraded" and fm["last_commit"] == "abc1234" and fm.get("degraded_reason")
+
+
+def test_synthesis_degradation_keeps_chunk_sends_then_persists_degraded(monkeypatch, tmp_path):
+    import repo_radar.llm as llm
+    records = []
+    fm = _run_repo(monkeypatch, tmp_path, _files(2), llm.PartitionResult([_files(1), _files(1)], None),
+                   synth_level=lambda *a, **k: llm.DegradedSynthesis("floor"), records=records)
+    assert 8192 in records and 16384 not in records            # chunk sends happened; no synthesis send
+    assert fm["parse_status"] == "degraded" and fm["last_commit"] == "abc1234"

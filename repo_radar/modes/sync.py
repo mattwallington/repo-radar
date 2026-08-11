@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
 from repo_radar import VERSION as REPO_RADAR_VERSION
@@ -24,7 +25,9 @@ from repo_radar.files import collect_repo_files, should_include_file
 from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking_threshold,
     count_tokens_accurate, chunk_repo_files, repo_needs_chunking, get_fallback_model,
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
-    _build_analysis_prompt, _build_full_repo_prompt)
+    _build_analysis_prompt, _build_full_repo_prompt,
+    authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult)
+from repo_radar.preflight import PreflightSession
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
@@ -165,6 +168,727 @@ def wait_for_network(host="github.com", port=443, timeout=300, interval=2, requi
                 notified = True
             time.sleep(interval)
     return False
+
+
+SyncContext = namedtuple("SyncContext", "meta_progress meta_tasks stats stats_lock sync_logger console")
+
+
+def generate_repo_metadata(task_data, session, args, ctx):
+    """Generate metadata for a single repo with progress updates."""
+    repo_config, cache_name, commit_hash, short_id, color, _ = task_data
+    full_name = repo_config['full_name']
+    repo_path = PRISTINE_DIR / cache_name
+
+    task_id, task_color = ctx.meta_tasks[full_name]
+
+    # Longer random delay to stagger requests and avoid rate limits
+    import random
+    # Increased delay range: 3-7 seconds between repos
+    time.sleep(random.uniform(3.0, 7.0))
+
+    ctx.meta_progress.update(task_id, completed=5, status=f"[{task_color}]collecting files...[/{task_color}]")
+
+    # Send status update to UI
+    if hasattr(args, 'status_server') and args.status_server:
+        send_status_update('progress', {
+            'repo': full_name, 'short_name': short_id,
+            'status': '📝 generating metadata...',
+            'percent': 5,
+            'color': color
+        }, args.status_server)
+
+    try:
+        # Custom metadata generation with progress updates
+        if args.dry_run:
+            ctx.meta_progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would analyze[/dim]")
+            time.sleep(0.1)
+            ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ analyzed (dry run)[/{task_color}]")
+            return 0.0
+
+        # Check for appropriate API key based on model
+        model = get_ai_model()
+        api_key_missing = False
+
+        provider = provider_for_model(model)
+        if provider == 'gemini':
+            api_key_missing = not os.getenv('GEMINI_API_KEY')
+        elif provider == 'anthropic':
+            api_key_missing = not os.getenv('ANTHROPIC_API_KEY')
+        elif provider == 'openai':
+            api_key_missing = not os.getenv('OPENAI_API_KEY')
+
+        if api_key_missing:
+            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no API key[/yellow]")
+
+            # Send status update to UI
+            if hasattr(args, 'status_server') and args.status_server:
+                send_status_update('progress', {
+                    'repo': full_name, 'short_name': short_id,
+                    'status': '⊘ skipped - no API key',
+                    'percent': 100,
+                    'color': 'yellow'
+                }, args.status_server)
+
+            # Note: Not counting as error since this is expected when user hasn't configured keys yet
+            # But it will be reported in the final stats
+            return 0.0
+
+        ctx.meta_progress.update(task_id, completed=10, status=f"[{task_color}]analyzing...[/{task_color}]")
+
+        # Send status update
+        if hasattr(args, 'status_server') and args.status_server:
+            send_status_update('progress', {
+                'repo': full_name, 'short_name': short_id,
+                'status': '🤖 analyzing with AI...',
+                'percent': 10,
+                'color': color
+            }, args.status_server)
+
+        # Collect files
+        files = collect_repo_files(repo_path)
+        if not files:
+            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no files found[/yellow]")
+            return 0.0
+
+        # Get model and calculate accurate token count
+        model = get_ai_model()
+        total_tokens = sum(count_tokens_accurate(f['content'], model) for f in files)
+        threshold = get_chunking_threshold(model)
+        context_window = get_model_context_window(model)
+
+        # ONE authoritative decision helper, so production decides on the same finished
+        # prompt the tests exercise (it used to reimplement the decision inline). Returns
+        # whether to chunk, the value it decided on, and whether that value is the exact
+        # finished-prompt count or a lower bound.
+        needs_chunk, decision_value, decision_exact = repo_needs_chunking(
+            full_name, files, model, threshold)
+        # Seam (a): the authoritative preflight makes the final single-vs-chunk decision,
+        # monotonically tightening Branch 1's local estimate (which still feeds the display
+        # below). In production the session memoizes this exact count, so it adds no paid
+        # call the partition would not already make; in tests it is a stub.
+        needs_chunk = authoritative_partition(session, full_name, files, model) == "chunk"
+
+        budget_label = "prompt-budget" if decision_exact else "content lower bound"
+        budget_note = f" / {decision_value:,} {budget_label}" if decision_value != total_tokens else ""
+        ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
+
+        total_api_cost = 0.0
+
+        def _finish_degraded(reason):
+            """Persist ONE degraded metadata record and stop. Recording the CURRENT commit
+            stops the repo being retried forever; parse_status=degraded keeps it visible in
+            INDEX. Any cost already spent (chunk-analysis sends + combine) stays in
+            total_api_cost and is still accounted below."""
+            degraded_content = f"""---
+repo_name: {full_name.split('/')[-1]}
+full_name: {full_name}
+cache_dir: {cache_name}
+clone_url: {repo_config['clone_url']}
+last_commit: {commit_hash}
+last_updated: {datetime.now().isoformat()}
+brief: Repository analysis
+type: Unknown
+language: Unknown
+framework: None
+database: None
+apis: None
+port: N/A
+related_repos: []
+parse_status: {PARSE_STATUS_DEGRADED}
+degraded_reason: {reason}
+---
+
+# Repository: {full_name}
+
+_Metadata generation degraded before completion: {reason}_
+"""
+            metadata_file = PRISTINE_DIR / f"{cache_name}.md"
+            with open(metadata_file, 'w') as f:
+                f.write(degraded_content)
+            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]\u26a0 degraded[/yellow]")
+            if hasattr(args, 'status_server') and args.status_server:
+                send_status_update('progress', {
+                    'repo': full_name, 'short_name': short_id,
+                    'status': '\u26a0 degraded metadata',
+                    'percent': 100,
+                    'color': 'yellow'
+                }, args.status_server)
+            with ctx.stats_lock:
+                ctx.stats['metadata_generated'] += 1
+                ctx.stats['api_cost'] += total_api_cost
+            if ctx.sync_logger:
+                ctx.sync_logger.event("metadata_degraded", repo=full_name, reason=reason)
+
+        if needs_chunk:
+            # Seam (b)+(d1): authoritative partition into sendable chunks. Every returned
+            # chunk's real analysis prompt has been authoritatively counted to fit; a truthy
+            # degraded_reason means the repo overflowed even at the template floor BEFORE any
+            # send, so persist ONE degraded record and make zero call_llm.
+            _partition = authoritative_chunks(session, full_name, files, model)
+            if _partition.degraded_reason:
+                _finish_degraded(_partition.degraded_reason)
+                return
+            chunks = _partition.chunks
+            expected_chunks = len(chunks)
+            ctx.meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
+
+            # Send status update
+            if hasattr(args, 'status_server') and args.status_server:
+                send_status_update('progress', {
+                    'repo': full_name, 'short_name': short_id,
+                    'status': f'🤖 processing {len(chunks)} chunks...',
+                    'percent': 25,
+                    'color': color
+                }, args.status_server)
+
+            chunk_analyses = []
+            for i, chunk in enumerate(chunks, 1):
+                # Calculate and log chunk size for debugging
+                chunk_tokens = sum(count_tokens_accurate(f['content'], model) for f in chunk)
+                ctx.console.print(f"[cyan]Chunk {i}/{len(chunks)}: {chunk_tokens:,} content tokens ({len(chunk)} files)[/cyan]")
+
+                # Add delay BEFORE processing each chunk (including first to give breathing room)
+                if i == 1:
+                    # Initial delay before first chunk
+                    ctx.meta_progress.update(task_id, status=f"[dim]waiting 3s before starting chunks...[/dim]")
+                    time.sleep(3)
+                else:
+                    # Longer delay between subsequent chunks
+                    ctx.meta_progress.update(task_id, status=f"[dim]waiting 6s before next chunk...[/dim]")
+                    time.sleep(6)
+
+                chunk_progress = 25 + (50 * i / len(chunks))
+                ctx.meta_progress.update(task_id, completed=chunk_progress, status=f"[{task_color}]chunk {i}/{len(chunks)} ({chunk_tokens:,} tokens)...[/{task_color}]")
+
+                # Send periodic status updates to UI
+                if hasattr(args, 'status_server') and args.status_server and i % 2 == 0:  # Every 2 chunks
+                    send_status_update('progress', {
+                        'repo': full_name, 'short_name': short_id,
+                        'status': f'🤖 chunk {i}/{len(chunks)}...',
+                        'percent': int(chunk_progress),
+                        'color': color
+                    }, args.status_server)
+
+                # Retry logic with model fallback for rate limits
+                max_retries = 5
+                base_wait = 3
+                chunk_result = None
+                current_model = get_ai_model()
+
+                for retry in range(max_retries):
+                    try:
+                        import litellm
+                        # Route through the shared builder the chunker budgets, so the
+                        # prompt sent is exactly the one measured to fit.
+                        prompt = _build_analysis_prompt(full_name, chunk, i, len(chunks))
+
+                        analysis, api_cost, response = call_llm(
+                            current_model, prompt, max_tokens=8192
+                        )
+
+                        # Update rate limit tracker
+                        rate_limit_tracker.update_from_response(response)
+
+                        # Log rate limit status after each chunk
+                        rate_status = rate_limit_tracker.get_status_string()
+                        if rate_status != "Rate limits: Unknown":
+                            ctx.console.print(f"    [dim]{rate_status}[/dim]")
+
+                        chunk_analyses.append(analysis)
+                        total_api_cost += api_cost
+
+                        # Success! Break out of retry loop
+                        break
+
+                    except Exception as e:
+                        import traceback
+                        error_str = str(e)
+                        error_type = type(e).__name__
+
+                        # Log VERY detailed error for debugging
+                        ctx.console.print(f"\n[bold red]╔══ ERROR ON CHUNK {i}/{len(chunks)} (Retry {retry+1}/{max_retries}) ══╗[/bold red]")
+                        ctx.console.print(f"[red]Repository: {full_name}[/red]")
+                        ctx.console.print(f"[red]Model: {current_model}[/red]")
+                        ctx.console.print(f"[red]Error Type: {error_type}[/red]")
+                        ctx.console.print(f"[red]Error Module: {type(e).__module__}[/red]")
+                        ctx.console.print(f"[red]Error: {error_str[:300]}[/red]")
+                        ctx.console.print(f"[bold red]╚══════════════════════════════════════╝[/bold red]\n")
+
+                        # Check if it's a rate limit error
+                        is_rate_limit = (
+                            error_type == 'RateLimitError' or
+                            '429' in error_str or
+                            'RESOURCE_EXHAUSTED' in error_str or
+                            'rate_limit' in error_str.lower()
+                        )
+
+                        if is_rate_limit:
+                            # Try fallback model if available
+                            fallback_model = get_fallback_model(current_model)
+
+                            if fallback_model and retry < max_retries - 1:
+                                ctx.console.print(f"[bold yellow]🔄 Rate limited on {current_model}[/bold yellow]")
+                                ctx.console.print(f"[bold yellow]   Falling back to {fallback_model} (separate quota)[/bold yellow]")
+                                current_model = fallback_model
+                                ctx.meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
+
+                                # Short delay before trying fallback
+                                time.sleep(2)
+                                continue
+                            elif retry < max_retries - 1:
+                                # No fallback available, wait and retry same model
+                                wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                                ctx.console.print(f"[yellow]No fallback available. Waiting {int(wait_time)}s...[/yellow]")
+                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
+
+                                # Send status update to UI
+                                if hasattr(args, 'status_server') and args.status_server:
+                                    send_status_update('progress', {
+                                        'repo': full_name, 'short_name': short_id,
+                                        'status': f'⏳ rate limited, waiting {int(wait_time)}s...',
+                                        'percent': int(chunk_progress),
+                                        'color': 'yellow'
+                                    }, args.status_server)
+
+                                time.sleep(wait_time)
+                                continue
+                            else:
+                                # Max retries exceeded
+                                raise Exception(f"Rate limit exceeded after {max_retries} retries")
+                        else:
+                            # Non-rate-limit error, raise immediately
+                            raise
+
+                # Note: Delay before next chunk is now at the start of the loop
+
+            # Set by whichever path produces `analysis`; used to name the model in a
+            # degraded-parse warning, since a rate-limit fallback means it is not
+            # necessarily the configured one.
+            analysis_model = None
+
+            if chunk_analyses:
+                ctx.meta_progress.update(task_id, completed=80, status=f"[{task_color}]combining analyses...[/{task_color}]")
+
+                # Retry logic for combine step with model fallback
+                current_model_combine = current_model  # Use whatever model succeeded for chunks
+
+                def _synthesize_bounded(prompt, synth_model):
+                    """One bounded synthesis call, with this loop's retry/fallback.
+
+                    combine_chunk_analyses owns *bounding* (how the analyses are
+                    batched so no prompt exceeds the window); this closure keeps the
+                    existing retry, model fallback and rate-limit accounting. It
+                    returns the model actually used so the caller can re-budget when a
+                    fallback has a smaller context window.
+                    """
+                    nonlocal current_model_combine
+                    for attempt in range(max_retries):
+                        try:
+                            text, cost, resp = call_llm(
+                                current_model_combine, prompt, max_tokens=16384
+                            )
+                            rate_limit_tracker.update_from_response(resp)
+                            return text, cost, current_model_combine
+                        except Exception as exc:
+                            err = str(exc)
+                            is_rl = (type(exc).__name__ == 'RateLimitError'
+                                     or '429' in err or 'RESOURCE_EXHAUSTED' in err)
+                            if not is_rl:
+                                raise
+                            fb = get_fallback_model(current_model_combine)
+                            if fb and attempt < max_retries - 1:
+                                ctx.console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fb}[/bold yellow]")
+                                current_model_combine = fb
+                                ctx.meta_progress.update(task_id, status=f"[yellow]combine fallback to {fb.split('/')[-1]}...[/yellow]")
+                                time.sleep(2)
+                            elif attempt < max_retries - 1:
+                                wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
+                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
+                                time.sleep(wait_time)
+                            else:
+                                raise Exception(
+                                    f"Rate limit exceeded on combine after {max_retries} retries")
+                    raise Exception(f"Combine failed after {max_retries} retries")
+
+                for retry in range(max_retries):
+                    try:
+                        # Bounded hierarchical synthesis. The previous inline version
+                        # concatenated every chunk analysis into ONE prompt with no
+                        # bound, which is what produced
+                        #   prompt is too long: 1189532 tokens > 1000000 maximum
+                        # on large repositories. Batching happens inside; this call
+                        # may perform several LLM requests and returns their total cost.
+                        analysis, combine_cost = combine_chunk_analyses(
+                            full_name, chunk_analyses,
+                            model=current_model_combine,
+                            synthesize=_synthesize_bounded,
+                            session=session,
+                        )
+
+                        # Success! Break out of retry loop
+                        break
+
+                    except Exception as e:
+                        error_str = str(e)
+                        error_type = type(e).__name__
+
+                        is_rate_limit = (
+                            error_type == 'RateLimitError' or
+                            '429' in error_str or
+                            'RESOURCE_EXHAUSTED' in error_str
+                        )
+
+                        if is_rate_limit:
+                            # Try fallback model
+                            fallback_model = get_fallback_model(current_model_combine)
+
+                            if fallback_model and retry < max_retries - 1:
+                                ctx.console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fallback_model}[/bold yellow]")
+                                current_model_combine = fallback_model
+                                ctx.meta_progress.update(task_id, status=f"[yellow]combine fallback to {fallback_model.split('/')[-1]}...[/yellow]")
+                                time.sleep(2)
+                                continue
+                            elif retry < max_retries - 1:
+                                # No fallback, wait
+                                wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
+                                time.sleep(wait_time)
+                                continue
+                            else:
+                                raise Exception(f"Rate limit exceeded on combine after {max_retries} retries")
+                        else:
+                            raise
+                total_api_cost += combine_cost
+                # The combine step may have fallen back to a different model than the
+                # one chunking used; this is the model that actually produced `analysis`.
+                analysis_model = current_model_combine
+                if isinstance(analysis, DegradedSynthesis):
+                    # Seam (d2): the per-chunk analysis sends already happened and their cost
+                    # is already in total_api_cost (plus combine_cost); synthesis could not be
+                    # reduced to fit, so make NO final synthesis send and persist a degraded
+                    # record at the current commit.
+                    _finish_degraded(analysis.reason)
+                    return
+        else:
+            # Repo fits in context - single analysis
+            ctx.meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
+
+            # Retry logic with model fallback for rate limits
+            max_retries = 5
+            base_wait = 3
+            analysis = None
+            current_model = get_ai_model()
+
+            for retry in range(max_retries):
+                try:
+                    import litellm
+                    # Route through the shared builder the decision measured, so the
+                    # prompt sent is exactly the one checked to fit.
+                    prompt = _build_full_repo_prompt(full_name, files)
+
+                    ctx.meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
+
+                    # Authoritatively COUNT the exact full-repo payload before sending it
+                    # (memoized in production, since authoritative_partition already counted
+                    # this same prompt). Not a gate here — the single-vs-chunk decision was
+                    # already made above; this keeps the guarantee that every send was counted.
+                    session.count(current_model, prompt, 16384)
+                    analysis, single_cost, response = call_llm(
+                        current_model, prompt, max_tokens=16384
+                    )
+                    analysis_model = current_model  # may be a fallback after a retry
+
+                    # Update rate limit tracker
+                    rate_limit_tracker.update_from_response(response)
+
+                    # Log rate limit status
+                    rate_status = rate_limit_tracker.get_status_string()
+                    if rate_status != "Rate limits: Unknown":
+                        ctx.console.print(f"    [dim]{rate_status}[/dim]")
+
+                    # Send rate limit info to UI (only if we have data)
+                    if hasattr(args, 'status_server') and args.status_server and rate_status != "Rate limits: Unknown":
+                        send_status_update('rate-limit', {
+                            'status': rate_status,
+                            'remaining_requests': rate_limit_tracker.remaining.get('requests'),
+                            'limit_requests': rate_limit_tracker.limits.get('requests'),
+                            'remaining_tokens': rate_limit_tracker.remaining.get('tokens'),
+                            'limit_tokens': rate_limit_tracker.limits.get('tokens')
+                        }, args.status_server)
+
+                    total_api_cost = single_cost
+
+                    # Success! Break out of retry loop
+                    break
+
+                except Exception as e:
+                    error_str = str(e)
+                    error_type = type(e).__name__
+
+                    # Log detailed error for debugging
+                    ctx.console.print(f"\n[red]Error analyzing repo:[/red]")
+                    ctx.console.print(f"[red]Repo: {full_name}[/red]")
+                    ctx.console.print(f"[red]Model: {current_model}[/red]")
+                    ctx.console.print(f"[red]Type: {error_type}[/red]")
+                    ctx.console.print(f"[red]Message: {error_str[:300]}[/red]")
+
+                    is_rate_limit = (
+                        error_type == 'RateLimitError' or
+                        '429' in error_str or
+                        'RESOURCE_EXHAUSTED' in error_str or
+                        'rate_limit' in error_str.lower()
+                    )
+
+                    if is_rate_limit:
+                        # Try fallback model if available
+                        fallback_model = get_fallback_model(current_model)
+
+                        if fallback_model and retry < max_retries - 1:
+                            ctx.console.print(f"[bold yellow]🔄 Falling back to {fallback_model}[/bold yellow]")
+                            current_model = fallback_model
+                            ctx.meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
+                            time.sleep(2)
+                            continue
+                        elif retry < max_retries - 1:
+                            # No fallback, wait
+                            wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                            ctx.console.print(f"[yellow]Retry {retry+1}/{max_retries}: Waiting {int(wait_time)}s...[/yellow]")
+                            ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
+
+                            # Send status update to UI
+                            if hasattr(args, 'status_server') and args.status_server:
+                                send_status_update('progress', {
+                                    'repo': full_name, 'short_name': short_id,
+                                    'status': f'⏳ rate limited (attempt {retry+1}/{max_retries}), waiting {int(wait_time)}s...',
+                                    'percent': 60,
+                                    'color': 'yellow'
+                                }, args.status_server)
+
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Max retries exceeded
+                            raise Exception(f"Rate limit exceeded after {max_retries} retries")
+                    else:
+                        # Non-rate-limit error, raise immediately
+                        raise
+
+        ctx.meta_progress.update(task_id, completed=90, status=f"[{task_color}]saving metadata...[/{task_color}]")
+
+        # Parse and save (simplified - use existing parse logic)
+        parsed = parse_llm_response(analysis)
+
+        # A failed parse used to be written to disk and indexed as if it were fine, so
+        # `type: Unknown` looked like a model that didn't know rather than a parser that
+        # gave up. Say so out loud, record it in the frontmatter, and keep the raw
+        # response — without it, diagnosing a bad parse after the fact is guesswork.
+        parse_problems = degradation_reasons(parsed)
+        parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
+        if parse_problems:
+            # Name the model that actually produced this response — including a
+            # rate-limit fallback — since which model degrades is the whole diagnostic.
+            print(f"  {YELLOW}Degraded metadata parse for {full_name}"
+                  f" (model: {analysis_model or get_ai_model()}){RESET}")
+            for problem in parse_problems:
+                print(f"    {YELLOW}- {problem}{RESET}")
+            try:
+                saved_to = save_degraded_response(PRISTINE_DIR, cache_name, analysis)
+                print(f"    {YELLOW}raw response saved (redacted, owner-only) to"
+                      f" {DEGRADED_DIR_NAME}/{saved_to.name}{RESET}")
+            except Exception as exc:
+                print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
+
+        # Build metadata file
+        quick_ref = parsed['quick_ref']
+        brief = parsed['brief']
+        related_repos = parsed['related_repos']
+        main_analysis = parsed['analysis']
+
+        # Build Quick Reference table
+        quick_ref_table = "## Quick Reference\n\n| Property | Value |\n|----------|-------|\n"
+        if 'type' in quick_ref:
+            quick_ref_table += f"| **Type** | {quick_ref['type']} |\n"
+        if 'language' in quick_ref:
+            quick_ref_table += f"| **Language** | {quick_ref['language']} |\n"
+        if 'framework' in quick_ref and quick_ref['framework'].lower() != 'none':
+            quick_ref_table += f"| **Framework** | {quick_ref['framework']} |\n"
+        if 'database' in quick_ref and quick_ref['database'].lower() != 'none':
+            quick_ref_table += f"| **Database** | {quick_ref['database']} |\n"
+        if 'apis' in quick_ref and quick_ref['apis'].lower() != 'none':
+            quick_ref_table += f"| **APIs Exposed** | {quick_ref['apis']} |\n"
+        if 'port' in quick_ref and quick_ref['port'].lower() != 'n/a':
+            quick_ref_table += f"| **Port** | {quick_ref['port']} |\n"
+        if 'dependencies' in quick_ref:
+            quick_ref_table += f"| **Key Dependencies** | {quick_ref['dependencies']} |\n"
+        quick_ref_table += "\n---\n\n"
+
+        metadata_content = f"""---
+repo_name: {full_name.split('/')[-1]}
+full_name: {full_name}
+cache_dir: {cache_name}
+clone_url: {repo_config['clone_url']}
+last_commit: {commit_hash}
+last_updated: {datetime.now().isoformat()}
+brief: {brief}
+type: {quick_ref.get('type', 'Unknown')}
+language: {quick_ref.get('language', 'Unknown')}
+framework: {quick_ref.get('framework', 'None')}
+database: {quick_ref.get('database', 'None')}
+apis: {quick_ref.get('apis', 'None')}
+port: {quick_ref.get('port', 'N/A')}
+related_repos: {json.dumps(related_repos)}
+parse_status: {parse_status}
+---
+
+# Repository: {full_name}
+
+{quick_ref_table}{main_analysis}
+"""
+
+        metadata_file = PRISTINE_DIR / f"{cache_name}.md"
+        with open(metadata_file, 'w') as f:
+            f.write(metadata_content)
+
+        # Create symlink
+        repo_name = full_name.split('/')[-1]
+        metadata_symlink = PRISTINE_DIR / f"{repo_name}.md"
+        if metadata_symlink.exists() or metadata_symlink.is_symlink():
+            try:
+                metadata_symlink.unlink()
+            except:
+                pass
+        try:
+            metadata_symlink.symlink_to(f"{cache_name}.md")
+        except Exception:
+            pass
+
+        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ generated (${total_api_cost:.4f})[/{task_color}]")
+
+        # Send status update to UI
+        if hasattr(args, 'status_server') and args.status_server:
+            send_status_update('progress', {
+                'repo': full_name, 'short_name': short_id,
+                'status': f'✓ metadata complete (${total_api_cost:.4f})',
+                'percent': 100,
+                'color': color
+            }, args.status_server)
+
+        with ctx.stats_lock:
+            ctx.stats['metadata_generated'] += 1
+            ctx.stats['api_cost'] += total_api_cost
+
+        if ctx.sync_logger:
+            ctx.sync_logger.event(
+                "metadata_generated",
+                repo=full_name,
+                cost=f"${total_api_cost:.4f}",
+            )
+
+        return total_api_cost
+
+    except Exception as e:
+        import traceback
+
+        full_error = str(e)
+        error_type = type(e).__name__
+        stack_trace = traceback.format_exc()
+
+        # Show more descriptive error for common issues
+        if 'NotFoundError' in full_error:
+            short_msg = f"Model not found: {get_ai_model()}"
+            detailed_msg = f"""ERROR: Model Not Found
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Details:
+{full_error}
+
+This usually means:
+- The model name is incorrect or not supported by litellm
+- The model requires a specific API endpoint configuration
+- Check the model name in Settings → AI Model
+
+Stack Trace:
+{stack_trace}"""
+        elif 'AuthenticationError' in full_error or 'API key' in full_error:
+            short_msg = "Invalid API key"
+            detailed_msg = f"""ERROR: Authentication Failed
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Details:
+{full_error}
+
+This usually means:
+- Your API key is invalid or expired
+- The API key doesn't have access to this model
+- Check your API key in Settings → API Configuration
+
+Stack Trace:
+{stack_trace}"""
+        elif 'RateLimitError' in full_error or '429' in full_error:
+            short_msg = "Rate limit exceeded"
+            detailed_msg = f"""ERROR: Rate Limit Exceeded
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Details:
+{full_error}
+
+This usually means:
+- Too many requests to the API
+- Exceeded quota for your API key
+- Try again in a few minutes
+
+Stack Trace:
+{stack_trace}"""
+        else:
+            short_msg = full_error[:50]
+            detailed_msg = f"""ERROR: Metadata Generation Failed
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Full Error:
+{full_error}
+
+Stack Trace:
+{stack_trace}"""
+
+        ctx.meta_progress.update(task_id, completed=100, status=f"[red]✗ {short_msg}[/red]")
+
+        # Send detailed error to status server
+        if hasattr(args, 'status_server') and args.status_server:
+            send_status_update('progress', {
+                'repo': full_name, 'short_name': short_id,
+                'status': f'✗ metadata failed: {short_msg}',
+                'percent': 100,
+                'color': 'red'
+            }, args.status_server)
+
+            # Send detailed error info
+            send_status_update('error', {
+                'repo': full_name,
+                'message': short_msg,
+                'fullError': detailed_msg
+            }, args.status_server)
+
+        # Count as error
+        with ctx.stats_lock:
+            ctx.stats['errors'] += 1
+
+        if ctx.sync_logger:
+            ctx.sync_logger.error(
+                "metadata_failed",
+                repo=full_name,
+                error_type=error_type,
+                detail=full_error,
+            )
+
+        return 0.0
 
 
 def sync_mode(args):
@@ -823,663 +1547,21 @@ Stack Trace:
         # Processing sequentially is slower but prevents rate limit errors
         max_metadata_workers = 1
 
-        def generate_metadata_task(task_data):
-            """Generate metadata for a single repo with progress updates."""
-            repo_config, cache_name, commit_hash, short_id, color, _ = task_data
-            full_name = repo_config['full_name']
-            repo_path = PRISTINE_DIR / cache_name
+        # Run metadata generation with live progress. ONE PreflightSession is shared across every
+        # repo in this phase, so its authoritative-count memo and per-model breaker are process-wide
+        # (intended: identical prompts are counted once; a model that degrades stays degraded).
+        with PreflightSession() as session:
+            ctx = SyncContext(meta_progress, meta_tasks, stats, stats_lock, sync_logger, console)
+            with Live(meta_progress, console=console, refresh_per_second=10):
+                with ThreadPoolExecutor(max_workers=max_metadata_workers) as executor:
+                    futures = [executor.submit(lambda td: generate_repo_metadata(td, session, args, ctx), task_data)
+                               for task_data in repos_needing_metadata]
 
-            task_id, task_color = meta_tasks[full_name]
-
-            # Longer random delay to stagger requests and avoid rate limits
-            import random
-            # Increased delay range: 3-7 seconds between repos
-            time.sleep(random.uniform(3.0, 7.0))
-
-            meta_progress.update(task_id, completed=5, status=f"[{task_color}]collecting files...[/{task_color}]")
-
-            # Send status update to UI
-            if hasattr(args, 'status_server') and args.status_server:
-                send_status_update('progress', {
-                    'repo': full_name, 'short_name': short_id,
-                    'status': '📝 generating metadata...',
-                    'percent': 5,
-                    'color': color
-                }, args.status_server)
-
-            try:
-                # Custom metadata generation with progress updates
-                if args.dry_run:
-                    meta_progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would analyze[/dim]")
-                    time.sleep(0.1)
-                    meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ analyzed (dry run)[/{task_color}]")
-                    return 0.0
-
-                # Check for appropriate API key based on model
-                model = get_ai_model()
-                api_key_missing = False
-
-                provider = provider_for_model(model)
-                if provider == 'gemini':
-                    api_key_missing = not os.getenv('GEMINI_API_KEY')
-                elif provider == 'anthropic':
-                    api_key_missing = not os.getenv('ANTHROPIC_API_KEY')
-                elif provider == 'openai':
-                    api_key_missing = not os.getenv('OPENAI_API_KEY')
-
-                if api_key_missing:
-                    meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no API key[/yellow]")
-
-                    # Send status update to UI
-                    if hasattr(args, 'status_server') and args.status_server:
-                        send_status_update('progress', {
-                            'repo': full_name, 'short_name': short_id,
-                            'status': '⊘ skipped - no API key',
-                            'percent': 100,
-                            'color': 'yellow'
-                        }, args.status_server)
-
-                    # Note: Not counting as error since this is expected when user hasn't configured keys yet
-                    # But it will be reported in the final stats
-                    return 0.0
-
-                meta_progress.update(task_id, completed=10, status=f"[{task_color}]analyzing...[/{task_color}]")
-
-                # Send status update
-                if hasattr(args, 'status_server') and args.status_server:
-                    send_status_update('progress', {
-                        'repo': full_name, 'short_name': short_id,
-                        'status': '🤖 analyzing with AI...',
-                        'percent': 10,
-                        'color': color
-                    }, args.status_server)
-
-                # Collect files
-                files = collect_repo_files(repo_path)
-                if not files:
-                    meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no files found[/yellow]")
-                    return 0.0
-
-                # Get model and calculate accurate token count
-                model = get_ai_model()
-                total_tokens = sum(count_tokens_accurate(f['content'], model) for f in files)
-                threshold = get_chunking_threshold(model)
-                context_window = get_model_context_window(model)
-
-                # ONE authoritative decision helper, so production decides on the same finished
-                # prompt the tests exercise (it used to reimplement the decision inline). Returns
-                # whether to chunk, the value it decided on, and whether that value is the exact
-                # finished-prompt count or a lower bound.
-                needs_chunk, decision_value, decision_exact = repo_needs_chunking(
-                    full_name, files, model, threshold)
-
-                budget_label = "prompt-budget" if decision_exact else "content lower bound"
-                budget_note = f" / {decision_value:,} {budget_label}" if decision_value != total_tokens else ""
-                meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
-
-                total_api_cost = 0.0
-
-                if needs_chunk:
-                    # Create chunks that each bound the FINISHED analysis prompt
-                    chunks = chunk_repo_files(files, model, threshold, full_name=full_name)
-                    expected_chunks = len(chunks)
-                    meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
-
-                    # Send status update
-                    if hasattr(args, 'status_server') and args.status_server:
-                        send_status_update('progress', {
-                            'repo': full_name, 'short_name': short_id,
-                            'status': f'🤖 processing {len(chunks)} chunks...',
-                            'percent': 25,
-                            'color': color
-                        }, args.status_server)
-
-                    chunk_analyses = []
-                    for i, chunk in enumerate(chunks, 1):
-                        # Calculate and log chunk size for debugging
-                        chunk_tokens = sum(count_tokens_accurate(f['content'], model) for f in chunk)
-                        console.print(f"[cyan]Chunk {i}/{len(chunks)}: {chunk_tokens:,} content tokens ({len(chunk)} files)[/cyan]")
-
-                        # Add delay BEFORE processing each chunk (including first to give breathing room)
-                        if i == 1:
-                            # Initial delay before first chunk
-                            meta_progress.update(task_id, status=f"[dim]waiting 3s before starting chunks...[/dim]")
-                            time.sleep(3)
-                        else:
-                            # Longer delay between subsequent chunks
-                            meta_progress.update(task_id, status=f"[dim]waiting 6s before next chunk...[/dim]")
-                            time.sleep(6)
-
-                        chunk_progress = 25 + (50 * i / len(chunks))
-                        meta_progress.update(task_id, completed=chunk_progress, status=f"[{task_color}]chunk {i}/{len(chunks)} ({chunk_tokens:,} tokens)...[/{task_color}]")
-
-                        # Send periodic status updates to UI
-                        if hasattr(args, 'status_server') and args.status_server and i % 2 == 0:  # Every 2 chunks
-                            send_status_update('progress', {
-                                'repo': full_name, 'short_name': short_id,
-                                'status': f'🤖 chunk {i}/{len(chunks)}...',
-                                'percent': int(chunk_progress),
-                                'color': color
-                            }, args.status_server)
-
-                        # Retry logic with model fallback for rate limits
-                        max_retries = 5
-                        base_wait = 3
-                        chunk_result = None
-                        current_model = get_ai_model()
-
-                        for retry in range(max_retries):
-                            try:
-                                import litellm
-                                # Route through the shared builder the chunker budgets, so the
-                                # prompt sent is exactly the one measured to fit.
-                                prompt = _build_analysis_prompt(full_name, chunk, i, len(chunks))
-
-                                analysis, api_cost, response = call_llm(
-                                    current_model, prompt, max_tokens=8192
-                                )
-
-                                # Update rate limit tracker
-                                rate_limit_tracker.update_from_response(response)
-
-                                # Log rate limit status after each chunk
-                                rate_status = rate_limit_tracker.get_status_string()
-                                if rate_status != "Rate limits: Unknown":
-                                    console.print(f"    [dim]{rate_status}[/dim]")
-
-                                chunk_analyses.append(analysis)
-                                total_api_cost += api_cost
-
-                                # Success! Break out of retry loop
-                                break
-
-                            except Exception as e:
-                                import traceback
-                                error_str = str(e)
-                                error_type = type(e).__name__
-
-                                # Log VERY detailed error for debugging
-                                console.print(f"\n[bold red]╔══ ERROR ON CHUNK {i}/{len(chunks)} (Retry {retry+1}/{max_retries}) ══╗[/bold red]")
-                                console.print(f"[red]Repository: {full_name}[/red]")
-                                console.print(f"[red]Model: {current_model}[/red]")
-                                console.print(f"[red]Error Type: {error_type}[/red]")
-                                console.print(f"[red]Error Module: {type(e).__module__}[/red]")
-                                console.print(f"[red]Error: {error_str[:300]}[/red]")
-                                console.print(f"[bold red]╚══════════════════════════════════════╝[/bold red]\n")
-
-                                # Check if it's a rate limit error
-                                is_rate_limit = (
-                                    error_type == 'RateLimitError' or
-                                    '429' in error_str or
-                                    'RESOURCE_EXHAUSTED' in error_str or
-                                    'rate_limit' in error_str.lower()
-                                )
-
-                                if is_rate_limit:
-                                    # Try fallback model if available
-                                    fallback_model = get_fallback_model(current_model)
-
-                                    if fallback_model and retry < max_retries - 1:
-                                        console.print(f"[bold yellow]🔄 Rate limited on {current_model}[/bold yellow]")
-                                        console.print(f"[bold yellow]   Falling back to {fallback_model} (separate quota)[/bold yellow]")
-                                        current_model = fallback_model
-                                        meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-
-                                        # Short delay before trying fallback
-                                        time.sleep(2)
-                                        continue
-                                    elif retry < max_retries - 1:
-                                        # No fallback available, wait and retry same model
-                                        wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                                        console.print(f"[yellow]No fallback available. Waiting {int(wait_time)}s...[/yellow]")
-                                        meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-
-                                        # Send status update to UI
-                                        if hasattr(args, 'status_server') and args.status_server:
-                                            send_status_update('progress', {
-                                                'repo': full_name, 'short_name': short_id,
-                                                'status': f'⏳ rate limited, waiting {int(wait_time)}s...',
-                                                'percent': int(chunk_progress),
-                                                'color': 'yellow'
-                                            }, args.status_server)
-
-                                        time.sleep(wait_time)
-                                        continue
-                                    else:
-                                        # Max retries exceeded
-                                        raise Exception(f"Rate limit exceeded after {max_retries} retries")
-                                else:
-                                    # Non-rate-limit error, raise immediately
-                                    raise
-
-                        # Note: Delay before next chunk is now at the start of the loop
-
-                    # Set by whichever path produces `analysis`; used to name the model in a
-                    # degraded-parse warning, since a rate-limit fallback means it is not
-                    # necessarily the configured one.
-                    analysis_model = None
-
-                    if chunk_analyses:
-                        meta_progress.update(task_id, completed=80, status=f"[{task_color}]combining analyses...[/{task_color}]")
-
-                        # Retry logic for combine step with model fallback
-                        current_model_combine = current_model  # Use whatever model succeeded for chunks
-
-                        def _synthesize_bounded(prompt, synth_model):
-                            """One bounded synthesis call, with this loop's retry/fallback.
-
-                            combine_chunk_analyses owns *bounding* (how the analyses are
-                            batched so no prompt exceeds the window); this closure keeps the
-                            existing retry, model fallback and rate-limit accounting. It
-                            returns the model actually used so the caller can re-budget when a
-                            fallback has a smaller context window.
-                            """
-                            nonlocal current_model_combine
-                            for attempt in range(max_retries):
-                                try:
-                                    text, cost, resp = call_llm(
-                                        current_model_combine, prompt, max_tokens=16384
-                                    )
-                                    rate_limit_tracker.update_from_response(resp)
-                                    return text, cost, current_model_combine
-                                except Exception as exc:
-                                    err = str(exc)
-                                    is_rl = (type(exc).__name__ == 'RateLimitError'
-                                             or '429' in err or 'RESOURCE_EXHAUSTED' in err)
-                                    if not is_rl:
-                                        raise
-                                    fb = get_fallback_model(current_model_combine)
-                                    if fb and attempt < max_retries - 1:
-                                        console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fb}[/bold yellow]")
-                                        current_model_combine = fb
-                                        meta_progress.update(task_id, status=f"[yellow]combine fallback to {fb.split('/')[-1]}...[/yellow]")
-                                        time.sleep(2)
-                                    elif attempt < max_retries - 1:
-                                        wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
-                                        meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-                                        time.sleep(wait_time)
-                                    else:
-                                        raise Exception(
-                                            f"Rate limit exceeded on combine after {max_retries} retries")
-                            raise Exception(f"Combine failed after {max_retries} retries")
-
-                        for retry in range(max_retries):
-                            try:
-                                # Bounded hierarchical synthesis. The previous inline version
-                                # concatenated every chunk analysis into ONE prompt with no
-                                # bound, which is what produced
-                                #   prompt is too long: 1189532 tokens > 1000000 maximum
-                                # on large repositories. Batching happens inside; this call
-                                # may perform several LLM requests and returns their total cost.
-                                analysis, combine_cost = combine_chunk_analyses(
-                                    full_name, chunk_analyses,
-                                    model=current_model_combine,
-                                    synthesize=_synthesize_bounded,
-                                )
-
-                                # Success! Break out of retry loop
-                                break
-
-                            except Exception as e:
-                                error_str = str(e)
-                                error_type = type(e).__name__
-
-                                is_rate_limit = (
-                                    error_type == 'RateLimitError' or
-                                    '429' in error_str or
-                                    'RESOURCE_EXHAUSTED' in error_str
-                                )
-
-                                if is_rate_limit:
-                                    # Try fallback model
-                                    fallback_model = get_fallback_model(current_model_combine)
-
-                                    if fallback_model and retry < max_retries - 1:
-                                        console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fallback_model}[/bold yellow]")
-                                        current_model_combine = fallback_model
-                                        meta_progress.update(task_id, status=f"[yellow]combine fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-                                        time.sleep(2)
-                                        continue
-                                    elif retry < max_retries - 1:
-                                        # No fallback, wait
-                                        wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                                        meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-                                        time.sleep(wait_time)
-                                        continue
-                                    else:
-                                        raise Exception(f"Rate limit exceeded on combine after {max_retries} retries")
-                                else:
-                                    raise
-                        total_api_cost += combine_cost
-                        # The combine step may have fallen back to a different model than the
-                        # one chunking used; this is the model that actually produced `analysis`.
-                        analysis_model = current_model_combine
-                else:
-                    # Repo fits in context - single analysis
-                    meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
-
-                    # Retry logic with model fallback for rate limits
-                    max_retries = 5
-                    base_wait = 3
-                    analysis = None
-                    current_model = get_ai_model()
-
-                    for retry in range(max_retries):
+                    for future in as_completed(futures):
                         try:
-                            import litellm
-                            # Route through the shared builder the decision measured, so the
-                            # prompt sent is exactly the one checked to fit.
-                            prompt = _build_full_repo_prompt(full_name, files)
-
-                            meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
-
-                            analysis, single_cost, response = call_llm(
-                                current_model, prompt, max_tokens=16384
-                            )
-                            analysis_model = current_model  # may be a fallback after a retry
-
-                            # Update rate limit tracker
-                            rate_limit_tracker.update_from_response(response)
-
-                            # Log rate limit status
-                            rate_status = rate_limit_tracker.get_status_string()
-                            if rate_status != "Rate limits: Unknown":
-                                console.print(f"    [dim]{rate_status}[/dim]")
-
-                            # Send rate limit info to UI (only if we have data)
-                            if hasattr(args, 'status_server') and args.status_server and rate_status != "Rate limits: Unknown":
-                                send_status_update('rate-limit', {
-                                    'status': rate_status,
-                                    'remaining_requests': rate_limit_tracker.remaining.get('requests'),
-                                    'limit_requests': rate_limit_tracker.limits.get('requests'),
-                                    'remaining_tokens': rate_limit_tracker.remaining.get('tokens'),
-                                    'limit_tokens': rate_limit_tracker.limits.get('tokens')
-                                }, args.status_server)
-
-                            total_api_cost = single_cost
-
-                            # Success! Break out of retry loop
-                            break
-
-                        except Exception as e:
-                            error_str = str(e)
-                            error_type = type(e).__name__
-
-                            # Log detailed error for debugging
-                            console.print(f"\n[red]Error analyzing repo:[/red]")
-                            console.print(f"[red]Repo: {full_name}[/red]")
-                            console.print(f"[red]Model: {current_model}[/red]")
-                            console.print(f"[red]Type: {error_type}[/red]")
-                            console.print(f"[red]Message: {error_str[:300]}[/red]")
-
-                            is_rate_limit = (
-                                error_type == 'RateLimitError' or
-                                '429' in error_str or
-                                'RESOURCE_EXHAUSTED' in error_str or
-                                'rate_limit' in error_str.lower()
-                            )
-
-                            if is_rate_limit:
-                                # Try fallback model if available
-                                fallback_model = get_fallback_model(current_model)
-
-                                if fallback_model and retry < max_retries - 1:
-                                    console.print(f"[bold yellow]🔄 Falling back to {fallback_model}[/bold yellow]")
-                                    current_model = fallback_model
-                                    meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-                                    time.sleep(2)
-                                    continue
-                                elif retry < max_retries - 1:
-                                    # No fallback, wait
-                                    wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                                    console.print(f"[yellow]Retry {retry+1}/{max_retries}: Waiting {int(wait_time)}s...[/yellow]")
-                                    meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-
-                                    # Send status update to UI
-                                    if hasattr(args, 'status_server') and args.status_server:
-                                        send_status_update('progress', {
-                                            'repo': full_name, 'short_name': short_id,
-                                            'status': f'⏳ rate limited (attempt {retry+1}/{max_retries}), waiting {int(wait_time)}s...',
-                                            'percent': 60,
-                                            'color': 'yellow'
-                                        }, args.status_server)
-
-                                    time.sleep(wait_time)
-                                    continue
-                                else:
-                                    # Max retries exceeded
-                                    raise Exception(f"Rate limit exceeded after {max_retries} retries")
-                            else:
-                                # Non-rate-limit error, raise immediately
-                                raise
-
-                meta_progress.update(task_id, completed=90, status=f"[{task_color}]saving metadata...[/{task_color}]")
-
-                # Parse and save (simplified - use existing parse logic)
-                parsed = parse_llm_response(analysis)
-
-                # A failed parse used to be written to disk and indexed as if it were fine, so
-                # `type: Unknown` looked like a model that didn't know rather than a parser that
-                # gave up. Say so out loud, record it in the frontmatter, and keep the raw
-                # response — without it, diagnosing a bad parse after the fact is guesswork.
-                parse_problems = degradation_reasons(parsed)
-                parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
-                if parse_problems:
-                    # Name the model that actually produced this response — including a
-                    # rate-limit fallback — since which model degrades is the whole diagnostic.
-                    print(f"  {YELLOW}Degraded metadata parse for {full_name}"
-                          f" (model: {analysis_model or get_ai_model()}){RESET}")
-                    for problem in parse_problems:
-                        print(f"    {YELLOW}- {problem}{RESET}")
-                    try:
-                        saved_to = save_degraded_response(PRISTINE_DIR, cache_name, analysis)
-                        print(f"    {YELLOW}raw response saved (redacted, owner-only) to"
-                              f" {DEGRADED_DIR_NAME}/{saved_to.name}{RESET}")
-                    except Exception as exc:
-                        print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
-
-                # Build metadata file
-                quick_ref = parsed['quick_ref']
-                brief = parsed['brief']
-                related_repos = parsed['related_repos']
-                main_analysis = parsed['analysis']
-
-                # Build Quick Reference table
-                quick_ref_table = "## Quick Reference\n\n| Property | Value |\n|----------|-------|\n"
-                if 'type' in quick_ref:
-                    quick_ref_table += f"| **Type** | {quick_ref['type']} |\n"
-                if 'language' in quick_ref:
-                    quick_ref_table += f"| **Language** | {quick_ref['language']} |\n"
-                if 'framework' in quick_ref and quick_ref['framework'].lower() != 'none':
-                    quick_ref_table += f"| **Framework** | {quick_ref['framework']} |\n"
-                if 'database' in quick_ref and quick_ref['database'].lower() != 'none':
-                    quick_ref_table += f"| **Database** | {quick_ref['database']} |\n"
-                if 'apis' in quick_ref and quick_ref['apis'].lower() != 'none':
-                    quick_ref_table += f"| **APIs Exposed** | {quick_ref['apis']} |\n"
-                if 'port' in quick_ref and quick_ref['port'].lower() != 'n/a':
-                    quick_ref_table += f"| **Port** | {quick_ref['port']} |\n"
-                if 'dependencies' in quick_ref:
-                    quick_ref_table += f"| **Key Dependencies** | {quick_ref['dependencies']} |\n"
-                quick_ref_table += "\n---\n\n"
-
-                metadata_content = f"""---
-repo_name: {full_name.split('/')[-1]}
-full_name: {full_name}
-cache_dir: {cache_name}
-clone_url: {repo_config['clone_url']}
-last_commit: {commit_hash}
-last_updated: {datetime.now().isoformat()}
-brief: {brief}
-type: {quick_ref.get('type', 'Unknown')}
-language: {quick_ref.get('language', 'Unknown')}
-framework: {quick_ref.get('framework', 'None')}
-database: {quick_ref.get('database', 'None')}
-apis: {quick_ref.get('apis', 'None')}
-port: {quick_ref.get('port', 'N/A')}
-related_repos: {json.dumps(related_repos)}
-parse_status: {parse_status}
----
-
-# Repository: {full_name}
-
-{quick_ref_table}{main_analysis}
-"""
-
-                metadata_file = PRISTINE_DIR / f"{cache_name}.md"
-                with open(metadata_file, 'w') as f:
-                    f.write(metadata_content)
-
-                # Create symlink
-                repo_name = full_name.split('/')[-1]
-                metadata_symlink = PRISTINE_DIR / f"{repo_name}.md"
-                if metadata_symlink.exists() or metadata_symlink.is_symlink():
-                    try:
-                        metadata_symlink.unlink()
-                    except:
-                        pass
-                try:
-                    metadata_symlink.symlink_to(f"{cache_name}.md")
-                except Exception:
-                    pass
-
-                meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ generated (${total_api_cost:.4f})[/{task_color}]")
-
-                # Send status update to UI
-                if hasattr(args, 'status_server') and args.status_server:
-                    send_status_update('progress', {
-                        'repo': full_name, 'short_name': short_id,
-                        'status': f'✓ metadata complete (${total_api_cost:.4f})',
-                        'percent': 100,
-                        'color': color
-                    }, args.status_server)
-
-                with stats_lock:
-                    stats['metadata_generated'] += 1
-                    stats['api_cost'] += total_api_cost
-
-                if sync_logger:
-                    sync_logger.event(
-                        "metadata_generated",
-                        repo=full_name,
-                        cost=f"${total_api_cost:.4f}",
-                    )
-
-                return total_api_cost
-
-            except Exception as e:
-                import traceback
-
-                full_error = str(e)
-                error_type = type(e).__name__
-                stack_trace = traceback.format_exc()
-
-                # Show more descriptive error for common issues
-                if 'NotFoundError' in full_error:
-                    short_msg = f"Model not found: {get_ai_model()}"
-                    detailed_msg = f"""ERROR: Model Not Found
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- The model name is incorrect or not supported by litellm
-- The model requires a specific API endpoint configuration
-- Check the model name in Settings → AI Model
-
-Stack Trace:
-{stack_trace}"""
-                elif 'AuthenticationError' in full_error or 'API key' in full_error:
-                    short_msg = "Invalid API key"
-                    detailed_msg = f"""ERROR: Authentication Failed
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- Your API key is invalid or expired
-- The API key doesn't have access to this model
-- Check your API key in Settings → API Configuration
-
-Stack Trace:
-{stack_trace}"""
-                elif 'RateLimitError' in full_error or '429' in full_error:
-                    short_msg = "Rate limit exceeded"
-                    detailed_msg = f"""ERROR: Rate Limit Exceeded
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- Too many requests to the API
-- Exceeded quota for your API key
-- Try again in a few minutes
-
-Stack Trace:
-{stack_trace}"""
-                else:
-                    short_msg = full_error[:50]
-                    detailed_msg = f"""ERROR: Metadata Generation Failed
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Full Error:
-{full_error}
-
-Stack Trace:
-{stack_trace}"""
-
-                meta_progress.update(task_id, completed=100, status=f"[red]✗ {short_msg}[/red]")
-
-                # Send detailed error to status server
-                if hasattr(args, 'status_server') and args.status_server:
-                    send_status_update('progress', {
-                        'repo': full_name, 'short_name': short_id,
-                        'status': f'✗ metadata failed: {short_msg}',
-                        'percent': 100,
-                        'color': 'red'
-                    }, args.status_server)
-
-                    # Send detailed error info
-                    send_status_update('error', {
-                        'repo': full_name,
-                        'message': short_msg,
-                        'fullError': detailed_msg
-                    }, args.status_server)
-
-                # Count as error
-                with stats_lock:
-                    stats['errors'] += 1
-
-                if sync_logger:
-                    sync_logger.error(
-                        "metadata_failed",
-                        repo=full_name,
-                        error_type=error_type,
-                        detail=full_error,
-                    )
-
-                return 0.0
-
-        # Run metadata generation with live progress
-        with Live(meta_progress, console=console, refresh_per_second=10):
-            with ThreadPoolExecutor(max_workers=max_metadata_workers) as executor:
-                futures = [executor.submit(generate_metadata_task, task_data) for task_data in repos_needing_metadata]
-
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
+                            future.result()
+                        except Exception:
+                            pass
 
         console.print()
 
