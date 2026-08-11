@@ -852,7 +852,7 @@ def _synthesis_budget(full_name, model):
 
 def combine_chunk_analyses(full_name, analyses, model=None,
                            max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS,
-                           synthesize=None):
+                           synthesize=None, session=None):
     """Combine chunk analyses into one cohesive report, bounded by the model's context.
 
     Previously every chunk analysis was concatenated into a single prompt with no bound, so a
@@ -870,7 +870,17 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     have a smaller window than the one the budget was computed from — budgeting one model while
     calling another is how a "bounded" prompt can still overflow.
 
-    Returns (final_analysis, total_api_cost) — cost is aggregated across every round.
+    session: optional PreflightSession (or test stub) exposing count(model, prompt, requested_output).
+    When supplied, the AUTHORITATIVE synthesis path activates: the per-round batch plan is computed
+    from authoritative provider counts (coverage-preserving, split-only), the send loop iterates that
+    plan, and every send is preflighted through run(). With session is None the behaviour is Branch 1,
+    unchanged.
+
+    Returns (final_analysis, total_api_cost) — cost is aggregated across every round. On the
+    authoritative path a synthesis that cannot be reduced to fit degrades to
+    (DegradedSynthesis(reason), cost_so_far): the sentinel occupies the result slot while the cost
+    already incurred at earlier levels is still returned. The caller checks
+    isinstance(result, DegradedSynthesis).
     """
     analyses = [a for a in (analyses or []) if a and str(a).strip()]
     if not analyses:
@@ -878,9 +888,18 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     if model is None:
         model = get_ai_model()
 
-    def run(batch):
-        """One synthesis call. Returns (text, cost) and re-budgets if the model changed."""
+    def run(batch, terminal=False):
+        """One synthesis call. Returns (text, cost) and re-budgets if the model changed.
+
+        With a preflight `session`, the EXACT prompt about to be sent is authoritatively counted
+        first — so every send is counted — and, if it authoritatively overflows the acceptance
+        budget, the batch is truncated to fit before sending. That truncation is legitimate ONLY for
+        a singleton batch or a terminal batch; an ordinary multi-item overflow is prevented upstream
+        by the coverage-preserving split plan and is never truncated here.
+        """
         nonlocal model, budget
+        if session is not None:
+            batch = _preflight_synthesis_batch(session, full_name, batch, model, terminal)
         prompt = _build_synthesis_prompt(full_name, batch)
         if synthesize is None:
             text, cost, used = _synthesize_once(full_name, batch, model)
@@ -899,6 +918,88 @@ def combine_chunk_analyses(full_name, analyses, model=None,
     depth = 0
     calls = 0
     total_cost = 0.0
+
+    def run_terminal(parts):
+        """Terminal (coverage-losing) final pass: collapse `parts` into ONE authoritatively-fitting
+        batch and send it; if even the template floor overflows, degrade. Returns
+        (text_or_sentinel, cumulative_cost) — the already-incurred cost is preserved on degradation."""
+        try:
+            trimmed = _authoritative_terminal_batch(session, full_name, parts, model)
+        except _NonAuthoritative:
+            # Provider went non-authoritative: fall back to Branch 1's framing-aware truncation.
+            trimmed = _truncate_all_to_fit(full_name, parts, budget, model) or None
+        if not trimmed:
+            reason = (f"{model}: the remaining {len(parts)} synthesis parts cannot be reduced to "
+                      f"fit the model's context window, even collapsed to the template floor")
+            return DegradedSynthesis(reason), total_cost
+        text, cost = run(trimmed, terminal=True)
+        return text, total_cost + cost
+
+    if session is not None:
+        # AUTHORITATIVE synthesis (Phase C). The per-round batch plan comes from authoritative
+        # provider counts (coverage-preserving, split-only); the send loop ITERATES that plan
+        # rather than re-batching by local estimate, and never truncates an ordinary multi-item
+        # batch (that would silently drop repository coverage). Every send is preflighted through
+        # run(). Branch 1 (session is None) is left byte-for-byte unchanged below.
+        while True:
+            plan = authoritative_synthesis_level(session, full_name, level, model)
+            if isinstance(plan, DegradedSynthesis):
+                # Degradation preserves the cost already incurred at earlier levels.
+                return plan, total_cost
+            if len(plan) == 1:
+                text, cost = run(plan[0])
+                return text, total_cost + cost
+
+            # Guards charge the AUTHORITATIVE post-split batch count. The +1 reserves the final
+            # reduction, so max_calls is a true ceiling rather than a ceiling on the map rounds.
+            remaining_depth = max_depth - depth
+            if remaining_depth <= 0 or calls + len(plan) + 1 > max_calls:
+                reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
+                print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
+                      f"truncating to a single final pass{RESET}")
+                return run_terminal(level)
+
+            print(f"    {CYAN}Synthesising {len(level)} parts in {len(plan)} batches "
+                  f"(round {depth + 1}){RESET}")
+
+            before = _total_tokens(level, model)
+            combined = []
+            idx = 0
+            while idx < len(plan):
+                # Enforce the ceiling per CALL: a mid-round model change can grow the replan.
+                if calls + 1 >= max_calls:
+                    print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
+                          f"remaining parts to finish{RESET}")
+                    remainder = combined + [a for b in plan[idx:] for a in b]
+                    return run_terminal(remainder)
+
+                prev_model = model
+                text, cost = run(plan[idx])
+                combined.append(text)
+                total_cost += cost
+                calls += 1
+                idx += 1
+
+                if model != prev_model:
+                    # The serving model changed (a smaller-window fallback): REPLAN only the unsent
+                    # remainder with the new model before the next send, so each prompt fits the
+                    # CURRENT model's authoritative budget. Coverage is preserved — nothing dropped.
+                    remainder = [a for b in plan[idx:] for a in b]
+                    if remainder:
+                        replanned = authoritative_synthesis_level(
+                            session, full_name, remainder, model)
+                        if isinstance(replanned, DegradedSynthesis):
+                            return replanned, total_cost
+                        plan, idx = replanned, 0
+
+            # No-progress guard: a whole round that failed to shrink would loop at the same size.
+            if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
+                print(f"    {YELLOW}Synthesis: a round made no progress; "
+                      f"truncating to finish{RESET}")
+                return run_terminal(combined)
+
+            level = combined
+            depth += 1
 
     while True:
         # A single analysis larger than one whole request cannot be reduced by regrouping —
@@ -1263,3 +1364,163 @@ def authoritative_chunks(session, full_name, files, model):
         return build()
     except _NonAuthoritative:
         return PartitionResult(chunk_repo_files(files, model, full_name=full_name), None)
+
+
+# ---------------------------------------------------------------------------
+# Phase C — AUTHORITATIVE (Count Tokens API) synthesis (§6.3).
+#
+# The analysis analogue of authoritative_chunks, one level up: instead of
+# splitting FILES into chunks it splits ANALYSES into synthesis batches, driven
+# by authoritative provider counts of the exact synthesis prompt. Active ONLY
+# when combine_chunk_analyses is passed a PreflightSession; with session is None
+# the hierarchical synthesis above is Branch 1, byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+# Sentinel returned by the authoritative synthesis path when the analyses cannot be reduced to fit
+# the model's context window even by truncation to the template floor. Carries a human reason; the
+# caller writes a degraded record and makes no synthesis send. isinstance(x, DegradedSynthesis)
+# distinguishes it from a batch plan (a plain list).
+DegradedSynthesis = namedtuple("DegradedSynthesis", "reason")
+
+
+def _join_for_terminal(parts):
+    """Collapse several synthesis parts into ONE blob for a terminal single-pass synthesis.
+
+    Numbered separators keep provenance; the blob is then authoritatively truncated to fit. This is a
+    deliberate coverage-loss path — a head-truncation can drop trailing parts entirely — used only
+    when the call/depth budget is exhausted and a bounded final answer is preferable to failing.
+    """
+    return "".join(f"\n[Part {i}]\n{p}\n" for i, p in enumerate(parts, 1))
+
+
+def _authoritative_truncate_synthesis(session, full_name, analysis, model):
+    """AUTHORITATIVE analogue of _authoritative_truncate_file, generalized to a synthesis TEXT item.
+
+    Binary-search the largest retained-content length whose OWN single-part synthesis prompt — the
+    exact string _build_synthesis_prompt would send — counts within acceptance_budget(model,
+    SYNTHESIS_OUTPUT_TOKENS), recounting EVERY candidate through session.count rather than a local
+    estimate. Returns the truncated text, or None when even zero retained content (the template floor)
+    overflows — the fixed template plus one framed marker already exceeds the budget, so nothing this
+    function can do makes the part sendable. Raises _NonAuthoritative on a non-authoritative count.
+    """
+    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    raw = count_tokens_accurate(analysis, model)
+    notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
+              f"{budget:,}-token synthesis budget)")
+
+    def candidate_for(keep):
+        return analysis[:keep] + notice
+
+    def fits(keep):
+        cand = candidate_for(keep)
+        r = session.count(model, _build_synthesis_prompt(full_name, [cand]), SYNTHESIS_OUTPUT_TOKENS)
+        if not r.authoritative:
+            raise _NonAuthoritative
+        return r.tokens <= budget, cand
+
+    # Floor first: if not even the notice-only prompt fits, the template overflows and no truncation
+    # helps — signal whole-synthesis degradation to the caller.
+    ok, floor = fits(0)
+    if not ok:
+        return None
+    lo, hi, best = 0, len(analysis), floor          # largest keep in [0, len] whose prompt fits
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        ok, cand = fits(mid)
+        if ok:
+            lo, best = mid, cand
+        else:
+            hi = mid - 1
+    return best
+
+
+def authoritative_synthesis_level(session, full_name, analyses, model):
+    """One synthesis level's batch plan, computed from AUTHORITATIVE provider counts (§6.3).
+
+    Split the ordered analyses into contiguous, coverage-preserving batches whose synthesis prompt —
+    _build_synthesis_prompt(full_name, batch) — each counts within acceptance_budget(model,
+    SYNTHESIS_OUTPUT_TOKENS), recounting every candidate through session.count. Split-only: it never
+    merges beyond what fits and never drops a part.
+
+      * A batch is the LARGEST contiguous prefix of the remaining analyses that fits (binary search).
+      * A single analysis that overflows even alone is authoritatively truncated (binary recount). If
+        even its template floor overflows, the whole synthesis degrades -> DegradedSynthesis(reason).
+      * ANY non-authoritative count abandons the authoritative plan and returns Branch 1's current
+        batches unchanged (_batch_by_budget) — the local estimate remains the best information and
+        Branch 1 already fail-closes on it.
+
+    Returns list[list[str]] (the batch plan) or DegradedSynthesis.
+    """
+    analyses = list(analyses)
+    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+
+    def fits(batch):
+        r = session.count(model, _build_synthesis_prompt(full_name, batch), SYNTHESIS_OUTPUT_TOKENS)
+        if not r.authoritative:
+            raise _NonAuthoritative
+        return r.tokens <= budget
+
+    try:
+        batches, remaining = [], analyses
+        while remaining:
+            if not fits(remaining[:1]):
+                # A lone analysis overflows by itself — nothing to regroup it with; truncate it.
+                truncated = _authoritative_truncate_synthesis(session, full_name, remaining[0], model)
+                if truncated is None:
+                    return DegradedSynthesis(
+                        f"{model}: a single analysis part exceeds the {budget:,}-token synthesis "
+                        f"acceptance budget even truncated to the template floor")
+                batches.append([truncated])
+                remaining = remaining[1:]
+                continue
+            # remaining[:1] fits, so search the largest fitting prefix starting from 2.
+            lo, hi, cut = 2, len(remaining), 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fits(remaining[:mid]):
+                    cut, lo = mid, mid + 1
+                else:
+                    hi = mid - 1
+            batches.append(remaining[:cut])
+            remaining = remaining[cut:]
+        return batches
+    except _NonAuthoritative:
+        return _batch_by_budget(full_name, analyses, _synthesis_budget(full_name, model), model)
+
+
+def _authoritative_terminal_batch(session, full_name, parts, model):
+    """A single fitting batch for a terminal final pass: collapse `parts` into ONE blob and, only if
+    it authoritatively overflows, truncate it to acceptance_budget. Returns [blob] (fitting) or None
+    (template floor overflow -> caller degrades). Raises _NonAuthoritative on a non-authoritative
+    count. This is the coverage-loss path the call/depth guards fall back to."""
+    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    blob = parts[0] if len(parts) == 1 else _join_for_terminal(parts)
+    r = session.count(model, _build_synthesis_prompt(full_name, [blob]), SYNTHESIS_OUTPUT_TOKENS)
+    if not r.authoritative:
+        raise _NonAuthoritative
+    if r.tokens <= budget:
+        return [blob]
+    truncated = _authoritative_truncate_synthesis(session, full_name, blob, model)
+    return None if truncated is None else [truncated]
+
+
+def _preflight_synthesis_batch(session, full_name, batch, model, terminal):
+    """run()'s preflight: authoritatively count the EXACT prompt about to be sent, and return the
+    batch to send.
+
+    Unchanged when it fits or the count is non-authoritative (Branch 1). If it authoritatively
+    overflows the acceptance budget it is truncated to fit — but ONLY for a singleton or a terminal
+    batch. An ordinary multi-item overflow is NOT truncated here (that would silently drop repository
+    coverage); it is prevented upstream by the split plan, so the batch is returned unchanged. In
+    every case the LAST prompt counted equals the prompt run() then sends, so every send is counted.
+    """
+    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    r = session.count(model, _build_synthesis_prompt(full_name, batch), SYNTHESIS_OUTPUT_TOKENS)
+    if not r.authoritative or r.tokens <= budget:
+        return batch
+    if terminal or len(batch) == 1:
+        blob = batch[0] if len(batch) == 1 else _join_for_terminal(batch)
+        truncated = _authoritative_truncate_synthesis(session, full_name, blob, model)
+        if truncated is not None:
+            return [truncated]
+    return batch
