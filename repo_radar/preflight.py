@@ -20,11 +20,26 @@ _Fatal = namedtuple("_Fatal", "exc")
 
 
 class PreflightLoop:
-    def __init__(self):
+    """Dedicated asyncio loop on a daemon thread, with a bounded best-effort close().
+
+    close() bounds shutdown on the assumption that the work it drains is
+    cancellation-COOPERATIVE — the only kind this loop ever runs (litellm's Count
+    Tokens call rides HTTPX, which honors cancellation at its await points; see
+    `_count_once`). The timeout is a hard bound for such coroutines. A pathological
+    cancellation-RESISTANT coroutine (one that catches CancelledError and refuses to
+    unwind) cannot be force-killed here, and we deliberately do NOT add hard-kill
+    machinery for a case the real provider path never produces. Its only observable
+    effect is that close() stays retryable — see close() for why that can never become
+    a false success.
+    """
+
+    def __init__(self, close_timeout=5.0):
         self._loop = None
         self._thread = None
         self._closing = False
         self._closed = False
+        # Injectable so tests can drive drain-timeout / join-timeout scenarios fast.
+        self._close_timeout = close_timeout
 
     def start(self):
         self._loop = asyncio.new_event_loop()
@@ -35,21 +50,49 @@ class PreflightLoop:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
     def close(self):
+        """Bounded best-effort shutdown: idempotent, retryable, never a false success.
+
+        Correctness contract:
+          * We report success (is_closed() True) ONLY after the drain actually
+            completed AND the loop thread stopped AND the loop was closed. Anything
+            short of that returns with _closed still False so the caller can retry.
+          * On a drain timeout/failure we do NOT stop or close the loop. Its pending
+            tasks are still alive; stopping/closing here would destroy them ("Task was
+            destroyed but it is pending!") while implying success. We log and return
+            retryable, leaving the loop running so the abandoned _drain keeps trying to
+            cancel/gather those tasks.
+          * We only ever submit _drain while the loop is running. A retry after a
+            partial close must never schedule a fresh _drain on an already-stopped loop
+            — that coroutine would never be awaited and would leak. If the loop already
+            stopped, we skip straight to join/close.
+
+        Because draining relies on task cancellation, a cancellation-resistant coroutine
+        can only keep close() retryable forever; it can never yield a false success.
+        """
         if self._closed or self._closing:
             return
         self._closing = True
         try:
-            async def _drain():
-                pending = [t for t in asyncio.all_tasks(self._loop) if t is not asyncio.current_task()]
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-            try:
-                asyncio.run_coroutine_threadsafe(_drain(), self._loop).result(timeout=5)
-            except Exception as e:
-                logger.warning("preflight drain failed: %s", e)  # surfaced, still try to stop
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(timeout=5)
+            # Drain only while the loop is actually running (property 2): never submit a
+            # fresh _drain to a stopped/stopping loop on a retry — it would never run,
+            # never be awaited, and leak. If already stopped, fall through to join/close.
+            if self._loop.is_running():
+                async def _drain():
+                    pending = [t for t in asyncio.all_tasks(self._loop) if t is not asyncio.current_task()]
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                try:
+                    asyncio.run_coroutine_threadsafe(_drain(), self._loop).result(timeout=self._close_timeout)
+                except Exception as e:
+                    # Drain did not complete in time (or errored). Do NOT stop/close the
+                    # loop — its pending tasks are still alive and must not be destroyed.
+                    # Stay retryable; the loop keeps running so _drain can keep trying.
+                    logger.warning("preflight drain did not complete; close() is retryable: %s", e)
+                    return  # _closed stays False
+                # Drain completed: every pending task was cancelled and awaited. Safe to stop.
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=self._close_timeout)
             if self._thread.is_alive():
                 logger.error("preflight loop thread did not stop; close() is retryable")
                 return  # _closed stays False
@@ -87,6 +130,16 @@ async def _count_once(model, prompt, timeout_s):
     KeyboardInterrupt/SystemExit are enveloped rather than swallowed, so an operator-initiated
     interrupt during the background loop's call still propagates as a distinguishable outcome
     instead of silently degrading to "not authoritative."
+
+    Timeout scope (narrow, not a hard kill): asyncio.wait_for's `timeout_s` is a HARD bound
+    only for a cancellation-COOPERATIVE awaitable. litellm.acount_tokens runs over HTTPX, which
+    honors cancellation at its await points, so on timeout wait_for cancels the request and it
+    actually unwinds — that is the only path this code runs in production. wait_for cannot
+    force-kill a cancellation-RESISTANT coroutine (one that catches CancelledError and refuses
+    to unwind); it would await that cancellation forever. We do NOT add speculative hard-kill
+    machinery for a case the real provider path never produces. The blast radius of such a
+    pathological coroutine is contained: PreflightLoop.close() stays retryable (never a false
+    success), it is never destroyed mid-flight, and close() never hangs — see PreflightLoop.close.
     """
     try:
         resp = await asyncio.wait_for(

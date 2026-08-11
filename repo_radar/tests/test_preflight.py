@@ -1,4 +1,4 @@
-import asyncio, threading, pytest, repo_radar.preflight as pf
+import asyncio, threading, time, pytest, repo_radar.preflight as pf
 from unittest.mock import patch
 from types import SimpleNamespace
 def _resp(total, tt="anthropic_api", error=False, rm="claude-opus-5", mu="claude-opus-5"):
@@ -44,17 +44,69 @@ def test_close_cancels_a_real_pending_coroutine(monkeypatch):
     import concurrent.futures
     with pytest.raises((concurrent.futures.CancelledError, asyncio.CancelledError)):
         never.result(timeout=1)
-def test_close_is_retryable_if_thread_does_not_stop(monkeypatch):
-    loop = pf.PreflightLoop(); loop.start()
-    real_join, real_alive = loop._thread.join, loop._thread.is_alive
-    monkeypatch.setattr(loop._thread, "join", lambda timeout=None: None)
-    monkeypatch.setattr(loop._thread, "is_alive", lambda: True)                     # pretend it won't stop
-    loop.close()
-    assert loop.is_closed() is False                                               # retryable, not a lie
-    monkeypatch.setattr(loop._thread, "is_alive", real_alive)
-    monkeypatch.setattr(loop._thread, "join", real_join)
-    loop.close()
+def test_close_is_retryable_then_completes_on_delayed_shutdown():
+    # REAL delayed-shutdown case (replaces the old inconsistent monkeypatch of is_alive/join).
+    # A task that honors cancellation but takes LONGER than close()'s drain timeout to unwind:
+    # it catches CancelledError, does a brief cleanup sleep, then exits. The FIRST close() must
+    # time out its drain and return retryable WITHOUT stopping/closing the loop or destroying the
+    # task; once the cleanup finishes, a SECOND close() completes for real. close_timeout is small
+    # so the test is fast; the cleanup delay is comfortably larger so the drain provably times out.
+    started = threading.Event(); finished = threading.Event()
+    loop = pf.PreflightLoop(close_timeout=0.2); loop.start()
+    async def delayed():
+        started.set()
+        try:
+            await asyncio.Event().wait()                # pending forever until cancelled
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.6)                    # honors cancel, but slow to unwind (> close_timeout)
+            finished.set()                             # exits normally after the delayed cleanup
+    fut = asyncio.run_coroutine_threadsafe(delayed(), loop._loop)
+    assert started.wait(timeout=5)                     # bounded: task is scheduled and running
+
+    t0 = time.monotonic()
+    loop.close()                                       # drain cancels the task but it won't unwind in time
+    assert time.monotonic() - t0 < 3                   # bounded: close() did not hang
+    assert loop.is_closed() is False                   # retryable, not a false success
+    assert loop._loop.is_running()                     # loop NOT stopped/closed...
+    assert not loop._loop.is_closed()
+    assert not fut.done()                              # ...and the pending task was NOT destroyed
+
+    assert finished.wait(timeout=3)                    # let the delayed cleanup complete
+    loop.close()                                       # now the drain completes -> real close
     assert loop.is_closed() is True
+    assert loop._loop.is_closed()
+
+
+def test_cancellation_resistant_task_keeps_close_retryable_and_bounded():
+    # A GENUINELY cancellation-resistant task: it swallows CancelledError and keeps looping, so
+    # close()'s single-shot drain can never cancel it. close() must return retryable (False),
+    # stay bounded (no hang), and NOT destroy the task or falsely report closed. At teardown we
+    # release the task (a stop flag it also checks) so it exits cleanly and a final close()
+    # succeeds — leaking a resistant task/thread into other tests would poison them.
+    started = threading.Event(); stop = threading.Event()
+    loop = pf.PreflightLoop(close_timeout=0.15); loop.start()
+    async def resistant():
+        started.set()
+        while not stop.is_set():
+            try:
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                pass                                   # resist: swallow the drain's cancel, keep going
+    fut = asyncio.run_coroutine_threadsafe(resistant(), loop._loop)
+    try:
+        assert started.wait(timeout=5)
+        t0 = time.monotonic()
+        loop.close()                                   # drain can't cancel it -> times out
+        assert time.monotonic() - t0 < 3               # bounded: no hang
+        assert loop.is_closed() is False               # retryable, never a false success
+        assert loop._loop.is_running()                 # loop NOT stopped/closed
+        assert not loop._loop.is_closed()
+        assert not fut.done()                          # task alive, not destroyed
+    finally:
+        stop.set()                                     # release the resistant task so it can exit
+        loop.close()                                   # now drain completes -> real close
+    assert loop.is_closed() is True
+    fut.result(timeout=3)                              # task finished cleanly, no leak
 
 
 # --- Task 7: PreflightSession (strategy gate + loop-owned single-flight + per-model breaker) ---
