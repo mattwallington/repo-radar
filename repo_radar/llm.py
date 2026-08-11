@@ -1435,19 +1435,26 @@ def _authoritative_truncate_synthesis(session, full_name, analysis, model):
 
 
 def authoritative_synthesis_level(session, full_name, analyses, model):
-    """One synthesis level's batch plan, computed from AUTHORITATIVE provider counts (§6.3).
+    """One synthesis level's batch plan, ANCHORED to Branch 1's partition and tightened with
+    AUTHORITATIVE provider counts (§6.3).
 
-    Split the ordered analyses into contiguous, coverage-preserving batches whose synthesis prompt —
-    _build_synthesis_prompt(full_name, batch) — each counts within acceptance_budget(model,
-    SYNTHESIS_OUTPUT_TOKENS), recounting every candidate through session.count. Split-only: it never
-    merges beyond what fits and never drops a part.
+    Start from Branch 1's conservative partition — _batch_by_budget against _synthesis_budget — and
+    authoritatively verify each Branch-1 batch, splitting it further only where the real provider count
+    of _build_synthesis_prompt(full_name, batch) exceeds acceptance_budget(model,
+    SYNTHESIS_OUTPUT_TOKENS). Split/tighten ONLY: a Branch-1 batch is a hard boundary the authoritative
+    plan may never cross. Searching the whole analysis list against acceptance_budget would COALESCE
+    batches Branch 1 deliberately separated (acceptance_budget, the ~99% ceiling, is larger than the
+    conservative _synthesis_budget) — that violates the monotonicity rule and drifts the safety
+    boundary toward the ceiling, so it is forbidden. No fixpoint is needed (unlike authoritative_chunks)
+    because _build_synthesis_prompt numbers parts WITHIN a batch, so each batch's count is independent
+    of the others.
 
-      * A batch is the LARGEST contiguous prefix of the remaining analyses that fits (binary search).
+      * Each Branch-1 batch is split at the LARGEST contiguous prefix that fits (binary search), never
+        pulling in analyses from the next Branch-1 batch.
       * A single analysis that overflows even alone is authoritatively truncated (binary recount). If
         even its template floor overflows, the whole synthesis degrades -> DegradedSynthesis(reason).
-      * ANY non-authoritative count abandons the authoritative plan and returns Branch 1's current
-        batches unchanged (_batch_by_budget) — the local estimate remains the best information and
-        Branch 1 already fail-closes on it.
+      * ANY non-authoritative count abandons the authoritative plan and returns Branch 1's partition
+        unchanged — the local estimate remains the best information and Branch 1 already fail-closes.
 
     Returns list[list[str]] (the batch plan) or DegradedSynthesis.
     """
@@ -1460,32 +1467,36 @@ def authoritative_synthesis_level(session, full_name, analyses, model):
             raise _NonAuthoritative
         return r.tokens <= budget
 
+    # Anchor to Branch 1's partition; authoritative counting may only split/tighten it, never merge.
+    branch1 = _batch_by_budget(full_name, analyses, _synthesis_budget(full_name, model), model)
     try:
-        batches, remaining = [], analyses
-        while remaining:
-            if not fits(remaining[:1]):
-                # A lone analysis overflows by itself — nothing to regroup it with; truncate it.
-                truncated = _authoritative_truncate_synthesis(session, full_name, remaining[0], model)
-                if truncated is None:
-                    return DegradedSynthesis(
-                        f"{model}: a single analysis part exceeds the {budget:,}-token synthesis "
-                        f"acceptance budget even truncated to the template floor")
-                batches.append([truncated])
-                remaining = remaining[1:]
-                continue
-            # remaining[:1] fits, so search the largest fitting prefix starting from 2.
-            lo, hi, cut = 2, len(remaining), 1
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if fits(remaining[:mid]):
-                    cut, lo = mid, mid + 1
-                else:
-                    hi = mid - 1
-            batches.append(remaining[:cut])
-            remaining = remaining[cut:]
+        batches = []
+        for b1 in branch1:                       # a Branch-1 batch is a hard boundary — never cross it
+            remaining = list(b1)
+            while remaining:
+                if not fits(remaining[:1]):
+                    # A lone analysis overflows by itself — nothing to regroup it with; truncate it.
+                    truncated = _authoritative_truncate_synthesis(session, full_name, remaining[0], model)
+                    if truncated is None:
+                        return DegradedSynthesis(
+                            f"{model}: a single analysis part exceeds the {budget:,}-token synthesis "
+                            f"acceptance budget even truncated to the template floor")
+                    batches.append([truncated])
+                    remaining = remaining[1:]
+                    continue
+                # remaining[:1] fits; search the largest fitting prefix WITHIN this Branch-1 batch.
+                lo, hi, cut = 2, len(remaining), 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if fits(remaining[:mid]):
+                        cut, lo = mid, mid + 1
+                    else:
+                        hi = mid - 1
+                batches.append(remaining[:cut])
+                remaining = remaining[cut:]
         return batches
     except _NonAuthoritative:
-        return _batch_by_budget(full_name, analyses, _synthesis_budget(full_name, model), model)
+        return branch1
 
 
 def _authoritative_terminal_batch(session, full_name, parts, model):

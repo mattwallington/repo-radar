@@ -95,6 +95,42 @@ def test_over_budget_batch_splits_into_more_batches(monkeypatch):
         assert _StubSession(table).count("claude-opus-5", llm._build_synthesis_prompt("o/r", b), 16384).tokens <= budget
 
 
+def test_authoritative_never_coalesces_branch1_batches(monkeypatch):
+    """Monotonicity: authoritative counting may SPLIT/tighten Branch 1's partition but must NEVER
+    merge across a Branch-1 boundary. Branch 1 batches against the conservative _synthesis_budget;
+    acceptance_budget is much larger, so a plan that searches the whole list against the larger
+    ceiling would coalesce batches Branch 1 deliberately separated (and drift the safety boundary
+    toward the ~99% ceiling). Here a REAL Branch-1 partition splits into >=2 batches, yet the provider
+    reports the whole union fits the authoritative ceiling — the exact condition under which the
+    pre-fix code merged to one batch. The authoritative result must keep Branch 1's boundaries."""
+    import repo_radar.llm as llm
+    model = "claude-opus-5"
+    analyses = ["A0 " * 400, "A1 " * 400, "A2 " * 400, "A3 " * 400]              # sizable, distinct
+    # Establish a REAL Branch-1 partition of >=2 batches under a genuinely small conservative budget
+    # (derived from the same framed-token sizes _batch_by_budget uses, so the split is deterministic).
+    overhead = llm._budget_tokens(llm._build_synthesis_prompt("o/r", []), model)
+    small_budget = overhead + llm._budget_tokens(llm._framed(analyses[0], 1), model) \
+                            + llm._budget_tokens(llm._framed(analyses[1], 2), model)
+    monkeypatch.setattr(llm, "_synthesis_budget", lambda *a, **k: small_budget)
+    branch1 = llm._batch_by_budget("o/r", analyses, small_budget, model)
+    assert len(branch1) >= 2                                                     # real conservative split
+    acc = llm.acceptance_budget(model, 16384)
+    assert acc > small_budget                                                    # the safety-boundary gap exists
+    # Provider says even the WHOLE union fits the larger acceptance ceiling -> pre-fix would merge to one.
+    out = llm.authoritative_synthesis_level(_StubSession(lambda p: PreflightResult(acc - 1, True)),
+                                            "o/r", analyses, model)
+    assert not isinstance(out, llm.DegradedSynthesis)
+    assert [a for b in out for a in b] == analyses                              # order preserved, none dropped
+    assert len(out) >= len(branch1)                                            # boundaries not merged (>=2)
+
+    def cutpoints(batches):
+        pts, i = set(), 0
+        for b in batches:
+            i += len(b); pts.add(i)
+        return pts
+    assert cutpoints(branch1) <= cutpoints(out)                                # no auth batch spans a Branch-1 boundary
+
+
 def test_max_calls_trips_on_authoritative_count_and_terminal_prompt_is_counted(monkeypatch):
     """Two guarantees: (a) the guard `calls + len(batches) + 1 > max_calls` charges the AUTHORITATIVE
     post-split count (4) -> with max_calls=4 it trips to a single terminal shot (1 send, not 4); and
