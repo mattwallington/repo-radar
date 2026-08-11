@@ -121,6 +121,10 @@ python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
   exit 1
 }
 
+python3 scripts/check_model_windows.py --target-date "$RELEASE_DATE" || {
+  echo "Release blocked: model window gate failed. Re-verify vendor windows; fix repo_radar/model_catalog.py or add a bound override." >&2
+  exit 1; }
+
 # Spec 2A runtime-binding: the full dependency-lock matrix must be present (the app
 # fails closed on an uncovered interpreter, so a partial matrix ships a broken runtime).
 node menubar/scripts/pydeps.js --assert-matrix || {
