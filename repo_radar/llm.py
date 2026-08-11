@@ -1112,3 +1112,154 @@ def authoritative_partition(session, full_name, files, model):
     if r.authoritative:
         return "single" if r.tokens <= acceptance_budget(model, FULL_REPO_OUTPUT) else "chunk"
     return "single"
+
+
+# The output-token budget every chunk analysis call reserves (call_llm(..., max_tokens=8192)).
+# The acceptance budget for a chunk send is acceptance_budget(model, CHUNK_OUTPUT), so this is the
+# SAME requested_output the send will use — the count we accept a chunk on is the count call_llm
+# will actually pay for.
+CHUNK_OUTPUT = 8192
+
+# `chunks` are only the SENDABLE chunks (N = len(chunks)); production makes exactly one call_llm per
+# chunk. `degraded_reason` is non-None ONLY on whole-repo degradation, in which case `chunks` is []
+# and production writes a single degraded record and makes ZERO call_llm calls.
+PartitionResult = namedtuple("PartitionResult", "chunks degraded_reason")
+
+
+class _NonAuthoritative(Exception):
+    """Raised at a count site the moment the provider returns a non-authoritative result, to abandon
+    the authoritative pass and fall back to the complete Branch 1 partition (unchanged)."""
+
+
+def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num, total_chunks):
+    """AUTHORITATIVE analogue of _truncate_file_to_prompt_budget: trim one file so its OWN single-file
+    (i/N) analysis prompt — the exact string call_llm would send — counts within
+    acceptance_budget(model, CHUNK_OUTPUT), recounting EVERY candidate through session.count rather
+    than a local estimate.
+
+    Binary-search the largest retained-content length whose finished prompt fits. Returns the
+    truncated file dict, or None when even zero retained content overflows — i.e. the fixed template
+    plus this file's framing already exceeds the budget (the "template floor"), so no truncation can
+    ever make the chunk sendable and the WHOLE repo must degrade. Raises _NonAuthoritative if any
+    count is non-authoritative (the caller turns that into the Branch 1 fallback).
+    """
+    budget = acceptance_budget(model, CHUNK_OUTPUT)
+    original = file_info['content']
+    raw = count_tokens_accurate(original, model)
+    notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
+              f"{budget:,}-token chunk budget)")
+
+    def candidate_for(keep):
+        return {**file_info, 'content': original[:keep] + notice}
+
+    def fits(keep):
+        cand = candidate_for(keep)
+        r = session.count(model, _build_analysis_prompt(full_name, [cand], chunk_num, total_chunks),
+                          CHUNK_OUTPUT)
+        if not r.authoritative:
+            raise _NonAuthoritative
+        return r.tokens <= budget, cand
+
+    # Floor first: if not even the notice-only prompt (zero retained content) fits, the template
+    # itself overflows and nothing this function can do will help — signal whole-repo degradation.
+    ok, floor = fits(0)
+    if not ok:
+        return None
+    lo, hi, best = 0, len(original), floor          # largest keep in [0, len] whose prompt fits
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        ok, cand = fits(mid)
+        if ok:
+            lo, best = mid, cand
+        else:
+            hi = mid - 1
+    return best
+
+
+def _largest_fitting_prefix(session, full_name, chunk, chunk_num, total_chunks, model, budget):
+    """Largest prefix length L in [1, len(chunk)-1] whose (i/N) prompt counts within `budget`, by
+    binary search with an authoritative recount per candidate. Always returns >= 1 so the split makes
+    progress even if a single-file prefix still overflows (that lone file is handled as a singleton on
+    the next pass). Raises _NonAuthoritative on a non-authoritative count."""
+    def fits(length):
+        r = session.count(model, _build_analysis_prompt(full_name, chunk[:length], chunk_num, total_chunks),
+                          CHUNK_OUTPUT)
+        if not r.authoritative:
+            raise _NonAuthoritative
+        return r.tokens <= budget
+
+    lo, hi, best = 1, len(chunk) - 1, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def authoritative_chunks(session, full_name, files, model):
+    """The chunked-analysis fixpoint with a whole-repo degradation contract (§6.2, §6.4).
+
+    Starting from Branch 1's conservative candidate set (chunk_repo_files), drive it to a fixpoint
+    where EVERY chunk's REAL analysis prompt — `_build_analysis_prompt(full_name, chunk, i, N)` with
+    the ACTUAL 1-based index and current total — counts within acceptance_budget(model, CHUNK_OUTPUT)
+    AND the count is authoritative. A chunk "fits" only if both hold.
+
+    Why the whole set is rebuilt and recounted after every split (not just the offending chunk): the
+    only text that varies with N is the "(chunk i/N)" header, and BPE token counts are NOT monotonic
+    in those numerals, so splitting one chunk (which changes N and therefore EVERY header) can push a
+    previously-fitting chunk over budget. A prior pass is never trusted; we iterate until one full
+    pass fits with zero changes. N only ever grows and is bounded by the file count, so it terminates.
+
+    Overflow handling:
+      * A MULTI-file chunk is split at its largest fitting prefix; the prefix and remainder both go
+        back into the candidate set and the whole set is recounted (N has changed).
+      * A SINGLE-file chunk is authoritatively truncated (binary search, recount per candidate). If
+        even the template floor overflows, the whole repo degrades: return PartitionResult([], reason)
+        immediately — production writes one degraded record and sends nothing.
+      * ANY non-authoritative count abandons the authoritative pass entirely and returns the complete,
+        unchanged Branch 1 partition (degraded_reason is None): the local estimate remains the best
+        information available and Branch 1 already fail-closes on it.
+    """
+    budget = acceptance_budget(model, CHUNK_OUTPUT)
+
+    def fits(chunk, i, n):
+        r = session.count(model, _build_analysis_prompt(full_name, chunk, i, n), CHUNK_OUTPUT)
+        if not r.authoritative:
+            raise _NonAuthoritative
+        return r.tokens <= budget
+
+    def build():
+        chunks = chunk_repo_files(files, model, full_name=full_name)
+        # Safety cap only — the fixpoint terminates by construction (N strictly grows on every split
+        # and is bounded by len(files); truncations converge once N stops changing). If this is ever
+        # hit it means an invariant broke, so fail loud rather than emit an unverified partition.
+        for _ in range(4 * len(files) + 8):
+            n = len(chunks)
+            rebuilt, changed = [], False
+            for idx, chunk in enumerate(chunks, start=1):
+                if fits(chunk, idx, n):
+                    rebuilt.append(chunk)
+                    continue
+                changed = True
+                if len(chunk) == 1:
+                    truncated = _authoritative_truncate_file(session, full_name, chunk[0], model, idx, n)
+                    if truncated is None:
+                        reason = (f"{model}: file {chunk[0]['path']!r} exceeds the {budget:,}-token "
+                                  f"chunk acceptance budget even truncated to the template floor")
+                        return PartitionResult([], reason)
+                    rebuilt.append([truncated])
+                else:
+                    cut = _largest_fitting_prefix(session, full_name, chunk, idx, n, model, budget)
+                    rebuilt.append(chunk[:cut])
+                    rebuilt.append(chunk[cut:])
+            chunks = rebuilt
+            if not changed:
+                return PartitionResult(chunks, None)
+        raise AssertionError("authoritative_chunks fixpoint failed to converge")  # unreachable
+
+    try:
+        return build()
+    except _NonAuthoritative:
+        return PartitionResult(chunk_repo_files(files, model, full_name=full_name), None)
