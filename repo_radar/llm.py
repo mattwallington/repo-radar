@@ -8,7 +8,7 @@ from datetime import datetime
 
 from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
 from repo_radar import model_catalog
-from repo_radar.model_catalog import get_caps, is_known_model
+from repo_radar.model_catalog import acceptance_budget, get_caps, is_known_model
 
 # TODO: refactor sync_mode to use analyze_repo_chunk and combine_chunk_analyses
 
@@ -1082,3 +1082,33 @@ def _synthesize_once(full_name, analyses, model=None):
                     raise Exception(f"Rate limit exceeded after {max_retries} retries")
             else:
                 raise
+
+
+# The single-vs-chunk decision is MONOTONIC: Branch 1's local-estimate chunk decision
+# (repo_needs_chunking) is checked first, and if it says "chunk" that is final — an
+# authoritative count is never even requested, let alone allowed to reverse it. Only when
+# Branch 1 says "single" do we ask for an authoritative count of the exact whole-repo prompt
+# call_llm would send (_build_full_repo_prompt), and only an AUTHORITATIVE count can tighten
+# "single" into "chunk". A non-authoritative result (model not on the anthropic_api count
+# strategy, or the provider call degraded) leaves Branch 1's "single" verdict standing — the
+# local estimate is still the best information available.
+FULL_REPO_OUTPUT = SYNTHESIS_OUTPUT_TOKENS
+
+
+def authoritative_partition(session, full_name, files, model):
+    """Decide "single" vs "chunk" for the whole-repo prompt, monotonically tightening Branch 1's
+    estimate-based decision with an authoritative provider count when one is available.
+
+    session is a PreflightSession (or test stub) exposing count(model, prompt, requested_output).
+    """
+    threshold = get_chunking_threshold(model)
+    needs_chunk, _v, _e = repo_needs_chunking(full_name, files, model, threshold)
+    if needs_chunk:
+        return "chunk"
+    caps = get_caps(model)
+    if caps is None or caps.count_strategy != "anthropic_api":
+        return "single"
+    r = session.count(model, _build_full_repo_prompt(full_name, files), FULL_REPO_OUTPUT)
+    if r.authoritative:
+        return "single" if r.tokens <= acceptance_budget(model, FULL_REPO_OUTPUT) else "chunk"
+    return "single"
