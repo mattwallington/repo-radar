@@ -1,116 +1,79 @@
-# Log Viewer / Activity History — design shape (v2, current codebase)
+# Activity History (formerly "Log Viewer") — design shape, Round 2
 
-**Status:** Shaping (paired with Codex before spec/plan)
+**Status:** Shaping — Round 2 (paired with Codex). Scope **B** agreed.
 **Date:** 2026-08-12
-**Supersedes the framing in:** `2026-08-12-log-viewer-design.md` (that doc inventoried the *old* `RepoRadar` viewer; we are re-designing for the current app, not porting it).
+**Supersedes:** the framing in `2026-08-12-log-viewer-design.md` (that inventoried the *old* RepoRadar viewer; we are not porting it).
+**Scope decision (paired Round 2):** **B — a phased MVP that is a complete vertical slice of the durable model.** Not a temporary read-time file-fusion. Scope A (deep instrumentation of every producer) is reached later by *adding producers to the same stable contract*, never by re-designing storage or UI.
 
-## Problem — re-grounded on what actually bites
+## Problem — re-grounded
 
-Repo Radar runs unattended background syncs. When one misbehaves there is **no in-app
-way to see what happened after the fact** — you open `~/Library/Logs/repo-radar/` in a
-terminal. We want an in-app view: open a window, find the failing run, see why.
+Unattended background syncs fail with no in-app way to see *what* happened or *why*. Opening `~/Library/Logs/repo-radar/` in a terminal is the only recourse today.
 
-**The sharpest lesson (from a real failure today):** a dev sync failed with
-`Dev sync blocked: … interpreter fingerprint mismatch`. That message lived in
-`status.json.errorLog` **and** the raw stderr — **not** in the clean `sync-*.log`
-event stream. Meanwhile the existing **"Sync Errors" window reads `status.json.errorList`
-and showed *nothing*** (empty checkmark). So the user saw a red icon and an empty error
-list, with the real cause invisible in the app.
+**The load-bearing failure that shapes the design:** yesterday a dev sync was **blocked before Python ever ran** (`Dev sync blocked: … interpreter fingerprint mismatch`). No `sync-<ISO>.log` was created; the message went to the mutable `status.json.errorLog`; the "Sync Errors" window (which reads `status.json.errorList`) showed an empty checkmark. **A viewer built on `sync-*.log` files would still miss this.** Correlating the three existing stores at read time is unsound: the guard fails before any log exists (`menubar/main.js:1092-1106`), `status.json` is a snapshot the next accepted sync clears (`:1113-1120`), Python has early exits before `_open_sync_logger()` (`repo_radar/modes/sync.py:924-940` vs `:948`), and the LaunchAgent reuses one shared `sync.error.log` (`:1990-1994`).
 
-**Design consequence:** a viewer that reads only the structured event log would have
-**missed today's error entirely.** The feature's real job is *"surface what went wrong,
-wherever it hides,"* not just "pretty-print the event log." This is the biggest departure
-from the old viewer (which read two fixed files).
+## Core model — durable activity, not files
 
-## Current surfaces to build on (reuse, do not rebuild)
+The canonical unit is an **Activity item**, not a log file.
 
-- **`SyncLogger`** (`repo_radar/modes/sync.py:48`) — writes one per-run file
-  `sync-<ISO>.log`, format `[HH:MM:SS] event_name k=v …`. It has **two** methods:
-  `event()` (routine) and `error(name, repo, detail=…)` (stamps an event **plus an
-  indented detail block**, first 8 lines of e.g. git stderr). Central, thread-safe,
-  **already error-aware** — so it already knows the severity of what it logs.
-- **Raw runtime streams:** `sync.log` / `sync.error.log` (LaunchAgent stdout/stderr,
-  ANSI, where low-level failures like the fingerprint mismatch land), `menubar.log` /
-  `menubar.error.log`, `renderer.log`.
-- **`status.json`** (`~/.config/repo-radar/status.json`) — the menubar's results
-  snapshot: `stats`, `repos`, `errorList` (per-repo), **`errorLog`** (free-text/stderr),
-  `channels`. This is where today's real error was.
-- **Live Progress window** — `showLogWindow()` (`menubar/main.js`), fed by the
-  status-server stream with `data.type` categories: `output | progress | error |
-  rate-limit | waiting-for-network | network-timeout | complete`. Live only; tray shows
-  "View Progress" **only while syncing**.
-- **`redact()`** (`menubar/runtime/hashing.js:32`) — strips API keys / tokens. **Every
-  rendered or exported line must pass through it** (esp. Export, which writes a shareable
-  file, and the raw stderr view, which can contain env dumps).
+- **Activity item** = one *sync attempt* **or** one *system incident* (a failure that occurs before a sync attempt can reasonably exist). Each has a **durable identity** (stable id) and record.
+- **Outcome** = an **authoritative lifecycle result, independent of event severity.** MVP outcomes: `running`, `succeeded`, `succeeded-with-warnings`, `blocked/failed`, `cancelled`, `skipped`, `incomplete/interrupted`. Determined by the finalization/exit state — **never** derived from "stderr exists" or "errorLog non-empty."
+- **Events** = ordered, structured facts recorded **under an attempt's identity**, each with an explicit `level` (`info`/`warn`/`error`), event name, fields, and optional detail block. Severity is *source-owned* (the code emitting the event knows it); the viewer never guesses except for legacy data.
+- **Problems lens** = the warn/error events + genuine failure diagnostics for an item, with provenance retained (exact duplicates grouped with a count — never string-deduped in a way that hides repeated failures).
 
-## Proposed shape (my recommendation — for Codex to challenge)
+### Identity is established BEFORE the first failure gate (invariant 1)
 
-**One persistent "Activity" view, available any time (not sync-gated), organized
-by run, that unifies the three error sources.**
+Every supported entry path creates or inherits the attempt/incident identity *before* anything that can fail:
 
-1. **Source-side severity.** Add `level=` to `SyncLogger` at the two chokepoints
-   (`event` → `info`/derived, `error` → `error`; add a `warn` path for
-   rate-limit/network/degraded). One-place change; the viewer just reads `level=`.
-   Keep a tiny viewer-side fallback so **legacy logs without `level=` still render**.
+- **Electron (manual / catch-up):** create the attempt **before** the dev/runtime guards (`main.js:1092-1106`). A guard block updates *that* attempt's outcome to `blocked` — it is a durable record, not a lost snapshot.
+- **Scheduled / CLI:** establish or inherit identity **before** Python's current early exits (unknown-model rejection, config/network aborts). Identity is passed down to Python (e.g. via env/arg).
+- **Python:** *adopts* an upstream identity when present; *creates* one only when none exists (direct CLI). Its structured events attach to that identity.
+- **Pre-attempt failures** (bootstrap/schedule/runtime problems with no sensible attempt) become durable **System incidents** — first-class Activity items, not attached to the nearest run.
 
-2. **Run-oriented navigation.** Left: a list of past runs (newest first), one row per
-   `sync-<ISO>.log`, each with a **summary chip** — time, trigger/channel, duration,
-   repos changed, **error/warn counts**, and an overall status dot (green/yellow/red).
-   Red is computed from *any* of: a `level=error` event, a non-empty `errorList`, **or**
-   a non-empty `errorLog` for that run — so a run can't look clean while hiding an error.
+## The record contract — versioned and stable (invariants 3, 6)
 
-3. **Run detail = three coherent lenses on the selected run:**
-   - **Events** (default) — parsed `sync-*.log` rows: time · level · event · k/v, with
-     the `error()` detail block expandable. Filter by level + free-text search.
-   - **Errors** — a focused roll-up: `level=error` events + `errorList` entries +
-     the `errorLog` text, deduped. *This is the lens that would have shown today's bug.*
-   - **Raw** — the run's raw stderr (`sync.error.log`), ANSI-stripped + **redacted**,
-     for low-level failures. (Advanced; may be v2.)
+A small **versioned** structured representation is the canonical store — written once, designed to be stable, so future producers join it *additively* (no second migration later):
 
-4. **Reuse the plumbing.** Same dark styling, preload, and IPC shape as the existing
-   `logWindow`. A tray item ("View Logs / Activity") available **when not syncing**
-   complements the sync-only "View Progress". Parsing + redaction live in **main**
-   (Node), renderer gets clean structured JSON — keeps secrets out of the renderer and
-   the parser unit-testable.
+- Append-only structured records (JSON-lines is the working assumption; final encoding TBD in spec) with: `schema_version`, `activity_id`, `kind` (sync|system), `channel`, `trigger`, `parent_id?`, full **ISO-8601 timestamps** (the current `[HH:MM:SS]`-only format is midnight-ambiguous), plus per-event `level`, `event`, `fields`, `detail`.
+- Attempt header/footer records carry `start`, `end`, `outcome`, `summary` (repos changed, error/warn counts).
+- **`SyncLogger` gains source-owned `level`** at its two chokepoints (`event`→info/derived, `error`→error, add a `warn` path for rate-limit/network/degraded) and writes the structured record under the attempt id. Its existing human-readable `sync-<ISO>.log` may remain for humans, but is **not** the machine contract.
 
-5. **Actions:** Refresh · Export (redacted `.txt` of the current filtered view) ·
-   Reveal-in-Finder · (later) Clear-old-logs with a mid-sync guard.
+**Legacy is read-only compatibility input (invariant 6).** Existing `sync-*.log` files (and the current `status.json`) are parsed best-effort by a **legacy adapter** and shown as older Activity items / System entries. We do **not** invent a second transitional canonical format.
 
-## Open decisions I most want Codex's take on
+## System section — an honest boundary, not a dumping ground (invariant 4)
 
-1. **Scope of surfaced data (the load-bearing one).** Is "Events + Errors roll-up +
-   Raw" the right set of lenses? Specifically: is folding `status.json.errorLog` and raw
-   `sync.error.log` into a per-run view the right move, or does that couple the viewer
-   too tightly to two volatile formats? Alternative: fix the *source* so every real
-   error also lands in `sync-*.log` (via `SyncLogger.error`) — then the viewer only needs
-   the event log. That's cleaner long-term but a bigger behavior change. **Which
-   direction?**
+A dedicated **System** area holds: (a) legacy/shared diagnostics that predate the contract, and (b) genuine pre-attempt failures. Uncorrelated messages live here honestly rather than being glued to an arbitrary run. New producers should emit under an attempt identity, not into System.
 
-2. **Level at source vs viewer.** Given `SyncLogger` already splits event/error, is
-   source-side `level=` clearly right, or is there value in keeping severity a pure
-   viewer concern (no log-format change, no migration)?
+## Redaction — a real, tested boundary (invariant 5)
 
-3. **Relationship to the existing "Sync Errors" window.** Subsume/replace it (it showed
-   empty while the real error was elsewhere — arguably a bug), or leave it and add this
-   alongside? Leaning subsume.
+The existing `redact()` (`menubar/runtime/hashing.js:32`) only masks `//user:pass@` in URLs — it does **not** cover API keys, bearer tokens, or env-var secrets. MVP needs a **purpose-built, unit-tested redaction module** covering the app's configured secret values (the real GitHub/Anthropic/Gemini/OpenAI keys) plus known credential forms. **Redact in main before IPC, and again on export.** Export is produced **in main** from a validated filter request — never from renderer-supplied text.
 
-4. **Window vs. tab, and run grouping.** Dedicated persistent "Activity" window, or a
-   "History" tab bolted onto the (sync-only) Progress window? And grouped-by-run
-   (proposed) vs. a merged cross-run timeline?
+## Retention — bounded, outcome-aware (invariant 5)
 
-5. **Where parsing/redaction live** — main-process (proposed, testable, secret-safe) vs
-   renderer.
+Replace the flat 10-file cap (`sync.py:44`, `_rotate_sync_logs` `:107-120`; ~2.5 days on a 6h schedule) with a **bounded age/size policy** over the durable store, with **failed/blocked attempts retained longer** than routine successes, so a Friday failure survives to Monday. Exact bounds set in spec.
 
-## Proposed MVP boundary (YAGNI)
+## UI + architecture
 
-**In:** source-side `level=` + viewer fallback; run list with status chips (severity
-computed across event log + `errorList` + `errorLog`); Events lens + Errors roll-up
-lens; search + level + time-window filters; redacted Export; tray entry when idle;
-parsing/redaction in main with unit tests.
-**Deferred:** Raw stderr lens; Clear-logs; group/merge toggle; per-run summary analytics;
-unifying live + historical into one timeline.
+- **Dedicated, context-isolated Activity window** — **not** the current `nodeIntegration:true` / `contextIsolation:false` window (`main.js:1519-1529`). Narrow preload + IPC, bounded payload/file sizes, ANSI/control-character handling, and **renderer inserts text (not HTML)**. Reuse only the visual language.
+- **Available any time, including during a sync** (invariant, corrects a Round-1 inconsistency) — the tray shows **both** "View Progress" (live) and "Activity" (history). It does not live-tail merely because it can be open.
+- **Attempt/incident list**, newest first, each row a chip: time · channel/trigger · duration · repos changed · **outcome** dot + error/warn counts. Grouped by attempt/incident (no merged cross-run timeline in MVP).
+- **Two lenses per item:** **Events** (structured rows; filter by level + free-text search; expandable detail) and **Problems** (warn/error roll-up with provenance). **Raw** stderr lens is deferred.
+- **Subsume the "Sync Errors" window.** Its "View Errors" affordance becomes a **deep-link into Activity** at the newest `blocked/failed` item's Problems lens — one error truth, not two.
+- **Pure, testable Node module** owns filesystem access, parsing, normalization, redaction, filtering-for-export, and path validation; `main` calls it and hands the renderer **bounded, already-redacted DTOs** over narrow IPC.
+
+## MVP boundary (Scope B)
+
+**In (the correctness floor — none of these deferred):** attempt/incident identity established before each entry path's first failure gate; authoritative outcome model; structured events under identity at every newly-touched boundary; System section for pre-attempt/legacy; real redaction module; bounded outcome-aware retention; context-isolated window; source-owned `level`; Events + Problems lenses; legacy `sync-*.log` adapter; the Node parse/redact module with unit tests.
+
+**Deferred (join the same stable contract later):** Raw stderr lens; clear-old-logs (with mid-sync guard); analytics/summary charts; merged cross-run timeline; exhaustive instrumentation of *every* internal producer.
 
 ## Non-goals
 
-Not a live tail (the Progress window is the live half). Not a general log platform. Not
-a port of the old viewer's JSON-lines assumptions or its two-fixed-file model.
+Not a live tail (the Progress window is the live half). Not a general log platform. Not a port of the old viewer's JSON-lines / two-fixed-file assumptions. Not a second canonical format that needs future migration.
+
+## Residual risks / to pin in the spec
+
+- Exact identity-propagation mechanism from Electron/dispatcher → Python (env vs arg), and how the LaunchAgent path carries it.
+- Final record encoding + `schema_version` semantics.
+- The precise secret-set the redaction module must cover and where it reads it from.
+- Concrete retention bounds (age/size, failed-vs-success).
+- Whether the legacy adapter reconstructs identity for old `sync-*.log` or lists them as opaque legacy items.
