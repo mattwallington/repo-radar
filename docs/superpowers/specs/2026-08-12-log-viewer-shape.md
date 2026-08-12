@@ -1,6 +1,6 @@
 # Activity History (formerly "Log Viewer") — design shape, Round 2
 
-**Status:** Shaping — Round 2 (paired with Codex). Scope **B** agreed.
+**Status:** Shaping — Round 3 (paired with Codex). Scope **B** agreed; architecture signed off, semantic tightenings applied.
 **Date:** 2026-08-12
 **Supersedes:** the framing in `2026-08-12-log-viewer-design.md` (that inventoried the *old* RepoRadar viewer; we are not porting it).
 **Scope decision (paired Round 2):** **B — a phased MVP that is a complete vertical slice of the durable model.** Not a temporary read-time file-fusion. Scope A (deep instrumentation of every producer) is reached later by *adding producers to the same stable contract*, never by re-designing storage or UI.
@@ -16,7 +16,7 @@ Unattended background syncs fail with no in-app way to see *what* happened or *w
 The canonical unit is an **Activity item**, not a log file.
 
 - **Activity item** = one *sync attempt* **or** one *system incident* (a failure that occurs before a sync attempt can reasonably exist). Each has a **durable identity** (stable id) and record.
-- **Outcome** = an **authoritative lifecycle result, independent of event severity.** MVP outcomes: `running`, `succeeded`, `succeeded-with-warnings`, `blocked/failed`, `cancelled`, `skipped`, `incomplete/interrupted`. Determined by the finalization/exit state — **never** derived from "stderr exists" or "errorLog non-empty."
+- **Outcome** = an **authoritative lifecycle result, independent of event severity.** MVP outcomes: `running`, `succeeded`, `succeeded-with-warnings`, `blocked/failed`, `cancelled`, `skipped`, `incomplete/interrupted`. Determined by the finalization/exit state — **never** derived from "stderr exists" or "errorLog non-empty." `succeeded-with-warnings` is an **explicit finalizer decision on defined adverse conditions** (e.g. degraded output, a repo skipped), not "any warn event happened."
 - **Events** = ordered, structured facts recorded **under an attempt's identity**, each with an explicit `level` (`info`/`warn`/`error`), event name, fields, and optional detail block. Severity is *source-owned* (the code emitting the event knows it); the viewer never guesses except for legacy data.
 - **Problems lens** = the warn/error events + genuine failure diagnostics for an item, with provenance retained (exact duplicates grouped with a count — never string-deduped in a way that hides repeated failures).
 
@@ -35,9 +35,13 @@ A small **versioned** structured representation is the canonical store — writt
 
 - Append-only structured records (JSON-lines is the working assumption; final encoding TBD in spec) with: `schema_version`, `activity_id`, `kind` (sync|system), `channel`, `trigger`, `parent_id?`, full **ISO-8601 timestamps** (the current `[HH:MM:SS]`-only format is midnight-ambiguous), plus per-event `level`, `event`, `fields`, `detail`.
 - Attempt header/footer records carry `start`, `end`, `outcome`, `summary` (repos changed, error/warn counts).
-- **`SyncLogger` gains source-owned `level`** at its two chokepoints (`event`→info/derived, `error`→error, add a `warn` path for rate-limit/network/degraded) and writes the structured record under the attempt id. Its existing human-readable `sync-<ISO>.log` may remain for humans, but is **not** the machine contract.
+- **`SyncLogger` gains source-owned `level`** at its two chokepoints, assigned **by rule, not by category**: ordinary retry / wait / recovery — including transient rate-limiting and network waiting — is `info`; degraded-but-completed behavior is `warn`; exhausted retry, timeout, or abort is `error`. (`event`→info by default, `error`→error.) It writes the structured record under the attempt id. Its existing human-readable `sync-<ISO>.log` may remain for humans, but is **not** the machine contract.
 
-**Legacy is read-only compatibility input (invariant 6).** Existing `sync-*.log` files (and the current `status.json`) are parsed best-effort by a **legacy adapter** and shown as older Activity items / System entries. We do **not** invent a second transitional canonical format.
+**Legacy is read-only compatibility input (invariant 6), with a strict correlation rule so misattribution can't sneak back in:**
+- A legacy `sync-<ISO>.log` may appear as an **opaque legacy attempt** — each file gives a genuine run boundary.
+- Legacy `status.json` and shared streams appear **only as explicitly uncorrelated "latest diagnostics" in System** — never as standalone Activity items.
+- They may **supplement** an Activity item **only** when an explicit durable `activity_id` proves the match. **Never** infer identity for identity-less `status.json` data by time proximity.
+- We do **not** invent a second transitional canonical format.
 
 ## System section — an honest boundary, not a dumping ground (invariant 4)
 
@@ -57,7 +61,7 @@ Replace the flat 10-file cap (`sync.py:44`, `_rotate_sync_logs` `:107-120`; ~2.5
 - **Available any time, including during a sync** (invariant, corrects a Round-1 inconsistency) — the tray shows **both** "View Progress" (live) and "Activity" (history). It does not live-tail merely because it can be open.
 - **Attempt/incident list**, newest first, each row a chip: time · channel/trigger · duration · repos changed · **outcome** dot + error/warn counts. Grouped by attempt/incident (no merged cross-run timeline in MVP).
 - **Two lenses per item:** **Events** (structured rows; filter by level + free-text search; expandable detail) and **Problems** (warn/error roll-up with provenance). **Raw** stderr lens is deferred.
-- **Subsume the "Sync Errors" window.** Its "View Errors" affordance becomes a **deep-link into Activity** at the newest `blocked/failed` item's Problems lens — one error truth, not two.
+- **Subsume the "Sync Errors" window.** Its "View Errors" affordance appears **only when a problem-bearing Activity item exists**, and deep-links to the **newest item carrying Problems or a failure-like outcome** — `blocked/failed`, `incomplete/interrupted`, `succeeded-with-warnings`, **or a first-class System incident**. One error truth, and never an empty view under a new name.
 - **Pure, testable Node module** owns filesystem access, parsing, normalization, redaction, filtering-for-export, and path validation; `main` calls it and hands the renderer **bounded, already-redacted DTOs** over narrow IPC.
 
 ## MVP boundary (Scope B)
@@ -77,3 +81,7 @@ Not a live tail (the Progress window is the live half). Not a general log platfo
 - The precise secret-set the redaction module must cover and where it reads it from.
 - Concrete retention bounds (age/size, failed-vs-success).
 - Whether the legacy adapter reconstructs identity for old `sync-*.log` or lists them as opaque legacy items.
+- **Abnormal-termination recovery:** an attempt with a start record but no terminal record must not stay `running` forever. Specify a crash-safe reconciliation that converts *provably abandoned* attempts to `incomplete/interrupted` **without** misclassifying a still-live process.
+- **Multi-process storage integrity:** Electron, the dispatcher, and Python may all touch the same activity. Pin writer ownership, locking/atomicity, truncated-tail recovery, event ordering, and duplicate-finalization behavior.
+- **At-rest security + bounds:** owner-only directory/files, bounded field/detail sizes, and a rule for whether source writes are redacted or raw-but-owner-only *before* the mandatory read/export redaction boundary.
+- **Observability failure behavior:** decide whether a failure to create/update Activity history is best-effort or blocks execution — it must **not** accidentally change sync semantics.
