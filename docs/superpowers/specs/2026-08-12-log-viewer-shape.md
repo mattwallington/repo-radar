@@ -1,4 +1,4 @@
-# Activity History (formerly "Log Viewer") — design shape, Round 2
+# Activity History (formerly "Log Viewer") — design shape, Round 3 (APPROVED)
 
 **Status:** Shaping — Round 3 (paired with Codex). Scope **B** agreed; architecture signed off, semantic tightenings applied.
 **Date:** 2026-08-12
