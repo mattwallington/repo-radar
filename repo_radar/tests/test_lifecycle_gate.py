@@ -1,6 +1,7 @@
 import json, subprocess, sys, datetime, tempfile, os
 from pathlib import Path
 from repo_radar import llm
+from repo_radar import model_catalog
 from scripts import check_model_lifecycle as gate
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,8 +26,8 @@ def test_real_manifest_exact_set_and_passes_at_release():
     rows = json.loads(MANIFEST.read_text())
     ids = [r["id"] for r in rows]
     assert len(ids) == len(set(ids)), "duplicate ids in manifest"
-    assert set(ids) == set(llm.KNOWN_LIMITS) | set(llm.MODEL_MIGRATIONS)
-    assert gate.check(str(MANIFEST), set(llm.KNOWN_LIMITS), set(llm.MODEL_MIGRATIONS), RELEASE) == []
+    assert set(ids) == set(model_catalog.MODEL_CAPS) | set(llm.MODEL_MIGRATIONS)
+    assert gate.check(str(MANIFEST), set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), RELEASE) == []
 
 def test_happy_row_passes():
     assert _run(

@@ -4,6 +4,26 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+On the **dev channel** (Repo Radar Dev) for testing before the next stable release.
+
+### Changed
+- **Authoritative token counting for Claude.** Metadata generation now preflights each prompt through Anthropic's Count-Tokens endpoint and accepts, splits, or (for a single oversized item) trims it against the model's *real* window — replacing the conservative multiplier added in 1.0.29. When an authoritative count isn't available (non-Anthropic models, provider errors, or transient failures) it falls back to the existing safe behaviour, so it is never less safe than before, and a batch that still can't fit is only ever split further — never silently merged past what fits. A repository that genuinely cannot be summarised is recorded as a visible `degraded` entry instead of failing quietly.
+
+### Added
+- **Model capability catalog.** Every model's context / input / output window and token-counting strategy now live in one explicit place, with a 1% acceptance-budget headroom, so budget decisions no longer depend on scattered constants.
+- **Release-time model-window gate.** `release.sh` now fails the release closed if a catalog window value drifts above what litellm reports, unless a vendor-verified, freshness-bounded override justifies the difference — so a stale or wrong window cannot ship.
+
+## [1.0.29] - 2026-08-07
+
+### Fixed
+- **Claude prompts overflowing the context window.** litellm bundles a single Claude tokenizer that undercounts Claude 4.7-and-later by roughly 1.6×, so a large repository's metadata prompt could pass the local budget check and then be rejected by the API (observed: a ~745K local count the server actually counted as ~1.19M against a 1M limit). Claude 4.7+ is now budgeted conservatively, chunk prompts are measured against the real assembled prompt rather than the bare text, and split remainders are merged forward instead of spawning tiny extra paid calls.
+- **GPT-5.4 mini / nano input limits.** `gpt-5.4-mini` and `gpt-5.4-nano` were recorded with a 1,050,000-token input window; corrected to their real 272,000 so chunking sizes prompts against the true limit.
+
+### Changed
+- **Retired Claude Opus 4.1** (vendor shutdown 2026-08-05). A saved `claude-opus-4-1` selection now migrates to Claude Opus 4.8.
+
 ## [1.0.28] - 2026-07-30
 
 ### Fixed
