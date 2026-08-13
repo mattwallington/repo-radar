@@ -1,6 +1,6 @@
 # Activity History — concrete spec
 
-**Status:** Spec — decision review (paired, rev 2). Scope **B**, full vertical MVP through the Activity window.
+**Status:** Spec — decision review (paired, rev 3). Scope **B**, full vertical MVP through the Activity window.
 **Date:** 2026-08-12
 **Builds on (approved):** `2026-08-12-log-viewer-shape.md` @ `4972b4e`. Resolves the deferred decisions per paired Rounds 3–5.
 
@@ -26,11 +26,11 @@ Producers (Electron main, the shell dispatcher, Python) append structured record
 
 - **Transport:** env var `REPO_RADAR_ACTIVITY_ID` = a fresh UUIDv4 **per invocation**, never persisted in the LaunchAgent plist environment.
 - **Validation:** before any producer uses an id in a filesystem path it MUST match the UUIDv4 regex `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`. Invalid/absent → the producer **mints** a fresh one (never trusts arbitrary text in a path).
-- **Exactly one `start` per attempt,** written by the **first** producer on the path:
-  - **Electron manual/catch-up:** mints the id + writes `start` **before** `currentSyncProcess` spawn and the dev/runtime guard (`menubar/main.js:1080-1106`); sets it in the child env. A guard block → Electron finalizes `blocked` directly (it is synchronously alive, no lease exists yet). A sync already running → `skipped`.
-  - **Scheduled (LaunchAgent):** the dispatcher mints the id + writes `start` **before** its root lock (`menubar/runtime/dispatchers.js:85-87`).
-  - **Direct CLI:** Python mints + writes `start` in `repo_radar/cli.py` **before dependency checking** (`cli.py:37-41` can exit first).
-- **Adopt vs mint:** a producer that receives a valid inherited id **adopts** it and does **not** write a second `start`; it may write an `ownership` record (below). The dispatcher launched by Electron adopts Electron's id; the dispatcher launched by the LaunchAgent mints.
+- **Lease before `start` (race-free):** on every path the first producer **acquires the activity lease (§5) before making `start` visible**, then writes `start` under the held lock. A visible `start` therefore always corresponds to a **held** lock (alive) or a **released** lock (finished or dead) — never a "start with no lock yet" window that reconciliation could misread as abandoned.
+  - **Electron manual/catch-up:** mints the id, **acquires the lock**, writes `start`, and runs the dev/runtime guards synchronously **while holding it** (`menubar/main.js:1080-1106`). A guard block → Electron writes the `blocked` terminal and releases. A sync already running → `skipped`. Otherwise Electron passes the **locked descriptor** to the spawned dispatcher (fd inheritance) and closes its own copy after handoff.
+  - **Scheduled (LaunchAgent):** the dispatcher mints the id, **acquires the lock**, then writes `start`, before its root lock (`menubar/runtime/dispatchers.js:85-87`).
+  - **Direct CLI:** Python mints the id, **acquires the lock**, then writes `start`, in `repo_radar/cli.py` **before dependency checking** (`cli.py:37-41` can exit first).
+- **Adopt vs mint:** a producer that receives a valid inherited id + inherited lock **adopts** them, does **not** write a second `start`, and writes an `ownership` record. The dispatcher launched by Electron adopts Electron's id + locked descriptor (carried by `exec`, §5); the dispatcher launched by the LaunchAgent mints and acquires.
 - **Kind:** `sync` (an attempt) or `system` (a failure with no sensible attempt).
 
 ## 2. Storage layout, record contract, schema versioning
@@ -42,9 +42,10 @@ Producers (Electron main, the shell dispatcher, Python) append structured record
   - `start` — `kind`, `channel`, `trigger`, `parent_id?`, `created_by` (producer).
   - `ownership` — written when a process **acquires** the execution lease: `owner_token` (an 8-hex token identifying the lease holder), `producer`, and corroborating fingerprint `pid`, `boot_id`, `proc_birth`. Evidence only; the held lock (§5), not this record, proves liveness.
   - `event` — `level` (`info`|`warn`|`error`), `event` (name), `fields` (flat map), `detail?` (string).
+  - `control` — a machine-exact control signal: `name` (e.g. `cancel_requested`) + optional bounded `fields`. **Reserve-eligible** (§7): writable even when ordinary capacity is exhausted, so cancellation is never lost precisely when it decides `cancelled` vs `interrupted`.
   - `terminal` — `outcome` (§3), `summary` (repos changed, error/warn counts), `by` (`owner_token` or `reconciler`).
-  - `integrity` — a machine-detected inconsistency surfaced as a Problem (conflicting terminals, interior corruption, unsupported schema).
-- **Ordering:** merge all segments for an id by `(ts, writer_id, seq)` — timestamps alone cannot order across processes.
+  - `integrity` — a machine-detected inconsistency surfaced as a Problem (conflicting terminals, interior corruption, unsupported schema, dropped-events truncation).
+- **Ordering:** each segment's `seq` is validated strictly increasing and its records are kept **in that append order**; the reader does a deterministic **k-way merge of segment heads by `(ts, writer_id)`**. Cross-writer order is wall-clock-based, but append order **within** a writer can never reverse — even if the wall clock steps backward (which a global `(ts, writer_id, seq)` sort would allow).
 - **Schema versioning:** a v1 reader accepts v1 records and ignores unknown **additive** fields. A record whose `schema_version` is **unsupported** is **never** interpreted as v1 — it yields a bounded System `unsupported-schema` integrity Problem, while all other readable records in the activity remain available.
 
 ## 3. Severity + outcome
@@ -62,17 +63,20 @@ Producers (Electron main, the shell dispatcher, Python) append structured record
 
 ## 5. Lifecycle ownership + lease (crash correctness — foundation)
 
-The lease is a **held advisory lock**, not a record. Liveness is proven by probing it.
+The lease is a **held advisory lock** acquired **before `start` is visible** (§1), so "start exists" always implies a live-or-released lock — never a not-yet-locked window. Liveness is proven by probing the lock, not by PID.
 
-- **Mechanism:** `flock`/`lockf` on `activity/<activity-id>/owner.lock`. The owning process holds it; because `exec` preserves open file descriptors, the lock **survives** the dispatcher→Python `exec` (`dispatchers.js:109`) — the same process keeps holding it. Released explicitly on clean finish, and by the OS on process death.
-- **Who holds it:** the process that **executes the sync** — the dispatcher (which `exec`s Python, so dispatcher-then-Python is one process holding one lock), or Python directly (direct CLI). **Electron never holds the execution lease**: it owns only the synchronous pre-spawn window and finalizes guard blocks (`blocked`/`skipped`) itself. On acquiring the lock, the holder writes an `ownership` record (owner_token + fingerprint).
-- **Handoff:** the only handoff is Electron (pre-spawn, no lock) → the spawned dispatcher acquiring the lock. There is exactly one lease-holding process per executed attempt; no dispatcher→Python re-transfer (same process via `exec`).
-- **Reconciliation** (reader at open + opportunistically at sync start), for an attempt in `running` with no `terminal`:
-  - **Probe the lock non-blocking.** If it **cannot** be acquired → owner alive → leave `running`.
-  - If it **can** be acquired (or `owner.lock` was never created) → owner is provably gone → synthesize a `terminal` by the `reconciler`: `cancelled` if a `cancel_requested` marker was persisted for this attempt, else `interrupted`.
-  - If liveness is genuinely **uncertain** (probe error), leave `running` and raise a System integrity warning — never guess a dead owner.
-  - `pid`/`boot_id`/`proc_birth` are corroborating diagnostics only.
-- **Cancellation ordering fix:** Electron MUST persist `cancel_requested` for the attempt **before** sending SIGTERM. Current order is racy (signals at `main.js:2135-2138`, records cancellation at `:2178-2184`). After the fix the reconciler maps dead-owner + `cancel_requested` → `cancelled`.
+- **Lock family — pinned to BSD `flock` semantics on macOS:** an exclusive advisory lock on `activity/<activity-id>/owner.lock`.
+  - **Python:** `fcntl.flock(fd, LOCK_EX|LOCK_NB)`, the fd held for the process lifetime.
+  - **Shell/Node:** `/usr/bin/lockf` in descriptor mode. Node opens the descriptor and runs `/usr/bin/lockf -t 0 <fd>`, then **retains the lock by keeping that descriptor open** until it deliberately closes it (verified: an external probe returns exit 75 until the descriptor is closed).
+- **Acquire → hold → hand off → release** — exactly one lease-holding process at a time:
+  - **Electron** acquires the lock, writes `start`, holds it across the synchronous guards, then either finalizes+releases (guard block/contention) or **passes the locked descriptor to the spawned dispatcher via fd inheritance** — writing the fd number in the child env and closing its own copy **after** the dispatcher confirms hold (the lock persists while any inheriting fd is open).
+  - **The dispatcher** inherits that descriptor (or, when scheduled, acquires its own), writes an `ownership` record, and `exec`s Python (`dispatchers.js:109`); the descriptor survives `exec`, so the same held lock passes into Python — no dispatcher→Python re-acquire.
+  - **Python** (executing owner) holds the inherited lock (or acquires its own on direct CLI) and **releases it only after its `terminal` is durably appended**.
+- **Reconciliation** (reader at open + opportunistically at sync start), for an attempt in `running` with no `terminal`: **acquire the lock non-blocking.**
+  - Cannot acquire → owner alive → leave `running`.
+  - Acquired (or `owner.lock` was never created) → owner provably gone → the `reconciler` **retains the lock**, synthesizes a `terminal` — `cancelled` if a `control{cancel_requested}` record exists for the attempt, else `interrupted` — and releases the lock **only after that terminal is durably appended**, so two concurrent readers cannot double-reconcile.
+  - Probe error / genuinely uncertain → leave `running` + a System integrity warning; never guess a dead owner. `pid`/`boot_id`/`proc_birth` are corroborating only.
+- **Cancellation ordering fix:** Electron MUST append the `control{cancel_requested}` record **before** sending SIGTERM (currently racy: signals `main.js:2135-2138`, records cancellation `:2178-2184`).
 
 ## 6. Finalization authority + integrity
 
@@ -84,9 +88,9 @@ The lease is a **held advisory lock**, not a record. Liveness is proven by probi
 ## 7. Retention + at-rest bounds
 
 - **Age policy:** a routine (non-problem) terminal item is prunable only when older than **14 days AND** outside the newest **50**; a problem-bearing item only when older than **90 days AND** outside the newest **50**. Never prune `running` or unreconciled items.
-- **Global ceiling 64 MiB** over `activity/`. Under pressure prune: oldest routine terminal → other terminal non-failures → old failures; always preserve the newest problem item. **If every candidate is `running`/unreconciled** (nothing prunable), do NOT violate no-prune-live: **refuse further best-effort Activity writes** with the single non-recursive warning until reconciliation frees space. Small concurrent-writer overshoot is permitted but bounded and corrected at the next prune.
+- **Global ceiling 64 MiB** over `activity/`, with a **128 KiB global reserve**: *ordinary* writes (a new `start` or `event`) stop at **64 MiB − 128 KiB**, but bounded **`control` / `terminal` / `integrity`** writes from an active attempt are **always permitted** into the reserve, so finalization can never deadlock. Under pressure prune in order: oldest routine terminal → other terminal non-failures → old failures; always preserve the newest problem item. **The hard ceiling OVERRIDES the 14/90-day and newest-50 preferences when necessary** (pruning younger terminal items if required) — **except** that `running`/unreconciled items are never pruned and the newest problem is preserved. If nothing is prunable, refuse only new ordinary starts/events (single non-recursive warning); the active attempt still finalizes via the reserve. The global reserve absorbs concurrent-writer terminals/controls, so there is **no unbounded overshoot**.
 - **Per-record bounds:** flat primitive `fields` only, ≤32 keys; key ≤64 B; each value ≤1 KiB; aggregate `fields` ≤8 KiB; `detail` ≤8 KiB; encoded record ≤20 KiB.
-- **Per-activity cap 4 MiB, with a reserved terminal headroom of 40 KiB** (≥ two 20 KiB records). Once *ordinary* capacity (4 MiB − 40 KiB) is reached, producers **stop writing `event` records** but MUST still be able to write the authoritative `terminal` and any `integrity` record into the reserved headroom (a dropped-events integrity note records the truncation).
+- **Per-activity cap 4 MiB with a reserved 60 KiB headroom** (≥ three 20 KiB records: one `control{cancel_requested}`, one dropped-events `integrity`, one `terminal`). Once *ordinary* capacity (4 MiB − 60 KiB) is reached, producers **stop writing `event` records** but MUST still write `control`, the authoritative `terminal`, and `integrity` into the reserve (a dropped-events integrity note marks the truncation).
 - **Legacy `_rotate_sync_logs` (10 files) stays independent** of Activity retention.
 - Validate activity/writer ids; reject unsafe file types/symlinks; create permissions securely.
 
@@ -118,7 +122,8 @@ Phases 1–3 are green review checkpoints but **not releasable** — the feature
 
 - Python: identity adopt/mint + validation; record writing + bounds/truncation + reserved-headroom terminal; severity rule; write-time redaction (shared fixtures); best-effort failure.
 - Node: parse/truncation; merge ordering; **reconciliation — held-lock⇒running, released-lock⇒interrupted, released-lock+cancel_requested⇒cancelled, conflicting terminals⇒integrity+interrupted**; read-time redaction (shared fixtures); retention (age + 64 MiB ceiling + prune order + all-live refusal); schema-version handling; DTO bounds.
-- Cross-process integration (macOS): a real attempt (env id → dispatcher lock → `exec` Python holds it → clean terminal → lock released) and a simulated crash (start + `ownership`, killed before terminal → reader acquires the freed lock → `interrupted`). **This proves the advisory lease survives `exec` and reconciliation is deterministic.**
+- Reserve/cap: at ordinary-capacity exhaustion a `control{cancel_requested}` and the authoritative `terminal` still write into the 60 KiB reserve (cancellation is not lost); the k-way merge preserves per-writer append order under a backwards wall-clock step.
+- Cross-process integration (macOS): a real attempt (Electron acquires the lock → **passes the locked fd to the spawned dispatcher (fd inheritance) → `exec` Python holds it** → clean terminal → lock released) and a simulated crash (lock acquired, `start`+`ownership` written, process killed before terminal → reader acquires the freed lock → `interrupted`; a `control{cancel_requested}` before kill → `cancelled`). **This proves the advisory lease survives spawn-inheritance and `exec`, and reconciliation is deterministic.**
 - Redaction parity: the shared fixtures assert Python and Node mask identically.
 
 ## Non-goals
