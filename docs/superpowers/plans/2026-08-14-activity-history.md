@@ -16,6 +16,7 @@ Every task's requirements implicitly include this section. Values are copied ver
 
 - **Best-effort observability — never changes sync semantics.** A failed Activity write emits exactly ONE non-recursive warning to the producer's existing stderr/log, then continues. Never route an Activity-write failure through the failing Activity writer. Admission failure releases the lease and skips recording; the sync proceeds unchanged.
 - **Redaction is defense-in-depth.** Redact at WRITE time (producer) AND again in Node before any IPC/export. High-confidence credential forms, masked identically by both: `sk-…`, `ghp_…` / `github_pat_…`, `AIza…`, `Bearer …`, `//user:pass@`, plus the app's configured/effective secret values. One shared (secret, expected-mask) fixture set exercised by BOTH redactors. Shell producers emit only fixed reason codes + bounded messages, never environment dumps.
+- **Configured-secret source + propagation (Round-3 #4) — the API must be WIRED, not just present.** The effective secret set = the GitHub token + Anthropic/Gemini/OpenAI API keys held in the app config. **Python** sources them from `repo_radar.config.load_config()` and passes them to `ActivityWriter(configured_secrets=...)` in `cli.py` and `sync_mode` (Tasks 2.5/2.6). **Electron** sources them from its `config.json` loader and passes them to the Node write-side `ActivityWriter` (Task 2.3) **and** to the Node read / System-diagnostics / IPC / export `Redactor` (Tasks 3.4/3.6/4.1/4.3). Each entry path carries a test using a **non-pattern-matching** configured secret value (e.g. a plain high-entropy string), proving the wiring — not merely the regex algorithm.
 - **No new runtime dependency.** Node + Python **stdlib** only for the record layer; existing Electron stack for UI.
 - **Schema:** `schema_version` = **1**. A v1 reader accepts v1 records and ignores unknown *additive* fields; an *unsupported* version is never interpreted as v1 — it yields a bounded System `unsupported-schema` integrity Problem while other readable records remain available.
 - **All size limits count UTF-8 bytes and mark truncation explicitly.**
@@ -33,7 +34,12 @@ Every task's requirements implicitly include this section. Values are copied ver
 The spec is a contract; these are the concrete engineering choices this plan commits to. They are the highest-value things for the reviewer to scrutinize.
 
 1. **The writer + lease + admission layer is implemented in BOTH Python and Node — by necessity, not choice.** Electron (Node) must acquire and *hold* the lease across its own dev/runtime guards and then hand the locked fd to the child it spawns (`main.js` → `runtime.runSync` → `/bin/sh` → `exec` python); it cannot delegate acquisition to a child, because the child cannot pass a held fd *back up* to the parent. So `repo_radar/activity/` (Python) and `menubar/activity/` (Node, write side) both implement mint/acquire/admit/`start`/guard-`terminal`/handoff. Two cross-language tests keep them in lockstep: a **golden-record byte-equality** test and a **lock-interop** test (a lock taken by one language is seen busy by the other). The reader/reconciler/retention is **Node-only**.
-2. **The POSIX-sh dispatcher stays thin — it never reimplements records/lease/quota.** The shell mints `activity_id`+`owner_token` and **acquires+holds** the `owner.lock` fd (same pattern as the existing root `.exec.lock` on fd 9). It then invokes the managed venv Python's bootstrap entrypoint (`python -m repo_radar.activity.bootstrap`) **before** the runtime-verify guard; the bootstrap, seeing an inherited lease but **no existing `start` in the segments**, does `admit` + writes the single `start` + initial `ownership` (the scheduled path's "first producer" case). That interpreter can still *execute* even when the fingerprint guard will later *reject* it (the motivating failure: a Homebrew python bump staled the fingerprint but python still ran). On a subsequent guard failure the shell calls `python -m repo_radar.activity.finalize` to write the `blocked` terminal + `settle` + release. **If the venv Python cannot execute at all** (rare hard corruption), the shell writes a bounded, redacted line to the **System diagnostic stream** (`sync.error.log`) — it does **NOT** append an un-quota'd Activity segment line (Round-1 finding 1). Root-lock contention finalizes the attempt `skipped` (finding 5).
+2. **The POSIX-sh dispatcher stays thin — it never reimplements records/lease/quota.**
+   - **Scheduled path:** the shell mints `activity_id`+`owner_token`, **acquires+holds** the `owner.lock` fd (same pattern as the root `.exec.lock` on fd 9), then invokes `python -m repo_radar.activity.bootstrap` **before** the runtime-verify guard; bootstrap (no existing `start` → first producer) does `admit` + writes the single `start` + initial `ownership`. That interpreter still *executes* even when the fingerprint guard will later *reject* it (the motivating failure).
+   - **Manual path (id inherited from Electron):** the shell does **not** mint or bootstrap — it carries Electron's fd (→ child fd 4) and `exec`s python, whose executing owner **adopts** the lease and writes the handoff `ownership` (Electron's ack).
+   - **A bootstrap that fails to adopt exits non-zero and writes nothing (no false ack) but does NOT abort the sync** — observability is best-effort; the lease is held by the shell/exec'd fd and the reconciler finalizes.
+   - On a dev/verify guard failure the shell calls `python -m repo_radar.activity.finalize` (`blocked` + settle + release). **Root-lock contention finalizes `skipped` with exactly one authority** — the dispatcher on the scheduled path, Electron on the manual path (Round-3 #2).
+   - **If the venv Python cannot execute at all** (rare hard corruption), the shell writes ONE bounded, redacted line to the **System diagnostic stream** (`sync.error.log`) — never an un-quota'd Activity segment (Round-1 #1).
 3. **~~sh-friendly `key=value` ledger~~ — REJECTED (Round-1 finding 1).** The ledger stays **JSON** `activity/quota/<activity-id>.json` exactly as the spec pins it (the thin shell never reads the ledger — only Python/Node do — so there is no shell-simplicity justification). **There is no `has_start` field**: making it authoritative reintroduced the reserve-before-`start` undercount race the spec closed (a crash between the durable `start` and a `mark_started` call would look abandoned). **Lifecycle state (`start` present? `terminal` present?) is derived from a bounded scan of the activity's segments under `quota.lock`**, and reclamation stays lease-gated per spec §5/§7.
 4. **A `test` script is added to `menubar/package.json`** (`"test": "node --test"`) — none exists today, though 18 `node:test` files already do. Python keeps `python -m pytest repo_radar/tests/`. (Reviewer baseline `cd menubar && node --test` passed.)
 5. **Shared redaction fixtures are test-only, not bundled.** They live at `repo_radar/tests/data/redaction_fixtures.json` (the packaging `extraResources` excludes `**/tests/**`, so nothing ships); `load_fixtures()` is a **test helper**, not part of production `redact.py`. The Python suite reads the file directly; the Node suite reads it via `../../repo_radar/tests/data/redaction_fixtures.json`. Fixtures include **configured-secret** cases (not only credential-form regexes) so both redactors' secret-value masking is proven identical (spec §4).
@@ -53,6 +59,34 @@ The spec is a contract; these are the concrete engineering choices this plan com
 | 9 | Compressed destructive/security/UI tasks | Tasks 3.5 (full retention matrix), 3.6/4.1 (concrete byte limits), 4.1 (dedicated Activity preload + security-options/allowlist tests), 4.2 (innerHTML source-prohibition + DOM adapter test), 4.3 (bounded/redacted `status.json` errorLog/errorList in System), 5.1 (legacy diagnostics into System) |
 
 Decision dispositions from the reviewer: #1 accepted (contingent on conformance tests + corrected handoff — done); #2 accepted (scheduled first-producer + System fallback corrected); **#3 rejected → reverted**; #4 accepted; #5 accepted (fixtures now test-only + configured-secret cases).
+
+## Plan-review Round 2 dispositions (all accepted, plan rev 3 @ `fe5289c`)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | quota not the real crash-recoverable machine | `reconcile.py` `synthesize_terminal`; `admit` reconciles before charging; parsed top-level types; lock-safe `prune`; concurrent-admission test |
+| 2 | cross-writer reserve slots | slot check under the writer mutex + exclusive cancellation authority (only the minter) |
+| 3 | never-raises init/finalization | inactive-on-failure writer; independent settle+release |
+| 4 | negative handoff | bootstrap non-zero + no false ack; Electron never unlocks under a live child |
+| 5 | Task 2.7 forward dep | crash case uses the Phase-1 Python reconciler |
+| 6 | fs hardening + lock path | fd-based fchmod + repair; `activity/quota.lock` |
+| 7 | record conformance | enum validation; nested redaction; `boot_id`/`proc_birth` |
+| 8 | reader/UI/stale contracts | tri-state probe; System limits; `{available,incomplete}`; stale docs removed |
+
+## Plan-review Round 3 dispositions (all accepted, this revision)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | façade can still unlock/leak/throw | adopted-cleanup = drop-only; all payload build inside `_emit`; independent settle+release proven FREE; idempotent `start` + `terminal` ensures one start |
+| 2 | double terminal on manual root contention | exactly one authority (Electron manual / dispatcher scheduled); `onContention` no double release |
+| 3 | ack timeout kills a healthy sync | post-spawn Electron never kills + never terminals; drop descriptor + reconcile; sync always completes |
+| 4 | configured-secret redaction not wired | source (`load_config` / `config.json`) + propagation pinned into every entry path + non-pattern secret tests |
+| 5 | Task 2.2 commit omits `reconcile.js` | added to the boundary |
+| 6 | lifecycle parsing / quota cleanup | shared `records.parse_valid` (v1 + activity_id + required fields); ledger full-invariant validation; prune removes `owner.lock` + whole dir |
+| 7 | not descriptor-relative | `dir_fd`+`O_NOFOLLOW` component walk; repair owned tree only; intermediate-symlink test |
+| 8 | numeric canonicalization | integral floats → int; non-finite rejected both languages; golden numeric case |
+| 9 | reader/UI result contracts | reconcile returns problems + duplicate counts; missing-dir = empty-available; literal search accepts metachars; three-state renderer assertions; get/reveal path-safety tests |
+| 10 | consistency/audit | this disposition record; Decision 2 reconciled with Task 2.4 |
 
 ---
 
@@ -314,6 +348,14 @@ def test_secure_mkdir_rejects_symlinked_ancestor(tmp_path):
     with pytest.raises(paths.UnsafePath):
         paths.secure_mkdir(base / "activity" / VALID)
 
+def test_secure_mkdir_rejects_intermediate_symlink(tmp_path):
+    # a symlink at an INTERMEDIATE owned component (activity/), not only the final one (Round-3 #7)
+    victim = tmp_path / "victim"; victim.mkdir()
+    prefix = tmp_path / "Library" / "Logs" / "repo-radar"; prefix.mkdir(parents=True)
+    os.symlink(victim, prefix / "activity")             # 'activity' is a symlink
+    with pytest.raises(paths.UnsafePath):
+        paths.secure_mkdir(prefix / "activity" / VALID)
+
 def test_secure_mkdir_repairs_overpermissive_existing_dir(tmp_path):
     d = paths.activity_dir(tmp_path, VALID)
     d.parent.mkdir(parents=True); os.mkdir(d, 0o777)    # pre-existing world-writable
@@ -372,33 +414,52 @@ def ledger_entry_path(home, activity_id) -> Path:
         raise UnsafePath(f"invalid activity_id: {activity_id!r}")
     return quota_dir(home) / f"{activity_id}.json"
 
+def _owned_prefix(path):
+    """The shared `~/Library/Logs/repo-radar` prefix (created best-effort, NOT repaired — it is
+    shared, not subsystem-owned). Everything at/below `activity/` is the owned subtree."""
+    for anc in [path, *path.parents]:
+        if anc.name == "repo-radar" and anc.parent.name == "Logs":
+            return anc
+    return path.parent                            # unusual layout -> treat parent as the prefix
+
 def secure_mkdir(path, mode=0o700) -> None:
-    """Create path + missing ancestors, refusing any symlinked component and REPAIRING an
-    over-permissive existing dir — operating on an O_NOFOLLOW dir FD, not a pathname, so a
-    symlink cannot be swapped in between the check and the chmod (finding 6)."""
-    path = Path(path); chain = []; cur = path
-    while not cur.exists():
-        chain.append(cur); cur = cur.parent       # cur = deepest existing ancestor
-    for p in [cur] + list(reversed(chain)):
-        if p in chain:
+    """Descriptor-relative creation of the OWNED subtree (activity/ and below): each component
+    is created + opened with `dir_fd` + `O_NOFOLLOW`, so an INTERMEDIATE symlink (not just the
+    final one) cannot redirect us, and `fchmod`-repair touches ONLY owned components — never the
+    shared prefix (Round-3 #7)."""
+    path = Path(path)
+    prefix = _owned_prefix(path)
+    os.makedirs(prefix, mode=0o700, exist_ok=True)             # shared prefix: create, no repair
+    try:
+        dir_fd = os.open(prefix, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except OSError as e:                                        # prefix itself is a symlink/non-dir
+        raise UnsafePath(f"unsafe prefix {prefix}: {e}")
+    try:
+        for name in path.relative_to(prefix).parts:            # owned components, one at a time
             try:
-                os.mkdir(p, mode)                 # atomic create with final mode
+                os.mkdir(name, mode, dir_fd=dir_fd)
             except FileExistsError:
                 pass
-        try:                                      # open the component itself, never following a link
-            dfd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
-        except OSError as e:                       # ELOOP (symlink) / ENOTDIR (non-dir)
-            raise UnsafePath(f"unsafe component {p}: {e}")
-        try:
-            if stat.S_IMODE(os.fstat(dfd).st_mode) != mode:
-                os.fchmod(dfd, mode)              # repair an over-permissive existing dir
-        finally:
-            os.close(dfd)
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dir_fd)
+            except OSError as e:                                # ELOOP (symlink) / ENOTDIR here
+                raise UnsafePath(f"unsafe component {name!r} under {prefix}: {e}")
+            os.close(dir_fd); dir_fd = child
+            if stat.S_IMODE(os.fstat(dir_fd).st_mode) != mode:
+                os.fchmod(dir_fd, mode)                        # repair owned component only
+    finally:
+        os.close(dir_fd)
 
 def secure_open_append(path, mode=0o600) -> int:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, mode)
+    path = Path(path)
+    pdir = os.open(path.parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)   # parent, no-follow
+    try:
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                     mode, dir_fd=pdir)                        # file opened RELATIVE to parent fd
+    finally:
+        os.close(pdir)
     if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
-        os.fchmod(fd, mode)                       # repair a pre-existing over-permissive file
+        os.fchmod(fd, mode)                                   # repair a pre-existing permissive file
     return fd
 
 def secure_scan(directory, pattern="*.jsonl"):
@@ -421,7 +482,7 @@ def secure_iterdirs(base):
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_paths.py -v`
-Expected: PASS (8 tests).
+Expected: PASS (9 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -504,7 +565,21 @@ def test_invalid_enums_are_rejected():
     with pytest.raises(R.InvalidRecord):
         R.build("terminal", seq=0, activity_id=AID, outcome="ok", summary={}, by="x")
     with pytest.raises(R.InvalidRecord):
-        R.build("ownership", seq=0, activity_id=AID, role="boss", owner_token="x")
+        R.build("ownership", seq=0, activity_id=AID, role="boss", owner_token="x", producer="p")
+
+def test_missing_required_field_is_rejected():
+    with pytest.raises(R.InvalidRecord):
+        R.build("terminal", seq=0, activity_id=AID, outcome="succeeded")   # missing summary + by
+    with pytest.raises(R.InvalidRecord):
+        R.build("start", seq=0, activity_id=AID, kind="sync")              # missing channel/trigger/created_by
+
+def test_non_finite_number_is_rejected():
+    with pytest.raises(R.InvalidRecord):
+        R.build("event", seq=0, activity_id=AID, level="info", event="x", fields={"v": float("inf")})
+
+def test_integral_float_canonicalizes_to_int():
+    rec = R.build("event", seq=0, activity_id=AID, level="info", event="x", fields={"v": 2.0})
+    assert rec["fields"]["v"] == 2 and isinstance(rec["fields"]["v"], int)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -516,7 +591,7 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # repo_radar/activity/records.py
-import json
+import json, math
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
@@ -539,16 +614,46 @@ _VALID_ROLES = {"initial", "handoff"}
 _VALID_OUTCOMES = {"succeeded", "succeeded-with-warnings", "blocked", "failed",
                    "cancelled", "skipped", "interrupted"}
 
+_REQUIRED = {
+    "start": ("kind", "channel", "trigger", "created_by"),
+    "ownership": ("owner_token", "role", "producer"),
+    "event": ("level", "event"),
+    "control": ("name",),
+    "terminal": ("outcome", "summary", "by"),
+    "integrity": ("kind",),
+}
+
 def _validate(rec):
     t = rec["type"]
     if t not in _VALID_TYPES:
         raise InvalidRecord(f"type {t!r}")
+    for k in _REQUIRED.get(t, ()):
+        if k not in rec:
+            raise InvalidRecord(f"missing {k!r} for {t}")
     if t == "event" and rec.get("level") not in _VALID_LEVELS:
         raise InvalidRecord(f"level {rec.get('level')!r}")
     if t == "ownership" and rec.get("role") not in _VALID_ROLES:
         raise InvalidRecord(f"role {rec.get('role')!r}")
     if t == "terminal" and rec.get("outcome") not in _VALID_OUTCOMES:
         raise InvalidRecord(f"outcome {rec.get('outcome')!r}")
+
+def parse_valid(raw, expected_activity_id):
+    """Shared minimal validator (Round-3 #6): parse one JSONL line and return the dict ONLY
+    if it is a SUPPORTED v1 record FOR the expected activity with its required fields present —
+    else None. An unsupported schema, wrong activity_id, or missing field never counts as a
+    real record (so a stray/nested/foreign `terminal` can't settle or prune an activity)."""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("schema_version") != SCHEMA_VERSION or obj.get("activity_id") != expected_activity_id:
+        return None
+    t = obj.get("type")
+    if t not in _VALID_TYPES or any(k not in obj for k in _REQUIRED.get(t, ())):
+        return None
+    return obj
 
 def _now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
@@ -568,6 +673,19 @@ def _bound_key(k):
     b = str(k).encode("utf-8")               # byte-bound, not char-bound (finding 7)
     return str(k) if len(b) <= MAX_KEY_BYTES else b[:MAX_KEY_BYTES].decode("utf-8", "ignore")
 
+def _canon(v):
+    """Numeric canonicalization for cross-language byte equality (Round-3 #8): reject non-finite
+    (JS JSON.parse can't read NaN/Infinity) and fold integral floats to int (Python `2.0`→`2`,
+    matching JS `JSON.stringify(2.0)`==`"2"`)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            raise InvalidRecord("non-finite number")
+        if v.is_integer():
+            return int(v)
+    return v
+
 def _bound_fields(fields):
     truncated = False
     out = {}
@@ -579,7 +697,9 @@ def _bound_fields(fields):
         if isinstance(v, str):
             v, t = _truncate(v, MAX_VALUE_BYTES)
             truncated = truncated or t
-        elif not isinstance(v, (int, float, bool)) and v is not None:
+        elif isinstance(v, (int, float, bool)) or v is None:
+            v = _canon(v)                            # integral floats -> int; non-finite -> reject
+        else:
             v, t = _truncate(str(v), MAX_VALUE_BYTES); truncated = True
         out[k] = v
     # aggregate cap
@@ -606,7 +726,10 @@ def build(type, *, seq, activity_id, ts=None, **payload):
     return rec
 
 def encode(record) -> bytes:
-    return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    # allow_nan=False so any non-finite number raises here rather than emitting NaN/Infinity,
+    # which JS JSON.parse rejects — preserving cross-language byte equality (Round-3 #8)
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":"),
+                       allow_nan=False) + "\n").encode("utf-8")
 
 def encoded_len(record) -> int:
     return len(encode(record))
@@ -615,7 +738,7 @@ def encoded_len(record) -> int:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_records.py -v`
-Expected: PASS (8 tests).
+Expected: PASS (11 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -880,7 +1003,7 @@ git commit -m "feat(activity): flock lease with exact inherited-descriptor valid
 
 ```python
 # repo_radar/tests/test_activity_quota.py
-import os
+import json, os
 from repo_radar.activity import quota, paths, lease, ids
 
 def _mk(tmp_path, aid):
@@ -892,15 +1015,18 @@ def _new_activity(tmp_path):
     aid = ids.mint_activity_id(); lp = _mk(tmp_path, aid)
     return aid, lease.acquire(lp)
 
-def _write_start(home, aid):   # a durable start line, as the writer would leave it
+def _write_rec(home, aid, **rec):   # a durable VALID v1 record, as the writer would leave it
+    rec.setdefault("schema_version", 1); rec.setdefault("activity_id", aid); rec.setdefault("ts", "t")
     seg = paths.segment_path(home, aid, "python", "deadbeef")
     fd = paths.secure_open_append(seg)
-    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t"}\n'); os.close(fd)
+    os.write(fd, (json.dumps(rec) + "\n").encode()); os.close(fd)
 
-def _write_terminal(home, aid):
-    seg = paths.segment_path(home, aid, "python", "deadbeef")
-    fd = paths.secure_open_append(seg)
-    os.write(fd, b'{"schema_version":1,"type":"terminal","seq":9,"ts":"t","outcome":"succeeded"}\n'); os.close(fd)
+def _write_start(home, aid):
+    _write_rec(home, aid, type="start", seq=0, kind="sync", channel="stable",
+               trigger="cli", created_by="python")
+
+def _write_terminal(home, aid, outcome="succeeded"):
+    _write_rec(home, aid, type="terminal", seq=9, outcome=outcome, summary={}, by="deadbeef")
 
 def test_admit_writes_json_entry_and_settle_removes_it(tmp_path):
     aid, l = _new_activity(tmp_path)
@@ -959,11 +1085,37 @@ def test_admit_reconciles_before_charging(tmp_path, monkeypatch):
 def test_top_type_uses_parsed_top_level_not_substring(tmp_path):
     # a start record whose fields nest type:"terminal" must NOT count as a terminal (finding 1)
     aid, l = _new_activity(tmp_path)
-    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
-    fd = paths.secure_open_append(seg)
-    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t","fields":{"type":"terminal"}}\n')
-    os.close(fd)
+    _write_rec(tmp_path, aid, type="start", seq=0, kind="sync", channel="stable",
+               trigger="cli", created_by="python", fields={"type": "terminal"})
     assert quota._has_start(tmp_path, aid) and not quota._has_terminal(tmp_path, aid)
+
+def test_unsupported_schema_terminal_does_not_count(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    _write_rec(tmp_path, aid, schema_version=999, type="terminal", seq=9,
+               outcome="succeeded", summary={}, by="x")             # unsupported schema
+    assert not quota._has_terminal(tmp_path, aid)                    # never interpreted as v1
+
+def test_foreign_activity_terminal_does_not_count(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    _write_rec(tmp_path, aid, activity_id=ids.mint_activity_id(), type="terminal", seq=9,
+               outcome="succeeded", summary={}, by="x")             # wrong activity_id
+    assert not quota._has_terminal(tmp_path, aid)                    # not THIS activity's terminal
+
+def test_impossible_ledger_counters_are_corrupt(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    p = paths.ledger_entry_path(tmp_path, aid)
+    p.write_text(json.dumps({"reserved": 0, "granted": 0}))          # reserved must equal RESERVE
+    assert quota._read_entry(p) == "CORRUPT"
+    p.write_text(json.dumps({"reserved": quota.RESERVE, "granted": quota.PER_ACTIVITY_CAP}))  # over cap
+    assert quota._read_entry(p) == "CORRUPT"
+
+def test_prune_removes_owner_lock_and_whole_directory(tmp_path):
+    aid, l = _new_activity(tmp_path); quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid); quota.settle(tmp_path, aid)
+    assert paths.owner_lock_path(tmp_path, aid).exists()
+    quota.prune(tmp_path, need_bytes=10_000_000)
+    assert not paths.activity_dir(tmp_path, aid).exists()            # dir fully gone (no accumulation)
 
 def test_concurrent_admissions_never_exceed_ceiling(tmp_path, monkeypatch):
     import threading
@@ -984,9 +1136,7 @@ def test_prune_frees_settled_items_ceiling_override(tmp_path):
         aid, l = _new_activity(tmp_path); quota.admit(tmp_path, aid, l)
         _write_start(tmp_path, aid); _write_terminal(tmp_path, aid); quota.settle(tmp_path, aid)
     prob, lp = _new_activity(tmp_path); quota.admit(tmp_path, prob, lp)
-    _write_start(tmp_path, prob)
-    seg = paths.segment_path(tmp_path, prob, "python", "deadbeef")
-    fd = paths.secure_open_append(seg); os.write(fd, b'{"type":"terminal","outcome":"failed","ts":"t"}\n'); os.close(fd)
+    _write_start(tmp_path, prob); _write_terminal(tmp_path, prob, outcome="failed")
     quota.settle(tmp_path, prob)
     freed = quota.prune(tmp_path, need_bytes=10)
     assert freed > 0
@@ -1031,11 +1181,13 @@ def _unlock(fd):
     fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 def _read_entry(path):
-    """JSON ledger (Decision 3). Returns dict or 'CORRUPT' (counters validated semantically)."""
+    """JSON ledger (Decision 3). Returns dict or 'CORRUPT'. Counters validated against the FULL
+    invariant (Round-3 #6): `reserved` is always exactly RESERVE, `granted >= 0`, and the total
+    liability never exceeds the per-activity cap — impossible 'healthy' values are corrupt."""
     try:
         d = json.loads(Path(path).read_text())
         r, g = int(d["reserved"]), int(d["granted"])
-        if not (0 <= r <= PER_ACTIVITY_CAP and 0 <= g <= PER_ACTIVITY_CAP):
+        if r != RESERVE or g < 0 or r + g > PER_ACTIVITY_CAP:
             return "CORRUPT"
         return {"reserved": r, "granted": g}
     except Exception:
@@ -1051,17 +1203,16 @@ def _segments(home, activity_id):
     return paths.secure_scan(paths.activity_dir(home, activity_id), "*.jsonl")   # lstat-safe
 
 def _top_types(home, aid):
-    """Parsed TOP-LEVEL record types — never substring (finding 1: nested fields.type
-    must not be mistaken for a record type)."""
+    """Types of VALID v1 records for THIS activity (Round-3 #6) — via the shared validator,
+    so nested `fields.type`, an unsupported schema, or a foreign activity_id never count."""
     types = []
     for f in _segments(home, aid):
         for line in f.read_bytes().split(b"\n"):
             if not line:
                 continue
-            try:
-                types.append(json.loads(line).get("type"))
-            except Exception:
-                pass                                   # a corrupt line is not a type
+            obj = records.parse_valid(line, aid)
+            if obj is not None:
+                types.append(obj["type"])
     return types
 
 # lifecycle state is DERIVED from parsed segments, never a ledger flag (finding 1)
@@ -1164,12 +1315,9 @@ def _classify(home, aid):
         for line in f.read_bytes().split(b"\n"):
             if not line:
                 continue
-            try:
-                r = json.loads(line)
-                if r.get("type") == "terminal":
-                    outcomes.append(r.get("outcome"))
-            except Exception:
-                pass
+            obj = records.parse_valid(line, aid)
+            if obj is not None and obj["type"] == "terminal":
+                outcomes.append(obj.get("outcome"))
     problem = ("integrity" in types) or any(
         o in ("failed", "blocked", "interrupted", "succeeded-with-warnings") for o in outcomes)
     return ("problem" if problem else "routine", mtime)
@@ -1196,10 +1344,16 @@ def _prune_locked(home, need_bytes):
         if freed >= need_bytes:
             break
         sz = _on_disk(home, aid)
+        d = paths.activity_dir(home, aid)
         for f in _segments(home, aid):
-            os.unlink(f)                           # delete files FIRST (scan reflects it)
-        try:
-            os.rmdir(paths.activity_dir(home, aid))
+            os.unlink(f)                           # delete segments FIRST (scan reflects it)
+        try:                                       # remove ALL remaining owned artifacts
+            for entry in os.scandir(d):            #   (owner.lock, etc.) so rmdir can succeed
+                try:
+                    os.unlink(entry.path)          # Round-3 #6: dirs must not accumulate
+                except OSError:
+                    pass
+            os.rmdir(d)
         except OSError:
             pass
         freed += sz
@@ -1228,12 +1382,9 @@ def _cancel_requested(home, aid):
         for line in f.read_bytes().split(b"\n"):
             if not line:
                 continue
-            try:
-                r = json.loads(line)
-                if r.get("type") == "control" and r.get("name") == "cancel_requested":
-                    return True
-            except Exception:
-                pass
+            obj = records.parse_valid(line, aid)     # shared validator (Round-3 #6)
+            if obj is not None and obj["type"] == "control" and obj.get("name") == "cancel_requested":
+                return True
     return False
 
 def synthesize_terminal(home, aid):
@@ -1394,13 +1545,34 @@ def test_admission_refusal_hand_off_env_is_empty(tmp_path, monkeypatch):
                               trigger="cli", producer="python")
     assert w._active is False and w.hand_off_env() == {}
 
-def test_settle_failure_during_terminal_never_raises(tmp_path, monkeypatch, capsys):
+def test_settle_failure_during_terminal_still_frees_the_lock(tmp_path, monkeypatch, capsys):
+    aid_lock = None
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
                               trigger="cli", producer="python")
+    aid = w.activity_id
     w.start()
     monkeypatch.setattr(quota, "settle", lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
     w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # must NOT raise into the sync
     assert "activity" in capsys.readouterr().err.lower()
+    # finding 1: the lease MUST be released even though settle raised -> lock is FREE
+    assert lease.probe(paths.owner_lock_path(tmp_path, aid)) == lease.FREE
+
+def test_terminal_ensures_exactly_one_start_when_none_written(tmp_path):
+    # a finalize-style path that calls terminal() without a prior start() must still produce a
+    # start, and exactly one (finding 1)
+    w = writer.ActivityWriter(tmp_path, kind="system", channel="dev",
+                              trigger="scheduled", producer="python")
+    w.terminal("blocked", reason="x")               # no explicit start() first
+    types = [r["type"] for r in _read_all(tmp_path, w.activity_id)]
+    assert types.count("start") == 1 and types[-1] == "terminal"
+
+def test_non_serializable_field_never_raises_and_drops_the_event(tmp_path):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    w.event("x", "info", bad=object())              # non-JSON value: must not raise (finding 1)
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # sync still finalizes cleanly
+    assert any(r["type"] == "terminal" for r in _read_all(tmp_path, w.activity_id))
 
 def test_nested_field_value_is_redacted(tmp_path):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
@@ -1452,6 +1624,8 @@ class ActivityWriter:
                  configured_secrets=(), inherited_id=None, inherited_fd=None, owner_token=None):
         self._active = False
         self._lease = None
+        self._adopted = False                           # set early so except-cleanup can branch
+        self._started = False
         self._lock = threading.Lock()
         self._reserve_used = {"terminal": False, "cancel": False, "dropped": False}
         try:
@@ -1469,7 +1643,8 @@ class ActivityWriter:
                                               paths.owner_lock_path(home, inherited_id))
                 self._first_producer = not quota._has_start(home, inherited_id)
                 if self._first_producer and not quota.admit(home, inherited_id, self._lease):
-                    _warn("admission refused; skipping activity recording"); return
+                    _warn("admission refused; skipping activity recording")
+                    self._lease.drop_local_reference(); self._lease = None; return
             else:
                 self.activity_id = ids.mint_activity_id()
                 paths.secure_mkdir(paths.activity_dir(home, self.activity_id))
@@ -1486,12 +1661,19 @@ class ActivityWriter:
             _warn(f"init failed; recording disabled: {e}")
             try:
                 if self._lease is not None:
-                    self._lease.release()
+                    # finding 1: an ADOPTED lease shares Electron's open-file description —
+                    # close only, NEVER LOCK_UN (that would unlock the parent's live copy).
+                    if self._adopted:
+                        self._lease.drop_local_reference()
+                    else:
+                        self._lease.release()           # only the original locker unlocks
             except Exception:
                 pass
             self._lease = None; self._active = False
 
-    def _durable_append(self, kind, payload, *, reserve=False, fsync=False, slot=None):
+    def _emit(self, kind, build, *, reserve=False, fsync=False, slot=None):
+        """Everything — payload construction, redaction, serialization, accounting, write —
+        happens INSIDE this boundary (finding 1), so no public method can raise into the sync."""
         if not self._active:
             return False
         with self._lock:
@@ -1500,6 +1682,7 @@ class ActivityWriter:
                     return False
                 self._reserve_used[slot] = True
             try:
+                payload = build()                       # redaction/serialization inside the boundary
                 rec = records.build(kind, seq=self._seq, activity_id=self.activity_id, **payload)
                 blob = records.encode(rec)
                 if not reserve and not quota.grant(self._home, self.activity_id, len(blob)):
@@ -1510,7 +1693,7 @@ class ActivityWriter:
                     while view:                         # handle short writes (finding 3)
                         view = view[os.write(fd, view):]
                     if fsync:
-                        os.fsync(fd)                    # durability for reserve/terminal
+                        os.fsync(fd)
                 finally:
                     os.close(fd)
                 self._seq += 1
@@ -1520,59 +1703,71 @@ class ActivityWriter:
                 return False
 
     def _redact_val(self, v):
-        if isinstance(v, (int, float, bool)) or v is None:
+        if isinstance(v, bool) or v is None:
             return v
-        # redact AFTER stringifying non-primitives, so nested secret-bearing values can't
-        # bypass the redactor (finding 7)
-        return self._redactor.scrub(v if isinstance(v, str) else json.dumps(v))
+        if isinstance(v, (int, float)):
+            return v
+        return self._redactor.scrub(v if isinstance(v, str) else json.dumps(v, allow_nan=False))
 
     def _redact_fields(self, fields):
         return {k: self._redact_val(v) for k, v in fields.items()}
 
     def start(self):
-        if not self._active:
+        if not self._active or self._started:           # idempotent (finding 1)
             return
+        self._started = True
         if self._adopted and not self._first_producer:  # adopt-existing: handoff ownership only
-            self._durable_append("ownership", dict(owner_token=self._lease.owner_token,
+            self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,
                 role="handoff", producer=self._producer, **_fingerprint()), fsync=True)
             return
-        self._durable_append("start", dict(kind=self._kind, channel=self._channel,
+        self._emit("start", lambda: dict(kind=self._kind, channel=self._channel,
             trigger=self._trigger, created_by=self._producer), fsync=True)
-        self._durable_append("ownership", dict(owner_token=self._lease.owner_token,
+        self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,
             role="initial", producer=self._producer, **_fingerprint()), fsync=True)
 
+    def _ensure_started(self):
+        if not self._started and not quota._has_start(self._home, self.activity_id):
+            self.start()                                # a terminal always follows a start (finding 1)
+
     def event(self, name, level, detail=None, **fields):
-        ok = self._durable_append("event", dict(level=level, event=name,
+        ok = self._emit("event", lambda: dict(level=level, event=name,
             fields=self._redact_fields(fields),
             detail=self._redactor.scrub(detail) if detail is not None else None))
         if ok is False:                                 # slot guarantees at-most-once
-            self._durable_append("integrity", dict(kind="dropped-events"),
-                                 reserve=True, fsync=True, slot="dropped")
+            self._emit("integrity", lambda: dict(kind="dropped-events"),
+                       reserve=True, fsync=True, slot="dropped")
 
     def control(self, name, **fields):
         if name == "cancel_requested":
             if not self._cancel_authority:              # exclusive authority (finding 2)
                 return
-            self._durable_append("control", dict(name=name, fields=self._redact_fields(fields)),
-                                 reserve=True, fsync=True, slot="cancel")
+            self._emit("control", lambda: dict(name=name, fields=self._redact_fields(fields)),
+                       reserve=True, fsync=True, slot="cancel")
         else:                                           # non-cancel = ordinary (grant-based)
-            self._durable_append("control", dict(name=name, fields=self._redact_fields(fields)))
+            self._emit("control", lambda: dict(name=name, fields=self._redact_fields(fields)))
 
     def terminal(self, outcome, **summary):
         if not self._active:
             return
-        ok = self._durable_append("terminal", dict(outcome=outcome,
+        self._ensure_started()
+        ok = self._emit("terminal", lambda: dict(outcome=outcome,
             summary=self._redact_fields(summary), by=self._lease.owner_token),
             reserve=True, fsync=True, slot="terminal")
-        try:                                            # settle+release must NEVER raise (finding 3)
+        # settle and release are attempted INDEPENDENTLY so a settle failure can't strand the
+        # lock (finding 1): release is in `finally` and always runs -> the lock becomes FREE.
+        try:
             if ok:
-                quota.settle(self._home, self.activity_id)   # settle ONLY after durability
+                try:
+                    quota.settle(self._home, self.activity_id)
+                except Exception as e:
+                    _warn(f"settle failed: {e}")
             else:
                 _warn("terminal not durable; leaving reservation for reconciliation")
-            self._lease.release()
-        except Exception as e:
-            _warn(f"finalization cleanup failed: {e}")
         finally:
+            try:
+                self._lease.release()
+            except Exception as e:
+                _warn(f"release failed: {e}")
             self._active = False
 
     def hand_off_env(self):
@@ -1591,7 +1786,7 @@ from repo_radar.activity.writer import ActivityWriter   # noqa: F401
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_writer.py -v`
-Expected: PASS (10 tests). Never-raises façade (inactive-on-failure, empty `hand_off_env`); three one-shot reserve slots checked under the mutex; exclusive cancellation authority (only the minter); nested field values redacted; `terminal` settles+releases only after a durable (`fsync`'d) write and never raises during cleanup.
+Expected: PASS (12 tests). Never-raises façade (inactive-on-failure with adopted=drop-only vs minted=release; empty `hand_off_env`); all payload construction inside the boundary; three one-shot reserve slots under the mutex; exclusive cancellation authority; nested field values redacted; a settle failure still frees the lock; `terminal` ensures exactly one start.
 
 - [ ] **Step 5: Commit**
 
@@ -1657,7 +1852,9 @@ def test_bootstrap_adopts_existing_start_writes_handoff_only(tmp_path):
     quota.admit(tmp_path, aid, held)
     seg = paths.segment_path(tmp_path, aid, "electron", "cafebabe")
     fd = paths.secure_open_append(seg)
-    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t","kind":"sync"}\n'); os.close(fd)
+    os.write(fd, (json.dumps({"schema_version": 1, "activity_id": aid, "type": "start", "seq": 0,
+        "ts": "t", "kind": "sync", "channel": "stable", "trigger": "cli",
+        "created_by": "electron"}) + "\n").encode()); os.close(fd)
     r = _run_bootstrap(tmp_path, aid, held)
     assert r.returncode == 0, r.stderr
     recs = _seg_records(tmp_path, aid)
@@ -1807,7 +2004,9 @@ def test_full_cli_style_attempt_end_to_end(tmp_path):
 def _durable_start(home, aid):
     seg = paths.segment_path(home, aid, "python", "deadbeef")
     fd = paths.secure_open_append(seg)
-    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t","kind":"sync"}\n'); os.close(fd)
+    os.write(fd, (json.dumps({"schema_version": 1, "activity_id": aid, "type": "start", "seq": 0,
+        "ts": "t", "kind": "sync", "channel": "stable", "trigger": "cli",
+        "created_by": "python"}) + "\n").encode()); os.close(fd)
 
 def test_crash_after_durable_start_self_heals_to_interrupted(tmp_path):
     # finding 1: durable start, lease freed, NO terminal -> reconcile synthesizes + settles
@@ -1872,7 +2071,8 @@ Node tests: add `"test": "node --test"` to `menubar/package.json` (Decision 4); 
   {"type":"control","args":{"seq":3,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","name":"cancel_requested","fields":{}}},
   {"type":"terminal","args":{"seq":4,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded-with-warnings","summary":{"repos_changed":1,"errors":0,"warns":2},"by":"deadbeef"}},
   {"type":"integrity","args":{"seq":5,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","kind":"dropped-events"}},
-  {"type":"event","args":{"seq":6,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"big","fields":{"v":"X̶TRUNCATE_ME_REPEATED..."}}}
+  {"type":"event","args":{"seq":6,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"big","fields":{"v":"X̶TRUNCATE_ME_REPEATED..."}}},
+  {"type":"event","args":{"seq":7,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"nums","fields":{"a":2.0,"b":1.5,"c":0,"d":-3}}}
 ]
 ```
 
@@ -1909,7 +2109,7 @@ def test_python_encodes_every_record_type_byte_for_byte():
 
 - [ ] **Step 3: Run both → FAIL** (no `golden-expected.jsonl`, no Node modules).
 
-- [ ] **Step 4: Implement** `ids.js`/`paths.js`/`records.js` as exact CommonJS mirrors (same regexes, bounds, encoding); add the `_gen_golden` helper and **generate + commit** `golden-expected.jsonl`; add `"test": "node --test"` to `menubar/package.json`.
+- [ ] **Step 4: Implement** `ids.js`/`paths.js`/`records.js` as exact CommonJS mirrors (same regexes, bounds, encoding, required-field + enum validation). **Numeric canonicalization (Round-3 #8):** JS already prints `2.0` as `2`, but `JSON.stringify(Infinity)` yields `"null"` silently — so `records.js` must **explicitly reject non-finite** numbers (throw), matching Python's `allow_nan=False`. Add the `_gen_golden` helper and **generate + commit** `golden-expected.jsonl`; add `"test": "node --test"` to `menubar/package.json`.
 
 - [ ] **Step 5: Run both → PASS.** `cd menubar && node --test` and `python -m pytest repo_radar/tests/test_activity_golden.py -v`. The two encoders provably agree on every record type, Unicode, and truncation.
 
@@ -1970,8 +2170,8 @@ test('Python-held lock is seen BUSY by Node (reverse direction)', () => {
 - [ ] **Step 6: Commit**
 
 ```bash
-git add menubar/activity/lease.js menubar/activity/quota.js menubar/activity/writer.js menubar/activity/__tests__/ repo_radar/tests/test_activity_behavior_vectors.py
-git commit -m "feat(activity): Node lease/quota/writer + bidirectional lock interop + shared behavioral vectors"
+git add menubar/activity/lease.js menubar/activity/quota.js menubar/activity/writer.js menubar/activity/reconcile.js menubar/activity/__tests__/ repo_radar/tests/test_activity_behavior_vectors.py
+git commit -m "feat(activity): Node lease/quota/writer/reconcile(synth) + bidirectional lock interop + shared behavioral vectors"
 ```
 
 ### Task 2.3: Electron `triggerSync` — acquire, start, hold across guards, hand off; cancel-ordering fix
@@ -1984,9 +2184,13 @@ git commit -m "feat(activity): Node lease/quota/writer + bidirectional lock inte
 - Consumes: `menubar/activity` (`ActivityWriter`, `quota.reconcile`).
 - Produces `menubar/activity/trigger-glue.js` (Electron-free, unit-testable):
   - `beginManualActivity(home, {channel, trigger}) -> { writer, lockFd }` — mints, acquires, admits, writes `start`+initial `ownership`, **holds** the fd. Called **first in `triggerSync`, before any gate** (identity-before-first-gate).
-  - `onContention(writer, kind)` — writes `terminal('skipped')` + `release()`. Used for **already-syncing** (`currentSyncProcess`, main.js:1080-1082) **and** root-lock-busy (exit 75) — both are contention → `skipped` (finding 5).
+  - `onContention(writer, kind)` — writes `terminal('skipped')` **only** (terminal() itself settles + releases — no separate `release()`, Round-3 #2). Used for **already-syncing** (`currentSyncProcess`, main.js:1080-1082, Electron sole holder pre-spawn) **and** the `runSync` **root-busy reject** (exit 75 — the child has already exited, so Electron is the sole fd holder and the `LOCK_UN` is safe). The scheduled-path dispatcher finalizes its **own** root contention; **manual contention is Electron's alone** — exactly one terminal authority.
   - `onGuardBlock(writer, reason)` — writes `terminal('blocked', reason)` + `release()` (dev-ownership 1092-1108; second dispatch guard 1284-1297).
-  - `handOff({writer, child, home})` — waits (bounded, e.g. ≤5 s) for the child to durably write **`ownership{role:'handoff'}` OR any `terminal`** (either proves the child took ownership / already finalized). On that ack → `writer.dropLocalReference()` (close-only, **no `LOCK_UN`** — the child's shared OFD keeps the lease) + controller-only (`_handedOff=true`). **On timeout (no ack) the shared open-file description means Electron must NOT `LOCK_UN` while the child may be alive (finding 4):** Electron **`child.kill('SIGKILL')` and awaits the child's exit** (which closes the child's copy of the fd); **only once the child is confirmed dead** — Electron now the sole fd holder — does it `writer.terminal('failed')` (a now-safe `LOCK_UN`). If the child **cannot be confirmed dead**, Electron calls `writer.dropLocalReference()` (never unlock under a live child) and leaves the activity `running` for the reconciler to finalize.
+  - `handOff({writer, child, home})` — **post-spawn, Electron NEVER kills the child and NEVER writes a terminal** (finding 3: best-effort — a healthy worker must never die because history recording failed). It waits (bounded, ≤5 s) for one of:
+    - **(a) ack** — the child durably writes `ownership{role:'handoff'}` **or** any `terminal` → `writer.dropLocalReference()` (close-only, **no `LOCK_UN`** — the child's shared OFD keeps the lease) + controller-only (`_handedOff=true`).
+    - **(b) child exits before any ack** (explicit validation rejection or a crash — the sync has already ended) → `writer.dropLocalReference()` (the child's fd is now closed, freeing the shared lease) + trigger `quota.reconcile(home)` so the reconciler synthesizes the terminal. Electron writes no terminal itself.
+    - **(c) timeout with the child still alive** (slow pre-exec, or Activity-write failed but the sync is running fine) → `writer.dropLocalReference()` only. The activity stays `running`/incomplete; the reconciler finalizes it when the worker later exits. **The worker is left running and the sync completes unrecorded/incomplete.**
+    An **explicit** validation rejection is distinguished from an **absent** durable ack purely by whether the child has exited — either way the live worker is never touched.
   - `onCancel({writer, child})` — appends `control('cancel_requested')` to Electron's own segment **before** `child.kill('SIGTERM')`. Allowed in the controller-only state; `terminal()` is a **no-op after handoff** (only the executing owner/reconciler finalizes).
 - `ActivityWriter` (Node, Task 2.2) gains `dropLocalReference()` and the `_handedOff` controller state (mirrors the Python `Lease.drop_local_reference` + terminal-suppression).
 
@@ -2005,39 +2209,36 @@ test('cancel appends control{cancel_requested} BEFORE SIGTERM', () => {
   assert.deepStrictEqual(calls, ['control:cancel_requested', 'kill:SIGTERM']);
 });
 
-test('contention finalizes the attempt as skipped', () => {
+test('contention finalizes the attempt as skipped (terminal owns release)', () => {
   const calls = [];
-  const writer = { terminal: (o) => calls.push('terminal:' + o), release: () => calls.push('release') };
+  const writer = { terminal: (o) => calls.push('terminal:' + o) };   // terminal() itself releases
   onContention(writer, 'already-syncing');
-  assert.deepStrictEqual(calls, ['terminal:skipped', 'release']);
+  assert.deepStrictEqual(calls, ['terminal:skipped']);               // one terminal, no extra release
 });
 
-test('handOff drops the local fd WITHOUT unlocking after a real child ack', async () => {
-  const events = [];
-  const writer = { dropLocalReference: () => events.push('drop'),
-                   terminal: (o) => events.push('terminal:' + o) };
-  const child = { killed: false, kill() { this.killed = true; }, on() {} };
-  // the child writes ownership{role:handoff}; ackSeen resolves true
-  await handOff({ writer, child, home: '/x', _awaitAck: async () => true });
-  assert.deepStrictEqual(events, ['drop']);            // dropLocalReference, NO terminal, NO kill
-  assert.strictEqual(child.killed, false);
-});
+// helpers: mkWriter(arr) records dropLocalReference()/terminal() calls into arr;
+// mkChild(aliveMs) fakes a child whose exit resolves after aliveMs (Infinity = stays alive).
+test('handOff NEVER kills a live worker and NEVER writes a terminal post-spawn (finding 3)', async () => {
+  // (a) ack -> dropLocalReference only
+  const a = []; const ackChild = mkChild(Infinity);
+  await handOff({ writer: mkWriter(a), child: ackChild, home: '/x', _awaitAck: async () => true });
+  assert.deepStrictEqual(a, ['drop']); assert.strictEqual(ackChild.killed, false);
 
-// helpers: mkChild(exits) fakes a child whose post-kill exit-wait resolves to `exits`;
-// mkWriter(arr) records dropLocalReference()/terminal() calls into arr.
-test('handOff timeout: kill + confirm-dead THEN terminal (safe unlock); never unlock a live child', async () => {
-  // (a) child confirmed dead -> terminal('failed'); (b) child stays alive -> dropLocalReference only
-  const dead = []; const deadChild = mkChild(/*exits=*/true);
-  await handOff({ writer: mkWriter(dead), child: deadChild, home: '/x', _awaitAck: async () => false });
-  assert.ok(deadChild.killed && dead.includes('terminal:failed'));         // killed, then safe unlock
+  // (b) child exits before ack -> dropLocalReference + reconcile, no kill, no terminal
+  const b = []; const gone = mkChild(0); const rec = [];
+  await handOff({ writer: mkWriter(b), child: gone, home: '/x',
+                  _awaitAck: async () => false, _reconcile: () => rec.push('reconcile') });
+  assert.ok(b.includes('drop') && rec.includes('reconcile') && !b.some(e => e.startsWith('terminal')));
+  assert.strictEqual(gone.killed, false);
 
-  const alive = []; const aliveChild = mkChild(/*exits=*/false);
-  await handOff({ writer: mkWriter(alive), child: aliveChild, home: '/x', _awaitAck: async () => false });
-  assert.ok(aliveChild.killed && alive.includes('drop') && !alive.some(e => e.startsWith('terminal')));
+  // (c) timeout, child still alive -> dropLocalReference only, worker untouched
+  const c = []; const busy = mkChild(Infinity);
+  await handOff({ writer: mkWriter(c), child: busy, home: '/x', _awaitAck: async () => false });
+  assert.deepStrictEqual(c, ['drop']); assert.strictEqual(busy.killed, false);
 });
 ```
 
-A companion **real-process** test (`menubar/activity/__tests__/handoff-realchild.test.js`) spawns an actual child that inherits the locked fd and either writes a handoff `ownership` (ack) or sleeps without acking, asserting the lock is **never released while that child is alive** (an independent `probeBusy` stays true) — this is the load-bearing proof for finding 4, not just the injected-boolean unit test.
+Companion **real-process** tests (`menubar/activity/__tests__/handoff-realchild.test.js`, finding 3): a child that (i) completes its sync while its **ownership write fails** — assert the run still finishes and the reconciler later synthesizes the terminal; (ii) delays its ack past the timeout — assert Electron drops its descriptor, **the child is never signalled**, and the sync completes. Observability failure never kills a healthy worker.
 
 - [ ] **Step 2: Run → FAIL** (`trigger-glue` missing).
 
@@ -2073,7 +2274,7 @@ git commit -m "feat(activity): Electron lifecycle — start-before-gates, skippe
   - **Scheduled path:** `python -m repo_radar.activity.bootstrap` runs BEFORE the verify/dev guards and (first-producer) writes `start`+initial `ownership`. A **failed** bootstrap exits non-zero and writes **nothing** (no false ack); the dispatcher still proceeds (observability is best-effort; the lease is held by the shell's fd and survives `exec`, so the reconciler finalizes it) — a failed adopter never proceeds *as owner* but the sync itself is not aborted.
   - **Manual path (id inherited):** the dispatcher does **not** run bootstrap — the exec'd python (the executing owner, via `cli.py`/`sync_mode`) adopts the fd and writes the **handoff `ownership`** that is Electron's `handOff` acknowledgement.
   - **On a dev/verify guard failure:** `python -m repo_radar.activity.finalize --outcome blocked --reason <code>` (writes terminal + settle + release), then exit. On the manual path this terminal also satisfies Electron's `handOff` ack (it waits for ownership-handoff OR any terminal).
-  - **On root exec-lock contention** (the existing fd-9 `.exec.lock` returns exit 75): `python -m repo_radar.activity.finalize --outcome skipped`, then exit 75 (finding 5 — contention is `skipped`, not lost).
+  - **On root exec-lock contention** (the existing fd-9 `.exec.lock` returns exit 75): **scheduled path only** → `python -m repo_radar.activity.finalize --outcome skipped`, then exit 75. **Manual path (id inherited): do NOT finalize** — exit 75 and let **Electron** finalize `skipped` via its `runSync` reject handler, so manual contention has **exactly one** terminal authority (Round-3 #2 — no double terminal/settlement).
   - **On success:** `exec` python (the executing owner adopts fd 4 and runs `sync`), which writes its own handoff `ownership`.
   - **Last-resort (finding 1):** only if the bootstrap python **cannot execute at all**, append ONE bounded, redacted line to the **System diagnostic stream** `~/Library/Logs/repo-radar/sync.error.log` — **never** an un-quota'd Activity segment.
   - Preserve the existing root `.exec.lock` fd-9 handshake untouched.
@@ -2217,9 +2418,9 @@ This drives the **actual** production path, not a synthetic stand-in: `runtime.r
 
 - [ ] **Step 1: Write the test**
   - **Happy path:** build the fake GEN + generated dispatcher, `runSync({home, channel, env, onChild})` with a one-repo dry-run config; wait for completion; assert the activity segment shows `start` → `ownership{role:'handoff'}` (same `owner_token` as the initial) → `terminal{by:<owner_token>}`, and `probeBusy(owner.lock) === false` (released). **Proves** the lease survives `runSync` spawn-inheritance (fd 4) + the shell + `exec` into python, and the handoff carries one continuous `owner_token`.
-  - **Root contention:** hold the root `.exec.lock` (fd 9) in a sidecar, run the dispatcher; assert a `skipped` terminal (finding 5), exit 75.
+  - **Root contention:** hold the root `.exec.lock` (fd 9) in a sidecar, run the dispatcher; assert **exactly one** `skipped` terminal, **one** settlement (ledger entry gone), and **one** release (Round-3 #2), exit 75.
   - **Crash:** kill the python child before its terminal; assert `probeBusy` is false (freed); then run the **Phase-1 Python reconciler** (`python -c "import os;from repo_radar.activity import quota;quota.reconcile(os.environ['HOME'])"`) and assert it synthesized a durable `interrupted` terminal (`by:'reconciler'`) + settled the reservation; a pre-kill `control{cancel_requested}` yields `cancelled` instead. (No Phase-3 dependency — the foundation reconciler exists in Task 1.6; the Node `reconcile.js` produces the same outcomes for display in Phase 3 — finding 5.)
-  - **Failed validation:** hand a *wrong* (unlocked look-alike) fd; assert the child rejects the handoff and Electron's `handOff` times out → the initial owner finalizes `failed`.
+  - **Failed validation:** hand a *wrong* (unlocked look-alike) fd; the adopter (bootstrap) rejects + exits non-zero **without an ack**; Electron's `handOff` sees the child exit → `dropLocalReference()` + `quota.reconcile` synthesizes the terminal. Assert the worker is **never signalled** and the activity is recorded (interrupted), not killed (finding 3).
 
 - [ ] **Step 2: Run → PASS** on macOS: `cd menubar && node --test runtime/__tests__/dispatcher-chain.integration.test.js`.
 
@@ -2320,7 +2521,7 @@ test('per-writer append order survives a backwards wall-clock step', () => {
 
 **Files:** **Extend** `menubar/activity/reconcile.js` (add the reader-display `reconcile(home, activityId)`; `synthesizeTerminal` already exists from Task 2.2); Test `menubar/activity/__tests__/reconcile.test.js`.
 
-**Interfaces:** `reconcile(home, activityId) -> { outcome|null, synthesized }`. Semantics (§5, §6) driven by the **tri-state `lease.probe`** (finding 7): for a `running` attempt (has `start`, no `terminal`) — **`BUSY` ⇒ leave `running`** (`outcome:null`); **`FREE` (or lock absent) ⇒ owner gone** → `acquire` + synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably (`fsync`) appended**, then release + `quota.settle`; **`UNCERTAIN` ⇒ leave `running` + a System `integrity` Problem** (never guess a dead owner). Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
+**Interfaces:** `reconcile(home, activityId) -> { outcome|null, synthesized, problems, duplicateTerminalCounts }` (Round-3 #9 — callers get **deterministic integrity Problems** and **duplicate-terminal counts**, not just the outcome). Semantics (§5, §6) driven by the **tri-state `lease.probe`** (finding 7): for a `running` attempt (has `start`, no `terminal`) — **`BUSY` ⇒ leave `running`** (`outcome:null`); **`FREE` (or lock absent) ⇒ owner gone** → `acquire` + synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably (`fsync`) appended**, then release + `quota.settle`; **`UNCERTAIN` ⇒ leave `running` + a System `integrity` Problem** (never guess a dead owner). Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2426,7 +2627,7 @@ test('symlinked activity dir/segment is refused by the scan', () => { /* ... */ 
 
 **Files:** Create `menubar/activity/read.js`; Modify `menubar/activity/index.js` (export the reader façade); Test `menubar/activity/__tests__/read.test.js`.
 
-**Interfaces:** `listActivities(home, filter) -> { items: DTO[], truncated, available, incomplete }` and `buildExport(home, filter) -> string`. **`available:false`** when the store is missing/unreadable and **`incomplete:true`** when some segments couldn't be parsed or a reconcile was `UNCERTAIN` — an **explicit** result the UI's "History unavailable/incomplete" state (Task 4.5) tests against (finding 8), never an ambiguous empty list. Each DTO is bounded + already redacted, newest-first, with derived `outcome` (via reconcile), duration, channel/trigger, error/warn counts, and the two lenses (Events, Problems). `buildExport` produces the redacted text in-process (never from renderer input). **Concrete bounds enforced (finding 9), defined as `menubar/activity/limits.js` constants:** list returns **≤ 200** item summaries per call (`truncated:true` past that); a single item's detail DTO carries **≤ 2000 event rows** and **≤ 2 MiB** total (further rows summarized); each rendered field/`detail` string **≤ 8 KiB**; the `filter` is validated — `level ∈ {info,warn,error}`, free-text `search ≤ 256` chars (literal match, not regex), `limit ≤ 200`, `offset ≥ 0`; **export ≤ 16 MiB** (truncated with a visible marker past that). Any filter violating these is rejected by the handler (Task 4.1), not clamped silently.
+**Interfaces:** `listActivities(home, filter) -> { items: DTO[], truncated, available, incomplete }` and `buildExport(home, filter) -> string`. **Three distinct states (Round-3 #9):** a **missing** activity directory on first use is **normal empty history** (`available:true, incomplete:false, items:[]`) — NOT unavailable; **`available:false`** only when the store exists but is **unreadable** (permissions/IO); **`incomplete:true`** when some segments couldn't be parsed or a reconcile was `UNCERTAIN`. The UI (Task 4.5) has a concrete renderer assertion for each of available-empty, available-incomplete, and unavailable. Each DTO is bounded + already redacted, newest-first, with derived `outcome` (via reconcile), duration, channel/trigger, error/warn counts, and the two lenses (Events, Problems). `buildExport` produces the redacted text in-process (never from renderer input). **Concrete bounds enforced (finding 9), defined as `menubar/activity/limits.js` constants:** list returns **≤ 200** item summaries per call (`truncated:true` past that); a single item's detail DTO carries **≤ 2000 event rows** and **≤ 2 MiB** total (further rows summarized); each rendered field/`detail` string **≤ 8 KiB**; the `filter` is validated — `level ∈ {info,warn,error}`, free-text `search ≤ 256` chars (literal match, not regex), `limit ≤ 200`, `offset ≥ 0`; **export ≤ 16 MiB** (truncated with a visible marker past that). Any filter violating these is rejected by the handler (Task 4.1), not clamped silently.
 
 - [ ] **Step 1: Write the failing test** (end-to-end read over a seeded store, incl. a `running` item that reconciles to `interrupted`, a redaction check on a DTO, and the `truncated` flag when over the DTO budget).
 
@@ -2447,7 +2648,8 @@ test('symlinked activity dir/segment is refused by the scan', () => { /* ... */ 
 **Interfaces:** channels `activity:list` (filter → `{items, truncated}`), `activity:get` (id → item + lenses), `activity:export` (filter → path; export built in main via `read.buildExport`), `activity:reveal` (id → `shell.showItemInFinder`). Handlers **validate the filter against `limits.js`** and reject (not clamp) violations; they **only ever return bounded, already-redacted DTOs**; the renderer sends filter parameters, never text to be echoed. The dedicated preload exposes exactly `contextBridge.exposeInMainWorld('activityApi', { list, get, export, reveal })` — an **allowlist of exactly those four `invoke` channels**, nothing else.
 
 - [ ] TDD:
-  - Handler tests: a seeded store returns bounded/redacted DTOs; an over-broad or malformed filter (bad `level`, `limit>200`, `search>256`, regex metachars) is **rejected**.
+  - Handler tests: a seeded store returns bounded/redacted DTOs; a malformed filter (bad `level`, `limit>200`, `search` longer than 256) is **rejected** — but **`search` is a literal substring match, so regex metacharacters (`.*`, `(`, `[`) are accepted as ordinary characters** (Round-3 #9), never compiled as a pattern.
+  - **`get`/`reveal` path-safety tests:** an unsafe/invalid `activity_id` (`../…`, non-UUIDv4) is **rejected** by the handler and never used to build a path; `reveal` only ever reveals a validated path under `activity/`.
   - Preload allowlist test: the preload's exposed API surface is exactly `{list,get,export,reveal}` and each maps to its single `activity:*` channel — assert no `ipcRenderer` object, no `require`, no wildcard is leaked to the window.
   - implement; commit `feat(activity): context-isolated IPC + dedicated Activity preload (allowlisted)`.
 
@@ -2485,7 +2687,10 @@ test('symlinked activity dir/segment is refused by the scan', () => { /* ... */ 
 
 **Interfaces:** "🗒 Activity" appears in **both** the syncing branch (alongside "📊 View Progress") and the idle branch. Export writes a redacted file via a save dialog, produced in main from the validated filter (never renderer text). "History unavailable" renders when the reader reports the store missing/incomplete.
 
-- [ ] TDD: `updateTrayMenu` includes an Activity item in both branches; implement; commit `feat(activity): tray Activity entry + redacted export + unavailable state`.
+- [ ] TDD:
+  - `updateTrayMenu` includes an Activity item in **both** the syncing and idle branches.
+  - **Three-state renderer assertions (Round-3 #9)** against the pure render helper: `{available:true, items:[]}` → the **empty-history** state; `{available:true, incomplete:true, items:[…]}` → items **plus** an incomplete banner; `{available:false}` → the **unavailable** message (distinct text from empty).
+  - implement; commit `feat(activity): tray Activity entry + redacted export + three-state unavailable/incomplete UI`.
 
 **Phase 4 gate:** both suites green; **manual acceptance** — open Activity with no sync running and browse past attempts; trigger a dev-guard block and confirm it appears as a `blocked` item and "View Errors" deep-links to it. Request an `implementation-review` over the Phase-4 range.
 
