@@ -33,10 +33,26 @@ Every task's requirements implicitly include this section. Values are copied ver
 The spec is a contract; these are the concrete engineering choices this plan commits to. They are the highest-value things for the reviewer to scrutinize.
 
 1. **The writer + lease + admission layer is implemented in BOTH Python and Node — by necessity, not choice.** Electron (Node) must acquire and *hold* the lease across its own dev/runtime guards and then hand the locked fd to the child it spawns (`main.js` → `runtime.runSync` → `/bin/sh` → `exec` python); it cannot delegate acquisition to a child, because the child cannot pass a held fd *back up* to the parent. So `repo_radar/activity/` (Python) and `menubar/activity/` (Node, write side) both implement mint/acquire/admit/`start`/guard-`terminal`/handoff. Two cross-language tests keep them in lockstep: a **golden-record byte-equality** test and a **lock-interop** test (a lock taken by one language is seen busy by the other). The reader/reconciler/retention is **Node-only**.
-2. **The POSIX-sh dispatcher stays thin — it never reimplements records/lease/quota.** On the scheduled path it invokes the managed venv Python's bootstrap entrypoint (`python -m repo_radar.activity.bootstrap`) **before** the runtime-verify guard, to mint + acquire + admit + write `start`. That interpreter can still *execute* even when the fingerprint guard will later *reject* it (the exact motivating failure: a Homebrew python bump staled the fingerprint but python still ran). On a subsequent guard failure the shell calls the Python finalizer (`python -m repo_radar.activity.finalize`) to write the `blocked`/`interrupted` terminal and release. Only if the venv Python cannot execute **at all** (rare hard corruption) does the shell append a minimal last-resort `system` incident line in pure sh (best-effort, no quota reservation) so a record still exists.
-3. **The ledger entry is a line-based `key=value` file, not JSON:** `activity/quota/<activity-id>.entry` containing `reserved=<int>\ngranted=<int>\nhas_start=<0|1>`, written atomically (temp + `rename`), `0600`, in `activity/quota/` `0700`. Rationale: it must be read/written from Python, Node, **and** POSIX sh (the last-resort path) without a JSON parser. The field semantics `{reserved, granted}` are exactly the spec's (§7); only the encoding is sh-friendly. `has_start` lets the lease-gated reconciler (§7) distinguish reserve-before-`start` without re-scanning segments.
-4. **A `test` script is added to `menubar/package.json`** (`"test": "node --test"`) — none exists today, though 18 `node:test` files already do. Python keeps `python -m pytest repo_radar/tests/`.
-5. **Shared redaction fixtures** live at `repo_radar/activity/redaction_fixtures.json` (bundled with the package), loaded by the Python test directly and by the Node test via `../../repo_radar/activity/redaction_fixtures.json`. This is the single source that proves both redactors mask identically (spec §4).
+2. **The POSIX-sh dispatcher stays thin — it never reimplements records/lease/quota.** The shell mints `activity_id`+`owner_token` and **acquires+holds** the `owner.lock` fd (same pattern as the existing root `.exec.lock` on fd 9). It then invokes the managed venv Python's bootstrap entrypoint (`python -m repo_radar.activity.bootstrap`) **before** the runtime-verify guard; the bootstrap, seeing an inherited lease but **no existing `start` in the segments**, does `admit` + writes the single `start` + initial `ownership` (the scheduled path's "first producer" case). That interpreter can still *execute* even when the fingerprint guard will later *reject* it (the motivating failure: a Homebrew python bump staled the fingerprint but python still ran). On a subsequent guard failure the shell calls `python -m repo_radar.activity.finalize` to write the `blocked` terminal + `settle` + release. **If the venv Python cannot execute at all** (rare hard corruption), the shell writes a bounded, redacted line to the **System diagnostic stream** (`sync.error.log`) — it does **NOT** append an un-quota'd Activity segment line (Round-1 finding 1). Root-lock contention finalizes the attempt `skipped` (finding 5).
+3. **~~sh-friendly `key=value` ledger~~ — REJECTED (Round-1 finding 1).** The ledger stays **JSON** `activity/quota/<activity-id>.json` exactly as the spec pins it (the thin shell never reads the ledger — only Python/Node do — so there is no shell-simplicity justification). **There is no `has_start` field**: making it authoritative reintroduced the reserve-before-`start` undercount race the spec closed (a crash between the durable `start` and a `mark_started` call would look abandoned). **Lifecycle state (`start` present? `terminal` present?) is derived from a bounded scan of the activity's segments under `quota.lock`**, and reclamation stays lease-gated per spec §5/§7.
+4. **A `test` script is added to `menubar/package.json`** (`"test": "node --test"`) — none exists today, though 18 `node:test` files already do. Python keeps `python -m pytest repo_radar/tests/`. (Reviewer baseline `cd menubar && node --test` passed.)
+5. **Shared redaction fixtures are test-only, not bundled.** They live at `repo_radar/tests/data/redaction_fixtures.json` (the packaging `extraResources` excludes `**/tests/**`, so nothing ships); `load_fixtures()` is a **test helper**, not part of production `redact.py`. The Python suite reads the file directly; the Node suite reads it via `../../repo_radar/tests/data/redaction_fixtures.json`. Fixtures include **configured-secret** cases (not only credential-form regexes) so both redactors' secret-value masking is proven identical (spec §4).
+
+## Plan-review Round 1 dispositions (all accepted)
+
+| # | Finding | Fix landed in |
+|---|---------|---------------|
+| 1 | `has_start` reintroduced the reserve→start race; `key=value` deviation; unreserved sh fallback | Decision 3 (revert to JSON, derive lifecycle from segment scan); Decision 2 (sh fallback → System stream); Tasks 1.6, 1.7, 1.9 |
+| 2 | Capacity state machine unenforced (no per-activity cap in `grant`; `reserve=True` bypasses accounting; 20 KiB partitions absent) | Tasks 1.6 (`grant` per-activity cap), 1.7 (one-shot partitioned reserve accounting), 2.2 (mirrored) |
+| 3 | Settle/release without durable terminal (short write, no flush, construction outside best-effort) | Task 1.7 (durable append: full-write loop + `fsync`; settle only after durability; construction inside the boundary; failure-injection tests) |
+| 4 | Scheduled bootstrap can't create the canonical `start` (adopt path skips admit+start) | Tasks 1.7 (two inherited cases), 1.8 (first-locker admit+start vs adopt-existing; assert exactly one `start`) |
+| 5 | Lifecycle ordering: Activity started after contention gates; no handoff-ack; `LOCK_UN` would unlock the child; controller may not terminalize | Tasks 2.3, 2.4 (`skipped` on contention; `dropLocalReference()` = close-without-unlock; ack protocol; fd→child-fd-4 remap; controller may append `cancel_requested` only; failed-spawn/root-busy/failed-validation outcomes) |
+| 6 | Admission pruning can't be a permanent no-op | New Task 1.6b (real settled-item ceiling-override pruner in Phase 1, exercised via Python+Node admission); Task 3.5 adds age/newest-50/cadence only |
+| 7 | Foundational safety: symlink-following in mkdir/chmod/scan; probe collapses errors to "busy"; UTF-8 byte-bounding, `detail`, summary bounds, redaction coverage; unsynchronized threaded writer | Tasks 1.2 (descriptor-relative + `lstat`), 1.5 (tri-state probe), 1.3/1.7 (byte-bounds, `detail`, summary, redact all free-text, construction in boundary), 1.7 (writer lock) |
+| 8 | Integration tests don't prove the production chain; golden too thin; both lock directions; CLI asserts only directory existence | Tasks 2.1 (all record types + Unicode/truncation golden), 2.2 (both directions + shared behavioral vectors), 2.5/2.6 (assert actual terminal outcomes), 2.7 (real generated dispatcher chain) |
+| 9 | Compressed destructive/security/UI tasks | Tasks 3.5 (full retention matrix), 3.6/4.1 (concrete byte limits), 4.1 (dedicated Activity preload + security-options/allowlist tests), 4.2 (innerHTML source-prohibition + DOM adapter test), 4.3 (bounded/redacted `status.json` errorLog/errorList in System), 5.1 (legacy diagnostics into System) |
+
+Decision dispositions from the reviewer: #1 accepted (contingent on conformance tests + corrected handoff — done); #2 accepted (scheduled first-producer + System fallback corrected); **#3 rejected → reverted**; #4 accepted; #5 accepted (fixtures now test-only + configured-secret cases).
 
 ---
 
@@ -46,7 +62,7 @@ The spec is a contract; these are the concrete engineering choices this plan com
 
 - `__init__.py` — package marker; re-exports the public writer API.
 - `ids.py` — mint/validate `activity_id` (UUIDv4), `writer_id` / `owner_token` (8-hex). Pure, no I/O.
-- `paths.py` — construct + securely create/validate the activity dir, segment paths, `owner.lock`, and the `quota/` dir + `<id>.entry`. Owns the `0700`/`0600` + reject-symlink/non-dir discipline.
+- `paths.py` — construct + securely create/validate the activity dir, segment paths, `owner.lock`, and the `quota/` dir + `<id>.json`. Owns the `0700`/`0600` + reject-symlink/non-dir discipline (lstat-based, no symlink follow).
 - `records.py` — build each record type, enforce per-record bounds (§7) with explicit truncation marking, and encode to a single UTF-8 JSON line; report encoded byte length (incl. newline). Pure.
 - `redact.py` — write-time redaction: the fixed credential-form patterns (mirroring `metadata._REDACTIONS`) **plus** the app's configured/effective secret values. Loads the shared fixtures only in tests.
 - `lease.py` — `flock` acquire/hold/release (`fcntl.flock(LOCK_EX|LOCK_NB)`), fd retention, `owner_token` minting, and the exact **inherited-descriptor validation** (§5: syntactic → `fstat` identity → independent-busy probe → inherited-fd reassert).
@@ -115,23 +131,25 @@ lease.Lease.owner_token: str
 lease.Lease.fd: int
 lease.Lease.release() -> None
 lease.adopt(inherited_fd, owner_token, lock_path) -> Lease   # runs §5 validation; raises HandoffRejected
-lease.probe_busy(lock_path) -> bool                 # fresh independent descriptor
+lease.probe(lock_path) -> FREE|BUSY|UNCERTAIN       # tri-state, fresh independent descriptor
+lease.probe_busy(lock_path) -> bool                 # == BUSY
 
-quota.admit(home, activity_id, lease) -> bool       # writes entry {reserved:60Ki, granted:0, has_start:0}
-quota.grant(home, activity_id, nbytes) -> bool      # batched; False = refuse ordinary write
-quota.mark_started(home, activity_id) -> None       # has_start=1
-quota.settle(home, activity_id) -> None             # measure on-disk, remove entry
-quota.reconcile(home) -> None                       # startup/pre-admission sweep (lease-gated)
+quota.admit(home, activity_id, lease) -> bool       # writes JSON entry {reserved:60Ki, granted:0}
+quota.grant(home, activity_id, nbytes) -> bool      # per-activity-cap + ceiling; False = refuse ordinary
+quota.settle(home, activity_id) -> None             # remove entry (bytes counted by scan thereafter)
+quota.reconcile(home) -> None                       # startup/pre-admission sweep; lifecycle derived from segments
+quota.prune(home, need_bytes) -> int                # ceiling-override settled-item pruner
 
 writer.ActivityWriter(home, *, kind, channel, trigger, producer,
                       inherited_id=None, inherited_fd=None, owner_token=None)
-writer.ActivityWriter.start() -> None
-writer.ActivityWriter.event(name, level, **fields) -> None
-writer.ActivityWriter.control(name, **fields) -> None       # reserve-eligible, idempotent for cancel_requested
-writer.ActivityWriter.terminal(outcome, **summary) -> None  # reserve-backed; settles quota; releases lease
-writer.ActivityWriter.integrity(kind, **fields) -> None     # reserve-eligible (single dropped-events note)
+writer.ActivityWriter.start() -> None                       # mint: start+initial-ownership; adopt-existing: handoff-ownership
+writer.ActivityWriter.event(name, level, detail=None, **fields) -> None   # ordinary (grant); auto dropped-events note if refused
+writer.ActivityWriter.control(name, **fields) -> None       # cancel_requested = one-shot reserve; other names = ordinary
+writer.ActivityWriter.terminal(outcome, **summary) -> None  # one-shot reserve; settles quota + releases lease ONLY after durable
 writer.ActivityWriter.activity_id: str
 writer.ActivityWriter.hand_off_env() -> dict                # {REPO_RADAR_ACTIVITY_ID, ..._OWNER_TOKEN, ..._LOCK_FD}
+# (no public integrity(): the single dropped-events note is emitted internally; further
+#  integrity findings are reader-derived / System Problems, per spec §7)
 ```
 
 **Node** (`menubar/activity/`): mirrors the above (`validActivityId`, `mintToken`, `segmentPath`, `buildRecord`, `encodeRecord`, `Redactor`, `acquire`, `adopt`, `probeBusy`, `admit`, `grant`, `settle`, `reconcile`, `ActivityWriter`) with camelCase names, plus the reader-only:
@@ -237,7 +255,7 @@ git commit -m "feat(activity): identity mint + validation (ids.py)"
 
 **Interfaces:**
 - Consumes: `ids.valid_activity_id`, `ids.valid_token`.
-- Produces: `activity_dir(home, activity_id) -> Path`, `segment_path(home, activity_id, producer, writer_id) -> Path`, `owner_lock_path(home, activity_id) -> Path`, `quota_dir(home) -> Path`, `ledger_entry_path(home, activity_id) -> Path`, `secure_mkdir(path, mode=0o700) -> None`, `secure_open_append(path, mode=0o600) -> int`. Raises `UnsafePath` on symlink/non-dir/invalid-id.
+- Produces: `activity_dir(home, activity_id) -> Path`, `segment_path(home, activity_id, producer, writer_id) -> Path`, `owner_lock_path(home, activity_id) -> Path`, `quota_dir(home) -> Path`, `ledger_entry_path(home, activity_id) -> Path`, `secure_mkdir(path, mode=0o700) -> None`, `secure_open_append(path, mode=0o600) -> int`, plus scan helpers `secure_scan(directory, pattern="*.jsonl") -> list[Path]` (files only, via `lstat`, never following a symlinked entry) and `secure_iterdirs(base) -> list[Path]` (immediate subdirs only, `lstat`, skipping symlinks). Raises `UnsafePath` on symlink/non-dir/invalid-id. **Ledger entry is `<id>.json`** (Decision 3). `secure_mkdir` creates each missing ancestor component with `lstat` re-verification (finding 7: no attacker-symlink follow).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -279,6 +297,22 @@ def test_segment_path_rejects_bad_producer_and_writer(tmp_path):
         paths.segment_path(tmp_path, VALID, "python", "BADWRITER")
     with pytest.raises(paths.UnsafePath):
         paths.segment_path(tmp_path, VALID, "hacker", "deadbeef")
+
+def test_secure_scan_skips_symlinked_entries(tmp_path):
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    real = d / "python-deadbeef.jsonl"; real.write_bytes(b"x\n")
+    victim = tmp_path / "outside.jsonl"; victim.write_bytes(b"secret\n")
+    os.symlink(victim, d / "python-cafebabe.jsonl")     # symlinked entry must be skipped
+    files = paths.secure_scan(d)
+    assert real in files and (d / "python-cafebabe.jsonl") not in files
+
+def test_secure_mkdir_rejects_symlinked_ancestor(tmp_path):
+    victim = tmp_path / "victim"; victim.mkdir()
+    base = tmp_path / "Library" / "Logs" / "repo-radar"
+    base.parent.mkdir(parents=True)
+    os.symlink(victim, base)                             # symlinked ANCESTOR of activity/
+    with pytest.raises(paths.UnsafePath):
+        paths.secure_mkdir(base / "activity" / VALID)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -290,7 +324,7 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # repo_radar/activity/paths.py
-import os
+import os, stat
 from pathlib import Path
 from repo_radar.activity import ids
 
@@ -323,37 +357,59 @@ def quota_dir(home) -> Path:
 def ledger_entry_path(home, activity_id) -> Path:
     if not ids.valid_activity_id(activity_id):
         raise UnsafePath(f"invalid activity_id: {activity_id!r}")
-    return quota_dir(home) / f"{activity_id}.entry"
+    return quota_dir(home) / f"{activity_id}.json"
+
+def _lstat_ok_dir(p):
+    st = os.lstat(p)                              # never follows a final symlink
+    if stat.S_ISLNK(st.st_mode):
+        raise UnsafePath(f"refuses symlink: {p}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise UnsafePath(f"exists as non-directory: {p}")
 
 def secure_mkdir(path, mode=0o700) -> None:
-    path = Path(path)
-    if path.is_symlink():
-        raise UnsafePath(f"refuses symlink: {path}")
-    if path.exists() and not path.is_dir():
-        raise UnsafePath(f"exists as non-directory: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=mode)
-    try:
-        os.mkdir(path, mode)            # atomic create with final mode (no perm window)
-    except FileExistsError:
-        if Path(path).is_symlink() or not Path(path).is_dir():
-            raise UnsafePath(f"raced to unsafe type: {path}")
-    os.chmod(path, mode)
+    """Create path + missing ancestors, rejecting any symlinked component (finding 7)."""
+    path = Path(path); chain = []; cur = path
+    while not cur.exists():
+        chain.append(cur); cur = cur.parent
+    _lstat_ok_dir(cur)                            # deepest existing ancestor must be a real dir
+    for p in reversed(chain):
+        try:
+            os.mkdir(p, mode)                    # atomic create with final mode (no window)
+        except FileExistsError:
+            pass
+        _lstat_ok_dir(p)                         # re-verify after creation (race-safe)
+        os.chmod(p, mode)
 
 def secure_open_append(path, mode=0o600) -> int:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
-    return os.open(path, flags, mode)
+    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, mode)
+
+def secure_scan(directory, pattern="*.jsonl"):
+    """Regular files only, via lstat; never follows a symlinked entry (finding 7)."""
+    d = Path(directory)
+    if not d.exists():
+        return []
+    return [e for e in d.glob(pattern) if stat.S_ISREG(os.lstat(e).st_mode)]
+
+def secure_iterdirs(base):
+    """Immediate real subdirs of base (lstat), skipping symlinks and non-dirs."""
+    b = Path(base)
+    if not b.exists():
+        return []
+    return [e for e in b.iterdir() if stat.S_ISDIR(os.lstat(e).st_mode)]
 ```
+
+(`import stat` is already needed by the tests; add `import os, stat` at the top of `paths.py`.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_paths.py -v`
-Expected: PASS (4 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add repo_radar/activity/paths.py repo_radar/tests/test_activity_paths.py
-git commit -m "feat(activity): secure storage paths (0700/0600, symlink-safe)"
+git commit -m "feat(activity): secure storage paths (0700/0600, symlink-safe, lstat scans)"
 ```
 
 ### Task 1.3: Record contract — build, bound, encode
@@ -404,6 +460,24 @@ def test_reserved_record_stays_under_20kib_including_newline():
     rec = R.build("terminal", seq=9, activity_id=AID, outcome="failed",
                   summary={"repos_changed": 0, "errors": 1, "warns": 0}, by="deadbeef")
     assert R.encoded_len(rec) <= R.MAX_RECORD_BYTES
+
+def test_key_is_byte_bounded_not_char_bounded():
+    rec = R.build("event", seq=4, activity_id=AID, level="info", event="x",
+                  fields={"é" * 100: 1})            # 2 bytes per char in UTF-8
+    key = next(iter(rec["fields"]))
+    assert len(key.encode("utf-8")) <= R.MAX_KEY_BYTES
+
+def test_terminal_summary_is_bounded_like_fields():
+    rec = R.build("terminal", seq=5, activity_id=AID, outcome="failed",
+                  summary={f"k{i}": "z" * 4000 for i in range(50)}, by="deadbeef")
+    import json
+    assert len(json.dumps(rec["summary"]).encode()) <= R.MAX_FIELDS_BYTES
+    assert R.encoded_len(rec) <= R.MAX_RECORD_BYTES
+
+def test_ts_override_is_deterministic():
+    rec = R.build("event", seq=0, activity_id=AID, ts="2026-08-14T00:00:00-07:00",
+                  level="info", event="x", fields={})
+    assert rec["ts"] == "2026-08-14T00:00:00-07:00"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -443,19 +517,23 @@ def _truncate(s: str, limit: int):
     kept = keep.decode("utf-8", "ignore")
     return kept + marker.format(len(b) - len(kept.encode())), True
 
+def _bound_key(k):
+    b = str(k).encode("utf-8")               # byte-bound, not char-bound (finding 7)
+    return str(k) if len(b) <= MAX_KEY_BYTES else b[:MAX_KEY_BYTES].decode("utf-8", "ignore")
+
 def _bound_fields(fields):
     truncated = False
     out = {}
-    for i, (k, v) in enumerate(fields.items()):
+    for i, (k, v) in enumerate((fields or {}).items()):
         if i >= MAX_KEYS:
             truncated = True
             break
-        k = str(k)[:MAX_KEY_BYTES]
+        k = _bound_key(k)
         if isinstance(v, str):
             v, t = _truncate(v, MAX_VALUE_BYTES)
             truncated = truncated or t
         elif not isinstance(v, (int, float, bool)) and v is not None:
-            v = str(v)[:MAX_VALUE_BYTES]; truncated = True
+            v, t = _truncate(str(v), MAX_VALUE_BYTES); truncated = True
         out[k] = v
     # aggregate cap
     while len(json.dumps(out, ensure_ascii=False).encode()) > MAX_FIELDS_BYTES and out:
@@ -463,13 +541,14 @@ def _bound_fields(fields):
         truncated = True
     return out, truncated
 
-def build(type, *, seq, activity_id, **payload):
+def build(type, *, seq, activity_id, ts=None, **payload):
     rec = {"schema_version": SCHEMA_VERSION, "activity_id": activity_id,
-           "type": type, "seq": seq, "ts": _now_iso()}
+           "type": type, "seq": seq, "ts": ts or _now_iso()}
     truncated = False
-    if "fields" in payload:
-        payload["fields"], t = _bound_fields(payload["fields"]); truncated |= t
-    if "detail" in payload and payload["detail"] is not None:
+    for dictkey in ("fields", "summary"):        # summary is bounded like fields (finding 7)
+        if dictkey in payload:
+            payload[dictkey], t = _bound_fields(payload[dictkey]); truncated |= t
+    if payload.get("detail") is not None:
         payload["detail"], t = _truncate(str(payload["detail"]), MAX_DETAIL_BYTES); truncated |= t
     rec.update(payload)
     if truncated:
@@ -488,35 +567,36 @@ def encoded_len(record) -> int:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_records.py -v`
-Expected: PASS (4 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add repo_radar/activity/records.py repo_radar/tests/test_activity_records.py
-git commit -m "feat(activity): record contract with per-record byte bounds + truncation"
+git commit -m "feat(activity): record contract — byte-bounded keys/values/summary + truncation + ts override"
 ```
 
 ### Task 1.4: Write-time redaction + shared fixtures
 
 **Files:**
 - Create: `repo_radar/activity/redact.py`
-- Create: `repo_radar/activity/redaction_fixtures.json`
+- Create: `repo_radar/tests/data/redaction_fixtures.json` (**test-only**, not bundled — Decision 5)
 - Test: `repo_radar/tests/test_activity_redact.py`
 
 **Interfaces:**
-- Produces: `Redactor(configured_secrets: list[str]).scrub(text) -> str`, `load_fixtures() -> list[tuple[str,str]]`. Masks the credential forms from spec §4 (`sk-…`, `ghp_…`/`github_pat_…`, `AIza…`, `Bearer …`, `//user:pass@`) plus every non-empty configured secret value (longest-first, so overlapping secrets fully mask).
+- Produces: `Redactor(configured_secrets: list[str]).scrub(text) -> str`. Masks the credential forms from spec §4 (`sk-…`, `ghp_…`/`github_pat_…`, `AIza…`, `Bearer …`, `//user:pass@`) plus every non-empty configured secret value (longest-first, so overlapping secrets fully mask). **`load_fixtures()` is NOT in production** — the fixtures are loaded in the test module (Decision 5).
 
-- [ ] **Step 1: Write the fixtures file**
+- [ ] **Step 1: Write the fixtures file** `repo_radar/tests/data/redaction_fixtures.json` (object form so configured-secret cases are covered, per finding 5's disposition)
 
 ```json
 [
-  ["Authorization: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "Authorization: [REDACTED authorization]"],
-  ["key sk-proj-ABCDEFGHIJKLMNOPQRSTUV", "key [REDACTED api key]"],
-  ["token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "token [REDACTED github token]"],
-  ["token github_pat_11ABCDE0000abcdefghij_KLMNOPQRSTUVWXYZ0123456789abcdefghij", "token [REDACTED github token]"],
-  ["gemini AIzaSyA0000000000000000000000000000000", "gemini [REDACTED google key]"],
-  ["clone https://user:s3cr3t@github.com/x/y.git", "clone https://<redacted>@github.com/x/y.git"]
+  {"secrets": [], "raw": "Authorization: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "expected": "Authorization: [REDACTED authorization]"},
+  {"secrets": [], "raw": "key sk-proj-ABCDEFGHIJKLMNOPQRSTUV", "expected": "key [REDACTED api key]"},
+  {"secrets": [], "raw": "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "expected": "token [REDACTED github token]"},
+  {"secrets": [], "raw": "gemini AIzaSyA0000000000000000000000000000000", "expected": "gemini [REDACTED google key]"},
+  {"secrets": [], "raw": "clone https://user:s3cr3t@github.com/x/y.git", "expected": "clone https://<redacted>@github.com/x/y.git"},
+  {"secrets": ["hunter2-configured-token-value"], "raw": "debug password=hunter2-configured-token-value end", "expected": "debug password=[REDACTED] end"},
+  {"secrets": ["abc", "abcdef123456"], "raw": "val=abcdef123456", "expected": "val=[REDACTED]"}
 ]
 ```
 
@@ -524,17 +604,15 @@ git commit -m "feat(activity): record contract with per-record byte bounds + tru
 
 ```python
 # repo_radar/tests/test_activity_redact.py
+import json, pathlib
 from repo_radar.activity import redact
 
-def test_credential_forms_from_shared_fixtures():
-    r = redact.Redactor(configured_secrets=[])
-    for raw, expected in redact.load_fixtures():
-        assert r.scrub(raw) == expected
+FIX = pathlib.Path(__file__).parent / "data" / "redaction_fixtures.json"
 
-def test_configured_secret_value_is_masked_even_if_unpatterned():
-    r = redact.Redactor(configured_secrets=["hunter2superlong-configured-value"])
-    assert "hunter2superlong-configured-value" not in r.scrub(
-        "debug: password=hunter2superlong-configured-value trailing")
+def test_shared_fixtures_mask_as_expected():
+    for case in json.loads(FIX.read_text()):
+        r = redact.Redactor(configured_secrets=case["secrets"])
+        assert r.scrub(case["raw"]) == case["expected"], case["raw"]
 
 def test_overlapping_secrets_mask_fully_longest_first():
     r = redact.Redactor(configured_secrets=["abc", "abcdef123456"])
@@ -546,26 +624,20 @@ def test_overlapping_secrets_mask_fully_longest_first():
 Run: `python -m pytest repo_radar/tests/test_activity_redact.py -v`
 Expected: FAIL (`ModuleNotFoundError`).
 
-- [ ] **Step 4: Write minimal implementation**
+- [ ] **Step 4: Write minimal implementation** (no fixture loading in production)
 
 ```python
 # repo_radar/activity/redact.py
-import json, re
-from pathlib import Path
-
-_FIXTURES = Path(__file__).with_name("redaction_fixtures.json")
+import re
 
 _FORMS = [
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-]{16,}"), "[REDACTED authorization]"),
-    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED github token]"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED github token]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED github token]"),
     (re.compile(r"sk-(?:ant-)?[A-Za-z0-9._\-]{16,}"), "[REDACTED api key]"),
     (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "[REDACTED google key]"),
     (re.compile(r"//[^/@\s]+@"), "//<redacted>@"),
 ]
-
-def load_fixtures():
-    return [tuple(pair) for pair in json.loads(_FIXTURES.read_text())]
 
 class Redactor:
     def __init__(self, configured_secrets):
@@ -585,13 +657,13 @@ class Redactor:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_redact.py -v`
-Expected: PASS (3 tests). (The `github_pat_` fixture matches before `gh[pousr]_`; order preserved.)
+Expected: PASS (2 tests). (`github_pat_` is ordered before `gh[pousr]_`; the Node mirror in Task 3.4 uses the identical ordering and reads the same fixtures.)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add repo_radar/activity/redact.py repo_radar/activity/redaction_fixtures.json repo_radar/tests/test_activity_redact.py
-git commit -m "feat(activity): write-time redaction + shared cross-language fixtures"
+git add repo_radar/activity/redact.py repo_radar/tests/data/redaction_fixtures.json repo_radar/tests/test_activity_redact.py
+git commit -m "feat(activity): write-time redaction + shared cross-language fixtures (test-only)"
 ```
 
 ### Task 1.5: The `flock` lease — acquire, adopt/validate, probe
@@ -602,7 +674,7 @@ git commit -m "feat(activity): write-time redaction + shared cross-language fixt
 
 **Interfaces:**
 - Consumes: `ids.mint_token`, `paths.owner_lock_path`, `paths.secure_mkdir`.
-- Produces: `acquire(lock_path) -> Lease|None` (None if busy), `Lease` with `.owner_token`, `.fd`, `.release()`; `adopt(inherited_fd, owner_token, lock_path) -> Lease` (raises `HandoffRejected` unless §5 validation passes); `probe_busy(lock_path) -> bool` (fresh independent descriptor). Validation order is exactly §5: syntactic → `fstat` identity vs a fresh non-symlink `stat` → independent-busy → inherited-fd reassert.
+- Produces: `acquire(lock_path) -> Lease|None` (None if busy), `Lease` with `.owner_token`, `.fd`, `.release()`, and `.drop_local_reference()` (close **without** `LOCK_UN` — for the Electron handoff, finding 5); `adopt(inherited_fd, owner_token, lock_path) -> Lease` (raises `HandoffRejected` unless §5 validation passes); a **tri-state** `probe(lock_path) -> FREE|BUSY|UNCERTAIN` (finding 7) and `probe_busy(lock_path) -> bool` (`== BUSY`). Validation order is exactly §5: syntactic → `fstat` identity vs a fresh non-symlink `stat` → independent probe **must be `BUSY`** → inherited-fd reassert. `UNCERTAIN` never counts as busy (adopt rejects; the reader emits an integrity Problem).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -659,8 +731,10 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # repo_radar/activity/lease.py
-import fcntl, os
+import errno, fcntl, os
 from repo_radar.activity import ids
+
+FREE, BUSY, UNCERTAIN = "free", "busy", "uncertain"
 
 class HandoffRejected(Exception):
     pass
@@ -670,11 +744,17 @@ class Lease:
         self.fd = fd
         self.owner_token = owner_token
     def release(self):
+        """Full release: unlock + close (the executing owner, at terminal)."""
         if self.fd is not None:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_UN)
             finally:
                 os.close(self.fd); self.fd = None
+    def drop_local_reference(self):
+        """Close WITHOUT LOCK_UN (finding 5). LOCK_UN would release the shared open-file
+        description the child inherited; a bare close leaves the child holding the lease."""
+        if self.fd is not None:
+            os.close(self.fd); self.fd = None
 
 def acquire(lock_path):
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -684,17 +764,23 @@ def acquire(lock_path):
         os.close(fd); return None
     return Lease(fd, ids.mint_token())
 
-def probe_busy(lock_path) -> bool:
-    """Fresh independent open-file description: True if someone else holds it."""
-    fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+def probe(lock_path):
+    """Tri-state via a fresh independent open-file description (finding 7)."""
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError:
+        return UNCERTAIN
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(fd, fcntl.LOCK_UN)     # we got it -> it was free
-        return False
-    except OSError:
-        return True                        # busy
+        return FREE
+    except OSError as e:
+        return BUSY if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK) else UNCERTAIN
     finally:
         os.close(fd)
+
+def probe_busy(lock_path) -> bool:
+    return probe(lock_path) == BUSY
 
 def adopt(inherited_fd, owner_token, lock_path) -> Lease:
     # (1) syntactic
@@ -708,9 +794,9 @@ def adopt(inherited_fd, owner_token, lock_path) -> Lease:
         raise HandoffRejected(f"stat failed: {e}")
     if (fst.st_dev, fst.st_ino) != (pst.st_dev, pst.st_ino):
         raise HandoffRejected("fd is not this activity's owner.lock")
-    # (3) independent probe MUST report busy (someone holds the lease)
-    if not probe_busy(lock_path):
-        raise HandoffRejected("no lease held on this inode (unlocked look-alike)")
+    # (3) independent probe MUST be strictly BUSY (UNCERTAIN never counts as held)
+    if probe(lock_path) != BUSY:
+        raise HandoffRejected("lease not confirmably held (unlocked look-alike or uncertain)")
     # (4) reassert on the INHERITED fd itself MUST succeed (shares the holding OFD)
     try:
         fcntl.flock(inherited_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -738,8 +824,8 @@ git commit -m "feat(activity): flock lease with exact inherited-descriptor valid
 - Test: `repo_radar/tests/test_activity_quota.py`
 
 **Interfaces:**
-- Consumes: `paths.quota_dir`, `paths.ledger_entry_path`, `paths.owner_lock_path`, `paths.secure_mkdir`, `lease.acquire`.
-- Produces: `admit(home, activity_id, lease) -> bool`, `grant(home, activity_id, nbytes) -> bool`, `mark_started(home, activity_id) -> None`, `settle(home, activity_id) -> None`, `reconcile(home) -> None`; constants `CEILING=64*1024*1024`, `RESERVE=60*1024`, `PER_ACTIVITY_CAP=4*1024*1024`. Ledger entry is the `key=value` file from Decision 3. All mutating ops hold `quota.lock` (BSD `flock`). Invariant: **charge = committed(scan) + Σ_live max(0, reserved+granted−on_disk) + Σ_corrupt 4 MiB**, and `admit`/`grant` require `charge + request ≤ CEILING`.
+- Consumes: `paths.quota_dir`, `paths.ledger_entry_path`, `paths.owner_lock_path`, `paths.secure_mkdir`, `lease.acquire` (used as the safe-bias free/held probe — success ⇒ free ⇒ reclaimable; failure ⇒ preserve).
+- Produces: `admit(home, activity_id, lease) -> bool`, `grant(home, activity_id, nbytes) -> bool`, `settle(home, activity_id) -> None`, `reconcile(home) -> None`, `prune(home, need_bytes) -> int`; constants `CEILING=64*1024*1024`, `RESERVE=60*1024`, `PER_ACTIVITY_CAP=4*1024*1024`, `ORDINARY_CAP=PER_ACTIVITY_CAP-RESERVE`. **Ledger entry is JSON `<id>.json` `{reserved,granted}` (Decision 3; no `has_start`).** All mutating ops hold `quota.lock` (BSD `flock`). Invariant: **charge = committed(scan) + Σ_live max(0, reserved+granted−on_disk) + Σ_corrupt 4 MiB**; `admit` requires `charge + RESERVE ≤ CEILING` (pruning first if needed, finding 6); `grant(nbytes)` requires **both** `granted+nbytes ≤ ORDINARY_CAP` (per-activity cap, finding 2) **and** `charge+nbytes ≤ CEILING`. **`start`/`terminal` presence is derived from a bounded segment scan under the lock — never a ledger flag (finding 1).**
 
 - [ ] **Step 1: Write the failing test** (the crash-safety invariants Codex required)
 
@@ -757,46 +843,81 @@ def _new_activity(tmp_path):
     aid = ids.mint_activity_id(); lp = _mk(tmp_path, aid)
     return aid, lease.acquire(lp)
 
-def test_admit_grant_settle_happy_path(tmp_path):
+def _write_start(home, aid):   # a durable start line, as the writer would leave it
+    seg = paths.segment_path(home, aid, "python", "deadbeef")
+    fd = paths.secure_open_append(seg)
+    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t"}\n'); os.close(fd)
+
+def _write_terminal(home, aid):
+    seg = paths.segment_path(home, aid, "python", "deadbeef")
+    fd = paths.secure_open_append(seg)
+    os.write(fd, b'{"schema_version":1,"type":"terminal","seq":9,"ts":"t","outcome":"succeeded"}\n'); os.close(fd)
+
+def test_admit_writes_json_entry_and_settle_removes_it(tmp_path):
     aid, l = _new_activity(tmp_path)
     assert quota.admit(tmp_path, aid, l) is True
-    assert paths.ledger_entry_path(tmp_path, aid).exists()
-    assert quota.grant(tmp_path, aid, 1000) is True
+    import json
+    assert json.loads(paths.ledger_entry_path(tmp_path, aid).read_text()) == {"reserved": quota.RESERVE, "granted": 0}
     quota.settle(tmp_path, aid)
-    assert not paths.ledger_entry_path(tmp_path, aid).exists()   # entry removed
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()
 
-def test_grant_before_append_overcounts_never_undercounts(tmp_path):
+def test_grant_enforces_both_per_activity_cap_and_global_ceiling(tmp_path):
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
-    quota.grant(tmp_path, aid, 500_000)          # granted, nothing appended yet -> overcount
-    entry = paths.ledger_entry_path(tmp_path, aid).read_text()
-    assert "granted=500000" in entry             # charged before any on-disk bytes
+    assert quota.grant(tmp_path, aid, quota.ORDINARY_CAP) is True          # fills ordinary cap
+    assert quota.grant(tmp_path, aid, 1) is False                         # per-activity cap hit
+    import json
+    assert json.loads(paths.ledger_entry_path(tmp_path, aid).read_text())["granted"] == quota.ORDINARY_CAP
 
-def test_reconcile_preserves_live_reserve_before_start_when_lease_held(tmp_path):
-    aid, l = _new_activity(tmp_path)             # lease HELD, has_start=0 (reserve-before-start)
+def test_reconcile_preserves_started_run_with_free_lease(tmp_path):
+    # finding 1: durable start present, lease freed, NO terminal -> must be PRESERVED
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l); _write_start(tmp_path, aid)
+    l.release()                                  # crash after start, before terminal
+    quota.reconcile(tmp_path)
+    assert paths.ledger_entry_path(tmp_path, aid).exists()   # NOT reclaimed (has start)
+
+def test_reconcile_releases_abandoned_pre_start_when_lease_free(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)                # reserved, NO start
+    l.release()
+    quota.reconcile(tmp_path)
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()
+
+def test_reconcile_preserves_pre_start_when_lease_held(tmp_path):
+    aid, l = _new_activity(tmp_path)             # reserve-before-start, lease HELD
     quota.admit(tmp_path, aid, l)
-    quota.reconcile(tmp_path)                     # must NOT reclaim: lease is held
+    quota.reconcile(tmp_path)
     assert paths.ledger_entry_path(tmp_path, aid).exists()
 
-def test_reconcile_releases_abandoned_no_start_when_lease_free(tmp_path):
+def test_reconcile_settles_durable_terminal(tmp_path):
     aid, l = _new_activity(tmp_path)
-    quota.admit(tmp_path, aid, l)
-    l.release()                                  # producer "died" before start
+    quota.admit(tmp_path, aid, l); _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release()
     quota.reconcile(tmp_path)
-    assert not paths.ledger_entry_path(tmp_path, aid).exists()   # abandoned reservation freed
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()   # settled
 
-def test_corrupt_entry_charges_full_4mib_and_blocks_admission(tmp_path):
+def test_prune_frees_settled_items_ceiling_override(tmp_path):
+    # two settled routine items + one settled problem item; prune must free routine first,
+    # keep the problem, and never touch a running item
+    for _ in range(2):
+        aid, l = _new_activity(tmp_path); quota.admit(tmp_path, aid, l)
+        _write_start(tmp_path, aid); _write_terminal(tmp_path, aid); quota.settle(tmp_path, aid)
+    prob, lp = _new_activity(tmp_path); quota.admit(tmp_path, prob, lp)
+    _write_start(tmp_path, prob)
+    seg = paths.segment_path(tmp_path, prob, "python", "deadbeef")
+    fd = paths.secure_open_append(seg); os.write(fd, b'{"type":"terminal","outcome":"failed","ts":"t"}\n'); os.close(fd)
+    quota.settle(tmp_path, prob)
+    freed = quota.prune(tmp_path, need_bytes=10)
+    assert freed > 0
+    assert paths.activity_dir(tmp_path, prob).exists()   # newest problem preserved
+
+def test_corrupt_entry_charges_full_4mib_and_blocks_admission(tmp_path, monkeypatch):
     aid, l = _new_activity(tmp_path)
-    paths.secure_mkdir(paths.quota_dir(tmp_path))
-    paths.ledger_entry_path(tmp_path, aid).write_text("garbage-not-kv")   # torn entry
-    # a fresh activity now cannot admit near the ceiling because 4 MiB is charged
+    paths.ledger_entry_path(tmp_path, aid).write_text("{not valid json")   # torn entry
     aid2, l2 = _new_activity(tmp_path)
-    # force near-ceiling: emulate by shrinking the ceiling for the test via monkeypatch
-    quota.CEILING, saved = 4 * 1024 * 1024 + 1024, quota.CEILING
-    try:
-        assert quota.admit(tmp_path, aid2, l2) is False   # 4 MiB corrupt liability blocks it
-    finally:
-        quota.CEILING = saved
+    monkeypatch.setattr(quota, "CEILING", quota.PER_ACTIVITY_CAP + 1024)   # near ceiling
+    assert quota.admit(tmp_path, aid2, l2) is False   # 4 MiB corrupt liability blocks it
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -808,13 +929,14 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # repo_radar/activity/quota.py
-import fcntl, os, tempfile
+import fcntl, json, os, tempfile
 from pathlib import Path
 from repo_radar.activity import paths, lease as lease_mod
 
 CEILING = 64 * 1024 * 1024
 RESERVE = 60 * 1024
 PER_ACTIVITY_CAP = 4 * 1024 * 1024
+ORDINARY_CAP = PER_ACTIVITY_CAP - RESERVE
 
 def _quota_lock(home):
     paths.secure_mkdir(paths.quota_dir(home))
@@ -827,51 +949,55 @@ def _unlock(fd):
     fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 def _read_entry(path):
-    """Returns dict or the sentinel 'CORRUPT'."""
+    """JSON ledger (Decision 3). Returns dict or the sentinel 'CORRUPT'."""
     try:
-        kv = {}
-        for line in Path(path).read_text().splitlines():
-            k, _, v = line.partition("=")
-            kv[k] = int(v)
-        return {"reserved": kv["reserved"], "granted": kv["granted"], "has_start": kv["has_start"]}
+        d = json.loads(Path(path).read_text())
+        return {"reserved": int(d["reserved"]), "granted": int(d["granted"])}
     except Exception:
         return "CORRUPT"
 
-def _write_entry(path, reserved, granted, has_start):
+def _write_entry(path, reserved, granted):
     d = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(dir=d)
-    os.write(fd, f"reserved={reserved}\ngranted={granted}\nhas_start={has_start}\n".encode())
+    os.write(fd, json.dumps({"reserved": reserved, "granted": granted}).encode())
     os.close(fd); os.chmod(tmp, 0o600); os.replace(tmp, path)     # atomic
 
-def _on_disk(home, activity_id):
-    d = paths.activity_dir(home, activity_id)
-    return sum(f.stat().st_size for f in d.glob("*.jsonl")) if d.exists() else 0
+def _segments(home, activity_id):
+    return paths.secure_scan(paths.activity_dir(home, activity_id), "*.jsonl")   # lstat-safe
+
+# lifecycle state is DERIVED from segments, never a ledger flag (finding 1)
+def _has_start(home, aid):
+    return any(b'"type":"start"' in f.read_bytes() for f in _segments(home, aid))
+def _has_terminal(home, aid):
+    return any(b'"type":"terminal"' in f.read_bytes() for f in _segments(home, aid))
+def _on_disk(home, aid):
+    return sum(os.lstat(f).st_size for f in _segments(home, aid))
 
 def _committed(home):
     base = paths.quota_dir(home).parent
-    return sum(f.stat().st_size for f in base.glob("*/*.jsonl"))
+    total = 0
+    for d in paths.secure_iterdirs(base):          # skips symlinked dirs (finding 7)
+        if d.name == "quota":
+            continue
+        total += sum(os.lstat(f).st_size for f in paths.secure_scan(d, "*.jsonl"))
+    return total
 
 def _charge(home):
     total = _committed(home)
-    qd = paths.quota_dir(home)
-    if qd.exists():
-        for entry in qd.glob("*.entry"):
-            aid = entry.stem
-            e = _read_entry(entry)
-            if e == "CORRUPT":
-                total += PER_ACTIVITY_CAP
-            else:
-                total += max(0, e["reserved"] + e["granted"] - _on_disk(home, aid))
+    for entry in paths.secure_scan(paths.quota_dir(home), "*.json"):
+        aid = entry.stem; e = _read_entry(entry)
+        total += PER_ACTIVITY_CAP if e == "CORRUPT" \
+            else max(0, e["reserved"] + e["granted"] - _on_disk(home, aid))
     return total
 
 def admit(home, activity_id, lease):
     fd = _quota_lock(home)
     try:
         if _charge(home) + RESERVE > CEILING:
-            _prune(home)
+            prune(home, (_charge(home) + RESERVE) - CEILING)   # finding 6: prune FIRST
             if _charge(home) + RESERVE > CEILING:
-                return False                       # best-effort refuse
-        _write_entry(paths.ledger_entry_path(home, activity_id), RESERVE, 0, 0)
+                return False                                   # best-effort refuse
+        _write_entry(paths.ledger_entry_path(home, activity_id), RESERVE, 0)
         return True
     finally:
         _unlock(fd)
@@ -879,23 +1005,15 @@ def admit(home, activity_id, lease):
 def grant(home, activity_id, nbytes):
     fd = _quota_lock(home)
     try:
-        p = paths.ledger_entry_path(home, activity_id)
-        e = _read_entry(p)
+        p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
         if e == "CORRUPT":
             return False
-        if _charge(home) + nbytes > CEILING:
+        if e["granted"] + nbytes > ORDINARY_CAP:      # per-activity cap (finding 2)
             return False
-        _write_entry(p, e["reserved"], e["granted"] + nbytes, e["has_start"])
+        if _charge(home) + nbytes > CEILING:           # global ceiling
+            return False
+        _write_entry(p, e["reserved"], e["granted"] + nbytes)
         return True
-    finally:
-        _unlock(fd)
-
-def mark_started(home, activity_id):
-    fd = _quota_lock(home)
-    try:
-        p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
-        if e != "CORRUPT":
-            _write_entry(p, e["reserved"], e["granted"], 1)
     finally:
         _unlock(fd)
 
@@ -908,44 +1026,78 @@ def settle(home, activity_id):
     finally:
         _unlock(fd)
 
-def _has_terminal(home, activity_id):
-    d = paths.activity_dir(home, activity_id)
-    return d.exists() and any(b'"type":"terminal"' in f.read_bytes() for f in d.glob("*.jsonl"))
-
 def reconcile(home):
     fd = _quota_lock(home)
     try:
-        qd = paths.quota_dir(home)
-        if not qd.exists():
-            return
-        for entry in list(qd.glob("*.entry")):
-            aid = entry.stem
-            e = _read_entry(entry)
-            if e == "CORRUPT":
-                if _has_terminal(home, aid) and not lease_mod.probe_busy(paths.owner_lock_path(home, aid)):
-                    os.unlink(entry)               # settle from segments+lease evidence
-                continue                           # else keep the 4 MiB charge (via _charge)
+        for entry in list(paths.secure_scan(paths.quota_dir(home), "*.json")):
+            aid = entry.stem; e = _read_entry(entry)
+            lock = paths.owner_lock_path(home, aid)
             if _has_terminal(home, aid):
-                os.unlink(entry); continue         # durable terminal -> settle
-            if e["has_start"] == 0:                # reserve-before-start: LEASE-GATED
-                l = lease_mod.acquire(paths.owner_lock_path(home, aid))
-                if l is not None:                  # lease free -> producer gone -> abandoned
-                    l.release(); os.unlink(entry)
-                # else: lease held -> preserve the charge (do nothing)
+                # settle only when the owner is provably gone (lease free); covers both
+                # readable and corrupt entries with a durable terminal
+                probe = lease_mod.acquire(lock)
+                if probe is not None:
+                    probe.release(); os.unlink(entry)
+                continue
+            if e == "CORRUPT":
+                continue                           # keep the 4 MiB charge (via _charge)
+            if not _has_start(home, aid):          # reserve-before-start: LEASE-GATED
+                l = lease_mod.acquire(lock)        # acquire succeeds ONLY if free (safe bias:
+                if l is not None:                  #   busy/uncertain -> None -> preserve)
+                    l.release(); os.unlink(entry)  # lease free + no start -> abandoned
+            # has_start and no terminal: preserve (the reader synthesizes the terminal, §5)
     finally:
         _unlock(fd)
 
-def _prune(home):
-    """Placeholder-free stub for Phase 1: no prunable settled items exist yet in unit
-    scope; full age/prune-order lands in Task 3.x (Node retention). Kept a no-op here so
-    admission fails closed rather than deleting live data."""
-    return
+def _classify(home, aid):
+    """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity."""
+    segs = _segments(home, aid)
+    mtime = max((f.stat().st_mtime for f in segs), default=0.0)
+    if not _has_terminal(home, aid):
+        return ("running", mtime)
+    blob = b"".join(f.read_bytes() for f in segs)
+    problem = any(m in blob for m in (b'"outcome":"failed"', b'"outcome":"blocked"',
+                  b'"outcome":"interrupted"', b'"outcome":"succeeded-with-warnings"',
+                  b'"type":"integrity"'))
+    return ("problem" if problem else "routine", mtime)
+
+def prune(home, need_bytes):
+    """Ceiling-override pruner: SETTLED items only (no live ledger entry), never
+    running/unreconciled, always keep the newest problem, delete segment files FIRST.
+    Prune order: oldest routine -> other non-failures -> oldest problems. Returns bytes freed.
+    (Age/newest-50/cadence policy is layered on in Task 3.5; this is the safe base pruner.)"""
+    base = paths.quota_dir(home).parent
+    live = {p.stem for p in paths.secure_scan(paths.quota_dir(home), "*.json")}
+    items = []
+    for d in paths.secure_iterdirs(base):
+        if d.name == "quota" or d.name in live:
+            continue
+        kind, mtime = _classify(home, d.name)
+        if kind == "running":
+            continue                               # never prune running/unreconciled
+        items.append((d.name, kind, mtime))
+    routine = sorted([i for i in items if i[1] == "routine"], key=lambda x: x[2])
+    problems = sorted([i for i in items if i[1] == "problem"], key=lambda x: x[2])
+    order = routine + (problems[:-1] if problems else [])   # keep newest problem
+    freed = 0
+    for aid, _, _ in order:
+        if freed >= need_bytes:
+            break
+        sz = _on_disk(home, aid)
+        for f in _segments(home, aid):
+            os.unlink(f)                           # delete files FIRST (scan reflects it)
+        try:
+            os.rmdir(paths.activity_dir(home, aid))
+        except OSError:
+            pass
+        freed += sz
+    return freed
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_quota.py -v`
-Expected: PASS (6 tests). Note the `_prune` no-op is intentional in Phase 1 — Python producers never prune; retention/prune is the Node reader's job (Task 3.5). Admission simply fails closed if there is no room, which is the safe direction.
+Expected: PASS (8 tests). Lifecycle is derived from segments (no `has_start` race), `grant` enforces the per-activity cap, admission prunes settled items before failing closed (finding 6), and reclamation is lease-gated (`acquire` succeeds only when free; busy/uncertain preserves the charge, the safe bias — the Node reader's tri-state probe is what emits an integrity Problem on genuine uncertainty).
 
 - [ ] **Step 5: Commit**
 
@@ -963,7 +1115,13 @@ git commit -m "feat(activity): crash-recoverable admission-lock quota ledger (§
 
 **Interfaces:**
 - Consumes: everything above (`ids`, `paths`, `records`, `redact`, `lease`, `quota`).
-- Produces: `ActivityWriter(home, *, kind, channel, trigger, producer, configured_secrets=(), inherited_id=None, inherited_fd=None, owner_token=None)`; methods `start()`, `event(name, level, **fields)`, `control(name, **fields)`, `terminal(outcome, **summary)`, `integrity(kind, **fields)`, `hand_off_env() -> dict`, property `activity_id`. Enforces: adopt-vs-mint; the 20 KiB×3 reserve partition; `event`/`start` refused once ordinary capacity (`grant`) is exhausted while `control`/`terminal`/`integrity` still write; `cancel_requested` idempotent; best-effort (a write failure emits one warning to stderr and never raises into the caller); `terminal` settles quota + releases the lease.
+- Produces: `ActivityWriter(home, *, kind, channel, trigger, producer, configured_secrets=(), inherited_id=None, inherited_fd=None, owner_token=None)`; methods `start()`, `event(name, level, detail=None, **fields)`, `control(name, **fields)`, `terminal(outcome, **summary)`, `hand_off_env() -> dict`, property `activity_id`. Enforces:
+  - **Adopt-vs-mint with first-producer detection (finding 4):** on adopt, if the segments already contain a `start` → write **handoff `ownership`** only; if **not** → this adopter is the scheduled path's first producer → `quota.admit` + write the single `start` + **initial `ownership`**. Mint path always admits+starts. Assert exactly one `start` per activity.
+  - **Partitioned one-shot reserve (finding 2):** three 20 KiB slots — `terminal` (once), `cancel_requested` control (once, idempotent), the dropped-events `integrity` note (once, auto-emitted when an `event` is refused). A reserve write is refused if its slot is already spent or the record exceeds 20 KiB. **Non-`cancel_requested` control names are ordinary (grant-based), not reserve.** No public `integrity()` — further integrity findings are reader-derived (spec §7).
+  - **Ordinary vs reserve accounting:** `event`/`start`/non-cancel `control` call `quota.grant` (refused when the per-activity `ORDINARY_CAP`/global ceiling is hit); reserve writes draw from the pre-reserved 60 KiB and are never grant-checked.
+  - **Durable append (finding 3):** a full-write loop (handles short writes) + `fsync` on every reserve/terminal record; record construction is **inside** the never-raises boundary. `terminal` **settles quota + releases the lease ONLY after the terminal is confirmed durable**; on any append failure it does **not** settle (the reservation is preserved so the reader can synthesize `interrupted`).
+  - **Thread-safety (finding 7):** a `threading.Lock` serializes `seq`+append (the writer is reachable from threaded `SyncLogger` paths).
+  - **Best-effort:** any failure emits one non-recursive stderr warning and never raises into the caller.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -982,33 +1140,45 @@ def _read_all(home, aid):
 def test_full_lifecycle_mint_start_event_terminal_settles_and_releases(tmp_path):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
                               trigger="cli", producer="python")
+    owner_token = w._lease.owner_token   # capture before terminal() releases the lease
     w.start()
     w.event("repos_loaded", "info", count=30)
     w.terminal("succeeded", repos_changed=2, errors=0, warns=0)
     recs = _read_all(tmp_path, w.activity_id)
     types = [r["type"] for r in recs]
-    owner_token = w._lease.owner_token   # release() clears the fd but preserves owner_token
-    assert types[0] == "start" and "event" in types and types[-1] == "terminal"
+    assert types.count("start") == 1 and "event" in types and types[-1] == "terminal"
     assert recs[-1]["outcome"] == "succeeded" and recs[-1]["by"] == owner_token
     assert not paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # settled
     assert lease.acquire(paths.owner_lock_path(tmp_path, w.activity_id)) is not None  # released
 
-def test_cancel_requested_control_is_idempotent(tmp_path):
+def test_cancel_requested_control_is_idempotent_and_uses_reserve(tmp_path):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
                               trigger="cli", producer="python")
     w.start(); w.control("cancel_requested"); w.control("cancel_requested")
     recs = [r for r in _read_all(tmp_path, w.activity_id)
             if r["type"] == "control" and r.get("name") == "cancel_requested"]
-    assert len(recs) == 1                          # written at most once
+    assert len(recs) == 1                          # one-shot slot
 
-def test_terminal_writes_into_reserve_even_when_ordinary_capacity_exhausted(tmp_path, monkeypatch):
+def test_dropped_events_note_is_one_shot(tmp_path, monkeypatch):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
                               trigger="cli", producer="python")
     w.start()
     monkeypatch.setattr(quota, "grant", lambda *a, **k: False)   # ordinary capacity gone
-    w.event("dropped", "info", x=1)                # refused (no crash)
-    w.terminal("failed", repos_changed=0, errors=1, warns=0)     # still lands (reserve)
+    w.event("dropped1", "info", x=1); w.event("dropped2", "info", x=2)   # both refused
+    notes = [r for r in _read_all(tmp_path, w.activity_id)
+             if r["type"] == "integrity" and r.get("kind") == "dropped-events"]
+    assert len(notes) == 1                         # emitted at most once
+    w.terminal("failed", repos_changed=0, errors=1, warns=0)     # terminal still lands (reserve)
     assert any(r["type"] == "terminal" for r in _read_all(tmp_path, w.activity_id))
+
+def test_terminal_append_failure_does_not_settle_or_swallow_reservation(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    monkeypatch.setattr(writer.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # durable write fails
+    assert paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # reservation PRESERVED
+    # reader can later synthesize interrupted from the freed lease + preserved reserve
 
 def test_best_effort_write_failure_never_raises(tmp_path, monkeypatch, capsys):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
@@ -1028,11 +1198,9 @@ Expected: FAIL (`ModuleNotFoundError`).
 
 ```python
 # repo_radar/activity/writer.py
-import os, sys
+import os, sys, threading
 from repo_radar.activity import ids, paths, records, quota, redact
 from repo_radar.activity import lease as lease_mod
-
-_RESERVE_TYPES = {"control", "terminal", "integrity"}
 
 class ActivityWriter:
     def __init__(self, home, *, kind, channel, trigger, producer,
@@ -1043,92 +1211,101 @@ class ActivityWriter:
         self._redactor = redact.Redactor(list(configured_secrets))
         self._seq = 0
         self._writer_id = ids.mint_token()
-        self._cancel_written = False
-        self._dropped_noted = False
+        self._lock = threading.Lock()                 # finding 7: serialize seq+append
+        self._reserve_used = {"terminal": False, "cancel": False, "dropped": False}
         self._closed = False
         self._adopted = bool(inherited_id) and ids.valid_activity_id(inherited_id)
         lock = paths.owner_lock_path
         if self._adopted:
             self.activity_id = inherited_id
             self._lease = lease_mod.adopt(inherited_fd, owner_token, lock(home, inherited_id))
+            # first-producer detection (finding 4): admit+start only if no start exists yet
+            self._first_producer = not quota._has_start(home, inherited_id)
+            if self._first_producer and not quota.admit(home, inherited_id, self._lease):
+                self._warn("admission refused; skipping activity recording"); self._closed = True
         else:
             self.activity_id = ids.mint_activity_id()
             paths.secure_mkdir(paths.activity_dir(home, self.activity_id))
             self._lease = lease_mod.acquire(lock(home, self.activity_id))
-            self._admitted = quota.admit(home, self.activity_id, self._lease)
-            if not self._admitted:                 # best-effort: skip recording, free lease
+            self._first_producer = True
+            if not quota.admit(home, self.activity_id, self._lease):
                 self._warn("admission refused; skipping activity recording")
                 self._lease.release(); self._closed = True
         self._seg = paths.segment_path(home, self.activity_id, producer, self._writer_id)
 
-    # ---- record emission ------------------------------------------------
     def _warn(self, msg):
         print(f"repo-radar: activity: {msg}", file=sys.stderr)
 
-    def _append(self, rec, reserve=False):
+    def _durable_append(self, kind, payload, *, reserve=False, fsync=False):
+        """Construction + accounting + append, all inside the never-raises boundary."""
         if self._closed:
-            return
-        try:
-            blob = records.encode(rec)
-            if not reserve:
-                if not quota.grant(self._home, self.activity_id, len(blob)):
-                    return False                   # ordinary capacity exhausted -> refuse
-            fd = paths.secure_open_append(self._seg)
-            try:
-                os.write(fd, blob)
-            finally:
-                os.close(fd)
-            self._seq += 1
-            return True
-        except Exception as e:                     # best-effort: never raise into caller
-            self._warn(f"write failed: {e}")
             return False
+        with self._lock:
+            try:
+                rec = records.build(kind, seq=self._seq, activity_id=self.activity_id, **payload)
+                blob = records.encode(rec)
+                if not reserve:
+                    if not quota.grant(self._home, self.activity_id, len(blob)):
+                        return False               # ordinary capacity exhausted -> refuse
+                fd = paths.secure_open_append(self._seg)
+                try:
+                    view = memoryview(blob)
+                    while view:                    # handle short writes (finding 3)
+                        view = view[os.write(fd, view):]
+                    if fsync:
+                        os.fsync(fd)               # durability for reserve/terminal
+                finally:
+                    os.close(fd)
+                self._seq += 1
+                return True
+            except Exception as e:                 # best-effort: never raise into caller
+                self._warn(f"write failed: {e}")
+                return False
+
+    def _redact_fields(self, fields):
+        return {k: self._redactor.scrub(v) if isinstance(v, str) else v for k, v in fields.items()}
 
     def start(self):
-        if self._adopted:                          # adopters write ownership, not a 2nd start
-            self._append(records.build("ownership", seq=self._seq, activity_id=self.activity_id,
-                                       owner_token=self._lease.owner_token, role="handoff",
-                                       producer=self._producer, pid=os.getpid()))
+        if self._adopted and not self._first_producer:      # adopt-existing: handoff only
+            self._durable_append("ownership", dict(owner_token=self._lease.owner_token,
+                role="handoff", producer=self._producer, pid=os.getpid()), fsync=True)
             return
-        self._append(records.build("start", seq=self._seq, activity_id=self.activity_id,
-                                   kind=self._kind, channel=self._channel,
-                                   trigger=self._trigger, created_by=self._producer))
-        self._append(records.build("ownership", seq=self._seq, activity_id=self.activity_id,
-                                   owner_token=self._lease.owner_token, role="initial",
-                                   producer=self._producer, pid=os.getpid()))
-        quota.mark_started(self._home, self.activity_id)
+        self._durable_append("start", dict(kind=self._kind, channel=self._channel,
+            trigger=self._trigger, created_by=self._producer), fsync=True)
+        self._durable_append("ownership", dict(owner_token=self._lease.owner_token,
+            role="initial", producer=self._producer, pid=os.getpid()), fsync=True)
 
-    def event(self, name, level, **fields):
-        fields = {k: self._redactor.scrub(v) if isinstance(v, str) else v
-                  for k, v in fields.items()}
-        ok = self._append(records.build("event", seq=self._seq, activity_id=self.activity_id,
-                                        level=level, event=name, fields=fields))
-        if ok is False and not self._dropped_noted:
-            self._dropped_noted = True
-            self._append(records.build("integrity", seq=self._seq, activity_id=self.activity_id,
-                                       kind="dropped-events"), reserve=True)
+    def event(self, name, level, detail=None, **fields):
+        ok = self._durable_append("event", dict(level=level, event=name,
+            fields=self._redact_fields(fields),
+            detail=self._redactor.scrub(detail) if detail is not None else None))
+        if ok is False and not self._reserve_used["dropped"]:
+            self._reserve_used["dropped"] = True                     # one-shot slot
+            self._durable_append("integrity", dict(kind="dropped-events"), reserve=True, fsync=True)
 
     def control(self, name, **fields):
         if name == "cancel_requested":
-            if self._cancel_written:
-                return
-            self._cancel_written = True
-        self._append(records.build("control", seq=self._seq, activity_id=self.activity_id,
-                                   name=name, fields=fields), reserve=True)
-
-    def integrity(self, kind, **fields):
-        self._append(records.build("integrity", seq=self._seq, activity_id=self.activity_id,
-                                   kind=kind, fields=fields), reserve=True)
+            if self._reserve_used["cancel"]:
+                return                                               # idempotent one-shot
+            self._reserve_used["cancel"] = True
+            self._durable_append("control", dict(name=name, fields=self._redact_fields(fields)),
+                                 reserve=True, fsync=True)
+        else:                                                        # non-cancel = ordinary
+            self._durable_append("control", dict(name=name, fields=self._redact_fields(fields)))
 
     def terminal(self, outcome, **summary):
-        if self._closed:
+        if self._closed or self._reserve_used["terminal"]:
             return
-        self._append(records.build("terminal", seq=self._seq, activity_id=self.activity_id,
-                                   outcome=outcome, summary=summary,
-                                   by=self._lease.owner_token), reserve=True)
-        quota.settle(self._home, self.activity_id)
-        self._lease.release()
-        self._closed = True
+        self._reserve_used["terminal"] = True
+        ok = self._durable_append("terminal", dict(outcome=outcome,
+            summary=self._redact_fields(summary), by=self._lease.owner_token),
+            reserve=True, fsync=True)
+        if ok:                                     # settle+release ONLY after durability
+            quota.settle(self._home, self.activity_id)
+            self._lease.release(); self._closed = True
+        else:                                      # preserve reservation; reader recovers
+            self._warn("terminal not durable; leaving reservation for reconciliation")
+            self._lease.release(); self._closed = True
 
     def hand_off_env(self):
         return {"REPO_RADAR_ACTIVITY_ID": self.activity_id,
@@ -1144,13 +1321,13 @@ from repo_radar.activity.writer import ActivityWriter   # noqa: F401
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_writer.py -v`
-Expected: PASS (4 tests).
+Expected: PASS (5 tests). The three reserve slots are one-shot; `terminal` settles+releases only after a durable (`fsync`'d) write; a durability failure preserves the reservation for the reader to reconcile.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add repo_radar/activity/writer.py repo_radar/activity/__init__.py repo_radar/tests/test_activity_writer.py
-git commit -m "feat(activity): ActivityWriter — reserve partition, idempotent cancel, best-effort, finalizer"
+git commit -m "feat(activity): ActivityWriter — partitioned reserve, durable terminal, thread-safe, best-effort"
 ```
 
 ### Task 1.8: Dispatcher entrypoints — `bootstrap` (adopt+start) and `finalize` (terminal/incident)
@@ -1179,22 +1356,43 @@ def _seg_records(home, aid):
         recs += [json.loads(x) for x in f.read_text().splitlines()]
     return recs
 
-def test_bootstrap_adopts_shell_held_fd_and_writes_start(tmp_path):
-    aid = ids.mint_activity_id()
-    paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
-    held = lease.acquire(paths.owner_lock_path(tmp_path, aid))   # simulates the shell holding fd
+def _run_bootstrap(tmp_path, aid, held):
     env = {**os.environ, "HOME": str(tmp_path),
            "REPO_RADAR_ACTIVITY_ID": aid,
            "REPO_RADAR_ACTIVITY_OWNER_TOKEN": held.owner_token,
            "REPO_RADAR_ACTIVITY_LOCK_FD": str(held.fd)}
-    r = subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
-                        "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
-                       env=env, pass_fds=[held.fd], capture_output=True, text=True)
+    return subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
+                           "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
+                          env=env, pass_fds=[held.fd], capture_output=True, text=True)
+
+def test_bootstrap_is_first_producer_writes_start_and_initial_ownership(tmp_path):
+    # scheduled path: the shell mints+holds; NO start exists yet -> bootstrap admits + starts
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    held = lease.acquire(paths.owner_lock_path(tmp_path, aid))   # shell holds the fd
+    r = _run_bootstrap(tmp_path, aid, held)
     assert r.returncode == 0, r.stderr
     recs = _seg_records(tmp_path, aid)
-    assert any(x["type"] == "start" for x in recs)
+    assert [x["type"] for x in recs].count("start") == 1
+    assert any(x["type"] == "ownership" and x["role"] == "initial" for x in recs)
+    assert paths.ledger_entry_path(tmp_path, aid).exists()       # admitted
+    assert lease.probe_busy(paths.owner_lock_path(tmp_path, aid)) # shell still holds it
+
+def test_bootstrap_adopts_existing_start_writes_handoff_only(tmp_path):
+    # Electron already admitted + wrote start; bootstrap must NOT write a second start
+    from repo_radar.activity import quota
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    held = lease.acquire(paths.owner_lock_path(tmp_path, aid))
+    quota.admit(tmp_path, aid, held)
+    seg = paths.segment_path(tmp_path, aid, "electron", "cafebabe")
+    fd = paths.secure_open_append(seg)
+    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t","kind":"sync"}\n'); os.close(fd)
+    r = _run_bootstrap(tmp_path, aid, held)
+    assert r.returncode == 0, r.stderr
+    recs = _seg_records(tmp_path, aid)
+    assert [x["type"] for x in recs].count("start") == 1         # still exactly one
     assert any(x["type"] == "ownership" and x["role"] == "handoff" for x in recs)
-    assert lease.probe_busy(paths.owner_lock_path(tmp_path, aid))   # shell still holds it
 
 def test_finalize_standalone_records_blocked_incident(tmp_path):
     r = subprocess.run([sys.executable, "-m", "repo_radar.activity.finalize",
@@ -1287,7 +1485,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_entrypoints.py -v`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1333,17 +1531,19 @@ def test_full_cli_style_attempt_end_to_end(tmp_path):
     assert "ghp_shouldnotappear" not in blob            # write-time redaction held
     assert not paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # settled
 
-def test_crash_before_terminal_leaves_recoverable_ledger(tmp_path):
-    # simulate: admit + start, then process "dies" (lease released, no terminal, no settle)
+def _durable_start(home, aid):
+    seg = paths.segment_path(home, aid, "python", "deadbeef")
+    fd = paths.secure_open_append(seg)
+    os.write(fd, b'{"schema_version":1,"type":"start","seq":0,"ts":"t","kind":"sync"}\n'); os.close(fd)
+
+def test_crash_after_durable_start_preserves_reservation(tmp_path):
+    # finding 1: durable start present, lease freed, NO terminal -> reservation PRESERVED
     aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
     l = lease.acquire(paths.owner_lock_path(tmp_path, aid))
-    quota.admit(tmp_path, aid, l); quota.mark_started(tmp_path, aid)
-    l.release()                                          # crash: lease freed, entry stranded
-    assert paths.ledger_entry_path(tmp_path, aid).exists()
-    # a durable terminal is absent + lease free -> reconcile must NOT reclaim a started run's
-    # reservation as "abandoned" (has_start=1); it stays until the reader synthesizes a terminal
+    quota.admit(tmp_path, aid, l); _durable_start(tmp_path, aid)
+    l.release()                                          # crash: lease freed, no terminal
     quota.reconcile(tmp_path)
-    assert paths.ledger_entry_path(tmp_path, aid).exists()   # preserved (started, no terminal)
+    assert paths.ledger_entry_path(tmp_path, aid).exists()   # preserved (has start in segments)
 
 def test_reconcile_reclaims_only_abandoned_pre_start(tmp_path):
     aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
@@ -1354,14 +1554,14 @@ def test_reconcile_reclaims_only_abandoned_pre_start(tmp_path):
     assert not paths.ledger_entry_path(tmp_path, aid).exists()
 ```
 
-- [ ] **Step 2: Run to verify it fails, then make it pass**
+- [ ] **Step 2: Run to verify it passes**
 
-Run: `python -m pytest repo_radar/tests/test_activity_phase1_acceptance.py -v`. `test_crash_before_terminal...` will likely FAIL against the Task-1.6 `reconcile`, which only checks `has_start==0`. **Fix `quota.reconcile`** so a started-but-unterminated entry with a *free* lease is preserved (it is the reader that later synthesizes the terminal, §5): the `has_start==1 and not _has_terminal` case must fall through to "preserve", which the current code already does (it only reclaims `has_start==0`). Confirm the started-run entry is preserved and the pre-start one is reclaimed. If the test exposes a gap, correct `reconcile` minimally and re-run.
+Run: `python -m pytest repo_radar/tests/test_activity_phase1_acceptance.py -v`. Because lifecycle is derived from the segments (finding 1 — no `has_start` flag), a durable `start` in the segment keeps `reconcile` from reclaiming a crashed run's reservation, while a genuine pre-`start` abandonment (lease free, no `start` line) is reclaimed. Both PASS against the Task-1.6 `quota.reconcile` as written.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add repo_radar/tests/test_activity_phase1_acceptance.py repo_radar/activity/quota.py
+git add repo_radar/tests/test_activity_phase1_acceptance.py
 git commit -m "test(activity): phase-1 acceptance — CLI attempt + crash-recoverable reconcile"
 ```
 
@@ -1386,35 +1586,37 @@ Node tests: add `"test": "node --test"` to `menubar/package.json` (Decision 4); 
 **Interfaces:**
 - Produces (CommonJS): `validActivityId`, `mintActivityId`, `mintToken`, `validToken` (ids.js); `activityDir`, `segmentPath`, `ownerLockPath`, `quotaDir`, `ledgerEntryPath`, `secureMkdir`, `secureOpenAppend` (paths.js); `buildRecord`, `encodeRecord`, `encodedLen` (records.js). **Byte-identical** JSON line encoding to `records.py`: same key order via insertion order, `ensure_ascii=false` equivalent (UTF-8, no `\uXXXX` escaping of non-ASCII), compact separators (`,`/`:`), trailing `\n`.
 
-**The equivalence is pinned by a shared golden file**, not by re-deriving the code: both suites read `menubar/activity/__tests__/golden-records.json` (a list of `{args, bytes}` where `bytes` is the exact expected line). If a future edit diverges, both languages' golden tests fail.
+**The equivalence is pinned by committed golden data covering ALL record types + Unicode + truncation (finding 8):** `golden-cases.json` lists `{type, args}` (each with a fixed `ts`); `golden-expected.jsonl` is the byte-exact encoder output, **generated once** by a committed helper `python -m repo_radar.activity._gen_golden` and checked in. Both suites encode each case and assert byte-equality against the committed expectation — so neither encoder can drift silently. (`records.py.build`/`records.js.buildRecord` already accept the `ts=` override from Task 1.3.)
 
-- [ ] **Step 1: Author the golden file** `menubar/activity/__tests__/golden-records.json`
+- [ ] **Step 1: Author `golden-cases.json`** covering every record type + a non-ASCII (`"café 数据"`) case + a value that exceeds `MAX_VALUE_BYTES` (asserting identical truncation):
 
 ```json
 [
-  {"type":"event","seq":0,"activity_id":"00000000-0000-4000-8000-000000000000",
-   "level":"info","event":"repos_loaded","fields":{"count":30},
-   "line":"{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":0,\"ts\":\"<TS>\",\"level\":\"info\",\"event\":\"repos_loaded\",\"fields\":{\"count\":30}}\n"}
+  {"type":"start","args":{"seq":0,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","kind":"sync","channel":"stable","trigger":"cli","created_by":"python"}},
+  {"type":"ownership","args":{"seq":1,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","owner_token":"deadbeef","role":"initial","producer":"python","pid":1234}},
+  {"type":"event","args":{"seq":2,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"repo_updated","fields":{"repo":"café 数据","count":30},"detail":"line1\nline2"}},
+  {"type":"control","args":{"seq":3,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","name":"cancel_requested","fields":{}}},
+  {"type":"terminal","args":{"seq":4,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded-with-warnings","summary":{"repos_changed":1,"errors":0,"warns":2},"by":"deadbeef"}},
+  {"type":"integrity","args":{"seq":5,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","kind":"dropped-events"}},
+  {"type":"event","args":{"seq":6,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"big","fields":{"v":"X̶TRUNCATE_ME_REPEATED..."}}}
 ]
 ```
-(The `<TS>` placeholder is substituted by each test with a fixed injected timestamp — both `buildRecord`/`build` accept an optional `ts=` override for determinism; add that parameter to both `records.py` and `records.js`.)
 
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Write the failing tests** (both read the SAME two files)
 
 ```js
 // menubar/activity/__tests__/records-golden.test.js
 const test = require('node:test'); const assert = require('node:assert');
 const fs = require('node:fs'); const path = require('node:path');
 const { buildRecord, encodeRecord } = require('../records');
-const golden = JSON.parse(fs.readFileSync(path.join(__dirname, 'golden-records.json')));
+const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'golden-cases.json')));
+const expected = fs.readFileSync(path.join(__dirname, 'golden-expected.jsonl'), 'utf8').split('\n');
 
-test('node encodes each golden record byte-for-byte', () => {
-  for (const g of golden) {
-    const { line, ...args } = g;
-    const rec = buildRecord(args.type, { ...args, ts: '2026-08-14T00:00:00-07:00' });
-    const expected = line.replace('<TS>', '2026-08-14T00:00:00-07:00');
-    assert.strictEqual(Buffer.from(encodeRecord(rec)).toString('utf8'), expected);
-  }
+test('node encodes every record type byte-for-byte (Unicode + truncation)', () => {
+  cases.forEach((c, i) => {
+    const line = Buffer.from(encodeRecord(buildRecord(c.type, c.args))).toString('utf8');
+    assert.strictEqual(line, expected[i] + '\n');
+  });
 });
 ```
 
@@ -1422,32 +1624,26 @@ test('node encodes each golden record byte-for-byte', () => {
 # repo_radar/tests/test_activity_golden.py
 import json, pathlib
 from repo_radar.activity import records as R
-GOLD = pathlib.Path("menubar/activity/__tests__/golden-records.json")
+D = pathlib.Path("menubar/activity/__tests__")
 
-def test_python_encodes_each_golden_record_byte_for_byte():
-    for g in json.loads(GOLD.read_text()):
-        line = g.pop("line"); typ = g.pop("type")
-        rec = R.build(typ, ts="2026-08-14T00:00:00-07:00", **g)
-        expected = line.replace("<TS>", "2026-08-14T00:00:00-07:00")
-        assert R.encode(rec).decode("utf-8") == expected
+def test_python_encodes_every_record_type_byte_for_byte():
+    cases = json.loads((D / "golden-cases.json").read_text())
+    expected = (D / "golden-expected.jsonl").read_text().split("\n")
+    for i, c in enumerate(cases):
+        assert R.encode(R.build(c["type"], **c["args"])).decode("utf-8") == expected[i] + "\n"
 ```
 
-- [ ] **Step 3: Run both to verify they fail**
+- [ ] **Step 3: Run both → FAIL** (no `golden-expected.jsonl`, no Node modules).
 
-Run: `cd menubar && node --test activity/__tests__/records-golden.test.js` → FAIL (no module).
-Run: `python -m pytest repo_radar/tests/test_activity_golden.py -v` → FAIL (`build()` has no `ts=` param yet).
+- [ ] **Step 4: Implement** `ids.js`/`paths.js`/`records.js` as exact CommonJS mirrors (same regexes, bounds, encoding); add the `_gen_golden` helper and **generate + commit** `golden-expected.jsonl`; add `"test": "node --test"` to `menubar/package.json`.
 
-- [ ] **Step 4: Implement `ids.js`/`paths.js`/`records.js` as exact CommonJS mirrors of the Python modules** (same regexes, same bounds constants, same encoding). Add the `ts=`/`ts:` override parameter to both `records.py.build` and `records.js.buildRecord`. Add `"test": "node --test"` to `menubar/package.json` `scripts`.
-
-- [ ] **Step 5: Run both to verify they pass**
-
-Run: `cd menubar && node --test` and `python -m pytest repo_radar/tests/test_activity_golden.py -v` → both PASS. This is the cross-language contract: the two encoders now provably agree.
+- [ ] **Step 5: Run both → PASS.** `cd menubar && node --test` and `python -m pytest repo_radar/tests/test_activity_golden.py -v`. The two encoders provably agree on every record type, Unicode, and truncation.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add menubar/activity/ids.js menubar/activity/paths.js menubar/activity/records.js menubar/activity/index.js menubar/activity/__tests__/ menubar/package.json repo_radar/activity/records.py repo_radar/tests/test_activity_golden.py
-git commit -m "feat(activity): Node ids/paths/records mirror + golden-record equivalence"
+git add menubar/activity/ids.js menubar/activity/paths.js menubar/activity/records.js menubar/activity/index.js menubar/activity/__tests__/ menubar/package.json repo_radar/activity/_gen_golden.py repo_radar/tests/test_activity_golden.py
+git commit -m "feat(activity): Node ids/paths/records mirror + all-record-type golden equivalence"
 ```
 
 ### Task 2.2: Node lease + quota + writer (write side) + cross-language lock interop
@@ -1457,9 +1653,9 @@ git commit -m "feat(activity): Node ids/paths/records mirror + golden-record equ
 - Test: `menubar/activity/__tests__/lease.test.js`, `menubar/activity/__tests__/quota.test.js`, `menubar/activity/__tests__/writer.test.js`, `menubar/activity/__tests__/lock-interop.test.js`
 
 **Interfaces:**
-- Produces (CommonJS mirror of Python write side): `acquire(lockPath)`, `adopt(inheritedFd, ownerToken, lockPath)`, `probeBusy(lockPath)`, `admit`, `grant`, `markStarted`, `settle`, `reconcile`, `ActivityWriter` (Electron manual path: `start`, `event`, `control`, `terminal`, `integrity`, `handOffEnv()`, `activityId`). Node holds the lease via a retained fd + `/usr/bin/lockf -t 0 <fd>` (spec §5); `probeBusy` spawns `/usr/bin/lockf -t 0` on a fresh fd and reads exit 75.
+- Produces (CommonJS mirror of Python write side): `acquire(lockPath)`, `adopt(inheritedFd, ownerToken, lockPath)`, `probe(lockPath)` (tri-state), `probeBusy(lockPath)`, `admit`, `grant`, `settle`, `reconcile`, `prune`, `ActivityWriter` (Electron manual path: `start`, `event`, `control`, `terminal`, `handOffEnv()`, `dropLocalReference()`, `activityId`, `_handedOff`). Node holds the lease via a retained fd + `/usr/bin/lockf -t 0 <fd>` (spec §5); `probe` runs `/usr/bin/lockf -t 0` on a fresh fd and maps exit 0→FREE, 75→BUSY, other→UNCERTAIN. **JSON ledger (Decision 3), lifecycle derived from segments, per-activity cap in `grant`, partitioned one-shot reserve — byte-for-byte the Python contract.**
 
-- [ ] **Step 1: Write the failing cross-language interop test** (the load-bearing one)
+- [ ] **Step 1: Write the failing cross-language interop test — BOTH directions (finding 8)**
 
 ```js
 // menubar/activity/__tests__/lock-interop.test.js
@@ -1469,31 +1665,39 @@ const path = require('node:path');
 const { acquire, probeBusy } = require('../lease');
 const { activityDir, ownerLockPath, secureMkdir } = require('../paths');
 
-test('a lock taken in Node is seen BUSY by Python, and vice-versa', () => {
+function fresh() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'act-'));
   const aid = '00000000-0000-4000-8000-000000000000';
   secureMkdir(activityDir(home, aid));
-  const lp = ownerLockPath(home, aid);
-  const lease = acquire(lp);
-  assert.ok(lease, 'node acquired');
-  // Python probe must report busy
-  const py = cp.spawnSync('python3', ['-c',
-    `import sys;from repo_radar.activity import lease;` +
-    `sys.exit(0 if lease.probe_busy(${JSON.stringify(lp)}) else 3)`],
-    { env: { ...process.env } });
-  assert.strictEqual(py.status, 0, 'python saw the Node lock as busy');
-  lease.release();
-  assert.strictEqual(probeBusy(lp), false);
+  return { home, lp: ownerLockPath(home, aid) };
+}
+const pyProbeBusy = (lp) => cp.spawnSync('python3', ['-c',
+  `import sys;from repo_radar.activity import lease;sys.exit(0 if lease.probe_busy(${JSON.stringify(lp)}) else 3)`]).status;
+
+test('Node-held lock is seen BUSY by Python', () => {
+  const { lp } = fresh(); const lease = acquire(lp);
+  assert.strictEqual(pyProbeBusy(lp), 0, 'python saw the Node lock busy');
+  lease.release(); assert.strictEqual(probeBusy(lp), false);
+});
+
+test('Python-held lock is seen BUSY by Node (reverse direction)', () => {
+  const { lp } = fresh();
+  // Python holds the lock for 2s in a child; Node must observe BUSY during that window
+  const child = cp.spawn('python3', ['-c',
+    `import time;from repo_radar.activity import lease;l=lease.acquire(${JSON.stringify(lp)});time.sleep(2)`]);
+  const wait = Date.now() + 800; while (Date.now() < wait) {}   // let it acquire
+  assert.strictEqual(probeBusy(lp), true, 'node saw the Python lock busy');
+  child.kill('SIGKILL');
 });
 ```
 
-- [ ] **Step 2..5:** Run → FAIL; implement `lease.js`/`quota.js`/`writer.js` mirroring the Python semantics (ledger `key=value`, same constants, same §5 validation truth table, same reserve partition); add unit tests mirroring `test_activity_lease.py`/`test_activity_quota.py`/`test_activity_writer.py`; run → PASS.
+- [ ] **Step 2..5:** Run → FAIL; implement `lease.js`/`quota.js`/`writer.js` mirroring the Python semantics (JSON ledger, same constants, §5 validation truth table incl. tri-state probe, partitioned one-shot reserve, durable append). **Add shared behavioral-vector tests (finding 8):** a committed `menubar/activity/__tests__/behavior-vectors.json` drives the SAME scenarios in both languages — grant per-activity-cap refusal, one-shot reserve slots, corrupt-ledger 4 MiB charge, terminal-durability-failure preserving the reservation — each asserted in `node:test` and in a `repo_radar/tests/test_activity_behavior_vectors.py`. Run → PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add menubar/activity/lease.js menubar/activity/quota.js menubar/activity/writer.js menubar/activity/__tests__/
-git commit -m "feat(activity): Node lease/quota/writer (write side) + cross-language lock interop"
+git add menubar/activity/lease.js menubar/activity/quota.js menubar/activity/writer.js menubar/activity/__tests__/ repo_radar/tests/test_activity_behavior_vectors.py
+git commit -m "feat(activity): Node lease/quota/writer + bidirectional lock interop + shared behavioral vectors"
 ```
 
 ### Task 2.3: Electron `triggerSync` — acquire, start, hold across guards, hand off; cancel-ordering fix
@@ -1502,44 +1706,70 @@ git commit -m "feat(activity): Node lease/quota/writer (write side) + cross-lang
 - Modify: `menubar/main.js` — `triggerSync` (1078–1121), the `runtime.runSync` call site (1317), the `stop-sync` handler (2115–2192)
 - Test: `menubar/__tests__/activity-trigger.test.js`
 
-**Interfaces:**
-- Consumes: `menubar/activity` (`ActivityWriter`), `menubar/activity/quota.reconcile`.
-- Produces: on manual sync, an `ActivityWriter` minted+held in `triggerSync`; guard block (dev-ownership gate 1092–1108) → `writer.terminal('blocked', reason)`; on dispatch, `writer.handOffEnv()` + the lock fd passed to `runtime.runSync`; on cancel, `writer.control('cancel_requested')` appended **before** `SIGTERM`.
+**Interfaces (finding 5 — full lifecycle ordering + handoff state machine):**
+- Consumes: `menubar/activity` (`ActivityWriter`, `quota.reconcile`).
+- Produces `menubar/activity/trigger-glue.js` (Electron-free, unit-testable):
+  - `beginManualActivity(home, {channel, trigger}) -> { writer, lockFd }` — mints, acquires, admits, writes `start`+initial `ownership`, **holds** the fd. Called **first in `triggerSync`, before any gate** (identity-before-first-gate).
+  - `onContention(writer, kind)` — writes `terminal('skipped')` + `release()`. Used for **already-syncing** (`currentSyncProcess`, main.js:1080-1082) **and** root-lock-busy (exit 75) — both are contention → `skipped` (finding 5).
+  - `onGuardBlock(writer, reason)` — writes `terminal('blocked', reason)` + `release()` (dev-ownership 1092-1108; second dispatch guard 1284-1297).
+  - `handOff({writer, child, home})` — waits (bounded, e.g. ≤5 s) for the child's **durable `ownership{role:'handoff'}`** to appear in the activity dir (the acknowledgement), then `writer.dropLocalReference()` (close-only, **no `LOCK_UN`** — the child's shared OFD keeps the lease) and flips the writer to **controller-only** (`_handedOff=true`). On **timeout / spawn error** → Electron stays authoritative: `writer.terminal('failed')`. Returns the resolved disposition.
+  - `onCancel({writer, child})` — appends `control('cancel_requested')` to Electron's own segment **before** `child.kill('SIGTERM')`. Allowed in the controller-only state; `terminal()` is a **no-op after handoff** (only the executing owner/reconciler finalizes).
+- `ActivityWriter` (Node, Task 2.2) gains `dropLocalReference()` and the `_handedOff` controller state (mirrors the Python `Lease.drop_local_reference` + terminal-suppression).
 
-- [ ] **Step 1: Write the failing test** (cancel-ordering — the spec's named race)
+- [ ] **Step 1: Write the failing tests** (cancel-ordering + contention + controller state)
 
 ```js
 // menubar/__tests__/activity-trigger.test.js
 const test = require('node:test'); const assert = require('node:assert');
-// Load the extracted, testable helpers (see Step 3): triggerSync's activity glue is
-// factored into menubar/activity/trigger-glue.js so it is unit-testable without Electron.
-const { onCancel } = require('../activity/trigger-glue');
+const { onCancel, onContention, handOff } = require('../activity/trigger-glue');
 
 test('cancel appends control{cancel_requested} BEFORE SIGTERM', () => {
   const calls = [];
-  const writer = { control: (n) => calls.push('control:' + n) };
+  const writer = { control: (n) => calls.push('control:' + n), _handedOff: true };
   const child = { kill: (sig) => calls.push('kill:' + sig) };
   onCancel({ writer, child });
   assert.deepStrictEqual(calls, ['control:cancel_requested', 'kill:SIGTERM']);
+});
+
+test('contention finalizes the attempt as skipped', () => {
+  const calls = [];
+  const writer = { terminal: (o) => calls.push('terminal:' + o), release: () => calls.push('release') };
+  onContention(writer, 'already-syncing');
+  assert.deepStrictEqual(calls, ['terminal:skipped', 'release']);
+});
+
+test('handOff drops the local fd WITHOUT unlocking after the ack, else finalizes failed', async () => {
+  const events = [];
+  const okWriter = { dropLocalReference: () => events.push('drop'),
+                     terminal: (o) => events.push('terminal:' + o) };
+  await handOff({ writer: okWriter, child: {}, home: '/x',
+                  _awaitAck: async () => true });      // injected ack = handoff ownership seen
+  assert.deepStrictEqual(events, ['drop']);            // dropLocalReference, no terminal
+  const failWriter = { dropLocalReference: () => events.push('drop2'),
+                       terminal: (o) => events.push('terminal:' + o) };
+  await handOff({ writer: failWriter, child: {}, home: '/x', _awaitAck: async () => false });
+  assert.deepStrictEqual(events.slice(1), ['terminal:failed']);   // timeout -> authoritative
 });
 ```
 
 - [ ] **Step 2: Run → FAIL** (`trigger-glue` missing).
 
-- [ ] **Step 3: Implement.** Create `menubar/activity/trigger-glue.js` exporting the small pure helpers (`beginManualActivity(home, opts)`, `onGuardBlock(writer, reason)`, `onCancel({writer, child})`, `handOff(writer)`), each doing exactly what the spec requires. Then wire them into `main.js`:
-  - In `triggerSync` **after** the already-syncing guard (1082) and **before** the dev-ownership gate (1092): `const activity = beginManualActivity(os.homedir(), { channel: runtimeChannel, trigger });` (mints, acquires, `start`, holds the fd).
-  - In the dev-ownership block (1096–1106) and the second dispatch guard (1289): call `onGuardBlock(activity.writer, reason)` (writes `blocked` terminal + releases) alongside the existing error-surface code.
-  - At the `runtime.runSync` call (1317): spread `...activity.writer.handOffEnv()` into `shellEnv` and pass `activity.lockFd` for inheritance (Task 2.4 consumes it).
-  - In the `stop-sync` handler: replace the ordering so `onCancel({ writer: activity.writer, child: currentSyncProcess })` runs — appending `control{cancel_requested}` (2178-side work) **before** `currentSyncProcess.kill('SIGTERM')` (2137). This closes the spec §5 cancel-ordering race.
-  - On app start, call `require('./activity/quota').reconcile(os.homedir())` once (pre-admission sweep).
+- [ ] **Step 3: Implement** `trigger-glue.js` and wire `main.js` in this exact order:
+  1. **First line of `triggerSync`** (before the already-syncing guard at 1080): `const activity = beginManualActivity(os.homedir(), { channel: runtimeChannel, trigger });`.
+  2. already-syncing (1080-1082) → `onContention(activity.writer, 'already-syncing'); return;`.
+  3. dev-ownership block (1096-1106) + second dispatch guard (1289) → `onGuardBlock(activity.writer, reason)` alongside the existing error-surface code, then `return`.
+  4. `runtime.runSync` (1317): spread `...activity.writer.handOffEnv()` into `shellEnv`, pass `activity.lockFd` (→ child **fd 4**, Task 2.4); in `onChild`, `await handOff({ writer: activity.writer, child, home: os.homedir() })`.
+  5. runSync **reject** — exit-75 "another sync is already running" → `onContention(activity.writer, 'root-busy')` (skipped); any other spawn error → `activity.writer.terminal('failed')`.
+  6. `stop-sync` handler (2115): `onCancel({ writer: activity.writer, child: currentSyncProcess })` — `cancel_requested` **before** `kill('SIGTERM')` (2137), closing the §5 race.
+  7. App start: `require('./activity/quota').reconcile(os.homedir())` once.
 
-- [ ] **Step 4: Run → PASS.** Also manually verify (documented, not automated): a dev-guard block now produces an Activity item with outcome `blocked` instead of only an `errorLog` string.
+- [ ] **Step 4: Run → PASS.** Documented manual check: a dev-guard block yields a `blocked` Activity item (not just an `errorLog` string); a request while syncing yields a `skipped` item.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add menubar/main.js menubar/activity/trigger-glue.js menubar/__tests__/activity-trigger.test.js
-git commit -m "feat(activity): Electron manual path — lease across guards, blocked terminal, cancel-ordering fix"
+git add menubar/main.js menubar/activity/trigger-glue.js menubar/activity/writer.js menubar/__tests__/activity-trigger.test.js
+git commit -m "feat(activity): Electron lifecycle — start-before-gates, skipped-on-contention, handoff ack + dropLocalReference, cancel-ordering"
 ```
 
 ### Task 2.4: Dispatcher + `runSync` — carry the lease, delegate to Python, last-resort sh incident
@@ -1548,35 +1778,50 @@ git commit -m "feat(activity): Electron manual path — lease across guards, blo
 - Modify: `menubar/runtime/index.js` (`runSync` 132–149), `menubar/runtime/dispatchers.js` (`_script` 11–111)
 - Test: `menubar/runtime/__tests__/dispatcher-activity.test.js`
 
-**Interfaces:**
-- Consumes: `REPO_RADAR_ACTIVITY_ID` / `_OWNER_TOKEN` / `_LOCK_FD` from the env, the inherited lock fd.
-- Produces: `runSync` adds the lock fd to the child `stdio` (fd 4) and forwards the three env vars; the generated `_script` (scheduled path) mints id+token via `uuidgen`/`openssl rand -hex 4`, opens+`lockf`s `owner.lock` on a dedicated fd, calls `python -m repo_radar.activity.bootstrap` **before** the verify guard, calls `python -m repo_radar.activity.finalize --outcome blocked` on a guard failure, and `exec`s python (which adopts as executing owner) on success. A last-resort pure-sh `system` incident line is written only if the bootstrap python cannot execute at all.
+**Interfaces (finding 5):**
+- Consumes: `REPO_RADAR_ACTIVITY_ID` / `_OWNER_TOKEN` / `_LOCK_FD` env when present (manual path), else mints.
+- `runSync` adds the inherited lock fd to the child `stdio` at index **4** (fd remap: parent fd → child fd 4) and forwards the three env vars.
+- The generated `_script`:
+  - **Lease setup:** if `REPO_RADAR_ACTIVITY_ID` is set (manual/Electron path) → use the inherited fd 4 + env (do **not** mint). Else (scheduled path) → mint `activity_id` (`uuidgen | tr A-F a-f`), `owner_token` (`openssl rand -hex 4`), `mkdir -m 700` the activity dir, open `owner.lock` on a dedicated fd, `/usr/bin/lockf -t 0` it, and export the three env vars.
+  - **`python -m repo_radar.activity.bootstrap` runs BEFORE the verify/dev guards** — it writes `start`+initial `ownership` (scheduled first-producer) or handoff `ownership` (manual, adopt-existing). This handoff-ownership record is the **acknowledgement** Electron's `handOff` waits for.
+  - **On a dev/verify guard failure:** `python -m repo_radar.activity.finalize --outcome blocked --reason <code>` (writes terminal + settle + release), then exit.
+  - **On root exec-lock contention** (the existing fd-9 `.exec.lock` returns exit 75): `python -m repo_radar.activity.finalize --outcome skipped`, then exit 75 (finding 5 — contention is `skipped`, not lost).
+  - **On success:** `exec` python (the executing owner adopts fd 4 and runs `sync`), which writes its own handoff `ownership`.
+  - **Last-resort (finding 1):** only if the bootstrap python **cannot execute at all**, append ONE bounded, redacted line to the **System diagnostic stream** `~/Library/Logs/repo-radar/sync.error.log` — **never** an un-quota'd Activity segment.
+  - Preserve the existing root `.exec.lock` fd-9 handshake untouched.
 
-- [ ] **Step 1: Write the failing test** (the generated script contains the required ordering)
+- [ ] **Step 1: Write the failing tests** (the generated script's ordering + contention + last-resort)
 
 ```js
 // menubar/runtime/__tests__/dispatcher-activity.test.js
 const test = require('node:test'); const assert = require('node:assert');
 const { _script } = require('../dispatchers');   // export _script for testing
 
-test('scheduled script bootstraps activity BEFORE the verify guard and finalizes on block', () => {
+test('scheduled script: bootstrap precedes verify; finalize handles block AND skipped', () => {
   const s = _script('stable', ' sync --status-server');
   const iBootstrap = s.indexOf('activity.bootstrap');
   const iVerify = s.indexOf('verify.py');
-  const iFinalize = s.indexOf('activity.finalize');
   assert.ok(iBootstrap > 0 && iVerify > 0 && iBootstrap < iVerify, 'bootstrap precedes verify');
-  assert.ok(iFinalize > 0, 'finalize path present for guard failure');
+  assert.ok(/activity\.finalize[^\n]*--outcome[= ]blocked/.test(s), 'blocked on guard failure');
+  assert.ok(/activity\.finalize[^\n]*--outcome[= ]skipped/.test(s), 'skipped on root contention');
   assert.ok(s.includes('REPO_RADAR_ACTIVITY_ID'), 'exports identity');
+});
+
+test('last-resort writes to the System stream, not an activity segment', () => {
+  const s = _script('stable', ' sync --status-server');
+  assert.ok(s.includes('sync.error.log'), 'last-resort goes to System diagnostics');
+  assert.ok(!/activity\/[^\n]*\.jsonl/.test(s.split('last-resort')[1] || ''),
+            'last-resort never appends an activity segment');
 });
 ```
 
-- [ ] **Step 2..5:** Run → FAIL; implement the `_script` additions (mint id/token, open+lockf `owner.lock` on a fd kept open across the guards, bootstrap call, finalize-on-guard-failure, last-resort sh line) and the `runSync` fd/env passing; run → PASS. Preserve the existing root `.exec.lock` fd-9 handshake untouched.
+- [ ] **Step 2..5:** Run → FAIL; implement the `_script` additions (mint-or-inherit lease, bootstrap before guards, finalize blocked/skipped, System-stream last resort) and the `runSync` fd-4 remap + env passing; add a Node-side integration that spawns the real generated script against a stub python to assert the ordering executes (not just the string). Run → PASS. The full production-chain integration is Task 2.7.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add menubar/runtime/index.js menubar/runtime/dispatchers.js menubar/runtime/__tests__/dispatcher-activity.test.js
-git commit -m "feat(activity): dispatcher carries the lease + delegates records to Python"
+git commit -m "feat(activity): dispatcher carries the lease, delegates to Python, skipped-on-contention, System-stream last resort"
 ```
 
 ### Task 2.5: Python CLI — identity before dependency checking
@@ -1593,16 +1838,25 @@ git commit -m "feat(activity): dispatcher carries the lease + delegates records 
 
 ```python
 # repo_radar/tests/test_cli_activity.py
-import os, subprocess, sys
+import json, os, subprocess, sys
 from repo_radar.activity import paths
 
-def test_dependency_failure_records_blocked_incident(tmp_path, monkeypatch):
-    # Force check_dependencies to fail in a child, assert a blocked terminal was written.
+def _terminal_outcomes(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    outs = []
+    for d in [p for p in base.iterdir() if p.is_dir() and p.name != "quota"]:
+        for f in d.glob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                r = json.loads(line)
+                if r["type"] == "terminal":
+                    outs.append(r["outcome"])
+    return outs
+
+def test_dependency_failure_records_a_blocked_terminal(tmp_path):
+    # Force check_dependencies to fail in a child; assert an ACTUAL blocked terminal (finding 8)
     env = {**os.environ, "HOME": str(tmp_path), "REPO_RADAR_FORCE_DEPS_FAIL": "1"}
     subprocess.run([sys.executable, "-m", "repo_radar.cli", "sync", "--dry-run"], env=env)
-    base = paths.quota_dir(tmp_path).parent
-    dirs = [p for p in base.iterdir() if p.is_dir() and p.name != "quota"]
-    assert dirs, "an activity was recorded before the dependency gate"
+    assert "blocked" in _terminal_outcomes(tmp_path)   # not merely "a directory exists"
 ```
 
 - [ ] **Step 2..4:** Run → FAIL; implement: near the top of `main()` (after the `clean` branch, before `check_dependencies()`), for `command in {"sync","configure","analyze"}`, build/adopt an `ActivityWriter`, `start()`, and stash it for `sync_mode` to adopt; a `check_dependencies()` failure calls `writer.terminal("blocked", reason="dependencies")` before `return 2`. Add a test-only `REPO_RADAR_FORCE_DEPS_FAIL` hook in `dependencies.check_dependencies`. Run → PASS.
@@ -1628,7 +1882,9 @@ git commit -m "feat(activity): CLI establishes identity+lease+start before depen
 
 ```python
 # repo_radar/tests/test_sync_activity.py
+import json, os, subprocess, sys
 from repo_radar.modes import sync as S
+from repo_radar.activity import paths
 
 def test_severity_rule_mapping():
     assert S._activity_level("info-ish", is_degraded=False, is_exhausted=False) == "info"
@@ -1639,9 +1895,23 @@ def test_outcome_mapping_is_the_seven():
     assert S._finalize_outcome(errors=0, warns=0, degraded=False) == "succeeded"
     assert S._finalize_outcome(errors=0, warns=1, degraded=True) == "succeeded-with-warnings"
     assert S._finalize_outcome(errors=2, warns=0, degraded=False) == "failed"
+
+def test_real_sync_path_writes_an_actual_terminal(tmp_path):
+    # finding 8: a real `sync` run (no config in an isolated HOME) must finalize with a
+    # durable terminal in the seven — proving the config-abort leak is closed and the writer
+    # is threaded, not just that helpers return values.
+    env = {**os.environ, "HOME": str(tmp_path)}
+    subprocess.run([sys.executable, "-m", "repo_radar.cli", "sync", "--dry-run"], env=env)
+    base = paths.quota_dir(tmp_path).parent
+    outs = [json.loads(l)["outcome"]
+            for d in base.iterdir() if d.is_dir() and d.name != "quota"
+            for f in d.glob("*.jsonl") for l in f.read_text().splitlines()
+            if json.loads(l)["type"] == "terminal"]
+    assert outs and set(outs) <= {"succeeded","succeeded-with-warnings","blocked","failed",
+                                  "cancelled","skipped","interrupted"}
 ```
 
-- [ ] **Step 2..4:** Run → FAIL; extract the pure helpers `_activity_level(...)` and `_finalize_outcome(...)` and thread the writer through `sync_mode`, calling `writer.event(...)` alongside each `sync_logger.event/error`, `writer.terminal(outcome, ...)` at each return, and `writer.control`/`integrity` where appropriate; give the unknown-model early exit (931–940) a `blocked` terminal; close the config-abort leak. Run → PASS.
+- [ ] **Step 2..4:** Run → FAIL; extract the pure helpers `_activity_level(...)` and `_finalize_outcome(...)` and thread the writer through `sync_mode`, calling `writer.event(...)` alongside each `sync_logger.event/error` (routing the git-stderr **error detail through `detail=`**, redacted, not a field — finding 7), `writer.terminal(outcome, ...)` at **every** return (unknown-model 931-940 → `blocked`; catch-up satisfied → `skipped`; network abort → `failed`; **config-abort 1051-1055 → terminal + close the logger leak**; empty-repos → `succeeded`; normal end → the mapped outcome), and `writer.control` on cancellation. Run → PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1650,22 +1920,26 @@ git add repo_radar/modes/sync.py repo_radar/tests/test_sync_activity.py
 git commit -m "feat(activity): sync_mode threads ActivityWriter; SyncLogger source-owned severity; System incidents"
 ```
 
-### Task 2.7: Cross-process macOS integration (the spec's headline test)
+### Task 2.7: Cross-process macOS integration — the REAL production chain (finding 8)
 
 **Files:**
-- Test: `repo_radar/tests/test_activity_integration.py` (marked `@pytest.mark.integration`, macOS-gated)
+- Test: `menubar/runtime/__tests__/dispatcher-chain.integration.test.js` (macOS-gated `node:test`)
+
+This drives the **actual** production path, not a synthetic stand-in: `runtime.runSync` → the **generated** `/bin/sh` dispatcher (`emitRunSync`) → `bootstrap` → verify guard → `exec` python. A minimal fake **generation** is provisioned in an isolated `HOME`: a `venv/bin/python` symlink to the real interpreter, a `repo-radar` entry that `exec`s `python -m repo_radar.cli`, and a `verify.py` that passes — so the real generated script runs unmodified.
 
 - [ ] **Step 1: Write the test**
+  - **Happy path:** build the fake GEN + generated dispatcher, `runSync({home, channel, env, onChild})` with a one-repo dry-run config; wait for completion; assert the activity segment shows `start` → `ownership{role:'handoff'}` (same `owner_token` as the initial) → `terminal{by:<owner_token>}`, and `probeBusy(owner.lock) === false` (released). **Proves** the lease survives `runSync` spawn-inheritance (fd 4) + the shell + `exec` into python, and the handoff carries one continuous `owner_token`.
+  - **Root contention:** hold the root `.exec.lock` (fd 9) in a sidecar, run the dispatcher; assert a `skipped` terminal (finding 5), exit 75.
+  - **Crash:** kill the python child before its terminal; assert `probeBusy` is false (freed) and that `require('../../activity/reconcile').reconcile(home, aid)` synthesizes `interrupted` (durable, `by:'reconciler'`); a pre-kill `control{cancel_requested}` yields `cancelled` instead.
+  - **Failed validation:** hand a *wrong* (unlocked look-alike) fd; assert the child rejects the handoff and Electron's `handOff` times out → the initial owner finalizes `failed`.
 
-Drive a real attempt end to end at the process boundary: acquire a lease in a parent, `pass_fds` it through a `/bin/sh -c` that `exec`s `python -m repo_radar.activity.bootstrap` then a second python that adopts + writes a `terminal`; assert the segment shows `start` → `ownership(handoff)` → `terminal(by=<owner_token>)` with the **same** `owner_token`, and the lease is released after the terminal. Then a **simulated crash**: acquire + `start` + `ownership`, `os.kill(child, SIGKILL)` before terminal, then assert `probe_busy` is False (freed) and `quota.reconcile` preserves the started entry (the reader will synthesize `interrupted` in Phase 3).
-
-- [ ] **Step 2: Run → PASS** on macOS: `python -m pytest repo_radar/tests/test_activity_integration.py -v -m integration`. **Proves** the advisory lease survives spawn-inheritance + `exec` and the handoff carries one continuous `owner_token`.
+- [ ] **Step 2: Run → PASS** on macOS: `cd menubar && node --test runtime/__tests__/dispatcher-chain.integration.test.js`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add repo_radar/tests/test_activity_integration.py
-git commit -m "test(activity): cross-process lease survival + owner_token continuity (macOS)"
+git add menubar/runtime/__tests__/dispatcher-chain.integration.test.js
+git commit -m "test(activity): real dispatcher-chain integration — lease survival, owner_token continuity, skipped/crash/cancel/failed-validation"
 ```
 
 **Phase 2 gate:** both suites green (`python -m pytest repo_radar/tests/ -v`; `cd menubar && node --test`). Request an `implementation-review` checkpoint over the full Phase-2 range (it couples Node write-side, Electron, dispatcher, and Python — review the coupling surface, not just the last task).
@@ -1758,7 +2032,7 @@ test('per-writer append order survives a backwards wall-clock step', () => {
 
 **Files:** Create `menubar/activity/reconcile.js`; Test `menubar/activity/__tests__/reconcile.test.js`.
 
-**Interfaces:** `reconcile(home, activityId) -> { outcome|null, synthesized }`. Semantics (§5, §6): for a `running` attempt (has `start`, no `terminal`) — `acquire` the lock non-blocking; **cannot acquire ⇒ leave `running`** (`outcome:null`); **acquired (or lock absent) ⇒ owner gone** → synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably appended**, then release + `quota.settle`; probe error ⇒ leave `running` + a System integrity warning. Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
+**Interfaces:** `reconcile(home, activityId) -> { outcome|null, synthesized }`. Semantics (§5, §6) driven by the **tri-state `lease.probe`** (finding 7): for a `running` attempt (has `start`, no `terminal`) — **`BUSY` ⇒ leave `running`** (`outcome:null`); **`FREE` (or lock absent) ⇒ owner gone** → `acquire` + synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably (`fsync`) appended**, then release + `quota.settle`; **`UNCERTAIN` ⇒ leave `running` + a System `integrity` Problem** (never guess a dead owner). Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1808,7 +2082,7 @@ test('conflicting terminals => interrupted + integrity', () => { /* seed two ter
 
 **Files:** Create `menubar/activity/redact.js`; Test `menubar/activity/__tests__/redact.test.js` (loads the shared fixtures).
 
-**Interfaces:** `Redactor(configuredSecrets).scrub(text)` — same credential forms + configured secrets as `redact.py`, proven by loading `../../repo_radar/activity/redaction_fixtures.json`. This is the read/export boundary (spec §4); it supersedes reliance on `runtime/hashing.js:redact` for Activity content.
+**Interfaces:** `Redactor(configuredSecrets).scrub(text)` — same credential forms + configured secrets as `redact.py`, proven by loading `../../repo_radar/tests/data/redaction_fixtures.json`. This is the read/export boundary (spec §4); it supersedes reliance on `runtime/hashing.js:redact` for Activity content.
 
 - [ ] **Step 1: Write the failing parity test**
 
@@ -1817,11 +2091,13 @@ const test = require('node:test'); const assert = require('node:assert');
 const fs = require('node:fs'); const path = require('node:path');
 const { Redactor } = require('../redact');
 const fixtures = JSON.parse(fs.readFileSync(
-  path.join(__dirname, '..', '..', '..', 'repo_radar', 'activity', 'redaction_fixtures.json')));
+  path.join(__dirname, '..', '..', '..', 'repo_radar', 'tests', 'data', 'redaction_fixtures.json')));
 
 test('node read-time redactor masks every shared fixture identically to Python', () => {
-  const r = new Redactor([]);
-  for (const [raw, expected] of fixtures) assert.strictEqual(r.scrub(raw), expected);
+  for (const c of fixtures) {                       // object form incl. configured-secret cases
+    const r = new Redactor(c.secrets);
+    assert.strictEqual(r.scrub(c.raw), c.expected, c.raw);
+  }
 });
 ```
 
@@ -1829,28 +2105,38 @@ test('node read-time redactor masks every shared fixture identically to Python',
 
 - [ ] **Step 5: Commit** `feat(activity): read-time redaction backstop with cross-language parity`.
 
-### Task 3.5: Reader-side retention + prune (age, 64 MiB ceiling, prune order)
+### Task 3.5: Reader-side retention — age/newest-50 policy atop the Phase-1 base pruner
 
-**Files:** Modify `menubar/activity/quota.js` (implement the real `prune` + `retain`); Test `menubar/activity/__tests__/retention.test.js`.
+**Files:** Add `retain(home)` to `menubar/activity/quota.js` (the ceiling-override base `prune` already exists from Phase-1 Task 1.6 — this **layers** age/newest-50 on top, it does not replace a no-op); Test `menubar/activity/__tests__/retention.test.js`.
 
-**Interfaces:** `retain(home) -> { pruned: [ids] }` applying §7: routine terminal prunable only if older than 14 days AND outside newest 50; problem item only if older than 90 days AND outside newest 50; never prune `running`/unreconciled; the 64 MiB ceiling **overrides** age/newest-50 (prune younger terminals if needed) except never `running` and always keep the newest problem; prune deletes segment files **first**, then the scan reflects it (Task 1.6 `_prune` no-op is now replaced/reused by this Node implementation, which is the authoritative one).
+**Interfaces:** `retain(home) -> { pruned: [ids] }` — the **complete §7 matrix (finding 9)**, all asserted:
+  - **Routine** terminal prunable only if **older than 14 days AND outside the newest 50**.
+  - **Problem** item prunable only if **older than 90 days AND outside the newest 50**.
+  - **Never** prune `running`/unreconciled items (no durable terminal), regardless of age/count.
+  - The **64 MiB ceiling overrides** the 14/90-day + newest-50 preferences (prune younger settled terminals if required), **except** never `running` and **always preserve the newest problem**.
+  - **Settled-only deletion** (an activity with a live ledger entry is never pruned), segment files deleted **first** (scan reflects the reduction), **prune order** oldest-routine → other non-failures → oldest-problems, and **symlinked entries refused** (via `secure_scan`/`secure_iterdirs`).
+  - `retain` reuses the Phase-1 `prune(home, need_bytes)` for the ceiling-override slice and adds the age/newest-50 selection for the periodic slice.
 
-- [ ] **Step 1: Write the failing test** (representative: ceiling overrides age)
+- [ ] **Step 1: Write the failing tests** — one per matrix row, e.g.:
 
 ```js
 const test = require('node:test'); const assert = require('node:assert');
-// seed >64 MiB across many settled routine items + one recent problem item;
-// assert retain() prunes oldest routine first, keeps the newest problem, and drops
-// under the ceiling; assert a running item is never pruned.
+// (helpers seed activities with controllable mtime + outcome + settled/running state)
+test('routine older than 14d AND outside newest 50 is pruned; a 13d one is kept', () => { /* ... */ });
+test('problem younger than 90d is kept even if outside newest 50', () => { /* ... */ });
+test('running/unreconciled is never pruned regardless of age', () => { /* ... */ });
+test('ceiling override prunes younger routine but preserves the newest problem + running', () => { /* ... */ });
+test('a settled item with a live ledger entry is never pruned', () => { /* ... */ });
+test('symlinked activity dir/segment is refused by the scan', () => { /* ... */ });
 ```
 
-- [ ] **Step 2-5:** implement `retain`/`prune`; run → PASS; commit `feat(activity): outcome-aware retention + 64 MiB ceiling enforcement`.
+- [ ] **Step 2-5:** implement `retain` (deletion order, mtime/age, newest-50, ceiling override via `prune`); run → PASS; commit `feat(activity): outcome-aware retention matrix (age + newest-50 + ceiling override)`.
 
 ### Task 3.6: `read.js` — enumerate → DTO assembly + export
 
 **Files:** Create `menubar/activity/read.js`; Modify `menubar/activity/index.js` (export the reader façade); Test `menubar/activity/__tests__/read.test.js`.
 
-**Interfaces:** `listActivities(home, filter) -> { items: DTO[], truncated }` and `buildExport(home, filter) -> string`. Each DTO is bounded + already redacted, newest-first, with derived `outcome` (via reconcile), duration, channel/trigger, error/warn counts, and the two lenses (Events, Problems). `buildExport` produces the redacted text in-process (never from renderer input). Enforces payload/size bounds before returning.
+**Interfaces:** `listActivities(home, filter) -> { items: DTO[], truncated }` and `buildExport(home, filter) -> string`. Each DTO is bounded + already redacted, newest-first, with derived `outcome` (via reconcile), duration, channel/trigger, error/warn counts, and the two lenses (Events, Problems). `buildExport` produces the redacted text in-process (never from renderer input). **Concrete bounds enforced (finding 9), defined as `menubar/activity/limits.js` constants:** list returns **≤ 200** item summaries per call (`truncated:true` past that); a single item's detail DTO carries **≤ 2000 event rows** and **≤ 2 MiB** total (further rows summarized); each rendered field/`detail` string **≤ 8 KiB**; the `filter` is validated — `level ∈ {info,warn,error}`, free-text `search ≤ 256` chars (literal match, not regex), `limit ≤ 200`, `offset ≥ 0`; **export ≤ 16 MiB** (truncated with a visible marker past that). Any filter violating these is rejected by the handler (Task 4.1), not clamped silently.
 
 - [ ] **Step 1: Write the failing test** (end-to-end read over a seeded store, incl. a `running` item that reconciles to `interrupted`, a redaction check on a DTO, and the `truncated` flag when over the DTO budget).
 
@@ -1864,29 +2150,36 @@ const test = require('node:test'); const assert = require('node:assert');
 
 **Deliverable:** a dedicated, context-isolated Activity window backed by the Phase-3 reader; a tray entry available any time; the two lenses; the System section; and the "Sync Errors" affordance subsumed so it never opens empty. **This is the first releasable state** — Phases 1–3 were checkpoints.
 
-### Task 4.1: Narrow, context-isolated IPC surface
+### Task 4.1: Narrow, context-isolated IPC surface + dedicated preload
 
-**Files:** Create `menubar/activity/ipc.js` (main-side handlers); Modify `menubar/main.js` (register handlers), `menubar/preload.js` (expose a minimal `activityApi`); Test `menubar/activity/__tests__/ipc.test.js` (unit-test the handler functions directly, Electron-free).
+**Files:** Create `menubar/activity/ipc.js` (main-side handlers), **`menubar/renderer/activity-preload.js`** (a **dedicated** preload — NOT the existing `preload.js`, finding 9); Modify `menubar/main.js` (register handlers); Test `menubar/activity/__tests__/ipc.test.js` (handler functions, Electron-free) + `menubar/activity/__tests__/preload-allowlist.test.js`.
 
-**Interfaces:** channels `activity:list` (filter → `{items, truncated}`), `activity:get` (id → item + lenses), `activity:export` (filter → path; export built in main via `read.buildExport`), `activity:reveal` (id → `shell.showItemInFinder`). Handlers validate the filter and **only ever return bounded, already-redacted DTOs**; the renderer sends filter parameters, never text to be echoed. `preload.js` exposes `contextBridge.exposeInMainWorld('activityApi', { list, get, export, reveal })`.
+**Interfaces:** channels `activity:list` (filter → `{items, truncated}`), `activity:get` (id → item + lenses), `activity:export` (filter → path; export built in main via `read.buildExport`), `activity:reveal` (id → `shell.showItemInFinder`). Handlers **validate the filter against `limits.js`** and reject (not clamp) violations; they **only ever return bounded, already-redacted DTOs**; the renderer sends filter parameters, never text to be echoed. The dedicated preload exposes exactly `contextBridge.exposeInMainWorld('activityApi', { list, get, export, reveal })` — an **allowlist of exactly those four `invoke` channels**, nothing else.
 
-- [ ] TDD: test the handler functions with a seeded store return bounded/redacted DTOs and reject an over-broad filter; implement; commit `feat(activity): context-isolated IPC for the Activity window`.
+- [ ] TDD:
+  - Handler tests: a seeded store returns bounded/redacted DTOs; an over-broad or malformed filter (bad `level`, `limit>200`, `search>256`, regex metachars) is **rejected**.
+  - Preload allowlist test: the preload's exposed API surface is exactly `{list,get,export,reveal}` and each maps to its single `activity:*` channel — assert no `ipcRenderer` object, no `require`, no wildcard is leaked to the window.
+  - implement; commit `feat(activity): context-isolated IPC + dedicated Activity preload (allowlisted)`.
 
 ### Task 4.2: Activity `BrowserWindow` + renderer (list + Events/Problems lenses)
 
-**Files:** Modify `menubar/main.js` (`showActivityWindow()` — a NEW window distinct from `showLogWindow`, with `contextIsolation:true, nodeIntegration:false, preload`); Create `menubar/renderer/activity.html`, `menubar/renderer/activity.js`; Test `menubar/__tests__/activity-renderer-dom.test.js` (jsdom-free: test the pure render helpers that build DOM text from a DTO).
+**Files:** Modify `menubar/main.js` (`showActivityWindow()` — a NEW window distinct from `showLogWindow`, `webPreferences: { contextIsolation:true, nodeIntegration:false, sandbox:true, preload: activity-preload.js }`); Create `menubar/renderer/activity.html`, `menubar/renderer/activity.js`; Test `menubar/__tests__/activity-renderer-dom.test.js` + `menubar/__tests__/activity-window-security.test.js`.
 
-**Interfaces:** `showActivityWindow()` opens the window (reusing an existing instance), loads `renderer/activity.html`. The renderer: a newest-first list of chips (time · channel/trigger · duration · outcome dot · error/warn counts); clicking opens the two lenses — **Events** (rows filterable by level + free-text, expandable `detail`) and **Problems** (warn/error + failure diagnostics, exact-dup terminals grouped w/ count, integrity Problems). **All content inserted via `textContent`, never `innerHTML`**; ANSI/control chars stripped. `renderer/activity.js` factors its DTO→DOM mapping into pure functions so they are unit-testable.
+**Interfaces:** `showActivityWindow(focusId?)` opens/reuses the window, loads `renderer/activity.html`. The renderer: a newest-first list of chips (time · channel/trigger · duration · outcome dot · error/warn counts); clicking opens the two lenses — **Events** (rows filterable by level + free-text, expandable `detail`) and **Problems** (warn/error + failure diagnostics, exact-dup terminals grouped w/ count, integrity Problems). **All content inserted via `textContent`, never `innerHTML`** (finding 9); ANSI/control chars stripped via a shared `sanitizeText()`. `renderer/activity.js` factors its DTO→DOM mapping into pure functions so they are unit-testable through a lightweight DOM adapter.
 
-- [ ] TDD: unit-test the pure `renderChip(dto)` / `renderEventRow(rec)` produce escaped text (a DTO carrying `<script>` and ANSI yields inert text); implement window + renderer; commit `feat(activity): context-isolated Activity window with Events/Problems lenses`.
+- [ ] TDD:
+  - **DOM adapter test:** feed `renderChip(dto)` / `renderEventRow(rec)` a DTO carrying `<script>alert(1)</script>` + ANSI escapes; assert the produced node's `textContent` holds the literal characters and the node has **no child elements** (inert — proves `textContent`, not markup).
+  - **Source-prohibition test:** assert `renderer/activity.js` contains **no `innerHTML`/`outerHTML`/`insertAdjacentHTML`/`document.write`** (regex over the file source) — a hard guard finding 9 asks for.
+  - **Window-security test:** assert `showActivityWindow`'s `webPreferences` are exactly `{contextIsolation:true, nodeIntegration:false, sandbox:true}` with the dedicated preload (extract the options into a testable constant).
+  - implement window + renderer; commit `feat(activity): context-isolated Activity window, textContent-only, Events/Problems lenses`.
 
 ### Task 4.3: System section
 
 **Files:** Modify `menubar/activity/read.js` (add `systemDiagnostics(home)`), `menubar/renderer/activity.js` (render the section); Test `menubar/activity/__tests__/system-section.test.js`.
 
-**Interfaces:** `systemDiagnostics(home) -> { streams: [{name, redactedTail}] }` — bounded, redacted, explicitly **uncorrelated** tails of at minimum `sync.error.log` and `menubar.log`; `sync.log` and `renderer.log` listed as available-on-demand. Never Activity items, never time-correlated. This is also where the viewer's **own** observability-write failure surfaces.
+**Interfaces:** `systemDiagnostics(home) -> { streams: [{name, redactedTail}], statusDiagnostics }` — bounded, redacted, explicitly **uncorrelated** tails of at minimum `sync.error.log` and `menubar.log`; `sync.log` and `renderer.log` available-on-demand; **plus the legacy `status.json` `errorLog` (string) + `errorList` (array), bounded + redacted (finding 9)** — the pre-contract diagnostic surface that must stay visible. All marked uncorrelated: never Activity items, never time-correlated. This is also where the viewer's **own** observability-write failure surfaces (the last-resort sh line from Task 2.4 lands in `sync.error.log`).
 
-- [ ] TDD: seeded log files → bounded redacted tails; implement; commit `feat(activity): System section (uncorrelated shared-stream diagnostics)`.
+- [ ] TDD: seeded log files + a seeded `status.json` with `errorLog`/`errorList` → bounded redacted diagnostics including the `status.json` surface; implement; commit `feat(activity): System section (shared streams + legacy status.json diagnostics)`.
 
 ### Task 4.4: Subsume "Sync Errors" — deep-link, never empty
 
@@ -1918,7 +2211,11 @@ const test = require('node:test'); const assert = require('node:assert');
 
 **Interfaces:** `legacyItems(home) -> DTO[]` — each `sync-<ISO>.log` becomes one **opaque legacy attempt** DTO (run boundary from the filename; `[HH:MM:SS]` line-times + filename-date → full timestamps; level derived only for legacy data), redacted, clearly marked legacy. **Never** correlated to a durable activity, never reconstructs identity. `status.json` and shared streams are **System-only** (Task 4.3), never standalone items.
 
-- [ ] TDD: a seeded `sync-*.log` yields one opaque legacy DTO with a reconstructed timestamp; a `status.json` never becomes a standalone item; implement; commit `feat(activity): opaque legacy sync-log adapter`.
+- [ ] TDD:
+  - a seeded `sync-*.log` yields one opaque legacy DTO with a reconstructed timestamp;
+  - a `status.json` **never** becomes a standalone Activity item;
+  - **but its `errorLog`/`errorList` DO appear in the System section** (positive assertion — finding 9: the legacy diagnostic surface must be present, not merely absent from the item list);
+  - implement; commit `feat(activity): opaque legacy sync-log adapter + legacy diagnostics in System`.
 
 ### Task 5.2: Retention wiring + independence from `_rotate_sync_logs`
 
