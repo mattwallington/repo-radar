@@ -1518,6 +1518,8 @@ def _write_entry(home, activity_id, reserved, granted):
     """Durable, DESCRIPTOR-RELATIVE ledger write (Round-5 #1): temp file + full-write loop +
     fsync, atomic rename and dir fsync all relative to the validated quota dir fd, with temp
     cleanup on any failure. Raises on durability failure."""
+    if not ids.valid_activity_id(activity_id):                # never interpolate an untrusted id into a path (spec validate-before-path; fixed post-build Ruling 6)
+        raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     blob = json.dumps({"reserved": reserved, "granted": granted}).encode()
     name = f"{activity_id}.json"; tmp = f".{activity_id}.{os.getpid()}.tmp"
     qfd = _open_quota_dir(home)
@@ -1553,6 +1555,8 @@ def _write_entry(home, activity_id, reserved, granted):
         os.close(qfd)
 
 def _unlink_entry(home, activity_id):
+    if not ids.valid_activity_id(activity_id):                # never interpolate an untrusted id into a path (spec validate-before-path; fixed post-build Ruling 6)
+        raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     qfd = _open_quota_dir(home)                              # descriptor-relative unlink (Round-5 #1)
     try:
         os.unlink(f"{activity_id}.json", dir_fd=qfd)
