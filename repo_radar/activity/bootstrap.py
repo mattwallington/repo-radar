@@ -1,5 +1,5 @@
 import argparse, os, sys
-from repo_radar.activity import ids
+from repo_radar.activity import ids, HANDOFF_REJECTED_EXIT
 from repo_radar.activity.writer import ActivityWriter
 
 def main(argv=None):
@@ -16,7 +16,6 @@ def main(argv=None):
         return 0                                   # best-effort: never block the sync
     # ActivityWriter never raises; a failed adopt/admit leaves it INACTIVE and writes NOTHING
     # (no false ack — finding 4). Signal that with a non-zero exit; the dispatcher does not abort.
-    from repo_radar.activity import HANDOFF_REJECTED_EXIT
     w = ActivityWriter(home, kind=a.kind, channel=a.channel, trigger=a.trigger,
                        producer="dispatcher", inherited_id=aid,
                        inherited_fd=int(fd), owner_token=token)

@@ -1,5 +1,5 @@
 import json, os, subprocess, sys
-from repo_radar.activity import paths, ids, lease
+from repo_radar.activity import paths, ids, lease, HANDOFF_REJECTED_EXIT
 
 def _seg_records(home, aid):
     d = paths.activity_dir(home, aid); recs = []
@@ -60,3 +60,25 @@ def test_finalize_standalone_records_blocked_incident(tmp_path):
     recs = _seg_records(tmp_path, dirs[0].name)
     assert recs[0]["type"] == "start" and recs[-1]["type"] == "terminal"
     assert recs[-1]["outcome"] == "blocked"
+
+def test_bootstrap_rejects_corrupt_handoff_exits_66(tmp_path):
+    # Corrupt handoff: env claims activity A but passes fd from activity B (fstat mismatch)
+    # -> lease.adopt() rejects it -> bootstrap exits 66 and writes nothing
+    aid_A = ids.mint_activity_id()
+    aid_B = ids.mint_activity_id()
+    paths.secure_mkdir(paths.activity_dir(tmp_path, aid_A))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, aid_B))
+    held_B = lease.acquire(paths.owner_lock_path(tmp_path, aid_B))  # fd is for B's lock
+    # Invoke bootstrap claiming A but passing B's fd (identity mismatch)
+    env = {**os.environ, "HOME": str(tmp_path),
+           "REPO_RADAR_ACTIVITY_ID": aid_A,
+           "REPO_RADAR_ACTIVITY_OWNER_TOKEN": held_B.owner_token,
+           "REPO_RADAR_ACTIVITY_LOCK_FD": str(held_B.fd)}
+    r = subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
+                        "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
+                       env=env, pass_fds=[held_B.fd], capture_output=True, text=True)
+    assert r.returncode == HANDOFF_REJECTED_EXIT, f"expected 66, got {r.returncode}\nstderr: {r.stderr}"
+    # Activity A must not have any records written and no ledger entry
+    recs = _seg_records(tmp_path, aid_A)
+    assert recs == [], f"expected no records for A, got {recs}"
+    assert not paths.ledger_entry_path(tmp_path, aid_A).exists()
