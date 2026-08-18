@@ -1,4 +1,5 @@
 import os
+import signal
 import pytest
 from repo_radar.activity import lease, paths, ids
 
@@ -38,3 +39,28 @@ def test_adopt_rejects_when_a_different_lease_holds_the_inode(tmp_path):
     fd = os.open(lp, os.O_RDWR)                   # our inherited fd does NOT share it
     with pytest.raises(lease.HandoffRejected):    # independent busy, reassert fails
         lease.adopt(fd, "deadbeef", lp)
+
+def test_acquire_refuses_a_fifo_owner_lock_without_blocking(tmp_path):
+    # Round-6 #4: a FIFO where owner.lock is expected must be rejected PROMPTLY (O_NONBLOCK),
+    # never hang unattended sync. Prove it via alarm timeout.
+    lp = _lock(tmp_path)
+    os.mkfifo(lp)
+    def _timeout(*_): raise TimeoutError("acquire/probe blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, _timeout); signal.alarm(5)
+    try:
+        assert lease.acquire(lp) is None           # acquire refuses, returns None
+        assert lease.probe(lp) == lease.UNCERTAIN  # probe returns UNCERTAIN (can't confirm state)
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, old)
+
+def test_acquire_refuses_owner_lock_under_intermediate_symlink(tmp_path):
+    # Round-6 #4: owner.lock path under a symlinked INTERMEDIATE component (activity/) must be
+    # rejected via UnsafePath, not attempted. acquire catches and returns None.
+    import shutil
+    lp = _lock(tmp_path)
+    # Replace the activity directory with a symlink to outside
+    outside = tmp_path / "outside"; outside.mkdir()
+    activity_root = paths.quota_dir(tmp_path).parent  # .../repo-radar/activity
+    shutil.rmtree(activity_root)
+    os.symlink(outside, activity_root)
+    assert lease.acquire(lp) is None                   # acquire catches UnsafePath -> None

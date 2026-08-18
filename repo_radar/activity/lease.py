@@ -1,4 +1,4 @@
-import errno, fcntl, os
+import errno, fcntl, os, stat
 from repo_radar.activity import ids, paths
 
 FREE, BUSY, UNCERTAIN = "free", "busy", "uncertain"
@@ -55,7 +55,6 @@ def probe_busy(lock_path) -> bool:
     return probe(lock_path) == BUSY
 
 def adopt(inherited_fd, owner_token, lock_path) -> Lease:
-    import stat
     # (1) syntactic
     if not (isinstance(inherited_fd, int) and inherited_fd >= 0 and ids.valid_token(owner_token)):
         raise HandoffRejected("bad fd/token syntax")
