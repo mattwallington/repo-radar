@@ -1,0 +1,187 @@
+import json, os
+from repo_radar.activity import writer, paths, ids, quota, lease
+
+def _read_all(home, aid):
+    d = paths.activity_dir(home, aid)
+    recs = []
+    for f in sorted(d.glob("*.jsonl")):
+        recs += [json.loads(x) for x in f.read_text().splitlines()]
+    return recs
+
+def test_full_lifecycle_mint_start_event_terminal_settles_and_releases(tmp_path):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    owner_token = w._lease.owner_token   # capture before terminal() releases the lease
+    w.start()
+    w.event("repos_loaded", "info", count=30)
+    w.terminal("succeeded", repos_changed=2, errors=0, warns=0)
+    recs = _read_all(tmp_path, w.activity_id)
+    types = [r["type"] for r in recs]
+    assert types.count("start") == 1 and "event" in types and types[-1] == "terminal"
+    assert recs[-1]["outcome"] == "succeeded" and recs[-1]["by"] == owner_token
+    assert not paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # settled
+    assert lease.acquire(paths.owner_lock_path(tmp_path, w.activity_id)) is not None  # released
+
+def test_cancel_requested_control_is_idempotent_and_uses_reserve(tmp_path):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start(); w.control("cancel_requested"); w.control("cancel_requested")
+    recs = [r for r in _read_all(tmp_path, w.activity_id)
+            if r["type"] == "control" and r.get("name") == "cancel_requested"]
+    assert len(recs) == 1                          # one-shot slot
+
+def test_dropped_events_note_is_one_shot(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    monkeypatch.setattr(quota, "grant", lambda *a, **k: False)   # ordinary capacity gone
+    w.event("dropped1", "info", x=1); w.event("dropped2", "info", x=2)   # both refused
+    notes = [r for r in _read_all(tmp_path, w.activity_id)
+             if r["type"] == "integrity" and r.get("kind") == "dropped-events"]
+    assert len(notes) == 1                         # emitted at most once
+    w.terminal("failed", repos_changed=0, errors=1, warns=0)     # terminal still lands (reserve)
+    assert any(r["type"] == "terminal" for r in _read_all(tmp_path, w.activity_id))
+
+def test_terminal_append_failure_does_not_settle_or_swallow_reservation(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    monkeypatch.setattr(writer.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # durable write fails
+    assert paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # reservation PRESERVED
+    # reader can later synthesize interrupted from the freed lease + preserved reserve
+
+def test_best_effort_write_failure_never_raises(tmp_path, monkeypatch, capsys):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    monkeypatch.setattr(paths, "secure_open_append",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    w.start()                                       # must not raise
+    assert "activity" in capsys.readouterr().err.lower()
+
+def test_adopter_has_no_cancellation_authority(tmp_path):
+    # finding 2: only the minter may write cancel_requested; an adopter must no-op so the
+    # single 20 KiB cancellation slot cannot be double-spent across writers
+    minter = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                                   trigger="cli", producer="python")
+    minter.start()
+    dup = os.dup(minter._lease.fd)                  # simulate an inherited fd
+    adopter = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli",
+                                    producer="dispatcher", inherited_id=minter.activity_id,
+                                    inherited_fd=dup, owner_token=minter._lease.owner_token)
+    adopter.control("cancel_requested")             # must be a no-op (not the authority)
+    cancels = [r for r in _read_all(tmp_path, minter.activity_id)
+               if r["type"] == "control" and r.get("name") == "cancel_requested"]
+    assert cancels == []
+
+def test_construction_failure_yields_inactive_writer_no_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "secure_mkdir",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("mkdir denied")))
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")   # must NOT raise
+    assert w._active is False
+    assert w.hand_off_env() == {}                   # never exposes a dead fd (finding 3)
+    w.start(); w.event("x", "info"); w.terminal("succeeded")      # all no-ops, no raise
+
+def test_admission_refusal_hand_off_env_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(quota, "admit", lambda *a, **k: False)
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    assert w._active is False and w.hand_off_env() == {}
+
+def test_settle_failure_during_terminal_still_frees_the_lock(tmp_path, monkeypatch, capsys):
+    aid_lock = None
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    aid = w.activity_id
+    w.start()
+    monkeypatch.setattr(quota, "settle", lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # must NOT raise into the sync
+    assert "activity" in capsys.readouterr().err.lower()
+    # finding 1: the lease MUST be released even though settle raised -> lock is FREE
+    assert lease.probe(paths.owner_lock_path(tmp_path, aid)) == lease.FREE
+
+def test_terminal_ensures_exactly_one_start_when_none_written(tmp_path):
+    # a finalize-style path that calls terminal() without a prior start() must still produce a
+    # start, and exactly one (finding 1)
+    w = writer.ActivityWriter(tmp_path, kind="system", channel="dev",
+                              trigger="scheduled", producer="python")
+    w.terminal("blocked", reason="x")               # no explicit start() first
+    types = [r["type"] for r in _read_all(tmp_path, w.activity_id)]
+    assert types.count("start") == 1 and types[-1] == "terminal"
+
+def test_failed_start_writes_no_terminal_and_reservation_recoverable(tmp_path, monkeypatch):
+    # Round-4 #2: if the start never becomes DURABLE, the writer writes no terminal (no
+    # terminal-only item); the lease is freed and the reservation is reclaimable by reconcile.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    aid = w.activity_id
+    monkeypatch.setattr(writer.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    w.start(); w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+    assert all(r["type"] != "terminal" for r in _read_all(tmp_path, aid))       # writer wrote no terminal
+    assert lease.probe(paths.owner_lock_path(tmp_path, aid)) == lease.FREE       # lease released
+    monkeypatch.undo()                              # Round-5 #2: restore fsync BEFORE reconciliation
+    quota.reconcile(tmp_path)                        # now able to durably synthesize + settle
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()                   # reservation recovered
+
+def test_start_retry_after_fsync_failure_strictly_increasing_seq(tmp_path, monkeypatch):
+    # construct FIRST (admission uses real fsync), THEN make the first start fsync fail
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    n = {"i": 0}; real = writer.os.fsync
+    def flaky(fd):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise OSError("transient")              # start line written; only its fsync fails
+        return real(fd)
+    monkeypatch.setattr(writer.os, "fsync", flaky)
+    w.start(); w.start()                            # retry re-fsyncs the SAME line, then ownership
+    recs = _read_all(tmp_path, w.activity_id)
+    assert [r["type"] for r in recs].count("start") == 1
+    seqs = [r["seq"] for r in recs]                 # Round-6 #1: no seq regression (start<ownership)
+    assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+
+def test_start_partial_write_then_error_retries_one_valid_start(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    real = writer.os.write; n = {"i": 0}
+    def flaky(fd, data):
+        n["i"] += 1
+        if n["i"] == 1:
+            real(fd, data[:5]); raise OSError("boom")   # write a prefix, then fail
+        return real(fd, data)
+    monkeypatch.setattr(writer.os, "write", flaky)
+    w.start()                                       # partial line truncated away -> _NOTHING
+    monkeypatch.undo()
+    w.start()                                       # retry -> exactly one CLEAN start, no partial line
+    recs = _read_all(tmp_path, w.activity_id)       # _read_all parses cleanly (no orphan prefix)
+    assert [r["type"] for r in recs].count("start") == 1
+
+def test_start_grant_refusal_writes_nothing_no_terminal_only(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    aid = w.activity_id
+    monkeypatch.setattr(quota, "grant", lambda *a, **k: False)   # even the start is refused
+    w.start(); w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+    assert _read_all(tmp_path, aid) == []           # nothing written at all -> no terminal-only item
+    assert lease.probe(paths.owner_lock_path(tmp_path, aid)) == lease.FREE
+
+def test_event_not_appended_when_grant_refuses(tmp_path, monkeypatch):
+    # Round-4 #1 ordering: the segment append is never attempted unless grant returns True
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    w.start()
+    monkeypatch.setattr(quota, "grant", lambda *a, **k: False)
+    w.event("x", "info")
+    assert [r for r in _read_all(tmp_path, w.activity_id) if r["type"] == "event"] == []
+
+def test_non_serializable_field_never_raises_and_drops_the_event(tmp_path):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    w.event("x", "info", bad=object())              # non-JSON value: must not raise (finding 1)
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # sync still finalizes cleanly
+    assert any(r["type"] == "terminal" for r in _read_all(tmp_path, w.activity_id))
+
+def test_nested_field_value_is_redacted(tmp_path):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    w.start()
+    w.event("x", "error", meta={"nested": "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
+    blob = json.dumps(_read_all(tmp_path, w.activity_id))
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in blob   # nested value scrubbed
