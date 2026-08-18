@@ -101,6 +101,29 @@ Decision dispositions from the reviewer: #1 accepted (contingent on conformance 
 | 7 | binding interfaces stale | contract updated: `reconcile` → `{outcome, synthesized, problems, duplicateTerminalCounts}`; `listActivities` → `{items, truncated, available, incomplete}`; missing-store = available-empty everywhere |
 | 8 | truncation golden not oversized | dedicated cross-language truncation-parity test with a genuinely >1 KiB multibyte value + `_truncated`/bound/UTF-8-boundary assertions |
 
+## Plan-review Round 5 dispositions (all accepted, plan rev 6 @ `d79d9eb`)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | ledger atomic-not-durable + pathname ops | descriptor-relative durable `_write_entry` (temp+full-write+fsync+atomic-rename+dir-fsync); `quota.lock`/settle/reconcile-unlink `dir_fd`-relative; admit/grant refuse on swapped component |
+| 2 | `_started` = attempted | 3-state `_emit`; `_start_written` set only on real write; no empty-resync terminal-only |
+| 3 | validator accepts malformed authority records | complete v1 shape validation both langs + shared vectors |
+| 4 | early exit ≠ rejection | `HANDOFF_REJECTED_EXIT=66` is the only `failed` signal; other exits → reconcile |
+| 5 | Node deletion unsafe | all destructive deletion delegated to Python; Python opens reject non-regular |
+| 6 | Task 3.3 tests vs canonical parser | valid seeds + all-segment enumeration |
+| 7 | truncation parity not executable | committed `golden-truncation.json` asserted in-process both langs |
+
+## Plan-review Round 6 dispositions (all accepted, this revision)
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | `_emit` seq/partial/zero-byte | seq consumed on a COMPLETE line (independent of fsync) so retry has strictly-increasing seq; partial line `ftruncate`d away; zero-byte write → error; +start recovery tests |
+| 2 | strict validation breaks fixtures | all fixtures use valid ISO ts + 8-hex `by`; ownership requires `pid`/`boot_id`/`proc_birth`; `parse_valid` rejects non-finite + validates an actual timestamp; vectors extended |
+| 3 | prune ownership / task ordering | Phase-1 `prune.py` entrypoint; Node admit release→invoke-Python→reacquire; retention impl (3.5) vs cadence wiring (5.2) split; Phase-3 gate runs Python too |
+| 4 | unsafe-file open can block | `open_owned_regular` = `O_NONBLOCK`+`O_NOFOLLOW`+`S_ISREG`; lease acquire/probe/adopt routed through it; FIFO no-block tests |
+| 5 | ledger edge cases | exact non-boolean int counters; zero-byte error; temp cleanup on rename failure; UUID-validate ledger names |
+| 6 | Phase-3 placeholder tests | concrete UNCERTAIN (probe seam) + full retention-matrix tests |
+
 ---
 
 ## File Structure
@@ -402,6 +425,23 @@ def test_append_scan_prune_refuse_a_replaced_intermediate_component(tmp_path):
     assert paths.list_owned_subdirs(activity_root) == []      # enumeration refuses
     assert paths.unlink_owned_tree(d) == 0                    # delete refuses (frees nothing)
     assert sentinel.exists()                                  # outside file untouched
+
+def test_owned_opens_reject_a_fifo_without_blocking(tmp_path):
+    # Round-6 #4: a FIFO where a segment/ledger file is expected must be rejected PROMPTLY
+    # (O_NONBLOCK), never hang an unattended sync.
+    import signal
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    fifo = paths.segment_path(tmp_path, VALID, "python", "deadbeef")
+    os.mkfifo(fifo)
+    def _timeout(*_): raise TimeoutError("open blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, _timeout); signal.alarm(5)
+    try:
+        with pytest.raises((paths.UnsafePath, OSError)):
+            paths.read_owned_file(fifo)
+        with pytest.raises((paths.UnsafePath, OSError)):
+            paths.secure_open_append(fifo)
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, old)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -509,19 +549,26 @@ def _read_fd(fd):
             return b"".join(chunks)
         chunks.append(b)
 
-def secure_open_append(path, mode=0o600) -> int:
+def open_owned_regular(path, flags, mode=0o600):
+    """Open a REGULAR file relative to its validated parent dir fd. `O_NONBLOCK` so a FIFO/device
+    can't **block** the open before we can `fstat`+reject it (Round-6 #4); `O_NOFOLLOW` so it can't
+    be a symlink; reject non-regular; repair mode on create. Caller closes. (Regular files ignore
+    `O_NONBLOCK` for I/O.)"""
     path = Path(path)
     dfd = open_owned_dir(path.parent)                         # FULLY validated parent (every component)
     try:
-        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, mode, dir_fd=dfd)
+        fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=dfd)
     finally:
         os.close(dfd)
     st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):                          # reject FIFO/device (Round-5 #5)
+    if not stat.S_ISREG(st.st_mode):                          # reject FIFO/device
         os.close(fd); raise UnsafePath(f"not a regular file: {path}")
-    if stat.S_IMODE(st.st_mode) != mode:
+    if (flags & os.O_CREAT) and stat.S_IMODE(st.st_mode) != mode:
         os.fchmod(fd, mode)                                   # repair a pre-existing permissive file
     return fd
+
+def secure_open_append(path, mode=0o600) -> int:
+    return open_owned_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
 
 def read_owned_segments(directory, suffix=".jsonl"):
     """Enumerate + read files under an owned dir via a validated dir fd, never following a
@@ -549,19 +596,12 @@ def read_owned_segments(directory, suffix=".jsonl"):
     return out
 
 def read_owned_file(path):
-    """Read one owned file's bytes via a validated parent dir fd (e.g. a ledger entry)."""
-    path = Path(path)
-    dfd = open_owned_dir(path.parent)
+    """Read one owned file's bytes via the nonblocking regular-file helper (e.g. a ledger entry)."""
+    fd = open_owned_regular(path, os.O_RDONLY)                # O_NONBLOCK + S_ISREG (Round-6 #4)
     try:
-        ffd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        try:
-            if not stat.S_ISREG(os.fstat(ffd).st_mode):      # reject FIFO/device (Round-5 #5)
-                raise UnsafePath(f"not a regular file: {path}")
-            return _read_fd(ffd)
-        finally:
-            os.close(ffd)
+        return _read_fd(fd)
     finally:
-        os.close(dfd)
+        os.close(fd)
 
 def list_owned_subdirs(base):
     """Immediate real subdir NAMES of an owned base via a validated dir fd (no symlink follow)."""
@@ -729,6 +769,11 @@ def test_shared_validation_vectors():      # Round-5 #3: same accept/reject case
     for case in json.loads(V.read_text()):
         accepted = R.parse_valid(json.dumps(case["raw"]), case["raw"]["activity_id"]) is not None
         assert accepted == case["accept"], case.get("why", case["raw"])
+
+def test_parse_valid_rejects_non_finite_numbers():   # Round-6 #2 (Node JSON.parse parity)
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"event","seq":0,'
+           '"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{"v":Infinity}}') % AID
+    assert R.parse_valid(raw, AID) is None
 ```
 
 - [ ] **Step 4b: Author `repo_radar/tests/data/record_validation_vectors.json`** — committed accept/reject vectors that BOTH `records.parse_valid` (Python) and `isValidV1` (Node, Task 3.1) are driven from, e.g.:
@@ -742,7 +787,10 @@ def test_shared_validation_vectors():      # Round-5 #3: same accept/reject case
   {"accept": false, "why": "invalid kind", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"start","seq":0,"ts":"2026-08-14T00:00:00-07:00","kind":"weird","channel":"stable","trigger":"cli","created_by":"python"}},
   {"accept": false, "why": "non-ISO ts", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"event","seq":0,"ts":"2026-08-14 00:00:00","level":"info","event":"x","fields":{}}},
   {"accept": false, "why": "nested field value", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"event","seq":0,"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{"a":{"b":1}}}},
-  {"accept": true,  "why": "ignores unknown additive field", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"event","seq":0,"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{},"future_field":"ok"}}
+  {"accept": true,  "why": "ignores unknown additive field", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"event","seq":0,"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{},"future_field":"ok"}},
+  {"accept": true,  "why": "valid ownership w/ evidence", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"ownership","seq":1,"ts":"2026-08-14T00:00:00-07:00","owner_token":"deadbeef","role":"initial","producer":"python","pid":1234,"boot_id":"a1b2c3d4e5f60718","proc_birth":"2026-08-14T00:00:00-07:00"}},
+  {"accept": false, "why": "ownership missing pid/boot_id/proc_birth", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"ownership","seq":1,"ts":"2026-08-14T00:00:00-07:00","owner_token":"deadbeef","role":"initial","producer":"python"}},
+  {"accept": false, "why": "non-ISO calendar ts (regex-shaped but invalid)", "raw": {"schema_version":1,"activity_id":"00000000-0000-4000-8000-000000000000","type":"event","seq":0,"ts":"2026-13-40T99:00:00-07:00","level":"info","event":"x","fields":{}}}
 ]
 ```
 
@@ -780,7 +828,7 @@ _VALID_OUTCOMES = {"succeeded", "succeeded-with-warnings", "blocked", "failed",
 
 _REQUIRED = {
     "start": ("kind", "channel", "trigger", "created_by"),
-    "ownership": ("owner_token", "role", "producer"),
+    "ownership": ("owner_token", "role", "producer", "pid", "boot_id", "proc_birth"),
     "event": ("level", "event"),
     "control": ("name",),
     "terminal": ("outcome", "summary", "by"),
@@ -817,6 +865,10 @@ def _validate(rec):
         raise InvalidRecord("seq")
     if not isinstance(rec.get("ts"), str) or not _ISO_RE.match(rec["ts"]):
         raise InvalidRecord("ts")
+    try:
+        datetime.fromisoformat(rec["ts"])           # validate an ACTUAL timestamp, not just the shape
+    except ValueError:
+        raise InvalidRecord("ts")
     if t == "event":
         if rec.get("level") not in _VALID_LEVELS: raise InvalidRecord("level")
         if not isinstance(rec.get("event"), str): raise InvalidRecord("event")
@@ -831,6 +883,9 @@ def _validate(rec):
         if not (isinstance(rec.get("owner_token"), str) and _TOKEN_RE.match(rec["owner_token"])):
             raise InvalidRecord("owner_token")
         if rec.get("producer") not in _PRODUCERS: raise InvalidRecord("producer")
+        if isinstance(rec.get("pid"), bool) or not isinstance(rec.get("pid"), int): raise InvalidRecord("pid")
+        if not isinstance(rec.get("boot_id"), str): raise InvalidRecord("boot_id")
+        if not isinstance(rec.get("proc_birth"), str): raise InvalidRecord("proc_birth")
     elif t == "control":
         if not isinstance(rec.get("name"), str): raise InvalidRecord("name")
         if not _flat_primitive_map(rec.get("fields", {})): raise InvalidRecord("fields")
@@ -850,7 +905,9 @@ def parse_valid(raw, expected_activity_id):
     (wrong outcome, wrong activity_id, unsupported schema, missing field) therefore never counts,
     so it cannot settle, finalize, or make an activity prunable."""
     try:
-        obj = json.loads(raw)
+        # parse_constant rejects NaN/Infinity/-Infinity, which Python's json would otherwise
+        # accept but Node's JSON.parse rejects — keeping the two parsers in agreement (Round-6 #2)
+        obj = json.loads(raw, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
     except Exception:
         return None
     if not isinstance(obj, dict):
@@ -1112,7 +1169,7 @@ Expected: FAIL (`ModuleNotFoundError`).
 ```python
 # repo_radar/activity/lease.py
 import errno, fcntl, os
-from repo_radar.activity import ids
+from repo_radar.activity import ids, paths
 
 FREE, BUSY, UNCERTAIN = "free", "busy", "uncertain"
 
@@ -1137,7 +1194,12 @@ class Lease:
             os.close(self.fd); self.fd = None
 
 def acquire(lock_path):
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # descriptor-relative, O_NONBLOCK, regular-file-only (Round-6 #4) — a FIFO owner.lock can
+    # neither block the open nor be adopted as a lease.
+    try:
+        fd = paths.open_owned_regular(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except (OSError, paths.UnsafePath):
+        return None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1147,8 +1209,8 @@ def acquire(lock_path):
 def probe(lock_path):
     """Tri-state via a fresh independent open-file description (finding 7)."""
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-    except OSError:
+        fd = paths.open_owned_regular(lock_path, os.O_RDWR)
+    except (OSError, paths.UnsafePath):
         return UNCERTAIN
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1163,15 +1225,18 @@ def probe_busy(lock_path) -> bool:
     return probe(lock_path) == BUSY
 
 def adopt(inherited_fd, owner_token, lock_path) -> Lease:
+    import stat
     # (1) syntactic
     if not (isinstance(inherited_fd, int) and inherited_fd >= 0 and ids.valid_token(owner_token)):
         raise HandoffRejected("bad fd/token syntax")
-    # (2) fstat identity vs a fresh non-symlink stat of the expected path
+    # (2) fstat identity vs a fresh non-symlink stat; inherited fd must be a REGULAR file (Round-6 #4)
     try:
         fst = os.fstat(inherited_fd)
         pst = os.stat(lock_path, follow_symlinks=False)
     except OSError as e:
         raise HandoffRejected(f"stat failed: {e}")
+    if not stat.S_ISREG(fst.st_mode):
+        raise HandoffRejected("inherited fd is not a regular file")
     if (fst.st_dev, fst.st_ino) != (pst.st_dev, pst.st_ino):
         raise HandoffRejected("fd is not this activity's owner.lock")
     # (3) independent probe MUST be strictly BUSY (UNCERTAIN never counts as held)
@@ -1188,20 +1253,22 @@ def adopt(inherited_fd, owner_token, lock_path) -> Lease:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest repo_radar/tests/test_activity_lease.py -v`
-Expected: PASS (4 tests). This is the §5 truth table in code: accept only on independent-busy AND inherited-reassert-succeeds.
+Expected: PASS. §5 truth table (independent-busy AND inherited-reassert-succeeds); **add FIFO/device, permission, and intermediate-symlink refusal tests for `owner.lock`** (Round-6 #4), each with a timeout to prove no blocking.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add repo_radar/activity/lease.py repo_radar/tests/test_activity_lease.py
-git commit -m "feat(activity): flock lease with exact inherited-descriptor validation (§5)"
+git commit -m "feat(activity): flock lease — §5 validation + descriptor-relative regular-file, FIFO-safe"
 ```
 
 ### Task 1.6: Crash-recoverable admission-lock quota ledger
 
 **Files:**
-- Create: `repo_radar/activity/quota.py`, `repo_radar/activity/reconcile.py`
+- Create: `repo_radar/activity/quota.py`, `repo_radar/activity/reconcile.py`, `repo_radar/activity/prune.py` (the **admission-prune entrypoint**, in Phase 1 so Node's Phase-2 admission can invoke it — Round-6 #3)
 - Test: `repo_radar/tests/test_activity_quota.py`, `repo_radar/tests/test_activity_reconcile.py`
+
+`prune.py` (`python -m repo_radar.activity.prune`): under `quota.lock`, `reconcile` then repeatedly `_prune_locked` until `charge ≤ CEILING` (or nothing prunable); prints the freed byte count. This is the ONLY destructive deletion path Node uses at admission (descriptor-relative, race-free — Round-6 #3/#5).
 
 **Interfaces:**
 - Consumes: `paths.*` descriptor-relative helpers (`open_owned_dir`/`read_owned_segments`/`read_owned_file`/`list_owned_subdirs`/`unlink_owned_tree` — Round-4 #3), `lease.acquire`/`lease.probe`, `records`, `reconcile.synthesize_terminal`. **Admission lock is `activity/quota.lock`** (sibling of `activity/quota/`, per spec §7 — finding 6). `admit` runs `reconcile` **before** charging (finding 1). `prune` is **lock-safe** (`_prune_locked` under the held lock; public `prune` takes it). Lifecycle is derived from **parsed top-level** record types, never substrings (finding 1). `reconcile` **self-heals**: a lease-free activity with a durable `start` but no `terminal` gets a **synthetic terminal** (`interrupted`/`cancelled`) written + settled — so a crashed run doesn't leak its reservation until the UI happens to open. Corrupt entries follow the same segment+lease evidence path (not preserved forever).
@@ -1224,7 +1291,8 @@ def _new_activity(tmp_path):
     return aid, lease.acquire(lp)
 
 def _write_rec(home, aid, **rec):   # a durable VALID v1 record, as the writer would leave it
-    rec.setdefault("schema_version", 1); rec.setdefault("activity_id", aid); rec.setdefault("ts", "t")
+    rec.setdefault("schema_version", 1); rec.setdefault("activity_id", aid)
+    rec.setdefault("ts", "2026-08-14T00:00:00-07:00")   # valid ISO-8601 with offset (Round-6 #2)
     seg = paths.segment_path(home, aid, "python", "deadbeef")
     fd = paths.secure_open_append(seg)
     os.write(fd, (json.dumps(rec) + "\n").encode()); os.close(fd)
@@ -1395,7 +1463,7 @@ Expected: FAIL (`ModuleNotFoundError`).
 ```python
 # repo_radar/activity/quota.py
 import fcntl, json, os, stat
-from repo_radar.activity import paths, records
+from repo_radar.activity import paths, records, ids
 from repo_radar.activity import lease as lease_mod
 from repo_radar.activity import reconcile as reconcile_mod
 
@@ -1427,11 +1495,13 @@ def _unlock(fd):
     fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 def _parse_entry(data):
-    """Validate the ledger's FULL invariant (Round-3 #6): `reserved` is always exactly RESERVE,
-    `granted >= 0`, total liability ≤ the per-activity cap — impossible 'healthy' values → CORRUPT."""
+    """Validate the ledger's FULL invariant (Round-3/6 #6/#5): counters must be EXACT non-boolean
+    ints (strings/floats → CORRUPT), `reserved` exactly RESERVE, `granted >= 0`, total ≤ cap."""
     try:
         d = json.loads(data)
-        r, g = int(d["reserved"]), int(d["granted"])
+        r, g = d["reserved"], d["granted"]
+        if isinstance(r, bool) or isinstance(g, bool) or not isinstance(r, int) or not isinstance(g, int):
+            return "CORRUPT"
         if r != RESERVE or g < 0 or r + g > PER_ACTIVITY_CAP:
             return "CORRUPT"
         return {"reserved": r, "granted": g}
@@ -1456,18 +1526,28 @@ def _write_entry(home, activity_id, reserved, granted):
         try:
             view = memoryview(blob)
             while view:
-                view = view[os.write(tfd, view):]            # full-write loop (short-write safe)
+                n = os.write(tfd, view)
+                if n <= 0:
+                    raise OSError("zero-byte write")         # no infinite loop (Round-6 #5)
+                view = view[n:]
             os.fsync(tfd)
         except BaseException:
             os.close(tfd)
             try:
-                os.unlink(tmp, dir_fd=qfd)                    # temp cleanup on failure
+                os.unlink(tmp, dir_fd=qfd)                    # temp cleanup on write/fsync failure
             except OSError:
                 pass
             raise
         else:
             os.close(tfd)
-        os.replace(tmp, name, src_dir_fd=qfd, dst_dir_fd=qfd) # atomic rename, descriptor-relative
+        try:
+            os.replace(tmp, name, src_dir_fd=qfd, dst_dir_fd=qfd)   # atomic rename, descriptor-relative
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=qfd)                    # cleanup on rename failure too (Round-6 #5)
+            except OSError:
+                pass
+            raise
         os.fsync(qfd)                                        # durable rename (dir entry)
     finally:
         os.close(qfd)
@@ -1513,9 +1593,14 @@ def _committed(home):
     return total
 
 def _ledger_entries(home):
-    # (aid, entry-or-CORRUPT) pairs read descriptor-relative from the owned quota dir
-    return [(name[:-5], _parse_entry(data))
-            for name, data, _sz, _mt in paths.read_owned_segments(paths.quota_dir(home), ".json")]
+    # (aid, entry-or-CORRUPT) pairs read descriptor-relative from the owned quota dir; a ledger
+    # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path — Round-6 #5)
+    out = []
+    for name, data, _sz, _mt in paths.read_owned_segments(paths.quota_dir(home), ".json"):
+        aid = name[:-5]
+        if ids.valid_activity_id(aid):
+            out.append((aid, _parse_entry(data)))
+    return out
 
 def _charge(home):
     total = _committed(home)
@@ -1688,7 +1773,10 @@ def synthesize_terminal(home, aid):
         try:
             view = memoryview(blob)
             while view:
-                view = view[os.write(fd, view):]
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("zero-byte write")   # no infinite loop (Round-6 #1)
+                view = view[n:]
             os.fsync(fd)                           # retain the lock until the terminal is durable
         finally:
             os.close(fd)
@@ -1859,18 +1947,44 @@ def test_failed_start_writes_no_terminal_and_reservation_recoverable(tmp_path, m
     quota.reconcile(tmp_path)                        # now able to durably synthesize + settle
     assert not paths.ledger_entry_path(tmp_path, aid).exists()                   # reservation recovered
 
-def test_start_retry_after_transient_fsync_failure_no_duplicate(tmp_path, monkeypatch):
+def test_start_retry_after_fsync_failure_strictly_increasing_seq(tmp_path, monkeypatch):
     # construct FIRST (admission uses real fsync), THEN make the first start fsync fail
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
     n = {"i": 0}; real = writer.os.fsync
     def flaky(fd):
         n["i"] += 1
         if n["i"] == 1:
-            raise OSError("transient")              # first start fsync fails; the line is still written
+            raise OSError("transient")              # start line written; only its fsync fails
         return real(fd)
     monkeypatch.setattr(writer.os, "fsync", flaky)
-    w.start(); w.start()                            # retry RE-FSYNCS the same line, never a 2nd start
-    assert [r["type"] for r in _read_all(tmp_path, w.activity_id)].count("start") == 1
+    w.start(); w.start()                            # retry re-fsyncs the SAME line, then ownership
+    recs = _read_all(tmp_path, w.activity_id)
+    assert [r["type"] for r in recs].count("start") == 1
+    seqs = [r["seq"] for r in recs]                 # Round-6 #1: no seq regression (start<ownership)
+    assert seqs == sorted(seqs) and len(seqs) == len(set(seqs))
+
+def test_start_partial_write_then_error_retries_one_valid_start(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    real = writer.os.write; n = {"i": 0}
+    def flaky(fd, data):
+        n["i"] += 1
+        if n["i"] == 1:
+            real(fd, data[:5]); raise OSError("boom")   # write a prefix, then fail
+        return real(fd, data)
+    monkeypatch.setattr(writer.os, "write", flaky)
+    w.start()                                       # partial line truncated away -> _NOTHING
+    monkeypatch.undo()
+    w.start()                                       # retry -> exactly one CLEAN start, no partial line
+    recs = _read_all(tmp_path, w.activity_id)       # _read_all parses cleanly (no orphan prefix)
+    assert [r["type"] for r in recs].count("start") == 1
+
+def test_start_grant_refusal_writes_nothing_no_terminal_only(tmp_path, monkeypatch):
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    aid = w.activity_id
+    monkeypatch.setattr(quota, "grant", lambda *a, **k: False)   # even the start is refused
+    w.start(); w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+    assert _read_all(tmp_path, aid) == []           # nothing written at all -> no terminal-only item
+    assert lease.probe(paths.owner_lock_path(tmp_path, aid)) == lease.FREE
 
 def test_event_not_appended_when_grant_refuses(tmp_path, monkeypatch):
     # Round-4 #1 ordering: the segment append is never attempted unless grant returns True
@@ -1996,9 +2110,8 @@ class ActivityWriter:
             self._lease = None; self._active = False
 
     def _emit(self, kind, build, *, reserve=False, fsync=False, slot=None):
-        """Everything — payload construction, redaction, serialization, accounting, write —
-        happens INSIDE this boundary (finding 1), so no public method can raise into the sync.
-        Returns _NOTHING / _WROTE / _DURABLE (Round-5 #2)."""
+        """All payload construction/redaction/accounting/write happen INSIDE this boundary
+        (finding 1). Returns _NOTHING / _WROTE / _DURABLE (Round-5 #2, Round-6 #1)."""
         if not self._active:
             return _NOTHING
         with self._lock:
@@ -2006,28 +2119,43 @@ class ActivityWriter:
                 if self._reserve_used[slot]:
                     return _NOTHING
                 self._reserve_used[slot] = True
-            wrote = False
-            try:
-                payload = build()                       # redaction/serialization inside the boundary
+            try:                                        # build/grant: any failure = nothing written
+                payload = build()
                 rec = records.build(kind, seq=self._seq, activity_id=self.activity_id, **payload)
                 blob = records.encode(rec)
                 if not reserve and not quota.grant(self._home, self.activity_id, len(blob)):
-                    return _NOTHING                     # refused BEFORE any write
+                    return _NOTHING
+            except Exception as e:
+                _warn(f"emit build failed: {e}"); return _NOTHING
+            try:
                 fd = paths.secure_open_append(self._seg)
+            except Exception as e:
+                _warn(f"emit open failed: {e}"); return _NOTHING   # nothing written (finding 2)
+            try:
+                start_off = os.lseek(fd, 0, os.SEEK_END)           # append offset for rollback
+                view = memoryview(blob)
+                while view:
+                    n = os.write(fd, view)
+                    if n <= 0:                          # zero-byte write -> error (no infinite loop)
+                        raise OSError("zero-byte write")
+                    view = view[n:]
+            except Exception as e:                      # PARTIAL line -> truncate it away (finding 1)
+                _warn(f"emit write failed: {e}")
                 try:
-                    view = memoryview(blob)
-                    while view:                         # full-write loop (short-write safe)
-                        view = view[os.write(fd, view):]
-                    wrote = True                        # the full line is now on disk (visible)
-                    if fsync:
-                        os.fsync(fd)
-                finally:
-                    os.close(fd)
-                self._seq += 1
-                return _DURABLE
-            except Exception as e:                      # best-effort: never raise into caller
-                _warn(f"write failed: {e}")
-                return _WROTE if wrote else _NOTHING    # full line written but fsync failed vs nothing
+                    os.ftruncate(fd, start_off)         # remove the contaminating prefix
+                except OSError:
+                    pass
+                os.close(fd)
+                return _NOTHING                         # nothing durable, no contamination left
+            self._seq += 1                              # a COMPLETE line is on disk -> consume the seq
+            if fsync:                                   #   NOW, independent of fsync (finding 1)
+                try:
+                    os.fsync(fd)
+                except Exception as e:
+                    _warn(f"emit fsync failed: {e}"); os.close(fd)
+                    return _WROTE                       # complete line written, not yet durable
+            os.close(fd)
+            return _DURABLE
 
     def _redact_val(self, v):
         if isinstance(v, bool) or v is None:
@@ -2215,7 +2343,7 @@ def test_bootstrap_adopts_existing_start_writes_handoff_only(tmp_path):
     seg = paths.segment_path(tmp_path, aid, "electron", "cafebabe")
     fd = paths.secure_open_append(seg)
     os.write(fd, (json.dumps({"schema_version": 1, "activity_id": aid, "type": "start", "seq": 0,
-        "ts": "t", "kind": "sync", "channel": "stable", "trigger": "cli",
+        "ts": "2026-08-14T00:00:00-07:00", "kind": "sync", "channel": "stable", "trigger": "cli",
         "created_by": "electron"}) + "\n").encode()); os.close(fd)
     r = _run_bootstrap(tmp_path, aid, held)
     assert r.returncode == 0, r.stderr
@@ -2366,12 +2494,18 @@ def test_full_cli_style_attempt_end_to_end(tmp_path):
     assert "ghp_shouldnotappear" not in blob            # write-time redaction held
     assert not paths.ledger_entry_path(tmp_path, w.activity_id).exists()   # settled
 
-def _durable_start(home, aid):
-    seg = paths.segment_path(home, aid, "python", "deadbeef")
-    fd = paths.secure_open_append(seg)
-    os.write(fd, (json.dumps({"schema_version": 1, "activity_id": aid, "type": "start", "seq": 0,
-        "ts": "t", "kind": "sync", "channel": "stable", "trigger": "cli",
-        "created_by": "python"}) + "\n").encode()); os.close(fd)
+def _durable_start(home, aid):   # a genuinely durable, valid v1 start (Round-6 #2)
+    blob = (json.dumps({"schema_version": 1, "activity_id": aid, "type": "start", "seq": 0,
+        "ts": "2026-08-14T00:00:00-07:00", "kind": "sync", "channel": "stable", "trigger": "cli",
+        "created_by": "python"}) + "\n").encode()
+    fd = paths.secure_open_append(seg := paths.segment_path(home, aid, "python", "deadbeef"))
+    try:
+        view = memoryview(blob)
+        while view:
+            view = view[os.write(fd, view):]        # full-write loop
+        os.fsync(fd)                                # durable
+    finally:
+        os.close(fd)
 
 def test_crash_after_durable_start_self_heals_to_interrupted(tmp_path):
     # finding 1: durable start, lease freed, NO terminal -> reconcile synthesizes + settles
@@ -2494,7 +2628,7 @@ git commit -m "feat(activity): Node ids/paths/records mirror + all-record-type g
 - Test: `menubar/activity/__tests__/lease.test.js`, `menubar/activity/__tests__/quota.test.js`, `menubar/activity/__tests__/writer.test.js`, `menubar/activity/__tests__/lock-interop.test.js`, `menubar/activity/__tests__/reconcile-synth.test.js`
 
 **Interfaces:**
-- Produces (CommonJS mirror of Python write side): `acquire(lockPath)`, `adopt(inheritedFd, ownerToken, lockPath)`, `probe(lockPath)` (tri-state), `probeBusy(lockPath)`, `admit`, `grant`, `settle`, `reconcile`, `prune`, `ActivityWriter` (Electron manual path: `start`, `event`, `control`, `terminal`, `handOffEnv()`, `dropLocalReference()`, `activityId`, `_handedOff`). Node holds the lease via a retained fd + `/usr/bin/lockf -t 0 <fd>` (spec §5); `probe` runs `/usr/bin/lockf -t 0` on a fresh fd and maps exit 0→FREE, 75→BUSY, other→UNCERTAIN. **JSON ledger (Decision 3), lifecycle derived from segments, per-activity cap in `grant`, partitioned one-shot reserve — byte-for-byte the Python contract.**
+- Produces (CommonJS mirror of Python write side): `acquire(lockPath)`, `adopt(inheritedFd, ownerToken, lockPath)`, `probe(lockPath)` (tri-state), `probeBusy(lockPath)`, `admit`, `grant`, `settle`, `reconcile`(synthesize), `ActivityWriter` (Electron manual path: `start`, `event`, `control`, `terminal`, `handOffEnv()`, `dropLocalReference()`, `activityId`, `_handedOff`). **Node NEVER deletes (Round-6 #3/#5):** when `admit` finds the charge over the ceiling it **releases `quota.lock`, spawns `python -m repo_radar.activity.prune`, then re-acquires the lock and re-evaluates** — it must **not** hold the Node lock while the Python helper obtains it. Node holds the lease via a retained fd + `/usr/bin/lockf -t 0 <fd>` (spec §5); `probe` runs `/usr/bin/lockf -t 0` on a fresh fd and maps exit 0→FREE, 75→BUSY, other→UNCERTAIN. **JSON ledger (Decision 3), lifecycle derived from segments, per-activity cap in `grant`, partitioned one-shot reserve — byte-for-byte the Python contract.**
 
 - [ ] **Step 1: Write the failing cross-language interop test — BOTH directions (finding 8)**
 
@@ -2822,10 +2956,11 @@ git commit -m "test(activity): real dispatcher-chain integration — lease survi
 const test = require('node:test'); const assert = require('node:assert');
 const { parseSegment } = require('../parse');
 const AID = '00000000-0000-4000-8000-000000000000';
-const j = (o) => JSON.stringify({ schema_version: 1, activity_id: AID, ts: 't', ...o }) + '\n';
+const TS = '2026-08-14T00:00:00-07:00';   // valid ISO-8601 with offset (Round-6 #2)
+const j = (o) => JSON.stringify({ schema_version: 1, activity_id: AID, ts: TS, ...o }) + '\n';
 const start = (seq) => j({ type:'start', seq, kind:'sync', channel:'stable', trigger:'cli', created_by:'python' });
 const ev = (seq) => j({ type:'event', seq, level:'info', event:'x', fields:{} });
-const term = (seq, outcome='succeeded') => j({ type:'terminal', seq, outcome, summary:{}, by:'x' });
+const term = (seq, outcome='succeeded') => j({ type:'terminal', seq, outcome, summary:{}, by:'deadbeef' });
 
 test('drops a truncated trailing line silently, keeps the rest', () => {
   const { records, integrity } = parseSegment(Buffer.from(start(0) + '{"type":"eve'), AID);
@@ -2852,9 +2987,9 @@ test('seq regression within a segment is flagged', () => {
 
 test('invalid-outcome OR foreign-activity terminal is NOT a valid record (Round-4 #5)', () => {
   const foreign = JSON.stringify({schema_version:1,activity_id:'11111111-1111-4111-8111-111111111111',
-    type:'terminal',seq:1,ts:'t',outcome:'succeeded',summary:{},by:'x'}) + '\n';
+    type:'terminal',seq:1,ts:TS,outcome:'succeeded',summary:{},by:'deadbeef'}) + '\n';
   const { records } = parseSegment(Buffer.from(start(0) + term(1,'bogus') + foreign), AID);
-  assert.strictEqual(records.filter(r => r.type === 'terminal').length, 0);   // neither counts
+  assert.strictEqual(records.filter(r => r.type === 'terminal').length, 0);   // bogus outcome + foreign id
 });
 ```
 
@@ -2894,7 +3029,7 @@ test('per-writer append order survives a backwards wall-clock step', () => {
 
 **Files:** **Extend** `menubar/activity/reconcile.js` (add the reader-display `reconcile(home, activityId)`; `synthesizeTerminal` already exists from Task 2.2); Test `menubar/activity/__tests__/reconcile.test.js`.
 
-**Interfaces:** `reconcile(home, activityId) -> { outcome|null, synthesized, problems, duplicateTerminalCounts }` (Round-3 #9 — callers get **deterministic integrity Problems** and **duplicate-terminal counts**, not just the outcome). Semantics (§5, §6) driven by the **tri-state `lease.probe`** (finding 7): for a `running` attempt (has `start`, no `terminal`) — **`BUSY` ⇒ leave `running`** (`outcome:null`); **`FREE` (or lock absent) ⇒ owner gone** → `acquire` + synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably (`fsync`) appended**, then release + `quota.settle`; **`UNCERTAIN` ⇒ leave `running` + a System `integrity` Problem** (never guess a dead owner). Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
+**Interfaces:** `reconcile(home, activityId, { _probe? } = {}) -> { outcome|null, synthesized, problems, duplicateTerminalCounts }` (Round-3 #9 — callers get **deterministic integrity Problems** and **duplicate-terminal counts**). The optional **`_probe` injection seam** (default `lease.probe`) makes the FREE/BUSY/UNCERTAIN branches unit-testable (Round-6 #6). Semantics (§5, §6) driven by the **tri-state `lease.probe`** (finding 7): for a `running` attempt (has `start`, no `terminal`) — **`BUSY` ⇒ leave `running`** (`outcome:null`); **`FREE` (or lock absent) ⇒ owner gone** → `acquire` + synthesize `interrupted`, or `cancelled` if a `control{cancel_requested}` exists, **retain the lock until the synthetic terminal is durably (`fsync`) appended**, then release + `quota.settle`; **`UNCERTAIN` ⇒ leave `running` + a System `integrity` Problem** (never guess a dead owner). Duplicate terminals (same outcome) group with a count; **conflicting** terminals (different outcomes) ⇒ `interrupted` + an integrity Problem (§6).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2946,7 +3081,11 @@ test('cancel_requested + freed lock => cancelled', () => {
   assert.strictEqual(reconcile(home, AID).outcome, 'cancelled');
 });
 test('UNCERTAIN probe => stays running + a System integrity Problem', () => {
-  // inject a probe stub returning UNCERTAIN; assert outcome null + a problems[] integrity entry
+  const home = fresh(); seed(home, [START]);
+  // reconcile exposes a `_probe` injection seam (default: lease.probe); force UNCERTAIN
+  const r = reconcile(home, AID, { _probe: () => 'uncertain' });
+  assert.strictEqual(r.outcome, null);                  // never guesses a dead owner
+  assert.ok(r.problems.some(p => /uncertain/i.test(p.kind || String(p))));
 });
 test('duplicate terminals (same outcome) group with a count', () => {
   const home = fresh(); seed(home, [START, term(1,'succeeded'), term(2,'succeeded')]);
@@ -2996,7 +3135,7 @@ test('node read-time redactor masks every shared fixture identically to Python',
 
 **Decision (Round-5 #5):** **all destructive deletion is the descriptor-relative Python pruner** — Node never unlinks, because stock Node's lstat-then-unlink cannot close the check/use race for a swapped intermediate component. Node's only role is to **invoke** the Python retention entrypoint on a bounded cadence.
 
-**Files:** Add `retain(home) -> [pruned_ids]` to `repo_radar/activity/quota.py` (builds on `_classify` + `_prune_locked`'s `unlink_owned_tree`, all under `quota.lock`); add `repo_radar/activity/retain.py` (`python -m repo_radar.activity.retain`); Modify `menubar/main.js` to spawn that entrypoint at app-start + after each sync completes. Test `repo_radar/tests/test_activity_retain.py`.
+**Files:** Add `retain(home) -> [pruned_ids]` to `repo_radar/activity/quota.py` (builds on `_classify` + `_prune_locked`'s `unlink_owned_tree`, all under `quota.lock`) + `repo_radar/activity/retain.py` (`python -m repo_radar.activity.retain`). **The Electron cadence wiring is Task 5.2** — kept separate (Round-6 #3). Test `repo_radar/tests/test_activity_retain.py`. **The Phase-3 gate runs the Python suite (`python -m pytest`) as well as `node --test`,** since this task adds Python code.
 
 **Interfaces:** `quota.retain(home) -> [ids]` — the **complete §7 matrix**, all asserted:
   - **Routine** terminal prunable only if **older than 14 days AND outside the newest 50**.
@@ -3005,14 +3144,58 @@ test('node read-time redactor masks every shared fixture identically to Python',
   - The **64 MiB ceiling overrides** the 14/90-day + newest-50 preferences (via the Phase-1 `_prune_locked` slice), **except** never `running` and **always preserve the newest problem**.
   - **Settled-only** (a live ledger entry is never pruned); deletion via the **descriptor-relative** `unlink_owned_tree` (Round-4/5 #3/#5) so it can never escape the owned tree. `retain` is `_reconcile_all_locked` → age/newest-50 selection → `unlink_owned_tree` per selected id → ceiling-override `_prune_locked`.
 
-- [ ] **Step 1: Failing tests (Python)** — one per matrix row (seed activities with controllable mtime + outcome + settled/running state), e.g.:
+- [ ] **Step 1: Failing tests (Python)** — one per matrix row, with concrete setup (Round-6 #6):
 
 ```python
-def test_routine_older_than_14d_outside_newest_50_pruned_but_13d_kept(tmp_path): ...
-def test_problem_younger_than_90d_is_kept_even_if_outside_newest_50(tmp_path): ...
-def test_running_is_never_pruned_regardless_of_age(tmp_path): ...
-def test_ceiling_override_prunes_younger_routine_but_keeps_newest_problem_and_running(tmp_path): ...
-def test_settled_item_with_a_live_ledger_entry_is_never_pruned(tmp_path): ...
+# repo_radar/tests/test_activity_retain.py
+import json, os, time
+from repo_radar.activity import quota, paths, lease, ids
+
+def _rec(home, aid, **r):
+    r.update(schema_version=1, activity_id=aid, ts="2026-08-14T00:00:00-07:00")
+    seg = paths.segment_path(home, aid, "python", "deadbeef")
+    fd = paths.secure_open_append(seg); os.write(fd, (json.dumps(r)+"\n").encode()); os.close(fd)
+    return seg
+
+def _settled(home, outcome="succeeded", age_days=0.0):
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(home, aid))
+    l = lease.acquire(paths.owner_lock_path(home, aid)); quota.admit(home, aid, l)
+    _rec(home, aid, type="start", seq=0, kind="sync", channel="stable", trigger="cli", created_by="python")
+    seg = _rec(home, aid, type="terminal", seq=9, outcome=outcome, summary={}, by="deadbeef")
+    l.release(); quota.settle(home, aid)
+    old = time.time() - age_days*86400; os.utime(seg, (old, old))     # backdate for the age policy
+    return aid
+
+def test_routine_older_than_14d_outside_newest_50_pruned_but_13d_kept(tmp_path):
+    old = _settled(tmp_path, "succeeded", 20); young = _settled(tmp_path, "succeeded", 13)
+    quota.retain(tmp_path)
+    assert not paths.activity_dir(tmp_path, old).exists()
+    assert paths.activity_dir(tmp_path, young).exists()
+
+def test_problem_younger_than_90d_is_kept_even_if_outside_newest_50(tmp_path):
+    prob = _settled(tmp_path, "failed", 30)                  # 30d < 90d
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, prob).exists()
+
+def test_running_is_never_pruned_regardless_of_age(tmp_path):
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    held = lease.acquire(paths.owner_lock_path(tmp_path, aid)); quota.admit(tmp_path, aid, held)
+    seg = _rec(tmp_path, aid, type="start", seq=0, kind="sync", channel="stable", trigger="cli", created_by="python")
+    old = time.time() - 999*86400; os.utime(seg, (old, old))
+    quota.retain(tmp_path)                                   # lease held -> running -> never pruned
+    assert paths.activity_dir(tmp_path, aid).exists(); held.release()
+
+def test_ceiling_override_keeps_newest_problem(tmp_path, monkeypatch):
+    problems = [_settled(tmp_path, "failed", 1) for _ in range(2)]
+    monkeypatch.setattr(quota, "CEILING", quota.RESERVE)     # force ceiling-override pruning
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, problems[-1]).exists()   # newest problem preserved
+
+def test_prune_skips_items_in_the_live_ledger(tmp_path):
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    l = lease.acquire(paths.owner_lock_path(tmp_path, aid)); quota.admit(tmp_path, aid, l)
+    quota._prune_locked(tmp_path, need_bytes=10**9)          # a live-ledger item is never a candidate
+    assert paths.activity_dir(tmp_path, aid).exists(); l.release()
 ```
 
 - [ ] **Step 2-5:** implement `quota.retain` + `retain.py`; wire the Node invocation (`menubar/main.js`) with a Node test asserting the entrypoint is spawned at the documented points (and that Node itself performs **no `unlink`**); run → PASS; commit `feat(activity): Python-owned retention matrix (race-free deletion) + Node invocation`.
