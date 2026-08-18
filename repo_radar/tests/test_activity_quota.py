@@ -1,4 +1,5 @@
 import json, os
+import pytest
 from repo_radar.activity import quota, paths, lease, ids
 
 def _mk(tmp_path, aid):
@@ -171,3 +172,47 @@ def test_corrupt_entry_charges_full_4mib_and_blocks_admission(tmp_path, monkeypa
     aid2, l2 = _new_activity(tmp_path)
     monkeypatch.setattr(quota, "CEILING", quota.PER_ACTIVITY_CAP + 1024)   # near ceiling
     assert quota.admit(tmp_path, aid2, l2) is False   # 4 MiB corrupt liability blocks it
+
+def test_write_and_unlink_entry_reject_malicious_activity_id(tmp_path):
+    # fix round 1, Critical, unit-level: prove the guard itself fires BEFORE any filename is
+    # built, independent of any other quirk in how _write_entry's tmp-file name happens to be
+    # constructed (a `../`-prefixed id already fails there for an UNRELATED reason — its `.`
+    # prefix mangles the traversal into a nonexistent literal path component — so a higher-level
+    # admit()-only test could pass even if this guard were removed; this test cannot).
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    for bad in ("../../evil", "/abs/evil", "..", "a/b", "id\nwith\nnewline", ""):
+        with pytest.raises(paths.UnsafePath):
+            quota._write_entry(tmp_path, bad, quota.RESERVE, 0)
+        with pytest.raises(paths.UnsafePath):
+            quota._unlink_entry(tmp_path, bad)
+
+def test_settle_rejects_traversal_activity_id(tmp_path):
+    # fix round 1, Critical: activity_id becomes a raw filename in _unlink_entry; dir_fd is
+    # IGNORED for an absolute name and `../` escapes the quota dir, so a malicious id must be
+    # rejected before any filename is built. Prove settle() can no longer delete a file outside
+    # the owned tree, for both a `../`-traversal id and an absolute-path id.
+    import tempfile
+    with tempfile.TemporaryDirectory() as canary_dir:
+        canary = os.path.join(canary_dir, "evil.json")
+        with open(canary, "w") as f:
+            f.write("do not delete me")
+
+        quota_dir = paths.quota_dir(tmp_path)
+        rel = os.path.relpath(canary, quota_dir)          # e.g. "../../../../../tmp/xyz/evil.json"
+        traversal_id = rel[: -len(".json")]                # _unlink_entry appends ".json" itself
+        quota.settle(tmp_path, traversal_id)               # must no-op: never raise, never delete
+        with open(canary) as f:
+            assert f.read() == "do not delete me"          # canary survives the traversal id
+
+        abs_id = canary[: -len(".json")]                   # dir_fd is IGNORED for an absolute name
+        quota.settle(tmp_path, abs_id)
+        with open(canary) as f:
+            assert f.read() == "do not delete me"          # canary survives the absolute-path id
+
+def test_admit_rejects_traversal_activity_id(tmp_path):
+    # fix round 1, Critical: same guard, exercised via the public admit() entrypoint — a
+    # malicious activity_id must fail admission closed rather than writing outside the quota dir.
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, "../../evil", l) is False
+    assert not list(tmp_path.rglob("evil.json"))            # nothing escaped the owned tree
+    assert not (tmp_path.parent / "evil.json").exists()

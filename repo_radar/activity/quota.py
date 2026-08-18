@@ -22,9 +22,12 @@ def _quota_lock(home):
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):                           # reject FIFO/device (Round-5 #5)
         os.close(fd); raise paths.UnsafePath("quota.lock is not a regular file")
-    if stat.S_IMODE(st.st_mode) != 0o600:
-        os.fchmod(fd, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)          # blocking; brief critical section
+    try:
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)      # blocking; brief critical section
+    except BaseException:
+        os.close(fd); raise                 # no fd leak on fchmod/flock failure (fix round 1, Minor 3)
     return fd
 
 def _unlock(fd):
@@ -54,6 +57,11 @@ def _write_entry(home, activity_id, reserved, granted):
     """Durable, DESCRIPTOR-RELATIVE ledger write (Round-5 #1): temp file + full-write loop +
     fsync, atomic rename and dir fsync all relative to the validated quota dir fd, with temp
     cleanup on any failure. Raises on durability failure."""
+    if not ids.valid_activity_id(activity_id):
+        # fix round 1, Critical: activity_id becomes a filename below; dir_fd is IGNORED for an
+        # absolute name and `../` escapes the quota dir, so this MUST be validated before any
+        # filename is built (mirrors paths.ledger_entry_path/activity_dir's own guard).
+        raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     blob = json.dumps({"reserved": reserved, "granted": granted}).encode()
     name = f"{activity_id}.json"; tmp = f".{activity_id}.{os.getpid()}.tmp"
     qfd = _open_quota_dir(home)
@@ -89,6 +97,9 @@ def _write_entry(home, activity_id, reserved, granted):
         os.close(qfd)
 
 def _unlink_entry(home, activity_id):
+    if not ids.valid_activity_id(activity_id):
+        # fix round 1, Critical: same path-traversal/arbitrary-delete guard as _write_entry.
+        raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     qfd = _open_quota_dir(home)                              # descriptor-relative unlink (Round-5 #1)
     try:
         os.unlink(f"{activity_id}.json", dir_fd=qfd)
@@ -182,11 +193,15 @@ def grant(home, activity_id, nbytes):
             _unlock(fd)
 
 def settle(home, activity_id):
-    fd = _quota_lock(home)
+    fd = None
     try:
+        fd = _quota_lock(home)
         _unlink_entry(home, activity_id)           # bytes now counted purely by the scan
+    except (OSError, paths.UnsafePath):
+        return None                                 # best-effort release; never raises (fix round 1, Minor 2)
     finally:
-        _unlock(fd)
+        if fd is not None:
+            _unlock(fd)
 
 def _reconcile_one_locked(home, aid):
     lock = paths.owner_lock_path(home, aid)
@@ -211,11 +226,15 @@ def _reconcile_all_locked(home):
         _reconcile_one_locked(home, aid)
 
 def reconcile(home):
-    fd = _quota_lock(home)
+    fd = None
     try:
+        fd = _quota_lock(home)
         _reconcile_all_locked(home)
+    except (OSError, paths.UnsafePath):
+        return None                                 # fail closed on lock failure (fix round 1, Minor 2)
     finally:
-        _unlock(fd)
+        if fd is not None:
+            _unlock(fd)
 
 def _classify(home, aid):
     """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — parsed top-level."""
@@ -261,8 +280,12 @@ def _prune_locked(home, need_bytes):
     return freed
 
 def prune(home, need_bytes):
-    fd = _quota_lock(home)                          # public entry is lock-safe (finding 1)
+    fd = None
     try:
+        fd = _quota_lock(home)                      # public entry is lock-safe (finding 1)
         return _prune_locked(home, need_bytes)
+    except (OSError, paths.UnsafePath):
+        return 0                                     # fail closed on lock failure (fix round 1, Minor 2)
     finally:
-        _unlock(fd)
+        if fd is not None:
+            _unlock(fd)
