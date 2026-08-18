@@ -130,8 +130,13 @@ def _truncate(s: str, limit: int):
     return kept + marker.format(len(b) - len(kept.encode())), True
 
 def _bound_key(k):
-    b = str(k).encode("utf-8")               # byte-bound, not char-bound (finding 7)
-    return str(k) if len(b) <= MAX_KEY_BYTES else b[:MAX_KEY_BYTES].decode("utf-8", "ignore")
+    """Return (key, was_truncated) where key is byte-bounded at MAX_KEY_BYTES (not char-bounded)."""
+    original = str(k)
+    b = original.encode("utf-8")
+    if len(b) <= MAX_KEY_BYTES:
+        return original, False
+    truncated_key = b[:MAX_KEY_BYTES].decode("utf-8", "ignore")
+    return truncated_key, True
 
 def _canon(v):
     """Numeric canonicalization for cross-language byte equality (Round-3 #8): reject non-finite
@@ -147,23 +152,36 @@ def _canon(v):
     return v
 
 def _bound_fields(fields):
+    """Bound fields/summary: max 32 keys, each key ≤64 bytes, each value ≤1 KiB, aggregate ≤8 KiB.
+    Non-dict input or non-primitive values raise InvalidRecord. Truncation sets _truncated flag."""
+    if not isinstance(fields, dict):
+        raise InvalidRecord("fields must be a flat map")
+
     truncated = False
     out = {}
-    for i, (k, v) in enumerate((fields or {}).items()):
+    for i, (k, v) in enumerate(fields.items()):
         if i >= MAX_KEYS:
             truncated = True
             break
-        k = _bound_key(k)
+        k, key_truncated = _bound_key(k)
+        truncated = truncated or key_truncated
+
         if isinstance(v, str):
             v, t = _truncate(v, MAX_VALUE_BYTES)
             truncated = truncated or t
         elif isinstance(v, (int, float, bool)) or v is None:
             v = _canon(v)                            # integral floats -> int; non-finite -> reject
+            # Per-value size check: even canonicalized numbers must fit in MAX_VALUE_BYTES
+            if len(json.dumps(v, ensure_ascii=False).encode("utf-8")) > MAX_VALUE_BYTES:
+                v, t = _truncate(str(v), MAX_VALUE_BYTES)
+                truncated = truncated or t
         else:
-            v, t = _truncate(str(v), MAX_VALUE_BYTES); truncated = True
+            # Reject non-primitive values (nested dicts/lists, etc.)
+            raise InvalidRecord("fields values must be flat primitives")
         out[k] = v
-    # aggregate cap
-    while len(json.dumps(out, ensure_ascii=False).encode()) > MAX_FIELDS_BYTES and out:
+
+    # aggregate cap (use compact separators to match wire encoding)
+    while len(json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_FIELDS_BYTES and out:
         out.pop(next(reversed(out)))
         truncated = True
     return out, truncated

@@ -96,3 +96,37 @@ def test_parse_valid_rejects_non_finite_numbers():   # Round-6 #2 (Node JSON.par
     raw = ('{"schema_version":1,"activity_id":"%s","type":"event","seq":0,'
            '"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{"v":Infinity}}') % AID
     assert R.parse_valid(raw, AID) is None
+
+def test_numeric_field_over_1kib_is_truncated():
+    """A 2000-digit integer exceeds MAX_VALUE_BYTES=1024 and should be truncated to a string."""
+    big_num = 10 ** 2000  # 2001-digit number
+    rec = R.build("event", seq=0, activity_id=AID, level="info", event="x",
+                  fields={"huge": big_num})
+    assert rec["_truncated"] is True
+    # The value is truncated to a string and its raw UTF-8 encoding should fit
+    raw_val = rec["fields"]["huge"].encode("utf-8")
+    assert len(raw_val) <= R.MAX_VALUE_BYTES
+    assert "truncated" in rec["fields"]["huge"]
+
+def test_byte_truncated_key_sets_truncated_flag():
+    """A key that exceeds MAX_KEY_BYTES should truncate and set _truncated=True."""
+    long_key = "k" * 100  # 100 chars = 100 bytes, exceeds MAX_KEY_BYTES=64
+    rec = R.build("event", seq=0, activity_id=AID, level="info", event="x",
+                  fields={long_key: "value"})
+    assert rec["_truncated"] is True
+    actual_key = next(iter(rec["fields"]))
+    assert len(actual_key.encode("utf-8")) <= R.MAX_KEY_BYTES
+
+def test_build_rejects_non_dict_fields():
+    """Passing fields=5 (non-dict) should raise InvalidRecord, not crash."""
+    with pytest.raises(R.InvalidRecord):
+        R.build("event", seq=0, activity_id=AID, level="info", event="x", fields=5)
+
+def test_build_rejects_nested_field_values():
+    """Nested dicts/lists in fields should raise InvalidRecord (not stringify)."""
+    with pytest.raises(R.InvalidRecord):
+        R.build("event", seq=0, activity_id=AID, level="info", event="x",
+                fields={"a": {"b": 1}})
+    with pytest.raises(R.InvalidRecord):
+        R.build("event", seq=0, activity_id=AID, level="info", event="x",
+                fields={"a": [1, 2, 3]})
