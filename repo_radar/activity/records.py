@@ -1,0 +1,195 @@
+import json, math, re
+from datetime import datetime, timezone
+
+SCHEMA_VERSION = 1
+MAX_KEYS = 32
+MAX_KEY_BYTES = 64
+MAX_VALUE_BYTES = 1024
+MAX_FIELDS_BYTES = 8192
+MAX_DETAIL_BYTES = 8192
+MAX_RECORD_BYTES = 20480
+
+class RecordTooLarge(Exception):
+    pass
+
+class InvalidRecord(Exception):
+    pass
+
+_VALID_TYPES = {"start", "ownership", "event", "control", "terminal", "integrity"}
+_VALID_LEVELS = {"info", "warn", "error"}
+_VALID_ROLES = {"initial", "handoff"}
+_VALID_OUTCOMES = {"succeeded", "succeeded-with-warnings", "blocked", "failed",
+                   "cancelled", "skipped", "interrupted"}
+
+_REQUIRED = {
+    "start": ("kind", "channel", "trigger", "created_by"),
+    "ownership": ("owner_token", "role", "producer", "pid", "boot_id", "proc_birth"),
+    "event": ("level", "event"),
+    "control": ("name",),
+    "terminal": ("outcome", "summary", "by"),
+    "integrity": ("kind",),
+}
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{2}$")
+_TOKEN_RE = re.compile(r"^[0-9a-f]{8}$")
+_PRODUCERS = {"electron", "dispatcher", "python"}
+_KINDS = {"sync", "system"}
+
+def _flat_primitive_map(m):
+    if not isinstance(m, dict):
+        return False
+    for k, v in m.items():
+        if not isinstance(k, str):
+            return False
+        if isinstance(v, bool) or v is None or isinstance(v, (int, float, str)):
+            continue
+        return False
+    return True
+
+def _validate(rec):
+    """Complete v1 shape validation (Round-5 #3) — fixed-domain enums, token/producer syntax,
+    seq >= 0, ISO-8601-with-offset ts, flat primitive maps, per-record field types. Unknown
+    ADDITIVE fields are still ignored."""
+    t = rec.get("type")
+    if t not in _VALID_TYPES:
+        raise InvalidRecord(f"type {t!r}")
+    for k in _REQUIRED.get(t, ()):
+        if k not in rec:
+            raise InvalidRecord(f"missing {k!r} for {t}")
+    if isinstance(rec.get("seq"), bool) or not isinstance(rec.get("seq"), int) or rec["seq"] < 0:
+        raise InvalidRecord("seq")
+    if not isinstance(rec.get("ts"), str) or not _ISO_RE.fullmatch(rec["ts"]):
+        raise InvalidRecord("ts")
+    try:
+        datetime.fromisoformat(rec["ts"])           # validate an ACTUAL timestamp, not just the shape
+    except ValueError:
+        raise InvalidRecord("ts")
+    if t == "event":
+        if rec.get("level") not in _VALID_LEVELS: raise InvalidRecord("level")
+        if not isinstance(rec.get("event"), str): raise InvalidRecord("event")
+        if not _flat_primitive_map(rec.get("fields", {})): raise InvalidRecord("fields")
+        if rec.get("detail") is not None and not isinstance(rec["detail"], str): raise InvalidRecord("detail")
+    elif t == "start":
+        if rec.get("kind") not in _KINDS: raise InvalidRecord("kind")
+        for k in ("channel", "trigger", "created_by"):
+            if not isinstance(rec.get(k), str): raise InvalidRecord(k)
+    elif t == "ownership":
+        if rec.get("role") not in _VALID_ROLES: raise InvalidRecord("role")
+        if not (isinstance(rec.get("owner_token"), str) and _TOKEN_RE.fullmatch(rec["owner_token"])):
+            raise InvalidRecord("owner_token")
+        if rec.get("producer") not in _PRODUCERS: raise InvalidRecord("producer")
+        if isinstance(rec.get("pid"), bool) or not isinstance(rec.get("pid"), int): raise InvalidRecord("pid")
+        if not isinstance(rec.get("boot_id"), str): raise InvalidRecord("boot_id")
+        if not isinstance(rec.get("proc_birth"), str): raise InvalidRecord("proc_birth")
+    elif t == "control":
+        if not isinstance(rec.get("name"), str): raise InvalidRecord("name")
+        if not _flat_primitive_map(rec.get("fields", {})): raise InvalidRecord("fields")
+    elif t == "terminal":
+        if rec.get("outcome") not in _VALID_OUTCOMES: raise InvalidRecord("outcome")
+        if not _flat_primitive_map(rec.get("summary")): raise InvalidRecord("summary")
+        by = rec.get("by")
+        if not (by == "reconciler" or (isinstance(by, str) and _TOKEN_RE.fullmatch(by))):
+            raise InvalidRecord("by")
+    elif t == "integrity":
+        if not isinstance(rec.get("kind"), str): raise InvalidRecord("kind")
+
+def parse_valid(raw, expected_activity_id):
+    """THE canonical validator (Round-4 #5): parse one JSONL line and return the dict ONLY if it
+    is a SUPPORTED v1 record FOR the expected activity with valid base metadata, required fields,
+    AND type-specific enums. Anything else → None. A stray/nested/foreign/malformed `terminal`
+    (wrong outcome, wrong activity_id, unsupported schema, missing field) therefore never counts,
+    so it cannot settle, finalize, or make an activity prunable."""
+    try:
+        # parse_constant rejects NaN/Infinity/-Infinity, which Python's json would otherwise
+        # accept but Node's JSON.parse rejects — keeping the two parsers in agreement (Round-6 #2)
+        obj = json.loads(raw, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("schema_version") != SCHEMA_VERSION or obj.get("activity_id") != expected_activity_id:
+        return None
+    try:
+        _validate(obj)                 # FULL v1 shape validation (Round-5 #3)
+    except InvalidRecord:
+        return None
+    return obj
+
+def _now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+def _truncate(s: str, limit: int):
+    b = s.encode("utf-8")
+    if len(b) <= limit:
+        return s, False
+    marker = "…[truncated {} bytes]"
+    # reserve room for the marker
+    keep = b[: max(0, limit - len(marker.format(len(b)).encode()))]
+    # avoid splitting a UTF-8 sequence
+    kept = keep.decode("utf-8", "ignore")
+    return kept + marker.format(len(b) - len(kept.encode())), True
+
+def _bound_key(k):
+    b = str(k).encode("utf-8")               # byte-bound, not char-bound (finding 7)
+    return str(k) if len(b) <= MAX_KEY_BYTES else b[:MAX_KEY_BYTES].decode("utf-8", "ignore")
+
+def _canon(v):
+    """Numeric canonicalization for cross-language byte equality (Round-3 #8): reject non-finite
+    (JS JSON.parse can't read NaN/Infinity) and fold integral floats to int (Python `2.0`→`2`,
+    matching JS `JSON.stringify(2.0)`==`"2"`)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            raise InvalidRecord("non-finite number")
+        if v.is_integer():
+            return int(v)
+    return v
+
+def _bound_fields(fields):
+    truncated = False
+    out = {}
+    for i, (k, v) in enumerate((fields or {}).items()):
+        if i >= MAX_KEYS:
+            truncated = True
+            break
+        k = _bound_key(k)
+        if isinstance(v, str):
+            v, t = _truncate(v, MAX_VALUE_BYTES)
+            truncated = truncated or t
+        elif isinstance(v, (int, float, bool)) or v is None:
+            v = _canon(v)                            # integral floats -> int; non-finite -> reject
+        else:
+            v, t = _truncate(str(v), MAX_VALUE_BYTES); truncated = True
+        out[k] = v
+    # aggregate cap
+    while len(json.dumps(out, ensure_ascii=False).encode()) > MAX_FIELDS_BYTES and out:
+        out.pop(next(reversed(out)))
+        truncated = True
+    return out, truncated
+
+def build(type, *, seq, activity_id, ts=None, **payload):
+    rec = {"schema_version": SCHEMA_VERSION, "activity_id": activity_id,
+           "type": type, "seq": seq, "ts": ts or _now_iso()}
+    truncated = False
+    for dictkey in ("fields", "summary"):        # summary is bounded like fields (finding 7)
+        if dictkey in payload:
+            payload[dictkey], t = _bound_fields(payload[dictkey]); truncated |= t
+    if payload.get("detail") is not None:
+        payload["detail"], t = _truncate(str(payload["detail"]), MAX_DETAIL_BYTES); truncated |= t
+    rec.update(payload)
+    if truncated:
+        rec["_truncated"] = True
+    _validate(rec)                               # enum validation (finding 7)
+    if encoded_len(rec) > MAX_RECORD_BYTES:
+        raise RecordTooLarge(f"{type} record exceeds {MAX_RECORD_BYTES} bytes")
+    return rec
+
+def encode(record) -> bytes:
+    # allow_nan=False so any non-finite number raises here rather than emitting NaN/Infinity,
+    # which JS JSON.parse rejects — preserving cross-language byte equality (Round-3 #8)
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":"),
+                       allow_nan=False) + "\n").encode("utf-8")
+
+def encoded_len(record) -> int:
+    return len(encode(record))
