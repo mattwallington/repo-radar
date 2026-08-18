@@ -8,6 +8,17 @@ _BOOT_ID = None
 def _warn(msg):
     print(f"repo-radar: activity: {msg}", file=sys.stderr)
 
+def _safe_close(fd):
+    """close() can raise too (EIO on NFS/FUSE, ENOSPC/EDQUOT on close-deferred allocation, EBADF)
+    -- realistic on a network/cloud-synced home dir. A close-time error must never escape the
+    never-raises boundary (finding 1); caller treats a failed close as "not confirmed"."""
+    try:
+        os.close(fd)
+        return True
+    except Exception as e:
+        _warn(f"emit close failed: {e}")
+        return False
+
 def _boot_id():
     global _BOOT_ID
     if _BOOT_ID is None:
@@ -38,7 +49,10 @@ class ActivityWriter:
         self._start_written = False                     # a start LINE was appended (visible, maybe not durable)
         self._started = False                            # start is DURABLE (fsync ok) — terminal gate
         self._handoff_rejected = False                   # a corrupt lease handoff (§5) — not benign
-        self._lock = threading.Lock()
+        # RLock (not Lock): start()/terminal() hold this across their whole decide-then-act
+        # sequence (I3) and internally call _emit, which re-acquires the same lock on the same
+        # thread -- a plain Lock would self-deadlock there.
+        self._lock = threading.RLock()
         self._reserve_used = {"terminal": False, "cancel": False, "dropped": False}
         try:
             self._home = home; self._producer = producer
@@ -87,6 +101,19 @@ class ActivityWriter:
                 pass
             self._lease = None; self._active = False
 
+    def _release_lease(self):
+        """Branch on adoption exactly like __init__'s cleanup path (finding 1 / C2): an ADOPTED
+        lease shares the parent's open-file-description, so only a close (drop_local_reference)
+        is safe here -- release()'s LOCK_UN would unlock the parent's still-live copy of the same
+        OFD. A minted (non-adopted) lease keeps using release(), the original locker's normal
+        unlock-and-close."""
+        if self._lease is None:
+            return
+        if self._adopted:
+            self._lease.drop_local_reference()
+        else:
+            self._lease.release()
+
     def _emit(self, kind, build, *, reserve=False, fsync=False, slot=None):
         """All payload construction/redaction/accounting/write happen INSIDE this boundary
         (finding 1). Returns _NOTHING / _WROTE / _DURABLE (Round-5 #2, Round-6 #1)."""
@@ -123,16 +150,18 @@ class ActivityWriter:
                     os.ftruncate(fd, start_off)         # remove the contaminating prefix
                 except OSError:
                     pass
-                os.close(fd)
+                _safe_close(fd)                         # C1: close() can raise too -- never escape
                 return _NOTHING                         # nothing durable, no contamination left
             self._seq += 1                              # a COMPLETE line is on disk -> consume the seq
             if fsync:                                   #   NOW, independent of fsync (finding 1)
                 try:
                     os.fsync(fd)
                 except Exception as e:
-                    _warn(f"emit fsync failed: {e}"); os.close(fd)
+                    _warn(f"emit fsync failed: {e}")
+                    _safe_close(fd)                     # C1: guarded, matches _resync_segment's pattern
                     return _WROTE                       # complete line written, not yet durable
-            os.close(fd)
+            if not _safe_close(fd):                     # C1: close failed -> not confirmed complete
+                return _WROTE                           # line is on disk, but treat conservatively
             return _DURABLE
 
     def _redact_val(self, v):
@@ -157,26 +186,29 @@ class ActivityWriter:
             _warn(f"resync failed: {e}"); return False
 
     def start(self):
-        if not self._active or self._started:           # idempotent once DURABLE
-            return
-        if self._adopted and not self._first_producer:  # adopt-existing: a valid start exists upstream
-            if self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,
-                    role="handoff", producer=self._producer, **_fingerprint()), fsync=True) == _DURABLE:
-                self._started = True
-            return
-        if not self._start_written:
-            res = self._emit("start", lambda: dict(kind=self._kind, channel=self._channel,
-                trigger=self._trigger, created_by=self._producer), fsync=True)
-            if res == _NOTHING:
-                return                                   # nothing written -> retry emits fresh (finding 2)
-            self._start_written = True                   # a FULL start line is on disk (visible)
-            if res != _DURABLE:
-                return                                   # written but not fsync'd -> retry re-fsyncs
-        elif not self._resync_segment():                 # retry: re-fsync the already-written line
-            return
-        self._started = True                             # only after a DURABLE start (finding 2)
-        self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,   # ownership AFTER start
-            role="initial", producer=self._producer, **_fingerprint()), fsync=True)
+        # I3: the whole decide-then-act sequence is atomic per writer -- an RLock so the internal
+        # _emit() calls below (same thread) can re-acquire it without self-deadlocking.
+        with self._lock:
+            if not self._active or self._started:           # idempotent once DURABLE
+                return
+            if self._adopted and not self._first_producer:  # adopt-existing: a valid start exists upstream
+                if self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,
+                        role="handoff", producer=self._producer, **_fingerprint()), fsync=True) == _DURABLE:
+                    self._started = True
+                return
+            if not self._start_written:
+                res = self._emit("start", lambda: dict(kind=self._kind, channel=self._channel,
+                    trigger=self._trigger, created_by=self._producer), fsync=True)
+                if res == _NOTHING:
+                    return                                   # nothing written -> retry emits fresh (finding 2)
+                self._start_written = True                   # a FULL start line is on disk (visible)
+                if res != _DURABLE:
+                    return                                   # written but not fsync'd -> retry re-fsyncs
+            elif not self._resync_segment():                 # retry: re-fsync the already-written line
+                return
+            self._started = True                             # only after a DURABLE start (finding 2)
+            self._emit("ownership", lambda: dict(owner_token=self._lease.owner_token,   # ownership AFTER start
+                role="initial", producer=self._producer, **_fingerprint()), fsync=True)
 
     def _durably_started(self):
         # this process fsync'd its own start, OR (adopt path) an upstream producer durably did
@@ -204,38 +236,41 @@ class ActivityWriter:
             self._emit("control", lambda: dict(name=name, fields=self._redact_fields(fields)))
 
     def terminal(self, outcome, **summary):
-        if not self._active:
-            return
-        self._ensure_started()
-        if not self._durably_started():
-            # no durable start -> a terminal-only item is INVALID (finding 2). Release the lease;
-            # reconciliation reclaims the reservation as a no-start abandonment (no Activity item).
-            _warn("cannot finalize: no durable start; leaving for reconciliation")
-            try:
-                self._lease.release()
-            except Exception as e:
-                _warn(f"release failed: {e}")
-            self._active = False
-            return
-        res = self._emit("terminal", lambda: dict(outcome=outcome,
-            summary=self._redact_fields(summary), by=self._lease.owner_token),
-            reserve=True, fsync=True, slot="terminal")
-        # settle and release are attempted INDEPENDENTLY so a settle failure can't strand the
-        # lock (finding 1): release is in `finally` and always runs -> the lock becomes FREE.
-        try:
-            if res == _DURABLE:                          # settle ONLY after a durable terminal
+        # I3: same atomicity as start() -- the _active gate, the _ensure_started()/start() call it
+        # may trigger, and the finalize decision must all happen as one indivisible step per writer.
+        with self._lock:
+            if not self._active:
+                return
+            self._ensure_started()
+            if not self._durably_started():
+                # no durable start -> a terminal-only item is INVALID (finding 2). Release the
+                # lease; reconciliation reclaims the reservation as a no-start abandonment.
+                _warn("cannot finalize: no durable start; leaving for reconciliation")
                 try:
-                    quota.settle(self._home, self.activity_id)
+                    self._release_lease()               # C2: adopted -> close-only, never LOCK_UN
                 except Exception as e:
-                    _warn(f"settle failed: {e}")
-            else:
-                _warn("terminal not durable; leaving reservation for reconciliation")
-        finally:
+                    _warn(f"release failed: {e}")
+                self._active = False
+                return
+            res = self._emit("terminal", lambda: dict(outcome=outcome,
+                summary=self._redact_fields(summary), by=self._lease.owner_token),
+                reserve=True, fsync=True, slot="terminal")
+            # settle and release are attempted INDEPENDENTLY so a settle failure can't strand the
+            # lock (finding 1): release is in `finally` and always runs -> the lock becomes FREE.
             try:
-                self._lease.release()
-            except Exception as e:
-                _warn(f"release failed: {e}")
-            self._active = False
+                if res == _DURABLE:                          # settle ONLY after a durable terminal
+                    try:
+                        quota.settle(self._home, self.activity_id)
+                    except Exception as e:
+                        _warn(f"settle failed: {e}")
+                else:
+                    _warn("terminal not durable; leaving reservation for reconciliation")
+            finally:
+                try:
+                    self._release_lease()               # C2: adopted -> close-only, never LOCK_UN
+                except Exception as e:
+                    _warn(f"release failed: {e}")
+                self._active = False
 
     def hand_off_env(self):
         if not self._active or self._lease is None or self._lease.fd is None:

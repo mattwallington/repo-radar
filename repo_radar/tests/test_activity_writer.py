@@ -1,4 +1,4 @@
-import json, os
+import json, os, threading
 from repo_radar.activity import writer, paths, ids, quota, lease
 
 def _read_all(home, aid):
@@ -185,3 +185,71 @@ def test_nested_field_value_is_redacted(tmp_path):
     w.event("x", "error", meta={"nested": "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
     blob = json.dumps(_read_all(tmp_path, w.activity_id))
     assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in blob   # nested value scrubbed
+
+# --- fix round 1: C1 (close() can raise), C2 (adopted lease must not be LOCK_UN'd), I3 (start/
+# terminal idempotency race) -----------------------------------------------------------------
+
+def test_emit_close_failure_does_not_escape(tmp_path, monkeypatch, capsys):
+    # C1: os.close(fd) inside _emit was unguarded -- a close-time OSError (EIO on NFS/FUSE,
+    # ENOSPC/EDQUOT on close-deferred allocation) must degrade the outcome, never raise.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    real_open = paths.secure_open_append
+    seg_fds = []
+    def spy_open(*a, **k):
+        fd = real_open(*a, **k)
+        seg_fds.append(fd)                              # remember exactly which fd is the segment
+        return fd
+    monkeypatch.setattr(paths, "secure_open_append", spy_open)
+    real_close = writer.os.close
+    def flaky_close(fd):
+        if fd in seg_fds:                                # only the segment fd's close fails --
+            raise OSError("EIO on close")                # unrelated closes (quota's lock fd, etc.)
+        return real_close(fd)                             # go through untouched
+    monkeypatch.setattr(writer.os, "close", flaky_close)
+    w.start()                                             # write + fsync succeed; close() fails
+    assert "activity" in capsys.readouterr().err.lower()  # must not raise -> warns instead
+    assert w._started is False                            # close failure -> treated as not durable
+
+def test_terminal_on_adopted_writer_does_not_unlock_shared_lease(tmp_path):
+    # C2: terminal() must release an ADOPTED lease with drop_local_reference() (close-only), never
+    # release() (LOCK_UN) -- LOCK_UN on a shared open-file-description frees the lock for every fd
+    # that shares it, including a parent (e.g. Electron) that still believes it holds the lease.
+    minter = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                                   trigger="cli", producer="python")
+    minter.start()
+    lock_path = paths.owner_lock_path(tmp_path, minter.activity_id)
+    sibling_fd = os.dup(minter._lease.fd)      # simulates a still-open parent copy of the same OFD
+    dup_for_adopter = os.dup(minter._lease.fd)  # the fd the adopter inherits (also same OFD)
+    adopter = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli",
+                                    producer="dispatcher", inherited_id=minter.activity_id,
+                                    inherited_fd=dup_for_adopter, owner_token=minter._lease.owner_token)
+    adopter.terminal("cancelled")
+    # sibling_fd (and minter's own fd) are still open on the shared OFD -> the flock must still be
+    # BUSY. If terminal() had wrongly called release() (LOCK_UN), this would now read FREE.
+    assert lease.probe(lock_path) == lease.BUSY
+    os.close(sibling_fd)
+
+def test_concurrent_start_and_terminal_writes_single_start(tmp_path):
+    # I3: start() and terminal() (which can itself call start() via _ensure_started()) raced on
+    # the same writer from two threads -- both could pass the "not yet started" check before
+    # either set _start_written, producing two `start` records. The RLock-guarded decide-then-act
+    # sequence must serialize this: exactly one `start` record, every trial.
+    for trial in range(20):
+        home = tmp_path / f"trial{trial}"
+        w = writer.ActivityWriter(home, kind="sync", channel="stable",
+                                  trigger="cli", producer="python")
+        barrier = threading.Barrier(2)
+        def run_start():
+            barrier.wait()
+            w.start()
+        def run_terminal():
+            barrier.wait()
+            w.terminal("cancelled")
+        t1 = threading.Thread(target=run_start)
+        t2 = threading.Thread(target=run_terminal)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        recs = _read_all(home, w.activity_id)
+        starts = [r for r in recs if r["type"] == "start"]
+        assert len(starts) == 1, f"trial {trial}: {len(starts)} start record(s)"
