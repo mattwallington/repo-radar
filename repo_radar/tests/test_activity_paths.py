@@ -92,6 +92,26 @@ def test_append_scan_prune_refuse_a_replaced_intermediate_component(tmp_path):
     assert paths.unlink_owned_tree(d) == 0                    # delete refuses (frees nothing)
     assert sentinel.exists()                                  # outside file untouched
 
+def test_all_ops_refuse_symlinked_shared_prefix(tmp_path):
+    # Fix round 1: open_owned_dir must wrap prefix open in try/except so a symlinked prefix
+    # raises UnsafePath (not raw OSError), and all dependent ops gracefully refuse.
+    import shutil
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    seg = paths.segment_path(tmp_path, VALID, "python", "deadbeef")
+    fd = paths.secure_open_append(seg); os.write(fd, b"x\n"); os.close(fd)
+    outside = tmp_path / "outside"; outside.mkdir()
+    sentinel = outside / "SENTINEL"; sentinel.write_bytes(b"keep")
+    prefix = paths._base(tmp_path).parent                         # ~/Library/Logs/repo-radar
+    shutil.rmtree(prefix)
+    os.symlink(outside, prefix)                                   # prefix is now a symlink
+    with pytest.raises(paths.UnsafePath):
+        paths.secure_open_append(seg)                             # append refuses
+    assert paths.read_owned_segments(d) == []                     # scan refuses (empty)
+    activity_root = prefix / "activity"                           # also verify activity level
+    assert paths.list_owned_subdirs(activity_root) == []          # enumeration refuses
+    assert paths.unlink_owned_tree(d) == 0                        # delete refuses (frees nothing)
+    assert sentinel.exists()                                      # outside file untouched
+
 def test_owned_opens_reject_a_fifo_without_blocking(tmp_path):
     # Round-6 #4: a FIFO where a segment/ledger file is expected must be rejected PROMPTLY
     # (O_NONBLOCK), never hang an unattended sync.

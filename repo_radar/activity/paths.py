@@ -75,7 +75,10 @@ def open_owned_dir(path):
     closes. Raises UnsafePath on a symlinked/non-dir component; FileNotFoundError if missing."""
     path = Path(path)
     prefix = _owned_prefix(path)
-    dir_fd = os.open(prefix, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        dir_fd = os.open(prefix, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    except OSError as e:                                        # prefix itself is a symlink/non-dir
+        raise UnsafePath(f"unsafe prefix {prefix}: {e}")
     try:
         for name in path.relative_to(prefix).parts:
             child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dir_fd)
@@ -128,14 +131,17 @@ def read_owned_segments(directory, suffix=".jsonl"):
         for entry in os.scandir(dfd):
             if not entry.name.endswith(suffix):
                 continue
-            st = os.lstat(entry.name, dir_fd=dfd)
-            if not stat.S_ISREG(st.st_mode):                 # skip symlinks / non-regular
-                continue
-            ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
             try:
-                out.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
-            finally:
-                os.close(ffd)
+                st = os.lstat(entry.name, dir_fd=dfd)
+                if not stat.S_ISREG(st.st_mode):                 # skip symlinks / non-regular
+                    continue
+                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                try:
+                    out.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
+                finally:
+                    os.close(ffd)
+            except OSError:                                       # TOCTOU: entry deleted/swapped mid-scan
+                continue
     finally:
         os.close(dfd)
     return out
@@ -154,11 +160,17 @@ def list_owned_subdirs(base):
         dfd = open_owned_dir(base)
     except (UnsafePath, FileNotFoundError):
         return []
+    out = []
     try:
-        return [e.name for e in os.scandir(dfd)
-                if stat.S_ISDIR(os.lstat(e.name, dir_fd=dfd).st_mode)]
+        for e in os.scandir(dfd):
+            try:
+                if stat.S_ISDIR(os.lstat(e.name, dir_fd=dfd).st_mode):
+                    out.append(e.name)
+            except OSError:                                       # TOCTOU: entry deleted/swapped mid-scan
+                continue
     finally:
         os.close(dfd)
+    return out
 
 def unlink_owned_tree(activity_dir):
     """Delete every entry in an owned activity dir, then rmdir it — all relative to validated dir
