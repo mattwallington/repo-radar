@@ -1,0 +1,268 @@
+import fcntl, json, os, stat
+from repo_radar.activity import paths, records, ids
+from repo_radar.activity import lease as lease_mod
+from repo_radar.activity import reconcile as reconcile_mod
+
+CEILING = 64 * 1024 * 1024
+RESERVE = 60 * 1024
+PER_ACTIVITY_CAP = 4 * 1024 * 1024
+ORDINARY_CAP = PER_ACTIVITY_CAP - RESERVE
+
+def _open_quota_dir(home):
+    paths.secure_mkdir(paths.quota_dir(home))              # ensure activity/ + quota/ exist
+    return paths.open_owned_dir(paths.quota_dir(home))     # validated quota/ dir fd (Round-5 #1)
+
+def _quota_lock(home):
+    paths.secure_mkdir(paths.quota_dir(home))
+    afd = paths.open_owned_dir(paths.quota_dir(home).parent)   # validated activity/ dir fd
+    try:                                                        # quota.lock opened RELATIVE to it
+        fd = os.open("quota.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=afd)
+    finally:
+        os.close(afd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):                           # reject FIFO/device (Round-5 #5)
+        os.close(fd); raise paths.UnsafePath("quota.lock is not a regular file")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)          # blocking; brief critical section
+    return fd
+
+def _unlock(fd):
+    fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
+def _parse_entry(data):
+    """Validate the ledger's FULL invariant (Round-3/6 #6/#5): counters must be EXACT non-boolean
+    ints (strings/floats → CORRUPT), `reserved` exactly RESERVE, `granted >= 0`, total ≤ cap."""
+    try:
+        d = json.loads(data)
+        r, g = d["reserved"], d["granted"]
+        if isinstance(r, bool) or isinstance(g, bool) or not isinstance(r, int) or not isinstance(g, int):
+            return "CORRUPT"
+        if r != RESERVE or g < 0 or r + g > PER_ACTIVITY_CAP:
+            return "CORRUPT"
+        return {"reserved": r, "granted": g}
+    except Exception:
+        return "CORRUPT"
+
+def _read_entry(path):
+    try:
+        return _parse_entry(paths.read_owned_file(path))     # descriptor-relative read + S_ISREG
+    except (paths.UnsafePath, FileNotFoundError, OSError):
+        return "CORRUPT"
+
+def _write_entry(home, activity_id, reserved, granted):
+    """Durable, DESCRIPTOR-RELATIVE ledger write (Round-5 #1): temp file + full-write loop +
+    fsync, atomic rename and dir fsync all relative to the validated quota dir fd, with temp
+    cleanup on any failure. Raises on durability failure."""
+    blob = json.dumps({"reserved": reserved, "granted": granted}).encode()
+    name = f"{activity_id}.json"; tmp = f".{activity_id}.{os.getpid()}.tmp"
+    qfd = _open_quota_dir(home)
+    try:
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=qfd)
+        try:
+            view = memoryview(blob)
+            while view:
+                n = os.write(tfd, view)
+                if n <= 0:
+                    raise OSError("zero-byte write")         # no infinite loop (Round-6 #5)
+                view = view[n:]
+            os.fsync(tfd)
+        except BaseException:
+            os.close(tfd)
+            try:
+                os.unlink(tmp, dir_fd=qfd)                    # temp cleanup on write/fsync failure
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(tfd)
+        try:
+            os.replace(tmp, name, src_dir_fd=qfd, dst_dir_fd=qfd)   # atomic rename, descriptor-relative
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=qfd)                    # cleanup on rename failure too (Round-6 #5)
+            except OSError:
+                pass
+            raise
+        os.fsync(qfd)                                        # durable rename (dir entry)
+    finally:
+        os.close(qfd)
+
+def _unlink_entry(home, activity_id):
+    qfd = _open_quota_dir(home)                              # descriptor-relative unlink (Round-5 #1)
+    try:
+        os.unlink(f"{activity_id}.json", dir_fd=qfd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(qfd)
+
+def _segments_data(home, activity_id):
+    # descriptor-relative enumerate+read: (name, data, size, mtime) tuples (Round-4 #3)
+    return paths.read_owned_segments(paths.activity_dir(home, activity_id))
+
+def _top_types(home, aid):
+    """Types of VALID v1 records for THIS activity (Round-4 #5) — via the canonical validator,
+    so a nested `fields.type`, unsupported schema, foreign activity_id, or bad enum never count."""
+    types = []
+    for _name, data, _size, _mt in _segments_data(home, aid):
+        for line in data.split(b"\n"):
+            if not line:
+                continue
+            obj = records.parse_valid(line, aid)
+            if obj is not None:
+                types.append(obj["type"])
+    return types
+
+# lifecycle state is DERIVED from parsed segments, never a ledger flag (finding 1)
+def _has_start(home, aid):    return "start" in _top_types(home, aid)
+def _has_terminal(home, aid): return "terminal" in _top_types(home, aid)
+def _on_disk(home, aid):      return sum(sz for _n, _d, sz, _mt in _segments_data(home, aid))
+
+def _committed(home):
+    base = paths.quota_dir(home).parent
+    total = 0
+    for name in paths.list_owned_subdirs(base):    # dir-fd-safe subdir names (Round-4 #3)
+        if name == "quota":
+            continue
+        total += sum(sz for _n, _d, sz, _mt in paths.read_owned_segments(base / name))
+    return total
+
+def _ledger_entries(home):
+    # (aid, entry-or-CORRUPT) pairs read descriptor-relative from the owned quota dir; a ledger
+    # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path — Round-6 #5)
+    out = []
+    for name, data, _sz, _mt in paths.read_owned_segments(paths.quota_dir(home), ".json"):
+        aid = name[:-5]
+        if ids.valid_activity_id(aid):
+            out.append((aid, _parse_entry(data)))
+    return out
+
+def _charge(home):
+    total = _committed(home)
+    for aid, e in _ledger_entries(home):
+        total += PER_ACTIVITY_CAP if e == "CORRUPT" \
+            else max(0, e["reserved"] + e["granted"] - _on_disk(home, aid))
+    return total
+
+def admit(home, activity_id, lease):
+    fd = None
+    try:
+        fd = _quota_lock(home)                                 # may raise UnsafePath (swapped component)
+        _reconcile_all_locked(home)                            # reconcile BEFORE charge
+        if _charge(home) + RESERVE > CEILING:
+            _prune_locked(home, (_charge(home) + RESERVE) - CEILING)   # prune FIRST
+            if _charge(home) + RESERVE > CEILING:
+                return False                                   # best-effort refuse
+        _write_entry(home, activity_id, RESERVE, 0)            # durable, descriptor-relative
+        return True
+    except (OSError, paths.UnsafePath):
+        return False                                           # durability/safety failure -> refuse
+    finally:
+        if fd is not None:
+            _unlock(fd)
+
+def grant(home, activity_id, nbytes):
+    fd = None
+    try:
+        fd = _quota_lock(home)
+        p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
+        if e == "CORRUPT":
+            return False
+        if e["granted"] + nbytes > ORDINARY_CAP:      # per-activity cap
+            return False
+        if _charge(home) + nbytes > CEILING:           # global ceiling
+            return False
+        _write_entry(home, activity_id, e["reserved"], e["granted"] + nbytes)   # durable BEFORE append
+        return True
+    except (OSError, paths.UnsafePath):
+        return False                                   # durability/safety failure -> refuse the append
+    finally:
+        if fd is not None:
+            _unlock(fd)
+
+def settle(home, activity_id):
+    fd = _quota_lock(home)
+    try:
+        _unlink_entry(home, activity_id)           # bytes now counted purely by the scan
+    finally:
+        _unlock(fd)
+
+def _reconcile_one_locked(home, aid):
+    lock = paths.owner_lock_path(home, aid)
+    if _has_terminal(home, aid):                   # durable terminal -> settle if owner gone
+        l = lease_mod.acquire(lock)
+        if l is not None:
+            l.release(); _unlink_entry(home, aid)
+        return
+    if not _has_start(home, aid):                  # reserve-before-start -> lease-gated release
+        l = lease_mod.acquire(lock)                # (nothing recorded; nothing to synthesize)
+        if l is not None:
+            l.release(); _unlink_entry(home, aid)
+        return
+    # has start, no terminal: provably-dead owner -> synthesize interrupted/cancelled + settle.
+    # synthesize_terminal acquires the owner.lock itself (its own free/busy gate); returns False
+    # if BUSY/UNCERTAIN or the write fails, in which case we preserve the charge (safe bias).
+    if reconcile_mod.synthesize_terminal(home, aid):
+        _unlink_entry(home, aid)
+
+def _reconcile_all_locked(home):
+    for aid, _e in _ledger_entries(home):
+        _reconcile_one_locked(home, aid)
+
+def reconcile(home):
+    fd = _quota_lock(home)
+    try:
+        _reconcile_all_locked(home)
+    finally:
+        _unlock(fd)
+
+def _classify(home, aid):
+    """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — parsed top-level."""
+    segs = _segments_data(home, aid)
+    mtime = max((mt for _n, _d, _sz, mt in segs), default=0.0)
+    types = _top_types(home, aid)
+    if "terminal" not in types:
+        return ("running", mtime)
+    outcomes = []
+    for _n, data, _sz, _mt in segs:
+        for line in data.split(b"\n"):
+            if not line:
+                continue
+            obj = records.parse_valid(line, aid)
+            if obj is not None and obj["type"] == "terminal":
+                outcomes.append(obj.get("outcome"))
+    problem = ("integrity" in types) or any(
+        o in ("failed", "blocked", "interrupted", "succeeded-with-warnings") for o in outcomes)
+    return ("problem" if problem else "routine", mtime)
+
+def _prune_locked(home, need_bytes):
+    """Ceiling-override pruner (CALLER HOLDS quota.lock): SETTLED items only (no live ledger
+    entry), never running/unreconciled, always keep the newest problem. Enumeration + deletion
+    are descriptor-relative (Round-4 #3) so pruning can never escape the Activity tree."""
+    base = paths.quota_dir(home).parent
+    live = {aid for aid, _e in _ledger_entries(home)}
+    items = []
+    for aid in paths.list_owned_subdirs(base):
+        if aid == "quota" or aid in live:
+            continue
+        kind, mtime = _classify(home, aid)
+        if kind == "running":
+            continue                               # never prune running/unreconciled
+        items.append((aid, kind, mtime))
+    routine = sorted([i for i in items if i[1] == "routine"], key=lambda x: x[2])
+    problems = sorted([i for i in items if i[1] == "problem"], key=lambda x: x[2])
+    order = routine + (problems[:-1] if problems else [])   # keep newest problem
+    freed = 0
+    for aid, _, _ in order:
+        if freed >= need_bytes:
+            break
+        freed += paths.unlink_owned_tree(paths.activity_dir(home, aid))   # dir-fd-safe delete
+    return freed
+
+def prune(home, need_bytes):
+    fd = _quota_lock(home)                          # public entry is lock-safe (finding 1)
+    try:
+        return _prune_locked(home, need_bytes)
+    finally:
+        _unlock(fd)
