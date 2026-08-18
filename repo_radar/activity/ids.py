@@ -8,10 +8,10 @@ def mint_activity_id() -> str:
     return str(uuid.uuid4())
 
 def valid_activity_id(s) -> bool:
-    return isinstance(s, str) and bool(ACTIVITY_ID_RE.match(s))
+    return isinstance(s, str) and bool(ACTIVITY_ID_RE.fullmatch(s))
 
 def mint_token() -> str:
     return secrets.token_hex(4)
 
 def valid_token(s) -> bool:
-    return isinstance(s, str) and bool(TOKEN_RE.match(s))
+    return isinstance(s, str) and bool(TOKEN_RE.fullmatch(s))
