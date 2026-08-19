@@ -1,0 +1,10 @@
+[
+  {"type":"start","args":{"seq":0,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","kind":"sync","channel":"stable","trigger":"cli","created_by":"python"}},
+  {"type":"ownership","args":{"seq":1,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","owner_token":"deadbeef","role":"initial","producer":"python","pid":1234,"boot_id":"a1b2c3d4e5f60718","proc_birth":"2026-08-14T00:00:00-07:00"}},
+  {"type":"event","args":{"seq":2,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"repo_updated","fields":{"repo":"café 数据","count":30},"detail":"line1\nline2"}},
+  {"type":"control","args":{"seq":3,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","name":"cancel_requested","fields":{}}},
+  {"type":"terminal","args":{"seq":4,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded-with-warnings","summary":{"repos_changed":1,"errors":0,"warns":2},"by":"deadbeef"}},
+  {"type":"integrity","args":{"seq":5,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","kind":"dropped-events"}},
+  {"type":"event","args":{"seq":6,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"unicode","fields":{"emoji":"🔑🧪","mixed":"a—b…c 数据"}}},
+  {"type":"event","args":{"seq":7,"activity_id":"00000000-0000-4000-8000-000000000000","ts":"2026-08-14T00:00:00-07:00","level":"info","event":"nums","fields":{"a":2.0,"b":1.5,"c":0,"d":-3}}}
+]
