@@ -112,6 +112,25 @@ def test_all_ops_refuse_symlinked_shared_prefix(tmp_path):
     assert paths.unlink_owned_tree(d) == 0                        # delete refuses (frees nothing)
     assert sentinel.exists()                                      # outside file untouched
 
+def test_read_owned_segments_rejects_a_fifo_without_blocking(tmp_path):
+    # Codex gate round 1, finding 2 (paths half): the final per-entry open must be
+    # O_NOFOLLOW|O_NONBLOCK with an fstat(S_ISREG) check on the OPENED fd -- not an lstat done
+    # BEFORE the open, which leaves a TOCTOU window and (for a FIFO) would otherwise risk
+    # blocking the open itself.
+    import signal
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    (d / "python-deadbeef.jsonl").write_bytes(b"x\n")
+    fifo = d / "python-cafebabe.jsonl"
+    os.mkfifo(fifo)
+    def _timeout(*_): raise TimeoutError("read_owned_segments blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, _timeout); signal.alarm(5)
+    try:
+        out = paths.read_owned_segments(d)
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, old)
+    names = [n for n, _data, _sz, _mt in out]
+    assert "python-deadbeef.jsonl" in names and "python-cafebabe.jsonl" not in names
+
 def test_owned_opens_reject_a_fifo_without_blocking(tmp_path):
     # Round-6 #4: a FIFO where a segment/ledger file is expected must be rejected PROMPTLY
     # (O_NONBLOCK), never hang an unattended sync.

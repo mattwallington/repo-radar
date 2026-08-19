@@ -140,13 +140,19 @@ def _committed(home):
     return total
 
 def _ledger_entries(home):
-    # (aid, entry-or-CORRUPT) pairs read descriptor-relative from the owned quota dir; a ledger
-    # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path — Round-6 #5)
+    # (aid, entry-or-CORRUPT) pairs for every valid-UUID-named ledger entry in the quota dir. A
+    # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path —
+    # Round-6 #5); every OTHER valid-UUID name is CLASSIFIED, never silently skipped (Codex gate
+    # round 1, finding 2): `paths.list_owned_entries` is an UNFILTERED name listing (unlike
+    # `read_owned_segments`, which would silently drop a symlink/FIFO/dir entry out of the
+    # enumeration entirely, undercounting the charge — fail-open). `_read_entry` already opens
+    # each entry descriptor-relative with the O_NOFOLLOW|O_NONBLOCK + fstat(S_ISREG) safe-open
+    # and returns "CORRUPT" for anything that isn't a safe, well-formed regular JSON ledger.
     out = []
-    for name, data, _sz, _mt in paths.read_owned_segments(paths.quota_dir(home), ".json"):
+    for name in paths.list_owned_entries(paths.quota_dir(home), suffix=".json"):
         aid = name[:-5]
         if ids.valid_activity_id(aid):
-            out.append((aid, _parse_entry(data)))
+            out.append((aid, _read_entry(paths.ledger_entry_path(home, aid))))
     return out
 
 def _charge(home):

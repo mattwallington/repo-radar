@@ -132,16 +132,22 @@ def read_owned_segments(directory, suffix=".jsonl"):
             if not entry.name.endswith(suffix):
                 continue
             try:
-                st = os.lstat(entry.name, dir_fd=dfd)
-                if not stat.S_ISREG(st.st_mode):                 # skip symlinks / non-regular
+                # open FIRST (O_NOFOLLOW rejects a symlink; O_NONBLOCK means opening a FIFO
+                # can't block), THEN fstat the OPENED fd -- an lstat done before the open would
+                # leave a TOCTOU window where the entry could be swapped between the check and
+                # the open (Codex gate round 1, finding 2; mirrors open_owned_regular).
+                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError:                                       # symlink (ELOOP) / gone / denied
+                continue
+            try:
+                st = os.fstat(ffd)
+                if not stat.S_ISREG(st.st_mode):                  # FIFO / directory / device
                     continue
-                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-                try:
-                    out.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
-                finally:
-                    os.close(ffd)
+                out.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
             except OSError:                                       # TOCTOU: entry deleted/swapped mid-scan
                 continue
+            finally:
+                os.close(ffd)
     finally:
         os.close(dfd)
     return out
@@ -187,6 +193,23 @@ def read_owned_file(path):
         return _read_fd(fd)
     finally:
         os.close(fd)
+
+def list_owned_entries(directory, suffix=None):
+    """Immediate entry NAMES of an owned dir via a validated dir fd -- UNFILTERED by type (a
+    symlink/FIFO/dir name is still returned as-is, no lstat classification here). Codex gate
+    round 1, finding 2: a caller that does its own per-name safety classification (e.g. quota's
+    ledger scan) must never have a name silently dropped before it gets the chance to classify
+    it CORRUPT; `read_owned_segments`' skip-unsafe-entries behavior is right for SEGMENT
+    reads/scans but wrong for that use, so this is a separate, unfiltered listing. `suffix`, if
+    given, filters by name suffix only (no fs access, so it can't itself hide an unsafe entry)."""
+    try:
+        dfd = open_owned_dir(directory)
+    except (UnsafePath, FileNotFoundError):
+        return []
+    try:
+        return [e.name for e in os.scandir(dfd) if suffix is None or e.name.endswith(suffix)]
+    finally:
+        os.close(dfd)
 
 def list_owned_subdirs(base):
     """Immediate real subdir NAMES of an owned base via a validated dir fd (no symlink follow)."""

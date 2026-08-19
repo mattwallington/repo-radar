@@ -259,6 +259,50 @@ def test_reconcile_settles_terminal_once_fsync_recovers(tmp_path, monkeypatch):
     quota.reconcile(tmp_path)                                     # real fsync now succeeds -> durable
     assert not paths.ledger_entry_path(tmp_path, aid).exists()    # settled
 
+# --- Codex gate round 1, Finding 2 (BLOCKER): unsafe/unreadable ledgers charge fail-closed ---
+
+def test_symlinked_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
+    # a valid-UUID-named ledger that is actually a SYMLINK must be CLASSIFIED (never silently
+    # skipped out of the enumeration) as CORRUPT -> full PER_ACTIVITY_CAP liability, not 0.
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"reserved": quota.RESERVE, "granted": 0}))
+    os.symlink(outside, paths.ledger_entry_path(tmp_path, aid))
+    entries = dict(quota._ledger_entries(tmp_path))
+    assert entries[aid] == "CORRUPT"                    # classified, not silently dropped
+    aid2, l2 = _new_activity(tmp_path)
+    monkeypatch.setattr(quota, "CEILING", quota.PER_ACTIVITY_CAP + 1024)   # near ceiling
+    assert quota.admit(tmp_path, aid2, l2) is False      # 4 MiB corrupt liability blocks it
+
+def test_fifo_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    os.mkfifo(paths.ledger_entry_path(tmp_path, aid))
+    entries = dict(quota._ledger_entries(tmp_path))
+    assert entries[aid] == "CORRUPT"
+    aid2, l2 = _new_activity(tmp_path)
+    monkeypatch.setattr(quota, "CEILING", quota.PER_ACTIVITY_CAP + 1024)
+    assert quota.admit(tmp_path, aid2, l2) is False
+
+def test_directory_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    os.mkdir(paths.ledger_entry_path(tmp_path, aid))
+    entries = dict(quota._ledger_entries(tmp_path))
+    assert entries[aid] == "CORRUPT"
+    aid2, l2 = _new_activity(tmp_path)
+    monkeypatch.setattr(quota, "CEILING", quota.PER_ACTIVITY_CAP + 1024)
+    assert quota.admit(tmp_path, aid2, l2) is False
+
+def test_well_formed_ledger_entry_still_counts_real_reserved_granted(tmp_path):
+    # positive control: a SAFE ledger must still be classified normally (not swept into CORRUPT)
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    quota.grant(tmp_path, aid, 100)
+    entries = dict(quota._ledger_entries(tmp_path))
+    assert entries[aid] == {"reserved": quota.RESERVE, "granted": 100}
+
 def test_reconcile_retains_ledger_when_synthesize_terminal_fsync_fails(tmp_path, monkeypatch):
     # finding 1, point 2: reconcile.synthesize_terminal (used for a provably-dead started
     # activity with no terminal at all) must fsync its OWN synthetic terminal durably BEFORE
