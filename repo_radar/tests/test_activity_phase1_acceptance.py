@@ -1,4 +1,4 @@
-import json, os
+import json, os, subprocess, sys
 from repo_radar.activity import writer, paths, quota, lease, ids, records
 
 def _records(home, aid):
@@ -95,3 +95,48 @@ def test_reconcile_reclaims_only_abandoned_pre_start(tmp_path):
 # Fork-after-multithreaded deadlocks manifest as indefinite hangs, not clean failures, which is a
 # worse failure mode for CI than a missing test, so per the brief's explicit escape hatch this was
 # left out rather than forced.
+#
+# Codex gate round 1, "Plus" (acceptable-through-gate, mandatory at Phase-2 gate -- added now):
+# the SAME crash scenario via a genuinely fresh, single-threaded interpreter (`subprocess`,
+# which execs a brand-new process image immediately -- no fork-after-multithreaded window, so
+# none of the DeprecationWarning/hang risk above applies) instead of os.fork().
+
+_CRASH_CHILD_SCRIPT = """
+import os, sys
+from repo_radar.activity import writer
+home = sys.argv[1]
+w = writer.ActivityWriter(home, kind="sync", channel="stable", trigger="cli", producer="python")
+if not w._active:
+    print("INIT_FAILED", file=sys.stderr); sys.exit(1)
+w.start()
+if not w._started:
+    print("START_NOT_DURABLE", file=sys.stderr); sys.exit(1)
+print(w.activity_id)
+sys.stdout.flush()
+os._exit(0)
+"""
+
+def test_dead_child_crash_after_durable_start_self_heals_via_reconcile(tmp_path):
+    # A fresh child process acquires the lease, constructs an ActivityWriter, writes a durable
+    # start, then os._exit(0) WITHOUT a terminal and WITHOUT releasing -- a genuine crash. The
+    # parent (a separate process the whole time; it never holds any copy of the child's lease
+    # fd) then asserts the start is durably on disk, the lease is FREE (the dead child's flock
+    # dropped when the OS reclaimed its fds on exit), and quota.reconcile synthesizes a durable
+    # terminal with outcome == "interrupted".
+    for trial in range(3):                       # a few reps for stability, per the brief
+        home = tmp_path / f"trial{trial}"
+        home.mkdir()
+        r = subprocess.run([sys.executable, "-c", _CRASH_CHILD_SCRIPT, str(home)],
+                           capture_output=True, text=True, timeout=15)
+        assert r.returncode == 0, f"child failed (trial {trial}): {r.stderr}"
+        aid = r.stdout.strip()
+        assert ids.valid_activity_id(aid), f"trial {trial}: bad activity id {aid!r}"
+
+        recs = _records(home, aid)
+        assert any(rr["type"] == "start" for rr in recs), f"trial {trial}: no start on disk"
+
+        assert lease.probe(paths.owner_lock_path(home, aid)) == lease.FREE   # dead child's flock dropped
+
+        quota.reconcile(home)
+        assert not paths.ledger_entry_path(home, aid).exists()               # settled (no leak)
+        assert _terminal_outcomes(home, aid) == ["interrupted"]              # exact synthesized outcome
