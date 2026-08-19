@@ -230,6 +230,53 @@ def test_terminal_on_adopted_writer_does_not_unlock_shared_lease(tmp_path):
     assert lease.probe(lock_path) == lease.BUSY
     os.close(sibling_fd)
 
+# --- Codex gate round 1, Finding 4 (IMPORTANT — NOT carryable): recheck `_active` under the
+# lock (post-terminal control race) ------------------------------------------------------------
+
+def test_post_terminal_control_is_dropped_not_written_behind_settlement(tmp_path, monkeypatch):
+    # `_active` was read in _emit's fast path BEFORE acquiring the RLock and never re-checked
+    # once held. Deterministic barrier: thread A finalizes (terminal) and, via a monkeypatched
+    # `quota.settle` that signals an Event then sleeps briefly WHILE STILL HOLDING self._lock and
+    # BEFORE `_active` is set False, gives thread B (a concurrent RESERVE-path
+    # `control("cancel_requested")`) a wide, reliable window to pass its pre-lock fast-path check
+    # (active still True) and then block on the RLock -- only to proceed, pre-fix, AFTER A has
+    # already deactivated, settled, and released. That produces a `control` record AFTER the
+    # `terminal` record (invalid lifecycle ordering) and a reserve-path write with NO outstanding
+    # reservation (since `reserve=True` skips quota.grant entirely) -- bytes that can exceed the
+    # hard ceiling and are never accounted anywhere, because the ledger was already removed.
+    real_settle = quota.settle
+    for trial in range(20):
+        home = tmp_path / f"trial{trial}"
+        w = writer.ActivityWriter(home, kind="sync", channel="stable",
+                                  trigger="cli", producer="python")
+        w.start()
+        a_in_critical_section = threading.Event()
+        def slow_settle(*a, **k):
+            a_in_critical_section.set()      # A still holds self._lock; _active is still True
+            import time; time.sleep(0.05)
+            return real_settle(*a, **k)
+        monkeypatch.setattr(quota, "settle", slow_settle)
+        def run_terminal():
+            w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+        def run_control():
+            a_in_critical_section.wait(timeout=2)   # start racing only once A is mid-critical-section
+            w.control("cancel_requested")
+        t1 = threading.Thread(target=run_terminal)
+        t1.start()
+        t2 = threading.Thread(target=run_control)
+        t2.start()
+        t1.join(); t2.join()
+        monkeypatch.setattr(quota, "settle", real_settle)
+        recs = _read_all(home, w.activity_id)
+        types = [r["type"] for r in recs]
+        assert "terminal" in types, f"trial {trial}: no terminal record: {types}"
+        term_idx = types.index("terminal")
+        assert types[term_idx + 1:] == [], \
+            f"trial {trial}: record(s) after terminal: {types}"
+        # settlement must be consistent with what actually landed: once terminal is durable and
+        # settles, no reserve-path write may land afterward with no outstanding reservation.
+        assert not paths.ledger_entry_path(home, w.activity_id).exists()
+
 def test_concurrent_start_and_terminal_writes_single_start(tmp_path):
     # I3: start() and terminal() (which can itself call start() via _ensure_started()) raced on
     # the same writer from two threads -- both could pass the "not yet started" check before

@@ -120,6 +120,12 @@ class ActivityWriter:
         if not self._active:
             return _NOTHING
         with self._lock:
+            if not self._active:                        # RE-CHECK under the lock (Codex gate round
+                return _NOTHING                          # 1, finding 4): _active only transitions
+                # True->False (on terminal/failure), and only ever UNDER this same lock, so a
+                # racing emit that passed the pre-lock fast-path check before terminal() ran can
+                # still block here until terminal() releases -- this authoritative recheck closes
+                # that window instead of proceeding to build/grant/write after settlement.
             if slot is not None:                        # one-shot check UNDER the mutex (finding 2)
                 if self._reserve_used[slot]:
                     return _NOTHING
