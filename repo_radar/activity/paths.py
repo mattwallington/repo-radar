@@ -146,6 +146,40 @@ def read_owned_segments(directory, suffix=".jsonl"):
         os.close(dfd)
     return out
 
+def fsync_owned_segments(directory, suffix=".jsonl"):
+    """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT
+    reading content (Codex gate round 1, finding 1): before reconcile settles an activity whose
+    segment scan shows a terminal present, the terminal-bearing segment(s) must actually be made
+    durable first -- the write() that produced the terminal LINE can succeed while its fsync
+    fails, in which case the line is readable (so `_has_terminal` sees it) but not yet durable.
+    Returns True iff EVERY segment fsync'd cleanly; False (fail-closed) on a missing dir or ANY
+    fsync failure, so the caller must not treat durability as achieved and must NOT settle."""
+    try:
+        dfd = open_owned_dir(directory)
+    except (UnsafePath, FileNotFoundError):
+        return False
+    ok = True
+    try:
+        for entry in os.scandir(dfd):
+            if not entry.name.endswith(suffix):
+                continue
+            try:
+                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError:
+                ok = False; continue                      # symlink / gone / denied -> not durable
+            try:
+                st = os.fstat(ffd)
+                if not stat.S_ISREG(st.st_mode):
+                    ok = False; continue                   # FIFO / directory -- not a real segment
+                os.fsync(ffd)
+            except OSError:
+                ok = False
+            finally:
+                os.close(ffd)
+    finally:
+        os.close(dfd)
+    return ok
+
 def read_owned_file(path):
     """Read one owned file's bytes via the nonblocking regular-file helper (e.g. a ledger entry)."""
     fd = open_owned_regular(path, os.O_RDONLY)                # O_NONBLOCK + S_ISREG (Round-6 #4)

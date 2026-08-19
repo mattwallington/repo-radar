@@ -205,10 +205,20 @@ def settle(home, activity_id):
 
 def _reconcile_one_locked(home, aid):
     lock = paths.owner_lock_path(home, aid)
-    if _has_terminal(home, aid):                   # durable terminal -> settle if owner gone
+    if _has_terminal(home, aid):                   # terminal LINE present -> settle if owner gone
         l = lease_mod.acquire(lock)
         if l is not None:
-            l.release(); _unlink_entry(home, aid)
+            # finding 1: a terminal LINE on disk is not necessarily DURABLE -- its write() can
+            # succeed while its own fsync failed (writer correctly retained the ledger then).
+            # Settlement must never happen unless the terminal is durable, else a power loss
+            # right after this unlink but before the OS flushes the line would lose BOTH the
+            # terminal and the ledger, leaving nothing to trigger recovery. Release the lease
+            # regardless so a future reconcile pass can retry; only unlink on a clean fsync.
+            try:
+                if paths.fsync_owned_segments(paths.activity_dir(home, aid)):
+                    _unlink_entry(home, aid)
+            finally:
+                l.release()
         return
     if not _has_start(home, aid):                  # reserve-before-start -> lease-gated release
         l = lease_mod.acquire(lock)                # (nothing recorded; nothing to synthesize)

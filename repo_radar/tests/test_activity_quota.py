@@ -1,6 +1,7 @@
 import json, os
 import pytest
-from repo_radar.activity import quota, paths, lease, ids
+from repo_radar.activity import quota, paths, lease, ids, writer
+from repo_radar.activity import reconcile as reconcile_mod
 
 def _mk(tmp_path, aid):
     d = paths.activity_dir(tmp_path, aid); paths.secure_mkdir(d)
@@ -216,3 +217,55 @@ def test_admit_rejects_traversal_activity_id(tmp_path):
     assert quota.admit(tmp_path, "../../evil", l) is False
     assert not list(tmp_path.rglob("evil.json"))            # nothing escaped the owned tree
     assert not (tmp_path.parent / "evil.json").exists()
+
+# --- Codex gate round 1, Finding 1 (BLOCKER): terminal durability must precede settlement ----
+
+def test_reconcile_does_not_settle_when_terminal_segment_fsync_fails(tmp_path, monkeypatch):
+    # The writer's OWN terminal fsync can fail (line WRITTEN, not durable) -- terminal()
+    # correctly does not settle then (ledger retained), but it DOES release the lease
+    # unconditionally. The NEXT reconcile sees "terminal exists" (parsed off the on-disk line,
+    # which is readable even though never fsync'd) and, pre-fix, settles immediately without
+    # ever trying to durabilize it -- a power loss right after that settlement but before the OS
+    # flushes the terminal would lose BOTH the terminal and the ledger, leaving nothing to
+    # trigger recovery. reconcile must fsync the terminal-bearing segment itself BEFORE
+    # settling, and must NOT settle when that fsync fails.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    aid = w.activity_id
+    w.start()
+    monkeypatch.setattr(writer.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)   # line written, fsync fails
+    monkeypatch.undo()
+    assert paths.ledger_entry_path(tmp_path, aid).exists()        # writer correctly retained it
+
+    # simulate reconcile running while the segment still cannot be made durable (e.g. the same
+    # transient fsync failure persists into the reconcile pass)
+    monkeypatch.setattr(paths.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("still failing")))
+    quota.reconcile(tmp_path)
+    monkeypatch.undo()
+    assert paths.ledger_entry_path(tmp_path, aid).exists()        # MUST remain: fsync failed, no settle
+
+def test_reconcile_settles_terminal_once_fsync_recovers(tmp_path, monkeypatch):
+    # happy-path companion to the test above: once the segment CAN be made durable, a later
+    # reconcile pass (using the real fsync) settles normally.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable",
+                              trigger="cli", producer="python")
+    aid = w.activity_id
+    w.start()
+    monkeypatch.setattr(writer.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+    monkeypatch.undo()
+    assert paths.ledger_entry_path(tmp_path, aid).exists()
+    quota.reconcile(tmp_path)                                     # real fsync now succeeds -> durable
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()    # settled
+
+def test_reconcile_retains_ledger_when_synthesize_terminal_fsync_fails(tmp_path, monkeypatch):
+    # finding 1, point 2: reconcile.synthesize_terminal (used for a provably-dead started
+    # activity with no terminal at all) must fsync its OWN synthetic terminal durably BEFORE
+    # the caller settles; on fsync failure the ledger must be retained for a future pass.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l); _write_start(tmp_path, aid)
+    l.release()                                     # crash after start, before any terminal
+    monkeypatch.setattr(reconcile_mod.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
+    quota.reconcile(tmp_path)
+    assert paths.ledger_entry_path(tmp_path, aid).exists()   # retained: synthetic terminal not durable
