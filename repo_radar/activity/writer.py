@@ -170,7 +170,17 @@ class ActivityWriter:
                     # valid record ever visible again on this file). Poison it: abandon it and
                     # rotate all subsequent writes to a fresh segment instead.
                     _warn(f"emit rollback ftruncate failed: {te}")
-                    self._rotate_segment()
+                    try:
+                        self._rotate_segment()
+                    except Exception as re:
+                        # never-raises boundary (Codex gate round 1 hardening): _rotate_segment
+                        # calls ids.mint_token() (-> secrets.token_hex -> os.urandom) and
+                        # paths.segment_path -- near-impossible to fail on macOS, but a rotation
+                        # failure must not escape _emit into start()/terminal()/control(). With
+                        # no working segment to fall back to, degrade the writer to inactive
+                        # (every subsequent _emit is then a no-op _NOTHING) rather than raise.
+                        _warn(f"emit segment rotation failed: {re}")
+                        self._active = False
                 _safe_close(fd)                         # C1: close() can raise too -- never escape
                 return _NOTHING                         # nothing durable, no contamination left
             self._seq += 1                              # a COMPLETE line is on disk -> consume the seq

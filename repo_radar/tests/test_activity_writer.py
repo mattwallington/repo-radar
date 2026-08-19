@@ -199,6 +199,49 @@ def test_rollback_ftruncate_failure_rotates_to_a_fresh_segment(tmp_path, monkeyp
     e = quota._read_entry(paths.ledger_entry_path(tmp_path, w.activity_id))
     assert e != "CORRUPT"
 
+def test_rotation_failure_cannot_escape_never_raises_boundary(tmp_path, monkeypatch):
+    # Codex gate round 1 hardening (post-approval, very-low-severity): _rotate_segment() is
+    # invoked from _emit's write-failure handler with no try/except of its own. It calls
+    # ids.mint_token() (-> secrets.token_hex -> os.urandom) and paths.segment_path(...) --
+    # near-impossible to fail on macOS, but if either DID raise, the exception would propagate
+    # out of _emit into start()/terminal()/control(), violating the writer's never-raises
+    # facade. Drive the SAME rollback-failure -> rotate path as the test above, but also make
+    # rotation itself fail, and assert the public call still returns cleanly.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    real_write = writer.os.write
+    def short_write(fd, data):
+        real_write(fd, data[:5])
+        raise OSError("boom")                          # a real partial write, then failure
+    def failing_ftruncate(fd, length):
+        raise OSError("rollback also fails")            # e.g. ENOSPC while truncating
+    def failing_mint_token():
+        raise OSError("os.urandom failed")               # the theoretical source per the review
+    monkeypatch.setattr(writer, "_seg_write", short_write)
+    monkeypatch.setattr(writer, "_seg_ftruncate", failing_ftruncate)
+    monkeypatch.setattr(writer.ids, "mint_token", failing_mint_token)
+
+    w.start()                                            # must NOT raise, even though rotation ALSO fails
+
+    assert w._active is False                            # degraded to inactive: no working segment left
+    monkeypatch.undo()
+
+    # a subsequent emit is a clean no-op (never-raises holds even after this degradation)
+    w.event("x", "info")
+    w.terminal("succeeded", repos_changed=0, errors=0, warns=0)
+    # mint_token failing meant rotation never got to reassign self._seg, so the ONLY segment on
+    # disk is still the poisoned one (5 raw garbage bytes, not valid JSON) -- read it back via
+    # the canonical validator (like the sibling quota/reconcile test files do), which skips
+    # anything that doesn't parse, rather than a naive json.loads that would choke on it.
+    valid_types = []
+    for _name, data, _sz, _mt in paths.read_owned_segments(paths.activity_dir(tmp_path, w.activity_id)):
+        for line in data.split(b"\n"):
+            if not line:
+                continue
+            obj = records.parse_valid(line, w.activity_id)
+            if obj is not None:
+                valid_types.append(obj["type"])
+    assert "terminal" not in valid_types                 # nothing further was ever durably written
+
 def test_start_grant_refusal_writes_nothing_no_terminal_only(tmp_path, monkeypatch):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
     aid = w.activity_id
