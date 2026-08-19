@@ -161,8 +161,10 @@ function secureMkdir(targetPath, mode = 0o700) {
 
 // Open a REGULAR file relative to its validated parent dir (every component checked).
 // O_NONBLOCK so a FIFO/device can't block the open before we can fstat+reject it; O_NOFOLLOW so
-// the final component can't be a symlink; reject non-regular; repair mode on create.
-function _openOwnedRegular(targetPath, flags, mode = 0o600) {
+// the final component can't be a symlink; reject non-regular; repair mode on create. Public --
+// mirrors Python's `paths.open_owned_regular` (used directly by lease.js for owner.lock, in
+// addition to secureOpenAppend below).
+function openOwnedRegular(targetPath, flags, mode = 0o600) {
   _validateOwnedDir(path.dirname(targetPath)); // every parent component checked
 
   let fd;
@@ -190,7 +192,7 @@ function _openOwnedRegular(targetPath, flags, mode = 0o600) {
 }
 
 function secureOpenAppend(targetPath, mode = 0o600) {
-  return _openOwnedRegular(
+  return openOwnedRegular(
     targetPath,
     fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND,
     mode,
@@ -200,5 +202,5 @@ function secureOpenAppend(targetPath, mode = 0o600) {
 module.exports = {
   UnsafePath,
   activityDir, segmentPath, ownerLockPath, quotaDir, ledgerEntryPath,
-  secureMkdir, secureOpenAppend,
+  secureMkdir, secureOpenAppend, openOwnedRegular,
 };
