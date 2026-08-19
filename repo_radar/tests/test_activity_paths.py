@@ -112,6 +112,15 @@ def test_all_ops_refuse_symlinked_shared_prefix(tmp_path):
     assert paths.unlink_owned_tree(d) == 0                        # delete refuses (frees nothing)
     assert sentinel.exists()                                      # outside file untouched
 
+def test_stat_owned_segments_returns_sizes_without_reading_content(tmp_path):
+    # Codex gate round 1, finding 7: a size-only, metadata (fstat) enumerator -- no content read.
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    (d / "python-deadbeef.jsonl").write_bytes(b"hello\n")           # 6 bytes
+    victim = tmp_path / "outside.jsonl"; victim.write_bytes(b"secret-content-here\n")
+    os.symlink(victim, d / "python-cafebabe.jsonl")                 # symlink must be skipped
+    sizes = dict(paths.stat_owned_segments(d))
+    assert sizes == {"python-deadbeef.jsonl": 6}
+
 def test_read_owned_segments_rejects_a_fifo_without_blocking(tmp_path):
     # Codex gate round 1, finding 2 (paths half): the final per-entry open must be
     # O_NOFOLLOW|O_NONBLOCK with an fstat(S_ISREG) check on the OPENED fd -- not an lstat done

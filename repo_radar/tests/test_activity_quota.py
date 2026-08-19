@@ -303,6 +303,36 @@ def test_well_formed_ledger_entry_still_counts_real_reserved_granted(tmp_path):
     entries = dict(quota._ledger_entries(tmp_path))
     assert entries[aid] == {"reserved": quota.RESERVE, "granted": 100}
 
+# --- Codex gate round 1, Finding 7 (IMPORTANT): quota size-accounting must use fstat
+# metadata, not content reads ------------------------------------------------------------------
+
+def test_grant_does_not_read_segment_contents_only_fstat_sizes(tmp_path, monkeypatch):
+    # _committed/_on_disk previously read FULL segment CONTENTS just to sum sizes; at the
+    # 64 MiB ceiling every ordinary grant() could reread ~64 MiB while holding quota.lock and
+    # excluding all other producers. They must use fstat-only sizing instead.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    big = paths.segment_path(tmp_path, aid, "python", "cafebabe")   # a large extra segment
+    with open(big, "wb") as f:
+        f.write(b"x" * (1024 * 1024))
+    def boom(*a, **k):
+        raise AssertionError("grant must not read segment CONTENTS for size accounting")
+    monkeypatch.setattr(paths, "read_owned_segments", boom)
+    assert quota.grant(tmp_path, aid, 100) is True       # must succeed using fstat-only sizing
+
+def test_on_disk_and_committed_sizes_match_real_bytes_across_matrix(tmp_path):
+    # accounting correctness: fstat-summed sizes must equal the real byte totals.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    extra = paths.segment_path(tmp_path, aid, "python", "cafebabe")
+    with open(extra, "wb") as f:
+        f.write(b"y" * 12345)
+    real_total = sum(f.stat().st_size for f in paths.activity_dir(tmp_path, aid).glob("*.jsonl"))
+    assert quota._on_disk(tmp_path, aid) == real_total
+    assert quota._committed(tmp_path) == real_total     # only activity dir present besides quota/
+
 def test_reconcile_retains_ledger_when_synthesize_terminal_fsync_fails(tmp_path, monkeypatch):
     # finding 1, point 2: reconcile.synthesize_terminal (used for a provably-dead started
     # activity with no terminal at all) must fsync its OWN synthetic terminal durably BEFORE

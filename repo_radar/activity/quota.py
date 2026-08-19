@@ -128,7 +128,11 @@ def _top_types(home, aid):
 # lifecycle state is DERIVED from parsed segments, never a ledger flag (finding 1)
 def _has_start(home, aid):    return "start" in _top_types(home, aid)
 def _has_terminal(home, aid): return "terminal" in _top_types(home, aid)
-def _on_disk(home, aid):      return sum(sz for _n, _d, sz, _mt in _segments_data(home, aid))
+# finding 7: SIZE accounting uses fstat metadata only, never a content read (content reads are
+# reserved for the lifecycle path above -- _top_types/_has_start/_has_terminal -- where the
+# actual bytes are needed to parse records; a per-event grant() must never reread a whole
+# segment, up to the 64 MiB ceiling, while holding quota.lock and excluding other producers).
+def _on_disk(home, aid):      return sum(sz for _n, sz in paths.stat_owned_segments(paths.activity_dir(home, aid)))
 
 def _committed(home):
     base = paths.quota_dir(home).parent
@@ -136,7 +140,7 @@ def _committed(home):
     for name in paths.list_owned_subdirs(base):    # dir-fd-safe subdir names (Round-4 #3)
         if name == "quota":
             continue
-        total += sum(sz for _n, _d, sz, _mt in paths.read_owned_segments(base / name))
+        total += sum(sz for _n, sz in paths.stat_owned_segments(base / name))
     return total
 
 def _ledger_entries(home):

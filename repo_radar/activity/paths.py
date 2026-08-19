@@ -152,6 +152,38 @@ def read_owned_segments(directory, suffix=".jsonl"):
         os.close(dfd)
     return out
 
+def stat_owned_segments(directory, suffix=".jsonl"):
+    """Like read_owned_segments but METADATA ONLY (Codex gate round 1, finding 7): opens each
+    segment safely (O_NOFOLLOW|O_NONBLOCK, fstat-validated S_ISREG) and returns
+    [(name, size)] WITHOUT reading file contents, so quota's per-event size accounting never
+    has to reread an entire segment (up to the 64 MiB ceiling) while holding quota.lock and
+    excluding all other producers. Skips unsafe entries exactly like read_owned_segments."""
+    try:
+        dfd = open_owned_dir(directory)
+    except (UnsafePath, FileNotFoundError):
+        return []
+    out = []
+    try:
+        for entry in os.scandir(dfd):
+            if not entry.name.endswith(suffix):
+                continue
+            try:
+                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError:
+                continue                                          # symlink (ELOOP) / gone / denied
+            try:
+                st = os.fstat(ffd)
+                if not stat.S_ISREG(st.st_mode):
+                    continue                                       # FIFO / directory / device
+                out.append((entry.name, st.st_size))
+            except OSError:                                        # TOCTOU: entry deleted/swapped mid-scan
+                continue
+            finally:
+                os.close(ffd)
+    finally:
+        os.close(dfd)
+    return out
+
 def fsync_owned_segments(directory, suffix=".jsonl"):
     """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT
     reading content (Codex gate round 1, finding 1): before reconcile settles an activity whose
