@@ -1,5 +1,5 @@
 import json, os, threading
-from repo_radar.activity import writer, paths, ids, quota, lease
+from repo_radar.activity import writer, paths, ids, quota, lease, records
 
 def _read_all(home, aid):
     d = paths.activity_dir(home, aid)
@@ -153,6 +153,51 @@ def test_start_partial_write_then_error_retries_one_valid_start(tmp_path, monkey
     w.start()                                       # retry -> exactly one CLEAN start, no partial line
     recs = _read_all(tmp_path, w.activity_id)       # _read_all parses cleanly (no orphan prefix)
     assert [r["type"] for r in recs].count("start") == 1
+
+# --- Codex gate round 1, Finding 5 (IMPORTANT): a rollback (ftruncate) failure must ROTATE the
+# segment, not reuse it ------------------------------------------------------------------------
+
+def test_rollback_ftruncate_failure_rotates_to_a_fresh_segment(tmp_path, monkeypatch):
+    # After a partial (short) write, _emit ftruncates to roll back the corrupting prefix; if
+    # THAT ftruncate also fails, the partial bytes remain on disk. Reusing the segment for the
+    # next emit would append BEHIND that unremovable prefix -- a malformed first line followed
+    # by otherwise-valid records with no valid parseable start ever again on that segment. The
+    # writer must instead poison the segment and rotate all subsequent writes to a fresh one.
+    #
+    # This also exercises the SEGMENT-specific write seam (`writer._seg_write` /
+    # `writer._seg_ftruncate`): the pre-existing test at line ~142 patches `writer.os.write`,
+    # which -- because writer.py and quota.py import the SAME `os` module -- also patches
+    # quota._write_entry's os.write, landing the injected failure during grant/ledger
+    # persistence rather than the segment write. The seam isolates segment writes from quota's.
+    w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")
+    poisoned_seg = w._seg
+    real_write = writer.os.write
+    def short_write(fd, data):
+        real_write(fd, data[:5])
+        raise OSError("boom")                        # a real partial write, then failure
+    def failing_ftruncate(fd, length):
+        raise OSError("rollback also fails")          # e.g. ENOSPC while truncating
+    monkeypatch.setattr(writer, "_seg_write", short_write)
+    monkeypatch.setattr(writer, "_seg_ftruncate", failing_ftruncate)
+    w.start()                                          # write fails, rollback ALSO fails -> rotate
+    monkeypatch.undo()
+
+    assert w._seg != poisoned_seg                       # rotated to a NEW segment path
+    assert poisoned_seg.exists()
+    poisoned_bytes = poisoned_seg.read_bytes()
+    assert len(poisoned_bytes) == 5                      # exactly the un-rolled-back partial prefix
+    assert records.parse_valid(poisoned_bytes, w.activity_id) is None   # never parses as valid
+
+    w.start()                                            # retry lands in the CLEAN (rotated) segment
+    assert w._started is True
+    clean_recs = [json.loads(x) for x in w._seg.read_text().splitlines()]
+    assert [r["type"] for r in clean_recs].count("start") == 1
+    # the poisoned segment is never touched again -- still just the 5-byte prefix
+    assert poisoned_seg.read_bytes() == poisoned_bytes
+    # the injected failure only touched SEGMENT writes -- quota's own ledger persistence
+    # (_write_entry, via quota.grant during the first, failed attempt) was never corrupted by it
+    e = quota._read_entry(paths.ledger_entry_path(tmp_path, w.activity_id))
+    assert e != "CORRUPT"
 
 def test_start_grant_refusal_writes_nothing_no_terminal_only(tmp_path, monkeypatch):
     w = writer.ActivityWriter(tmp_path, kind="sync", channel="stable", trigger="cli", producer="python")

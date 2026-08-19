@@ -37,6 +37,15 @@ def _fingerprint():                                   # corroborating evidence o
 # from "durable", so a retry never fsyncs an empty segment into a terminal-only item.
 _NOTHING, _WROTE, _DURABLE = 0, 1, 2
 
+# Codex gate round 1, finding 5: a SEGMENT-specific write seam, distinct from quota's own
+# `os.write`/`os.ftruncate` usage. writer.py and quota.py import the SAME `os` module, so
+# monkeypatching `writer.os.write` in a test also silently patches quota._write_entry's
+# `os.write` (ledger persistence) -- a segment-write failure test would actually be exercising
+# the grant/ledger path instead. These two module-level names are used ONLY for segment I/O in
+# _emit, so a test can patch them to inject a segment-only failure without touching quota.
+_seg_write = os.write
+_seg_ftruncate = os.ftruncate
+
 class ActivityWriter:
     """Never-raises façade (finding 3): ANY construction failure yields an INACTIVE writer
     whose methods are no-ops and whose hand_off_env() is empty — a broken observability layer
@@ -146,16 +155,22 @@ class ActivityWriter:
                 start_off = os.lseek(fd, 0, os.SEEK_END)           # append offset for rollback
                 view = memoryview(blob)
                 while view:
-                    n = os.write(fd, view)
+                    n = _seg_write(fd, view)
                     if n <= 0:                          # zero-byte write -> error (no infinite loop)
                         raise OSError("zero-byte write")
                     view = view[n:]
             except Exception as e:                      # PARTIAL line -> truncate it away (finding 1)
                 _warn(f"emit write failed: {e}")
                 try:
-                    os.ftruncate(fd, start_off)         # remove the contaminating prefix
-                except OSError:
-                    pass
+                    _seg_ftruncate(fd, start_off)       # remove the contaminating prefix
+                except OSError as te:
+                    # finding 5: the rollback itself failed -- the partial bytes are STUCK on
+                    # disk. Reusing this segment would let the NEXT emit append BEHIND that
+                    # unremovable prefix (a malformed first line, valid records after it but no
+                    # valid record ever visible again on this file). Poison it: abandon it and
+                    # rotate all subsequent writes to a fresh segment instead.
+                    _warn(f"emit rollback ftruncate failed: {te}")
+                    self._rotate_segment()
                 _safe_close(fd)                         # C1: close() can raise too -- never escape
                 return _NOTHING                         # nothing durable, no contamination left
             self._seq += 1                              # a COMPLETE line is on disk -> consume the seq
@@ -179,6 +194,15 @@ class ActivityWriter:
 
     def _redact_fields(self, fields):
         return {k: self._redact_val(v) for k, v in fields.items()}
+
+    def _rotate_segment(self):
+        """Finding 5: abandon the current (poisoned) segment and switch to a FRESH one -- a new
+        writer_id under the same producer, the writer's normal segment-naming scheme -- for all
+        subsequent writes. reconcile/scan read ALL segments and parse_valid isolates a poisoned
+        tail line (returns None for it), so the clean segment's records are never orphaned
+        behind the unremoved partial prefix left by a rollback failure."""
+        self._writer_id = ids.mint_token()
+        self._seg = paths.segment_path(self._home, self.activity_id, self._producer, self._writer_id)
 
     def _resync_segment(self):
         try:
