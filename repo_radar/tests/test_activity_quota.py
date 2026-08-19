@@ -264,8 +264,11 @@ def test_reconcile_settles_terminal_once_fsync_recovers(tmp_path, monkeypatch):
 def test_symlinked_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
     # a valid-UUID-named ledger that is actually a SYMLINK must be CLASSIFIED (never silently
     # skipped out of the enumeration) as CORRUPT -> full PER_ACTIVITY_CAP liability, not 0.
-    aid = ids.mint_activity_id()
-    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    # Codex fix-review B2: uses a REAL, HELD owner.lock (owner provably still around) so this
+    # stays a pure detection/charging test -- an owner.lock that was never created at all now
+    # correctly clears via the owner-gone reconcile path (spec line 78/§7), which is orthogonal
+    # to what this test is proving.
+    aid, l = _new_activity(tmp_path)
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps({"reserved": quota.RESERVE, "granted": 0}))
     os.symlink(outside, paths.ledger_entry_path(tmp_path, aid))
@@ -276,8 +279,8 @@ def test_symlinked_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, m
     assert quota.admit(tmp_path, aid2, l2) is False      # 4 MiB corrupt liability blocks it
 
 def test_fifo_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
-    aid = ids.mint_activity_id()
-    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    # Codex fix-review B2: real, HELD owner.lock -- see comment above.
+    aid, l = _new_activity(tmp_path)
     os.mkfifo(paths.ledger_entry_path(tmp_path, aid))
     entries = dict(quota._ledger_entries(tmp_path))
     assert entries[aid] == "CORRUPT"
@@ -286,8 +289,8 @@ def test_fifo_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkey
     assert quota.admit(tmp_path, aid2, l2) is False
 
 def test_directory_ledger_entry_charges_corrupt_and_blocks_admission(tmp_path, monkeypatch):
-    aid = ids.mint_activity_id()
-    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    # Codex fix-review B2: real, HELD owner.lock -- see comment above.
+    aid, l = _new_activity(tmp_path)
     os.mkdir(paths.ledger_entry_path(tmp_path, aid))
     entries = dict(quota._ledger_entries(tmp_path))
     assert entries[aid] == "CORRUPT"
@@ -343,3 +346,80 @@ def test_reconcile_retains_ledger_when_synthesize_terminal_fsync_fails(tmp_path,
     monkeypatch.setattr(reconcile_mod.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("no fsync")))
     quota.reconcile(tmp_path)
     assert paths.ledger_entry_path(tmp_path, aid).exists()   # retained: synthetic terminal not durable
+
+# --- Codex fix-review B2 (BLOCKER): corrupt-ledger fail-closed state machine ------------------
+# All four tests use the REAL 64 MiB CEILING (no monkeypatch) -- a lowered ceiling was the prior
+# round's weakness (Codex called it a "ceiling artifact" that couldn't prove unconditional
+# refusal, only capacity exhaustion).
+
+def test_held_corrupt_refuses_admit_and_grant_at_real_ceiling(tmp_path):
+    # Gap 1 (spec §7): a corrupt entry whose owner.lock is HELD can never clear via evidence, so
+    # spec requires unconditional refusal of new admissions AND grants while it stands -- not
+    # merely "until capacity runs out". Total charge here is far below 64 MiB.
+    live, ll = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live, ll) is True         # a legitimate live activity, pre-corrupt
+
+    held, hl = _new_activity(tmp_path)                     # owner.lock HELD (never released below)
+    paths.ledger_entry_path(tmp_path, held).write_text("{not valid json")   # torn/corrupt entry
+
+    fresh, fl = _new_activity(tmp_path)
+    try:
+        assert quota.admit(tmp_path, fresh, fl) is False    # refused: corrupt entry stands
+        assert quota.grant(tmp_path, live, 100) is False    # grants refused too, unrelated activity
+    finally:
+        hl.release()
+
+def test_corrupt_entry_with_no_owner_lock_clears_via_owner_gone_path(tmp_path):
+    # Gap 2b (spec line 78): owner.lock NEVER CREATED (no activity dir at all) => owner provably
+    # gone => the corrupt entry must clear on reconcile, not be preserved forever.
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.quota_dir(tmp_path))          # quota/ exists; NO activity dir for aid
+    paths.ledger_entry_path(tmp_path, aid).write_text("{not valid json")
+
+    quota.reconcile(tmp_path)
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()   # cleared: owner never existed
+
+    fresh, fl = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh, fl) is True         # admissions resume once corrupt is gone
+
+def test_directory_ledger_cleanup_is_contained_and_fail_closed(tmp_path):
+    # Gap 2a: a corrupt <uuid>.json LEDGER that is a DIRECTORY must never let os.unlink's
+    # IsADirectoryError/PermissionError escape and break an UNRELATED admission's reconcile pass.
+    # Both entries have a REAL owner.lock that is present but FREE (reserve-before-start
+    # abandoned before any start was written) so the no-start reconcile branch actually reaches
+    # _unlink_entry -- the exact call that raises pre-fix (an absent owner.lock would short-
+    # circuit via lease_mod.acquire returning None and never call _unlink_entry at all). An EMPTY
+    # dir-ledger can be safely rmdir'd and clears; a NON-empty one is left in place (fail-closed)
+    # rather than mistaken for cleared.
+    empty_aid, el = _new_activity(tmp_path)
+    el.release()                                             # owner.lock exists, now FREE
+    os.mkdir(paths.ledger_entry_path(tmp_path, empty_aid))   # empty dir-ledger
+
+    nonempty_aid, nl = _new_activity(tmp_path)
+    nl.release()
+    os.mkdir(paths.ledger_entry_path(tmp_path, nonempty_aid))
+    (paths.ledger_entry_path(tmp_path, nonempty_aid) / "stray").write_text("x")   # non-empty
+
+    other, ol = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, other, ol) is False        # must not raise; non-empty still corrupt
+
+    entries = dict(quota._ledger_entries(tmp_path))
+    assert empty_aid not in entries                          # empty dir-ledger rmdir'd -- cleared
+    assert entries.get(nonempty_aid) == "CORRUPT"             # non-empty left in place -- fail-closed
+    assert quota._has_corrupt(tmp_path) is True
+    assert quota.admit(tmp_path, other, ol) is False          # still refused, not mistaken for success
+
+def test_cleared_directory_ledger_resumes_admission_at_real_ceiling(tmp_path):
+    # Gap 2a + Gap 1 together: once the ONLY corrupt entry (an empty dir-ledger whose owner.lock
+    # is present but FREE) is reconciled away via the fixed _unlink_entry, charge is trustworthy
+    # again and an unrelated admit at the REAL 64 MiB ceiling succeeds -- proving "cleared =>
+    # resume", not "stays refused forever" and not "crashes the reconcile pass".
+    stale_aid, sl = _new_activity(tmp_path)
+    sl.release()                                              # owner.lock present, FREE
+    os.mkdir(paths.ledger_entry_path(tmp_path, stale_aid))   # empty dir-ledger
+
+    quota.reconcile(tmp_path)
+    assert not paths.ledger_entry_path(tmp_path, stale_aid).exists()   # cleared
+
+    fresh, fl = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh, fl) is True          # charge trustworthy again -> resumes

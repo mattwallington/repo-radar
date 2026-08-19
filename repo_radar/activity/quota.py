@@ -102,9 +102,21 @@ def _unlink_entry(home, activity_id):
         raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     qfd = _open_quota_dir(home)                              # descriptor-relative unlink (Round-5 #1)
     try:
-        os.unlink(f"{activity_id}.json", dir_fd=qfd)
-    except FileNotFoundError:
-        pass
+        name = f"{activity_id}.json"
+        try:
+            os.unlink(name, dir_fd=qfd)
+        except FileNotFoundError:
+            pass
+        except (IsADirectoryError, PermissionError):
+            # a corrupt <uuid>.json DIRECTORY (EISDIR on Linux, EPERM on macOS): try rmdir for an
+            # EMPTY dir. If it can't be removed (non-empty / other), LEAVE it -- the entry stays
+            # CORRUPT and refuse-while-corrupt keeps admissions fail-closed. This is NOT mistaken for
+            # success because _has_corrupt re-reads the actual ledger. NEVER propagate (would break
+            # an unrelated admission's reconcile pass -- Codex fix-review B2).
+            try:
+                os.rmdir(name, dir_fd=qfd)
+            except OSError:
+                pass
     finally:
         os.close(qfd)
 
@@ -166,11 +178,18 @@ def _charge(home):
             else max(0, e["reserved"] + e["granted"] - _on_disk(home, aid))
     return total
 
+def _has_corrupt(home):
+    # spec §7: whether ANY ledger entry is currently untrustworthy. Used to fail-closed refuse
+    # new admissions/grants while it stands (Codex fix-review B2, Gap 1).
+    return any(e == "CORRUPT" for _aid, e in _ledger_entries(home))
+
 def admit(home, activity_id, lease):
     fd = None
     try:
         fd = _quota_lock(home)                                 # may raise UnsafePath (swapped component)
         _reconcile_all_locked(home)                            # reconcile BEFORE charge
+        if _has_corrupt(home):
+            return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
         if _charge(home) + RESERVE > CEILING:
             _prune_locked(home, (_charge(home) + RESERVE) - CEILING)   # prune FIRST
             if _charge(home) + RESERVE > CEILING:
@@ -187,6 +206,8 @@ def grant(home, activity_id, nbytes):
     fd = None
     try:
         fd = _quota_lock(home)
+        if _has_corrupt(home):
+            return False        # spec §7: refuse grants while any corrupt entry stands
         p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
         if e == "CORRUPT":
             return False
@@ -213,6 +234,28 @@ def settle(home, activity_id):
         if fd is not None:
             _unlock(fd)
 
+def _owner_lock_absent(home, aid):
+    """spec §5/line 78: an owner.lock that was NEVER CREATED => owner provably gone. Returns True
+    ONLY when provably absent (activity dir missing, or dir present but owner.lock missing); any
+    uncertainty (unsafe component, unexpected OSError, or a present-but-unsafe lock) => False so
+    we PRESERVE rather than risk reclaiming a live reservation (Codex fix-review B2, Gap 2b)."""
+    try:
+        d = paths.open_owned_dir(paths.activity_dir(home, aid))
+    except FileNotFoundError:
+        return True                              # activity dir never created => lock never created
+    except (paths.UnsafePath, OSError):
+        return False                             # uncertain => preserve (conservative)
+    try:
+        try:
+            os.stat("owner.lock", dir_fd=d, follow_symlinks=False)
+            return False                         # lock present
+        except FileNotFoundError:
+            return True                          # dir exists but lock never created => owner gone
+        except OSError:
+            return False                         # uncertain => preserve
+    finally:
+        os.close(d)
+
 def _reconcile_one_locked(home, aid):
     lock = paths.owner_lock_path(home, aid)
     if _has_terminal(home, aid):                   # terminal LINE present -> settle if owner gone
@@ -231,6 +274,8 @@ def _reconcile_one_locked(home, aid):
                 l.release()
         return
     if not _has_start(home, aid):                  # reserve-before-start -> lease-gated release
+        if _owner_lock_absent(home, aid):           # §5/line 78: never-created lock => owner gone
+            _unlink_entry(home, aid); return
         l = lease_mod.acquire(lock)                # (nothing recorded; nothing to synthesize)
         if l is not None:
             l.release(); _unlink_entry(home, aid)
