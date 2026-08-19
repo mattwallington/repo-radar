@@ -43,6 +43,13 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{2}$/;
 const TOKEN_RE = /^[0-9a-f]{8}$/;
 const PRODUCERS = new Set(['electron', 'dispatcher', 'python']);
 const KINDS = new Set(['sync', 'system']);
+// Canonical-integer-string field/summary keys ("0", "1", "42" -- NOT "01"/"1.0"/"x") are
+// rejected outright rather than accepted (fix round 1): a JS plain object promotes such keys
+// ahead of all other keys at object-CREATION time (before any of our code runs -- `JSON.parse`
+// itself already reorders them), while Python dicts preserve their original insertion order,
+// so the two encoders would silently produce different bytes for the same logical record.
+// Refusing the key class on both sides keeps them symmetric instead of letting this drift.
+const INT_KEY_RE = /^(0|[1-9]\d*)$/;
 
 // Strict JSON stringify: identical to `JSON.stringify` except it explicitly rejects a
 // non-finite number ANYWHERE in the value tree (top-level or nested), instead of letting
@@ -210,8 +217,13 @@ function _truncate(s, limit) {
 }
 
 // Byte-bounded key (not char-bounded). No marker appended (matches Python `_bound_key`).
+// Rejects a canonical-integer-string key outright (fix round 1, cross-language byte-parity --
+// see `INT_KEY_RE`); no real producer uses one, this only forecloses a future silent drift.
 function _boundKey(k) {
   const original = String(k);
+  if (INT_KEY_RE.test(original)) {
+    throw new InvalidRecord(`numeric-like field key not allowed: ${JSON.stringify(original)}`);
+  }
   const b = Buffer.from(original, 'utf8');
   if (b.length <= MAX_KEY_BYTES) return [original, false];
   return [_utf8SafePrefix(b, MAX_KEY_BYTES).toString('utf8'), true];
@@ -251,6 +263,10 @@ function _boundFields(fields) {
       v = tv; truncated = truncated || t;
     } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
       v = _canon(v); // non-finite -> reject
+      // Structurally unreachable for a finite JS `number` (max ~309 chars for the largest
+      // finite double, always << MAX_VALUE_BYTES): kept only for structural parity with
+      // records.py, where an arbitrary-precision Python `int` genuinely CAN exceed this bound.
+      // Not dead-by-mistake -- do not delete as "unreachable".
       if (Buffer.byteLength(_strictStringify(v), 'utf8') > MAX_VALUE_BYTES) {
         const [tv, t] = _truncate(String(v), MAX_VALUE_BYTES);
         v = tv; truncated = truncated || t;

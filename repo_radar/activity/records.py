@@ -34,6 +34,13 @@ _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?[+-]\d{2}:\d{
 _TOKEN_RE = re.compile(r"^[0-9a-f]{8}$")
 _PRODUCERS = {"electron", "dispatcher", "python"}
 _KINDS = {"sync", "system"}
+# Canonical-integer-string field/summary keys ("0", "1", "42" -- NOT "01"/"1.0"/"x") are
+# rejected outright rather than accepted (fix round 1): Python dicts preserve insertion order
+# for such keys, but a JS plain object promotes them ahead of all other keys at
+# object-CREATION time (before any of our code runs -- JSON.parse itself already reorders),
+# so the two encoders would silently produce different bytes for the same logical record.
+# Refusing the key class on both sides keeps them symmetric instead of letting this drift.
+_INT_KEY_RE = re.compile(r"^(0|[1-9]\d*)$")
 
 def _flat_primitive_map(m):
     """Codex gate round 1, finding 6: `1e400` is a REGULAR numeric literal that overflows
@@ -139,8 +146,12 @@ def _truncate(s: str, limit: int):
     return kept + marker.format(len(b) - len(kept.encode())), True
 
 def _bound_key(k):
-    """Return (key, was_truncated) where key is byte-bounded at MAX_KEY_BYTES (not char-bounded)."""
+    """Return (key, was_truncated) where key is byte-bounded at MAX_KEY_BYTES (not char-bounded).
+    Rejects a canonical-integer-string key outright (fix round 1, cross-language byte-parity --
+    see `_INT_KEY_RE`); no real producer uses one, this only forecloses a future silent drift."""
     original = str(k)
+    if _INT_KEY_RE.fullmatch(original):
+        raise InvalidRecord(f"numeric-like field key not allowed: {original!r}")
     b = original.encode("utf-8")
     if len(b) <= MAX_KEY_BYTES:
         return original, False
