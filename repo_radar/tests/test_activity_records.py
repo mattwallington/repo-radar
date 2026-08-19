@@ -117,6 +117,31 @@ def test_byte_truncated_key_sets_truncated_flag():
     actual_key = next(iter(rec["fields"]))
     assert len(actual_key.encode("utf-8")) <= R.MAX_KEY_BYTES
 
+# --- Codex gate round 1, Finding 6 (IMPORTANT before Node mirror): reject non-finite floats
+# from JSON overflow (not just the literal Infinity/-Infinity/NaN tokens) -------------------
+
+def test_parse_valid_rejects_json_overflow_to_infinite():
+    # `1e400` is a REGULAR numeric literal (unlike the special Infinity/-Infinity/NaN tokens
+    # json.loads' parse_constant already rejects) that overflows float() to +-inf; json.loads
+    # accepts it silently, and pre-fix _flat_primitive_map only checked `isinstance(v, float)`
+    # with no math.isfinite check, so a terminal with summary.x == inf was accepted.
+    #
+    # A raw JSON string is used deliberately: build()+encode() would re-serialize inf as the
+    # literal "Infinity" token (json.dumps' allow_nan behavior), which is a DIFFERENT code path
+    # (Round-6 #2, already covered by test_parse_valid_rejects_non_finite_numbers above) and
+    # would mask this overflow-specific defect entirely.
+    for lit in ("1e400", "-1e400"):
+        raw = ('{"schema_version":1,"activity_id":"%s","type":"event","seq":0,'
+               '"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x",'
+               '"fields":{"v":%s}}') % (AID, lit)
+        assert R.parse_valid(raw, AID) is None, f"{lit} was accepted"
+
+def test_parse_valid_rejects_json_overflow_nested_in_terminal_summary():
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"terminal","seq":9,'
+           '"ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded",'
+           '"summary":{"x":1e400},"by":"deadbeef"}') % AID
+    assert R.parse_valid(raw, AID) is None
+
 def test_build_rejects_non_dict_fields():
     """Passing fields=5 (non-dict) should raise InvalidRecord, not crash."""
     with pytest.raises(R.InvalidRecord):

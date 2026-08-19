@@ -36,12 +36,21 @@ _PRODUCERS = {"electron", "dispatcher", "python"}
 _KINDS = {"sync", "system"}
 
 def _flat_primitive_map(m):
+    """Codex gate round 1, finding 6: `1e400` is a REGULAR numeric literal that overflows
+    float() to +-inf -- json.loads' `parse_constant` only intercepts the special
+    Infinity/-Infinity/NaN TOKENS (Round-6 #2), not an ordinary literal that overflows during
+    conversion, so a bare `isinstance(v, float)` check here previously accepted it. Reject any
+    non-finite float leaf explicitly."""
     if not isinstance(m, dict):
         return False
     for k, v in m.items():
         if not isinstance(k, str):
             return False
-        if isinstance(v, bool) or v is None or isinstance(v, (int, float, str)):
+        if isinstance(v, bool) or v is None or isinstance(v, (int, str)):
+            continue
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                return False
             continue
         return False
     return True
