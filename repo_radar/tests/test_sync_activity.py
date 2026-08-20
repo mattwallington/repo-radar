@@ -148,6 +148,53 @@ class _SpyWriter:
         self.terminals.append((outcome, summary))
 
 
+def test_synclogger_forwards_source_owned_level_to_the_writer(tmp_path):
+    """The severity rule (`_activity_level`) is tested in isolation above, but that only proves
+    the pure function computes the right string -- it says nothing about whether a real
+    `SyncLogger` call actually FORWARDS that level to the writer. This drives the exact three
+    production call-site patterns sync.py itself uses (copied verbatim from
+    `_notify_waiting`/`_finish_degraded`/`process_repo`'s clone-failure branch) through a real
+    `SyncLogger` bound to a spy writer via `set_activity_writer`, and asserts on what the writer
+    actually RECEIVED -- not on `_activity_level`'s return value."""
+    sync_logger = S.SyncLogger(tmp_path / "sync-test.log")
+    writer = _SpyWriter()
+    sync_logger.set_activity_writer(writer)
+
+    # 1. Ordinary retry/wait/recovery -- verbatim from _notify_waiting: `sync_logger.event(
+    #    "network_wait")`, no explicit level -- must forward as the "info" default.
+    sync_logger.event("network_wait")
+
+    # 2. Degraded-but-completed -- verbatim from _finish_degraded's real call site.
+    sync_logger.event("metadata_degraded",
+                      level=S._activity_level("metadata_degraded", is_degraded=True),
+                      repo="acme/widgets", reason="chunk_synthesis_failed")
+
+    # 3. Exhausted retry / abort, via .error() -- verbatim from process_repo's clone-failure
+    #    branch: `sync_logger.error("clone_failed", repo=full_name, detail=...)`, no explicit
+    #    level -- must forward as the "error" default.
+    sync_logger.error("clone_failed", repo="acme/widgets",
+                      detail="fatal: could not resolve host github.com")
+
+    sync_logger.close()
+
+    assert len(writer.events) == 3, f"expected 3 forwarded events, got {writer.events!r}"
+
+    name, level, detail, fields = writer.events[0]
+    assert (name, level, detail, fields) == ("network_wait", "info", None, {})
+
+    name, level, detail, fields = writer.events[1]
+    assert name == "metadata_degraded"
+    assert level == "warn"
+    assert fields == {"repo": "acme/widgets", "reason": "chunk_synthesis_failed"}
+
+    name, level, detail, fields = writer.events[2]
+    assert name == "clone_failed"
+    assert level == "error"
+    assert detail == "fatal: could not resolve host github.com", (
+        "git-stderr detail must be forwarded via detail=, not folded into fields")
+    assert fields == {"repo": "acme/widgets"}
+
+
 def test_unknown_model_early_exit_calls_terminal_blocked_on_the_supplied_writer(monkeypatch):
     monkeypatch.setenv("AI_MODEL", "not-a-real-model-xyz")
     writer = _SpyWriter()
