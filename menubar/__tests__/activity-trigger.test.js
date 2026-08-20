@@ -134,6 +134,52 @@ test('beginManualActivity never throws when config.json is absent or malformed',
   result2.writer.terminal('succeeded');
 });
 
+test('beginManualActivity falls back to a valid channel when channel is null (Codex B6) -- durable start survives, and a subsequent guard blocked terminal is accepted', () => {
+  // Before the fix: main.js calls beginManualActivity({ channel: runtimeChannel, ... }) BEFORE
+  // its own runtime-resolution guard runs, so a build-info failure means runtimeChannel is still
+  // `null` at this call. records.js's `start` schema requires `channel` to be a STRING (no
+  // null-allowing sentinel), so the raw null failed validation -> no durable `start` -> the later
+  // guard's `terminal('blocked', ...)` found no durable start to attach to and was refused too
+  // (writer.js's terminal() gate) -- the whole failed attempt vanished. Prove both halves now
+  // land: a durable start (with a valid, non-null channel) AND the guard's blocked terminal.
+  const home = tmpHome();
+  try {
+    const { writer } = beginManualActivity(home, { channel: null, trigger: 'manual' });
+    assert.strictEqual(writer._active, true, 'a null channel must not sink the mint/admit/start');
+
+    const afterStart = readAll(home, writer.activityId);
+    const startRecs = afterStart.filter((r) => r.type === 'start');
+    assert.strictEqual(startRecs.length, 1, 'exactly one durable start must exist');
+    assert.strictEqual(typeof startRecs[0].channel, 'string', 'channel must be a valid bounded string, never null');
+    assert.notStrictEqual(startRecs[0].channel, null);
+
+    onGuardBlock(writer, 'runtime channel unresolved');
+    const afterGuard = readAll(home, writer.activityId);
+    assert.ok(
+      afterGuard.some((r) => r.type === 'terminal' && r.outcome === 'blocked'),
+      'a durable blocked terminal must exist alongside the start -- not refused for lack of one',
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('beginManualActivity falls back to a valid channel for every non-string/empty channel shape', () => {
+  for (const bad of [undefined, '']) {
+    const home = tmpHome();
+    try {
+      const { writer } = beginManualActivity(home, { channel: bad, trigger: 'manual' });
+      assert.strictEqual(writer._active, true, `channel=${JSON.stringify(bad)} must not sink start`);
+      const startRecs = readAll(home, writer.activityId).filter((r) => r.type === 'start');
+      assert.strictEqual(startRecs.length, 1);
+      assert.strictEqual(typeof startRecs[0].channel, 'string');
+      writer.terminal('succeeded');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
 // === onCancel / onContention / onGuardBlock (brief's sketch, verbatim shape) ===================
 
 test('cancel appends control{cancel_requested} BEFORE SIGTERM', () => {

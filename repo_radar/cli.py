@@ -46,10 +46,14 @@ def _establish_activity():
     "no writer" rather than aborting a real command -- observability must never block a sync.
 
     Returns (writer_or_None, handoff_rejected_exit_or_None). `handoff_rejected_exit_or_None` is
-    non-None ONLY for a corrupt/spoofed inherited lease (§5) -- the caller must exit with it
-    WITHOUT running the command; that exit code is the ONLY signal that authorizes a watching
-    Electron to finalize `failed`. A benign admission-refusal or write failure leaves the writer
-    merely inactive (every method on it a safe no-op) and is not reported as a rejection.
+    non-None for TWO rejection classes, both exit `HANDOFF_REJECTED_EXIT` (66) WITHOUT running
+    the command: (1) a PARTIAL/malformed handoff env -- some but not all of the three vars set,
+    or one that fails its own format check (§ three-way classification below) -- rejected here
+    before ActivityWriter is even constructed, so nothing is minted and nothing is written; (2) a
+    structurally-complete tuple that `adopt()` itself rejects as a corrupt/spoofed lease (§5).
+    Either way that exit code is the ONLY signal that authorizes a watching Electron to finalize
+    `failed`. A benign admission-refusal or write failure leaves the writer merely inactive (every
+    method on it a safe no-op) and is not reported as a rejection.
     """
     try:
         from repo_radar.activity import ActivityWriter, HANDOFF_REJECTED_EXIT, ids
@@ -63,10 +67,23 @@ def _establish_activity():
 
         kwargs = dict(kind='sync', channel=resolve_channel(), trigger=resolve_trigger(default='cli'),
                       producer='python', configured_secrets=_secret_values(load_config()))
-        # Presence/format check mirrors bootstrap.py's own handoff validation exactly (finding:
-        # mirror bootstrap/finalize construction) -- an absent or malformed env is treated as "no
-        # handoff" (mint fresh) rather than risking passing a garbage fd through to adopt().
-        if aid and token and fd and fd.isdigit() and ids.valid_activity_id(aid):
+        # Three-way classification (Codex B4): ALL THREE handoff env vars ABSENT is the
+        # legitimate direct-CLI case (`repo-radar sync` invoked with no dispatcher/Electron
+        # parent) -- mint fresh, unchanged. But if ANY of the three is set, this IS a handoff
+        # attempt, and it must be the COMPLETE, valid tuple (aid a valid UUIDv4, token present,
+        # fd a non-negative integer) or be rejected outright. A PARTIAL handoff -- e.g. a valid
+        # inherited aid but a MISSING token, or a NON-NUMERIC fd -- must never silently fall
+        # through to a fresh mint: that would leave the upstream (Electron) item unresolved
+        # forever while this process ran under a second, different identity. A rejected
+        # handoff writes NOTHING -- ActivityWriter is never constructed for it -- so no activity
+        # is minted and the upstream stays authoritative.
+        handoff_present = bool(aid) or bool(token) or bool(fd)
+        handoff_complete = (bool(aid) and bool(token) and bool(fd)
+                             and fd.isdigit() and ids.valid_activity_id(aid))
+        if handoff_present and not handoff_complete:
+            print("repo-radar: activity: handoff rejected (partial/malformed env)", file=sys.stderr)
+            return None, HANDOFF_REJECTED_EXIT
+        if handoff_complete:
             kwargs.update(inherited_id=aid, inherited_fd=int(fd), owner_token=token)
 
         writer = ActivityWriter(home, **kwargs)

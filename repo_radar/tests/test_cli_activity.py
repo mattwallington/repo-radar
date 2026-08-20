@@ -121,6 +121,60 @@ def test_sync_rejects_corrupt_handoff_exits_66_without_running(tmp_path):
     assert not paths.ledger_entry_path(tmp_path, aid_a).exists()
 
 
+def test_sync_partial_handoff_env_rejected_no_fresh_mint(tmp_path):
+    # Codex B4 -- three-way classification, the two malformed-tuple legs: a PARTIAL handoff (some
+    # but not all of the three vars set, or one that fails its own format check) must be REJECTED
+    # (exit 66, nothing written), never silently fall through to mint a fresh activity under a
+    # second identity while the upstream (Electron) item stays unresolved forever. (The
+    # all-absent-mints leg is covered by test_establish_activity_mints_fresh_when_all_three_
+    # handoff_vars_absent below; the all-valid-adopts leg is covered by
+    # test_sync_with_valid_handoff_env_adopts_not_mints above.)
+    from repo_radar.activity import ids, HANDOFF_REJECTED_EXIT
+
+    def _activity_dirs():
+        base = paths.quota_dir(tmp_path).parent
+        if not base.exists():
+            return []
+        return [p for p in base.iterdir() if p.is_dir() and p.name != "quota"]
+
+    aid = ids.mint_activity_id()
+
+    # (b) valid aid + MISSING token (and no fd) -> exit 66, nothing written, no fresh mint
+    env = {**os.environ, "HOME": str(tmp_path), "REPO_RADAR_ACTIVITY_ID": aid}
+    env.pop("REPO_RADAR_ACTIVITY_OWNER_TOKEN", None)
+    env.pop("REPO_RADAR_ACTIVITY_LOCK_FD", None)
+    r = subprocess.run([sys.executable, "-m", "repo_radar.cli", "sync", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == HANDOFF_REJECTED_EXIT, f"(b) expected 66, got {r.returncode}\n{r.stderr}"
+    assert _activity_dirs() == [], f"(b) expected no activity directories, got {_activity_dirs()}"
+
+    # (c) valid aid + valid-shaped token + NON-NUMERIC fd -> exit 66, nothing written
+    env = {**os.environ, "HOME": str(tmp_path), "REPO_RADAR_ACTIVITY_ID": aid,
+           "REPO_RADAR_ACTIVITY_OWNER_TOKEN": "deadbeef",
+           "REPO_RADAR_ACTIVITY_LOCK_FD": "notanumber"}
+    r = subprocess.run([sys.executable, "-m", "repo_radar.cli", "sync", "--dry-run"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == HANDOFF_REJECTED_EXIT, f"(c) expected 66, got {r.returncode}\n{r.stderr}"
+    assert _activity_dirs() == [], f"(c) expected no activity directories, got {_activity_dirs()}"
+
+
+def test_establish_activity_mints_fresh_when_all_three_handoff_vars_absent(tmp_path, monkeypatch):
+    # Codex B4 -- three-way classification, leg (a): ALL THREE handoff env vars absent is the
+    # legitimate direct-CLI case (`repo-radar sync` with no dispatcher/Electron parent) -> mint
+    # fresh, unchanged, no rejection.
+    from repo_radar import cli as cli_mod
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("REPO_RADAR_ACTIVITY_ID", "REPO_RADAR_ACTIVITY_OWNER_TOKEN", "REPO_RADAR_ACTIVITY_LOCK_FD"):
+        monkeypatch.delenv(var, raising=False)
+
+    writer, handoff_exit = cli_mod._establish_activity()
+    assert handoff_exit is None
+    assert writer is not None and writer._active
+    assert writer._adopted is False   # a FRESH mint, not an adoption
+    writer.terminal("succeeded")
+
+
 def test_establish_activity_wires_configured_secrets_for_redaction(tmp_path, monkeypatch):
     # A non-pattern configured secret (matches none of redact.py's built-in credential-shape
     # patterns) must be masked in a written event once cli.py's own establishment routine

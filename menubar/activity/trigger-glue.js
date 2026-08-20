@@ -60,8 +60,18 @@ function _loadConfiguredSecrets(home) {
 // methods are all safe no-ops -- callers never need to branch on success here.
 function beginManualActivity(home, { channel, trigger } = {}) {
   const configuredSecrets = _loadConfiguredSecrets(home);
+  // Codex B6: a null/unresolved `channel` (main.js passes its own `runtimeChannel`, which is
+  // `null` until build-info resolves) must not silently sink the whole attempt. records.js's
+  // `start` schema requires `channel` to be a STRING -- there is no null-allowing sentinel or
+  // fixed enum -- so passing the raw `null` through fails validation and no `start` is ever
+  // written; the later guard `blocked` terminal then has no durable start to attach to and is
+  // refused too (writer.js's terminal() gate), and the entire failed attempt vanishes -- exactly
+  // the pre-attempt failure this feature exists to capture. Fall back to a bounded, schema-valid
+  // placeholder so the start/terminal pair is always durable even when the real channel could
+  // not be resolved.
+  const resolvedChannel = (typeof channel === 'string' && channel) ? channel : 'unknown';
   const writer = new ActivityWriter(home, {
-    kind: 'sync', channel, trigger, producer: 'electron', configuredSecrets,
+    kind: 'sync', channel: resolvedChannel, trigger, producer: 'electron', configuredSecrets,
   });
   writer.start(); // idempotent, never-raises
   const lockFd = (writer._lease && typeof writer._lease.fd === 'number') ? writer._lease.fd : null;

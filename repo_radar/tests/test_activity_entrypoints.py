@@ -61,6 +61,52 @@ def test_finalize_standalone_records_blocked_incident(tmp_path):
     assert recs[0]["type"] == "start" and recs[-1]["type"] == "terminal"
     assert recs[-1]["outcome"] == "blocked"
 
+def test_bootstrap_no_handoff_env_is_a_benign_noop(tmp_path):
+    # Codex B4 -- three-way classification, leg (a): bootstrap is adopt-only (no mint path), so
+    # ALL THREE handoff env vars absent means no handoff was ever signaled -- unchanged benign
+    # no-op, exit 0, nothing written.
+    env = {**os.environ, "HOME": str(tmp_path)}
+    for var in ("REPO_RADAR_ACTIVITY_ID", "REPO_RADAR_ACTIVITY_OWNER_TOKEN", "REPO_RADAR_ACTIVITY_LOCK_FD"):
+        env.pop(var, None)
+    r = subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
+                        "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    base = paths.quota_dir(tmp_path).parent
+    assert not base.exists() or [p for p in base.iterdir() if p.name != "quota"] == []
+
+
+def test_bootstrap_partial_handoff_env_rejects_exits_66(tmp_path):
+    # Codex B4 -- three-way classification, the two malformed-tuple legs: a PARTIAL handoff (some
+    # but not all of the three vars set, or one that fails its own format check) must be REJECTED
+    # (exit 66, nothing written) -- never silently `return 0` as if nothing had been attempted,
+    # which would let the dispatcher believe recording is merely "off" while the upstream handoff
+    # item stays unresolved. (The all-valid-adopts leg is already covered by
+    # test_bootstrap_is_first_producer_writes_start_and_initial_ownership /
+    # test_bootstrap_adopts_existing_start_writes_handoff_only above.)
+    aid = ids.mint_activity_id()
+    base = paths.quota_dir(tmp_path).parent
+
+    # valid aid + MISSING token (and no fd)
+    env = {**os.environ, "HOME": str(tmp_path), "REPO_RADAR_ACTIVITY_ID": aid}
+    env.pop("REPO_RADAR_ACTIVITY_OWNER_TOKEN", None)
+    env.pop("REPO_RADAR_ACTIVITY_LOCK_FD", None)
+    r = subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
+                        "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == HANDOFF_REJECTED_EXIT, f"expected 66, got {r.returncode}\n{r.stderr}"
+    assert not base.exists() or [p for p in base.iterdir() if p.name != "quota"] == []
+
+    # valid aid + valid-shaped token + NON-NUMERIC fd
+    env2 = {**os.environ, "HOME": str(tmp_path), "REPO_RADAR_ACTIVITY_ID": aid,
+            "REPO_RADAR_ACTIVITY_OWNER_TOKEN": "deadbeef", "REPO_RADAR_ACTIVITY_LOCK_FD": "notanumber"}
+    r2 = subprocess.run([sys.executable, "-m", "repo_radar.activity.bootstrap",
+                        "--kind", "sync", "--channel", "stable", "--trigger", "scheduled"],
+                       env=env2, capture_output=True, text=True)
+    assert r2.returncode == HANDOFF_REJECTED_EXIT, f"expected 66, got {r2.returncode}\n{r2.stderr}"
+    assert not base.exists() or [p for p in base.iterdir() if p.name != "quota"] == []
+
+
 def test_bootstrap_rejects_corrupt_handoff_exits_66(tmp_path):
     # Corrupt handoff: env claims activity A but passes fd from activity B (fstat mismatch)
     # -> lease.adopt() rejects it -> bootstrap exits 66 and writes nothing
