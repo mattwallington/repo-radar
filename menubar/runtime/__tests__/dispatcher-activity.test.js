@@ -3,21 +3,30 @@
 // establishment to Python (bootstrap before the dev/verify guards; finalize on guard-failure/
 // root-contention), and last-resorts to the System diagnostic stream when even that can't run.
 //
-// Fix round 1: the ENTIRE activity lifecycle is scoped to the sync runner only, via
-// `_script(channel, tail, { withActivity })`. `emitRunSync` (the sync runner) passes
-// `withActivity: true`; `emitCliDispatcher` (the generic, user-facing `repo-radar`/
-// `repo-radar-dev` CLI, which runs for EVERY subcommand -- `--version`, `analyze`, `configure`,
-// `clean`, not just `sync`) passes nothing, defaulting to `false`. Getting this wrong means
-// `repo-radar --version` mints a phantom "sync" activity that starts and never terminates
-// (cli.py only calls sync_mode for the literal `sync` subcommand).
+// Fix round 1 (Ruling 13): the ENTIRE activity lifecycle was scoped to the sync runner only,
+// via `_script(channel, tail, { withActivity })` -- `emitRunSync` true, `emitCliDispatcher`
+// false (omitted at GENERATION time).
+//
+// Fix-A (Codex Phase-2 gate, Rulings 16/B1 + 17/B2) revises that design:
+//  B1(a) -- the durable `start` (bootstrap) now runs BEFORE the root `.exec.lock`
+//    acquisition, not after it, so a root-contention loser always has a real `start` to
+//    finalize `skipped` against.
+//  B1(b) -- `withActivity` is replaced by `activityGate` ('always' | 'cli') plus a RUNTIME
+//    `_ACT_ON` variable: the activity SOURCE is now always present in both generated scripts,
+//    but every step is wrapped in `if [ -n "${_ACT_ON:-}" ]; then ... fi`. `emitRunSync`
+//    hardcodes `_ACT_ON=1` (its tail is the literal `sync` subcommand). `emitCliDispatcher`
+//    sets it only when the CALLER's own `$1` is literally `sync`, so `repo-radar sync` now
+//    gets identity-before-gates too, while every other subcommand still runs none of it.
+//  B2 -- the mint block now refuses a symlinked activity root (or any ancestor down to
+//    `$HOME/Library/Logs`) via a `test -L` walk, BEFORE creating anything under it.
 //
 // Three layers:
 //  (1) STRING-LEVEL assertions on the generated `_script()` text (fast, exact wording/ordering).
-//  (2) withActivity SCOPING assertions: the CLI-dispatcher rendering (withActivity: false, both
-//      via the raw flag and via the real `emitCliDispatcher`) contains NONE of the activity
-//      additions and is BYTE-FOR-BYTE identical to the pre-Task-2.4 script; the sync-runner
-//      rendering (withActivity: true, both via the raw flag and via the real `emitRunSync`)
-//      still contains everything.
+//  (2) `activityGate` SCOPING assertions: both `_script()` renderings (raw flag and real
+//      emitter) now carry the SAME activity source; only the `_ACT_ON`-setting prelude differs.
+//      A REAL-PROCESS runtime comparison proves a non-sync CLI invocation is byte-identical
+//      (status/stdout/stderr) to the pre-activity script, and a `sync` CLI invocation runs the
+//      full lifecycle exactly like the scheduled runner.
 //  (3) A REAL-PROCESS integration that spawns the actual generated script against a STUB `python`
 //      planted at the resolved generation's `venv/bin/python` (the dispatcher never searches
 //      PATH for python -- it always uses the anchored `$GEN/venv/bin/python`), so the assertions
@@ -26,8 +35,9 @@
 // What's deferred to later tasks: the stub python never really adopts fd 4 or writes activity
 // records (that's repo_radar.activity.bootstrap/finalize, already covered by
 // repo_radar/tests/test_activity_entrypoints.py) and the exec'd sync worker never really becomes
-// cli.py/sync_mode (Tasks 2.5/2.6 -- not yet built, so a live adopt-and-handoff chain is Task 2.7).
-// This file proves the SHELL's own ordering/branching/env/fd/scoping plumbing only.
+// cli.py/sync_mode (Tasks 2.5/2.6 -- already built and covered elsewhere; Task 2.7 covers the
+// real cross-process chain). This file proves the SHELL's own ordering/branching/env/fd/scoping
+// plumbing only.
 const test = require('node:test'); const assert = require('node:assert');
 const os = require('os'); const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
 const cp = require('child_process');
@@ -37,11 +47,11 @@ const { layout, cliPath } = require('../paths');
 const { withLock } = require('../lock');
 
 // ---------------------------------------------------------------------------------------------
-// Layer 1: string-level assertions on the generated script (sync runner: withActivity: true)
+// Layer 1: string-level assertions on the generated script (sync runner: activityGate: 'always')
 // ---------------------------------------------------------------------------------------------
 
 test('scheduled script: bootstrap precedes verify; finalize handles block AND skipped', () => {
-  const s = _script('stable', ' sync --status-server', { withActivity: true });
+  const s = _script('stable', ' sync --status-server', { activityGate: 'always' });
   const iBootstrap = s.indexOf('activity.bootstrap');
   const iVerify = s.indexOf('verify.py');
   assert.ok(iBootstrap > 0 && iVerify > 0 && iBootstrap < iVerify, 'bootstrap precedes verify');
@@ -50,27 +60,35 @@ test('scheduled script: bootstrap precedes verify; finalize handles block AND sk
   assert.ok(s.includes('REPO_RADAR_ACTIVITY_ID'), 'exports identity');
 });
 
+test('Fix-A/B1(a): scheduled script -- durable start (bootstrap) precedes the root .exec.lock acquisition, and the fd-3 handshake still stays AFTER the root-lock (unchanged)', () => {
+  const s = _script('stable', ' sync --status-server', { activityGate: 'always' });
+  const iBootstrap = s.indexOf('activity.bootstrap');
+  const iRootLock = s.indexOf('exec 9>"$ROOT/.exec.lock"');
+  const iHandshake = s.indexOf("printf 'L' >&3");
+  assert.ok(iBootstrap > 0 && iRootLock > 0 && iHandshake > 0, 'all three present');
+  assert.ok(iBootstrap < iRootLock, 'a root-contention loser now has a real durable start to finalize skipped against');
+  assert.ok(iRootLock < iHandshake, 'the fd-3 lock-acquired handshake still fires only AFTER the root-lock');
+});
+
 test('last-resort writes to the System stream, not an activity segment', () => {
-  const s = _script('stable', ' sync --status-server', { withActivity: true });
+  const s = _script('stable', ' sync --status-server', { activityGate: 'always' });
   assert.ok(s.includes('sync.error.log'), 'last-resort goes to System diagnostics');
   assert.ok(!/activity\/[^\n]*\.jsonl/.test(s.split('last-resort')[1] || ''),
             'last-resort never appends an activity segment');
 });
 
-test('mint-or-inherit: identity export and root-lock acquisition are both gated on the SAME conditional, and bootstrap/contention-finalize are gated on _ACT_MINTED (never set on the inherited/manual path)', () => {
-  const s = _script('stable', ' sync --status-server', { withActivity: true });
+test('mint-or-inherit: identity export is gated on identity being absent; bootstrap and contention-finalize are both gated on `_ACT_ON && _ACT_MINTED` (never on the inherited/manual path)', () => {
+  const s = _script('stable', ' sync --status-server', { activityGate: 'always' });
   assert.match(s, /if \[ -z "\$\{REPO_RADAR_ACTIVITY_ID:-\}" \]; then/, 'mint only when identity is absent');
   assert.match(s, /_ACT_MINTED=1/, 'mint sets the scheduled-path marker');
-  // Both the root-contention finalize AND the bootstrap call are inside `if [ -n "$_ACT_MINTED" ]`
-  // blocks -- on the manual/inherited path (identity present, _ACT_MINTED never set) neither runs.
-  const contentionBlock = s.slice(s.indexOf('another sync is running') - 400, s.indexOf('another sync is running'));
-  assert.match(contentionBlock, /if \[ -n "\$_ACT_MINTED" \]/, 'contention-finalize gated on _ACT_MINTED');
   const bootstrapBlock = s.slice(s.indexOf('activity.bootstrap') - 200, s.indexOf('activity.bootstrap'));
-  assert.match(bootstrapBlock, /if \[ -n "\$_ACT_MINTED" \]/, 'bootstrap gated on _ACT_MINTED');
+  assert.match(bootstrapBlock, /if \[ -n "\$\{_ACT_ON:-\}" \] && \[ -n "\$_ACT_MINTED" \]; then/, 'bootstrap gated on _ACT_ON && _ACT_MINTED');
+  const contentionBlock = s.slice(s.indexOf('another sync is running') - 400, s.indexOf('another sync is running'));
+  assert.match(contentionBlock, /if \[ -n "\$\{_ACT_ON:-\}" \] && \[ -n "\$_ACT_MINTED" \]; then/, 'contention-finalize gated on _ACT_ON && _ACT_MINTED');
 });
 
 test('devGuard is untouched: exact original guard messages and fd-9/fd-3 handshakes survive verbatim', () => {
-  const s = _script('dev', ' sync --status-server', { withActivity: true });
+  const s = _script('dev', ' sync --status-server', { activityGate: 'always' });
   assert.match(s, /exec 9>"\$ROOT\/\.exec\.lock"/);
   assert.match(s, /\{ printf 'L' >&3; \} 2>\/dev\/null \|\| true/);
   assert.match(s, /repo-radar-dev: legacy stable install present; run dev in an isolated HOME/);
@@ -79,51 +97,83 @@ test('devGuard is untouched: exact original guard messages and fd-9/fd-3 handsha
 });
 
 // ---------------------------------------------------------------------------------------------
-// Layer 2: withActivity scoping -- the bug this fix round closes. The generic CLI dispatcher
-// (emitCliDispatcher, tail='') MUST carry NONE of the activity additions, for BOTH channels, via
-// both the raw flag and the real emitter; the sync runner (emitRunSync) MUST carry all of them.
+// Layer 2: activityGate scoping -- the bug this fix round (Fix-A/B1b) closes. Both the sync
+// runner (emitRunSync) AND the generic CLI dispatcher (emitCliDispatcher, tail='') now ALWAYS
+// carry the full activity source; only the `_ACT_ON`-setting prelude differs (hardcoded-on vs
+// gated on the caller's own `$1`). A real-process runtime comparison proves the CLI dispatcher's
+// behavior for a non-sync invocation is unchanged from the pre-activity script.
 // ---------------------------------------------------------------------------------------------
 
-function assertNoActivity(s, label) {
-  assert.ok(!s.includes('activity.bootstrap'), `${label}: no bootstrap call`);
-  assert.ok(!s.includes('--kind sync'), `${label}: no --kind sync`);
-  assert.ok(!s.includes('_act_guard_blocked'), `${label}: no guard-blocked trap`);
-  assert.ok(!/trap .* 0/.test(s), `${label}: no EXIT trap at all`);
-  assert.ok(!s.includes('activity.finalize'), `${label}: no finalize call`);
-  assert.ok(!s.includes('sync.error.log'), `${label}: no last-resort System-stream write`);
-  assert.ok(!s.includes('REPO_RADAR_ACTIVITY_ID'), `${label}: no identity export/check at all`);
-  assert.ok(!s.includes('_ACT_MINTED'), `${label}: no mint marker`);
-  assert.ok(!s.includes('owner.lock'), `${label}: no lease file`);
-}
-
-function assertHasActivity(s, label) {
-  assert.ok(s.includes('activity.bootstrap'), `${label}: has bootstrap call`);
-  assert.ok(s.includes('--kind sync'), `${label}: has --kind sync`);
-  assert.ok(s.includes('_act_guard_blocked'), `${label}: has guard-blocked trap`);
-  assert.ok(s.includes('activity.finalize'), `${label}: has finalize call`);
-  assert.ok(s.includes('sync.error.log'), `${label}: has last-resort System-stream write`);
-  assert.ok(s.includes('REPO_RADAR_ACTIVITY_ID'), `${label}: has identity export/check`);
-}
-
-test('CLI dispatcher rendering (withActivity: false, both channels): NONE of the activity additions, via the raw flag', () => {
-  assertNoActivity(_script('stable', '', { withActivity: false }), 'stable CLI (explicit false)');
-  assertNoActivity(_script('dev', '', { withActivity: false }), 'dev CLI (explicit false)');
+test('both _script() renderings now ALWAYS emit the activity source (Fix-A/B1b): only the _ACT_ON gate-setting prelude differs', () => {
+  const runSyncScript = _script('stable', ' sync --status-server', { activityGate: 'always' });
+  const cliScript = _script('stable', '', { activityGate: 'cli' });
+  for (const [label, s] of [['run-sync', runSyncScript], ['cli', cliScript]]) {
+    assert.ok(s.includes('activity.bootstrap'), `${label}: bootstrap source present`);
+    assert.ok(s.includes('--kind sync'), `${label}: --kind sync present`);
+    assert.ok(s.includes('_act_guard_blocked'), `${label}: guard-blocked trap present`);
+    assert.ok(s.includes('activity.finalize'), `${label}: finalize present`);
+    assert.ok(s.includes('sync.error.log'), `${label}: last-resort present`);
+    assert.ok(s.includes('REPO_RADAR_ACTIVITY_ID'), `${label}: identity export/check present`);
+  }
+  assert.match(runSyncScript, /^_ACT_ON=1$/m, 'run-sync hardcodes _ACT_ON on -- no $1 worth inspecting');
+  assert.ok(!runSyncScript.includes('${1:-}'), 'run-sync never inspects $1 for the gate');
+  assert.match(cliScript, /if \[ "\$\{1:-\}" = sync \]; then _ACT_ON=1; fi/, "cli gates _ACT_ON on the caller's own $1");
 });
 
-test('CLI dispatcher rendering (default, no options object at all): withActivity defaults to false', () => {
-  assertNoActivity(_script('stable', ''), 'stable CLI (default)');
-  assertNoActivity(_script('dev', ''), 'dev CLI (default)');
+test('_script default (no options object at all): activityGate defaults to "cli" (the sync-gated, safer default)', () => {
+  assert.match(_script('stable', ''), /if \[ "\$\{1:-\}" = sync \]; then _ACT_ON=1; fi/);
+  assert.match(_script('dev', ''), /if \[ "\$\{1:-\}" = sync \]; then _ACT_ON=1; fi/);
 });
 
-test('sync-runner rendering (withActivity: true, both channels): has every activity addition', () => {
-  assertHasActivity(_script('stable', ' sync --status-server', { withActivity: true }), 'stable sync');
-  assertHasActivity(_script('dev', ' sync --status-server', { withActivity: true }), 'dev sync');
+test('emitCliDispatcher (the real emitter) writes a script with the CLI-gated _ACT_ON prelude, both channels; emitRunSync writes one with _ACT_ON hardcoded on', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-actscope-'));
+  try {
+    const cliPathStable = emitCliDispatcher(home, 'stable');
+    const cliPathDev = emitCliDispatcher(home, 'dev');
+    const runSyncPath = emitRunSync(home, 'stable');
+    const cliStable = fs.readFileSync(cliPathStable, 'utf8');
+    const cliDev = fs.readFileSync(cliPathDev, 'utf8');
+    const runSyncScript = fs.readFileSync(runSyncPath, 'utf8');
+    for (const s of [cliStable, cliDev]) {
+      assert.match(s, /if \[ "\$\{1:-\}" = sync \]; then _ACT_ON=1; fi/, "CLI dispatcher gates _ACT_ON on the caller's own $1");
+    }
+    assert.match(runSyncScript, /^_ACT_ON=1$/m, 'run-sync hardcodes _ACT_ON on');
+    cp.execFileSync('/bin/sh', ['-n', cliPathStable]); // still syntactically valid
+    cp.execFileSync('/bin/sh', ['-n', cliPathDev]);
+    cp.execFileSync('/bin/sh', ['-n', runSyncPath]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
-test('withActivity: false is byte-for-byte identical to the pre-Task-2.4 script (both channels, both a sync-shaped and an empty tail)', () => {
-  // Pinned from git show f272808:menubar/runtime/dispatchers.js (the commit immediately before
-  // Task 2.4 landed) -- the exact pre-activity generic dispatcher, byte for byte.
-  const PRE_TASK_2_4_STABLE_CLI = `#!/bin/sh
+test('shellcheck -s sh is clean on all four generated variants (stable/dev x run-sync/cli)', (t) => {
+  const probe = cp.spawnSync('shellcheck', ['--version']);
+  if (probe.error) { t.skip('shellcheck not installed on this machine'); return; }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-shellcheck-'));
+  try {
+    const variants = [
+      emitRunSync(home, 'stable'),
+      emitRunSync(home, 'dev'),
+      emitCliDispatcher(home, 'stable'),
+      emitCliDispatcher(home, 'dev'),
+    ];
+    for (const p of variants) {
+      const r = cp.spawnSync('shellcheck', ['-s', 'sh', p], { encoding: 'utf8' });
+      assert.strictEqual(r.status, 0, `shellcheck -s sh ${p}:\n${r.stdout}${r.stderr}`);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Layer 3: real-process integration against a stub `python` planted at $GEN/venv/bin/python
+// ---------------------------------------------------------------------------------------------
+
+// Pinned from git show f272808:menubar/runtime/dispatchers.js (the commit immediately before
+// Task 2.4 landed) -- the exact pre-activity generic dispatcher, byte for byte. Used below to
+// prove a non-sync CLI invocation's RUNTIME behavior (not just its source) is unchanged.
+const PRE_TASK_2_4_STABLE_CLI = `#!/bin/sh
 set -eu
 ROOT="$HOME/.repo-radar"
 CH="stable"
@@ -163,25 +213,6 @@ grep -q "\\"manifestSha\\": *\\"$MSHA\\"" "$DES" || { echo "repo-radar: manifest
   || { echo "repo-radar: runtime failed verification" >&2; exit 1; }
 exec "$GEN/venv/bin/python" "$GEN/repo-radar" "$@"
 `;
-  assert.strictEqual(_script('stable', '', { withActivity: false }), PRE_TASK_2_4_STABLE_CLI);
-  assert.strictEqual(_script('stable', ''), PRE_TASK_2_4_STABLE_CLI); // default (no options) matches too
-});
-
-test('emitCliDispatcher (the real emitter) writes a script with none of the activity additions; emitRunSync (the real emitter) writes one with all of them', () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-actscope-'));
-  const cliPathStable = emitCliDispatcher(home, 'stable');
-  const cliPathDev = emitCliDispatcher(home, 'dev');
-  const runSyncPath = emitRunSync(home, 'stable');
-  assertNoActivity(fs.readFileSync(cliPathStable, 'utf8'), 'emitCliDispatcher stable');
-  assertNoActivity(fs.readFileSync(cliPathDev, 'utf8'), 'emitCliDispatcher dev');
-  assertHasActivity(fs.readFileSync(runSyncPath, 'utf8'), 'emitRunSync stable');
-  cp.execFileSync('/bin/sh', ['-n', cliPathStable]); // still syntactically valid
-  cp.execFileSync('/bin/sh', ['-n', runSyncPath]);
-});
-
-// ---------------------------------------------------------------------------------------------
-// Layer 2: real-process integration against a stub `python` planted at $GEN/venv/bin/python
-// ---------------------------------------------------------------------------------------------
 
 function tmpHome() { return fs.mkdtempSync(path.join(os.tmpdir(), 'rr-actdisp-')); }
 function sha256(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
@@ -247,6 +278,18 @@ function runScript(home, channel, extraEnv) {
   return { ...r, log };
 }
 
+// Same as runScript, but against the CLI dispatcher (installed `repo-radar`), with the caller's
+// own argv -- exercises the `activityGate: 'cli'` runtime path (Fix-A/B1b).
+function runCliScript(home, channel, argv, extraEnv) {
+  const p = emitCliDispatcher(home, channel);
+  const logPath = path.join(home, 'stub.log');
+  fs.writeFileSync(logPath, '');
+  const env = { ...process.env, HOME: home, _STUB_LOG: logPath, ...extraEnv };
+  const r = cp.spawnSync('/bin/sh', [p, ...argv], { encoding: 'utf8', env, timeout: 20000 });
+  const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean) : [];
+  return { ...r, log };
+}
+
 test('integration (scheduled, happy path): bootstrap -> verify -> exec, in that real execution order', () => {
   const home = tmpHome();
   fakeActiveGeneration(home, 'stable');
@@ -276,16 +319,18 @@ test('integration (scheduled, guard failure): bootstrap ran, then finalize --out
   assert.ok(!log.some((l) => l.startsWith('EXEC')), `no exec after a guard failure: ${JSON.stringify(log)}`);
 });
 
-test('integration (scheduled, root-lock contention): finalize --outcome skipped runs, script exits 75, never reaches bootstrap/verify', async () => {
+test('integration (scheduled, root-lock contention): the durable start ALREADY ran (Fix-A/B1a), then finalize --outcome skipped runs, script exits 75, never reaches verify', async () => {
   const home = tmpHome();
   fakeActiveGeneration(home, 'stable');
   const L = layout(home, 'stable');
   await withLock(L.execLock, 0, async () => {
     const { status, log } = runScript(home, 'stable', {});
     assert.strictEqual(status, 75);
+    const iBoot = log.findIndex((l) => l.startsWith('MODULE repo_radar.activity.bootstrap'));
     const iSkipped = log.findIndex((l) => l.startsWith('MODULE repo_radar.activity.finalize') && l.includes('--outcome skipped'));
+    assert.ok(iBoot >= 0, `a durable start was written BEFORE the root-lock attempt: ${JSON.stringify(log)}`);
     assert.ok(iSkipped >= 0, `skipped finalize ran: ${JSON.stringify(log)}`);
-    assert.ok(!log.some((l) => l.startsWith('MODULE repo_radar.activity.bootstrap')), 'never reached bootstrap (root lock never acquired)');
+    assert.ok(iBoot < iSkipped, `start precedes the skipped terminal it's finalizing: ${JSON.stringify(log)}`);
     assert.ok(!log.some((l) => l === 'VERIFY'), 'never reached verify');
   });
 });
@@ -354,6 +399,95 @@ test('integration: mint creates a 0700 activity dir and a lockf-held owner.lock 
   // when the last process holding it (the stub's "EXEC" invocation) exits.
   const probe = cp.spawnSync('/usr/bin/lockf', ['-t', '0', path.join(dir, 'owner.lock'), '/usr/bin/true'], { encoding: 'utf8' });
   assert.strictEqual(probe.status, 0, 'lock is free after the process tree exited');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix-A/B1(b): emitCliDispatcher, `$1`-gated activity -- `repo-radar sync` now behaves exactly
+// like the scheduled runner; every other subcommand stays fully activity-free.
+// ---------------------------------------------------------------------------------------------
+
+test("emitCliDispatcher, $1=sync: activity establishes identity + a durable start BEFORE the root lock, exactly like the scheduled runner (Fix-A/B1b)", () => {
+  const home = tmpHome();
+  fakeActiveGeneration(home, 'stable');
+  const { status, log } = runCliScript(home, 'stable', ['sync', '--status-server'], {});
+  assert.strictEqual(status, 0, `log=${JSON.stringify(log)}`);
+  const iBoot = log.findIndex((l) => l.startsWith('MODULE repo_radar.activity.bootstrap'));
+  const iVerify = log.findIndex((l) => l === 'VERIFY');
+  const iExec = log.findIndex((l) => l.startsWith('EXEC'));
+  assert.ok(iBoot >= 0 && iVerify >= 0 && iExec >= 0, `all three ran: ${JSON.stringify(log)}`);
+  assert.ok(iBoot < iVerify && iVerify < iExec, `order: ${JSON.stringify(log)}`);
+  assert.match(log[iExec], /^EXEC sync --status-server/, "forwards the caller's own args verbatim (no baked-in tail)");
+  const activityBase = path.join(home, 'Library', 'Logs', 'repo-radar', 'activity');
+  assert.strictEqual(fs.readdirSync(activityBase).length, 1, 'exactly one activity was minted');
+});
+
+test('emitCliDispatcher, $1=sync, root-lock contention: the durable start already ran, then skipped finalize, exits 75, never reaches verify (Fix-A/B1a via the CLI-sync path)', async () => {
+  const home = tmpHome();
+  fakeActiveGeneration(home, 'stable');
+  const L = layout(home, 'stable');
+  await withLock(L.execLock, 0, async () => {
+    const { status, log } = runCliScript(home, 'stable', ['sync'], {});
+    assert.strictEqual(status, 75);
+    const iBoot = log.findIndex((l) => l.startsWith('MODULE repo_radar.activity.bootstrap'));
+    const iSkipped = log.findIndex((l) => l.startsWith('MODULE repo_radar.activity.finalize') && l.includes('--outcome skipped'));
+    assert.ok(iBoot >= 0, `bootstrap ran before the contention gate: ${JSON.stringify(log)}`);
+    assert.ok(iSkipped >= 0, `skipped finalize ran: ${JSON.stringify(log)}`);
+    assert.ok(iBoot < iSkipped, `durable start precedes the skipped terminal: ${JSON.stringify(log)}`);
+    assert.ok(!log.some((l) => l === 'VERIFY'), 'never reached verify');
+  });
+});
+
+test('emitCliDispatcher, non-sync $1: mints/runs NOTHING (no activity dir ever created), and its runtime output is byte-identical to the pre-activity script (Fix-A/B1b)', () => {
+  const home = tmpHome();
+  fakeActiveGeneration(home, 'stable');
+  const oldScriptPath = path.join(home, 'pre-activity-cli.sh');
+  fs.writeFileSync(oldScriptPath, PRE_TASK_2_4_STABLE_CLI, { mode: 0o700 });
+  const newScriptPath = emitCliDispatcher(home, 'stable');
+
+  const run = (scriptPath, argv) => {
+    const logPath = path.join(home, 'stub.log');
+    fs.writeFileSync(logPath, '');
+    const env = { ...process.env, HOME: home, _STUB_LOG: logPath };
+    const r = cp.spawnSync('/bin/sh', [scriptPath, ...argv], { encoding: 'utf8', env, timeout: 20000 });
+    return { status: r.status, signal: r.signal, stdout: r.stdout, stderr: r.stderr };
+  };
+
+  const oldRun = run(oldScriptPath, ['--version']);
+  const newRun = run(newScriptPath, ['--version']);
+  assert.deepStrictEqual(newRun, oldRun, 'non-sync CLI runtime output (status/stdout/stderr) is byte-identical to the pre-activity script');
+  assert.ok(!fs.existsSync(path.join(home, 'Library', 'Logs', 'repo-radar', 'activity')), 'no activity dir was ever created for a non-sync invocation');
+  assert.ok(!fs.existsSync(path.join(home, 'Library', 'Logs', 'repo-radar', 'sync.error.log')), 'no last-resort line either -- the activity code truly never ran');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fix-A/B2: the shell mint refuses a symlinked activity root before creating anything under it.
+// ---------------------------------------------------------------------------------------------
+
+test('Fix-A/B2: a symlinked activity root is refused before minting -- no UUID dir is created outside the owned tree, the outside sentinel is untouched, and the run degrades gracefully (no crash)', () => {
+  const home = tmpHome();
+  fakeActiveGeneration(home, 'stable');
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-outside-'));
+  const sentinel = path.join(outside, 'sentinel.txt');
+  fs.writeFileSync(sentinel, 'do-not-touch');
+  try {
+    const repoRadarDir = path.join(home, 'Library', 'Logs', 'repo-radar');
+    fs.mkdirSync(repoRadarDir, { recursive: true });
+    const activityLink = path.join(repoRadarDir, 'activity');
+    fs.symlinkSync(outside, activityLink);
+
+    const { status, log } = runScript(home, 'stable', {});
+    assert.strictEqual(status, 0, `the run degraded gracefully -- the sync itself still completed: log=${JSON.stringify(log)}`);
+    assert.ok(log.some((l) => l === 'VERIFY') && log.some((l) => l.startsWith('EXEC')), 'the sync itself still ran to completion');
+    assert.ok(!log.some((l) => l.startsWith('MODULE repo_radar.activity')), 'mint was refused -- no activity was ever established');
+
+    assert.ok(fs.lstatSync(activityLink).isSymbolicLink(), 'the symlink itself is untouched');
+    assert.strictEqual(fs.readlinkSync(activityLink), outside, 'the symlink still points where it always did');
+    assert.deepStrictEqual(fs.readdirSync(outside).sort(), ['sentinel.txt'], 'no UUID activity dir was created outside the owned tree');
+    assert.strictEqual(fs.readFileSync(sentinel, 'utf8'), 'do-not-touch', 'the outside sentinel content is untouched');
+  } finally {
+    fs.rmSync(outside, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
