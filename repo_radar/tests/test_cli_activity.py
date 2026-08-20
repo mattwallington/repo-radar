@@ -23,9 +23,14 @@ def test_dependency_failure_records_a_blocked_terminal(tmp_path):
     assert "blocked" in _terminal_outcomes(tmp_path)   # not merely "a directory exists"
 
 
-def test_dependency_failure_on_configure_and_analyze_also_records_blocked(tmp_path):
-    # The brief calls for establishment on configure/analyze too (not just sync) -- a dependency
-    # failure on either of those must be equally durable, not silently lost.
+def test_configure_and_analyze_do_not_establish_an_activity_even_on_dependency_failure(tmp_path):
+    # Fix round 1: configure/analyze must NOT establish an activity at all (not even on a
+    # dependency failure) -- neither mode has a `.terminal()` call on success, so an
+    # established-but-never-terminaled activity would self-heal via reconciliation into a phantom
+    # `interrupted` incident for a run that actually succeeded (the same failure class already
+    # fixed one task earlier at the shell-dispatcher layer, Ruling 13 / Task 2.4). Forcing a
+    # dependency failure here is a stronger check than a plain successful run: it proves there is
+    # no writer to write `blocked` even on the one path `sync` WOULD record durably.
     for command in ("configure", "analyze"):
         home = tmp_path / command
         home.mkdir()
@@ -33,18 +38,24 @@ def test_dependency_failure_on_configure_and_analyze_also_records_blocked(tmp_pa
         r = subprocess.run([sys.executable, "-m", "repo_radar.cli", command],
                            env=env, capture_output=True, text=True)
         assert r.returncode == 2, f"{command}: {r.stderr}"
-        assert "blocked" in _terminal_outcomes(home), f"{command}: no blocked terminal"
+        activity_base = paths.quota_dir(home).parent
+        assert not activity_base.exists() or list(activity_base.iterdir()) == [], \
+            f"{command}: unexpected activity records on disk"
 
 
-def test_version_help_get_description_and_clean_do_not_establish_activity(tmp_path):
+def test_non_sync_commands_do_not_establish_activity(tmp_path):
     # CARRY-FORWARD (Ruling 13 / Task 2.4): the shell dispatcher no longer mints a phantom
     # activity for non-attempt commands. cli.py must not reintroduce that at the Python layer --
-    # --version/help/get-description/clean must never create an activity directory.
+    # --version/help/get-description/clean, AND (fix round 1) configure/analyze on a normal
+    # successful-ish run, must never create an activity directory. `sync` is the only command
+    # cli.py establishes an activity for.
     env = {**os.environ, "HOME": str(tmp_path)}
-    for argv in (["--version"], ["help"], ["get-description"], ["clean", "--dry-run"]):
+    env.pop("GITHUB_TOKEN", None)   # configure must hit its "no token" exit, never a real API call
+    for argv in (["--version"], ["help"], ["get-description"], ["clean", "--dry-run"],
+                 ["configure"], ["analyze"]):
         r = subprocess.run([sys.executable, "-m", "repo_radar.cli", *argv],
                            env=env, capture_output=True, text=True)
-        assert r.returncode == 0, f"{argv}: {r.stderr}"
+        assert r.returncode in (0, 1), f"{argv}: unexpected exit {r.returncode}\n{r.stderr}"
     activity_base = paths.quota_dir(tmp_path).parent
     assert not activity_base.exists() or list(activity_base.iterdir()) == []
 

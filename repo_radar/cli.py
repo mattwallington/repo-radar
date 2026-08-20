@@ -24,9 +24,14 @@ def _secret_values(cfg):
 
 
 def _establish_activity():
-    """Establish/adopt the activity identity + lease + `start` for a command that attempts real
-    work (sync/configure/analyze), BEFORE check_dependencies() runs -- so a dependency failure
-    becomes a durable `blocked` incident instead of a silently lost error.
+    """Establish/adopt the activity identity + lease + `start` for the `sync` command, BEFORE
+    check_dependencies() runs -- so a dependency failure becomes a durable `blocked` incident
+    instead of a silently lost error.
+
+    `sync`-only: `configure`/`analyze` are deliberately NOT wired to this (see the call site in
+    `main()`) -- neither mode has a `.terminal()` call on success, so establishing here without a
+    matching completion call would leave a phantom started-but-never-terminaled activity that
+    reconciliation later synthesizes into a false `interrupted` incident.
 
     Adopt-vs-mint: a valid inherited handoff env (REPO_RADAR_ACTIVITY_ID/_OWNER_TOKEN/_LOCK_FD --
     set when a dispatcher/Electron parent already minted + leased) is ADOPTED as the executing
@@ -119,12 +124,20 @@ def main():
         from repo_radar.modes.clean import clean_mode
         return clean_mode(args)
 
-    # Establish/adopt the activity identity + lease + `start` BEFORE dependency checking, for
-    # every command that attempts real work -- so a dependency failure below becomes a durable
-    # `blocked` incident rather than a lost error. Additive + best-effort: this can only ever
-    # STOP a real command via the exit-66 handoff-rejected signal immediately below.
+    # Establish/adopt the activity identity + lease + `start` BEFORE dependency checking, so a
+    # dependency failure below becomes a durable `blocked` incident rather than a lost error.
+    # Additive + best-effort: this can only ever STOP a real command via the exit-66
+    # handoff-rejected signal immediately below.
+    #
+    # `sync` ONLY -- not `configure`/`analyze`. Those two modes have no `.terminal()` call on
+    # their success path (no follow-up task wires one, unlike `sync` -> Task 2.6), so an
+    # established-but-never-terminaled activity would self-heal via reconciliation into a
+    # phantom `interrupted` incident for a run that actually succeeded -- the exact failure class
+    # already fixed one task earlier at the shell-dispatcher layer (Ruling 13 / Task 2.4).
+    # configure/analyze can re-join as activity producers once real terminal-on-success/failure
+    # wiring exists for them; an un-terminable `start` is worse than no record.
     activity_writer = None
-    if args.command in ('sync', 'configure', 'analyze'):
+    if args.command == 'sync':
         activity_writer, handoff_rejected_exit = _establish_activity()
         if handoff_rejected_exit is not None:
             # A corrupt/spoofed inherited lease (§5) -- do NOT run the command. This exit code is
