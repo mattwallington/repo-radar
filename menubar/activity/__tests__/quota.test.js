@@ -1,9 +1,15 @@
 'use strict';
 // Node mirror of the key scenarios in repo_radar/tests/test_activity_quota.py (Task 2.2b),
-// adapted to Ruling B (Node never unlinks -- settle is a no-op; corrupt-clearing and
+// adapted to Ruling B (Node never unlinks the ledger entry ITSELF; corrupt-clearing and
 // over-ceiling pruning are delegated to python -m repo_radar.activity.prune, proven separately
-// by quota-delegation.test.js). See ../quota.js's header comment for the full architecture.
+// by quota-delegation.test.js). See ../quota.js's header comment for the full architecture,
+// including the Codex B3(a)/(b)/(c) fixes: settle() now (b3c) excludes a durable-terminal entry
+// from `_charge` and proactively (best-effort, never-raises) delegates a bounded reap -- but that
+// reap can only physically remove an entry once its owner.lock is free, so a scenario with the
+// lease still HELD (like the one directly below) still legitimately leaves the entry on disk,
+// exactly as before.
 const test = require('node:test');
+const { after } = test;
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -11,9 +17,19 @@ const path = require('node:path');
 const A = require('../index');
 const { quota } = A;
 
+// Tracks every tmp home this file mints so a single after() sweep can clean them all up (the
+// suite has had disk-exhausting tmp accumulation -- see the brief for Codex B3).
+const _tmpHomes = [];
 function tmpHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'rr-quota-'));
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-quota-'));
+  _tmpHomes.push(h);
+  return h;
 }
+after(() => {
+  for (const h of _tmpHomes) {
+    try { fs.rmSync(h, { recursive: true, force: true }); } catch (e) { /* best-effort */ }
+  }
+});
 
 function newActivity(home) {
   const aid = A.mintActivityId();
@@ -26,17 +42,82 @@ function readEntry(home, aid) {
   return JSON.parse(fs.readFileSync(A.ledgerEntryPath(home, aid), 'utf8'));
 }
 
-test('admit writes a {reserved, granted} JSON ledger entry; settle is a no-op (Ruling B)', () => {
+// Writes a durable (fsynced) `terminal` record straight into the activity's segment, the same
+// shape writer.js's terminal() durably appends -- without driving the full ActivityWriter
+// machinery, so tests here can exercise `_hasTerminal`/`_charge` in isolation.
+function writeTerminalRecord(home, aid, outcome = 'succeeded') {
+  const rec = {
+    schema_version: 1, activity_id: aid, type: 'terminal', seq: 1,
+    ts: '2026-08-14T00:00:00-07:00', outcome, summary: {}, by: A.mintToken(),
+  };
+  const seg = A.segmentPath(home, aid, 'electron', 'deadbeef');
+  const fd = A.secureOpenAppend(seg);
+  fs.writeSync(fd, Buffer.from(`${JSON.stringify(rec)}\n`));
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+}
+
+test('admit writes a {reserved, granted} JSON ledger entry; settle leaves it in place while the lease is still held', () => {
   const home = tmpHome();
   const [aid, l] = newActivity(home);
   assert.strictEqual(quota.admit(home, aid, l), true);
   assert.deepStrictEqual(readEntry(home, aid), { reserved: quota.RESERVE, granted: 0 });
 
-  quota.settle(home, aid);
-  // Ruling B: Node cannot unlink -- settle must leave the entry in place. The next Python
-  // reconcile/prune pass is what actually removes it (proven by quota-delegation.test.js's use
-  // of the real prune entrypoint, and by test_activity_quota.py's Python-side settle tests).
-  assert.ok(fs.existsSync(A.ledgerEntryPath(home, aid)), 'settle must NOT remove the ledger entry');
+  assert.doesNotThrow(() => quota.settle(home, aid));
+  // No durable terminal exists yet (only admit() ran -- no start/terminal record), and the lease
+  // `l` is still HELD (never released) -- so neither the charge exclusion nor the delegated reap
+  // apply here: the entry legitimately remains, and still counts as outstanding. Codex
+  // B3(c)'s fix is exercised by the dedicated tests below (a durable terminal present, and/or
+  // the lease released first).
+  assert.ok(fs.existsSync(A.ledgerEntryPath(home, aid)), 'settle must not remove an entry with no durable terminal / a still-held lease');
+});
+
+test('B3(c): a durable terminal makes _charge drop that entry\'s outstanding reserve+granted to 0 (the measured ~60 KiB false charge)', () => {
+  const home = tmpHome();
+  const [aid, l] = newActivity(home);
+  assert.strictEqual(quota.admit(home, aid, l), true);
+  assert.strictEqual(quota.grant(home, aid, 1000), true);
+
+  const before = quota._charge(home);
+  const committedBefore = quota._committed(home);
+  assert.ok(before > committedBefore, 'before a terminal lands, the reserve+granted is genuinely outstanding');
+  assert.ok(before - committedBefore > 50000, `outstanding should be on the order of the ~60 KiB RESERVE (got ${before - committedBefore})`);
+
+  writeTerminalRecord(home, aid);
+  assert.strictEqual(quota._hasTerminal(home, aid), true);
+
+  const after = quota._charge(home);
+  assert.strictEqual(
+    after, quota._committed(home),
+    'a durable terminal is SETTLED: 0 outstanding, counted purely by the on-disk scan (mirrors Python\'s post-settle state)',
+  );
+});
+
+test('_hasTerminal reflects a durable terminal record on disk, not merely a start', () => {
+  const home = tmpHome();
+  const [aid] = newActivity(home);
+  assert.strictEqual(quota._hasTerminal(home, aid), false, 'no records at all yet');
+
+  const startRec = {
+    schema_version: 1, activity_id: aid, type: 'start', seq: 0,
+    ts: '2026-08-14T00:00:00-07:00', kind: 'sync', channel: 'stable', trigger: 'cli', created_by: 'python',
+  };
+  const startSeg = A.segmentPath(home, aid, 'python', 'cafebabe');
+  const sfd = A.secureOpenAppend(startSeg);
+  fs.writeSync(sfd, Buffer.from(`${JSON.stringify(startRec)}\n`));
+  fs.closeSync(sfd);
+  assert.strictEqual(quota._hasTerminal(home, aid), false, 'a start record alone is not a terminal');
+
+  writeTerminalRecord(home, aid);
+  assert.strictEqual(quota._hasTerminal(home, aid), true);
+});
+
+test('configurePythonRunner is a function; a falsy/invalid value un-configures back to the source-checkout default (never throws)', () => {
+  assert.strictEqual(typeof quota.configurePythonRunner, 'function');
+  assert.doesNotThrow(() => quota.configurePythonRunner(null));
+  assert.doesNotThrow(() => quota.configurePythonRunner({}));
+  assert.doesNotThrow(() => quota.configurePythonRunner({ python: '' }));
+  assert.doesNotThrow(() => quota.configurePythonRunner(undefined));
 });
 
 test('grant enforces both the per-activity cap and the global ceiling', () => {
@@ -101,7 +182,7 @@ test('a symlinked/FIFO/directory ledger entry is CLASSIFIED as CORRUPT, never si
   assert.strictEqual(quota._hasCorrupt(home), true);
 });
 
-test('_committed / _onDisk use fstat sizes only -- charge accounting never reads segment content', () => {
+test('_committed / _onDisk use fstat sizes only -- SIZE accounting never reads segment content', () => {
   const home = tmpHome();
   const [aid, l] = newActivity(home);
   quota.admit(home, aid, l);
@@ -111,24 +192,37 @@ test('_committed / _onDisk use fstat sizes only -- charge accounting never reads
   // The pathsMod module object is shared by reference (Node's require cache): stubbing its
   // readOwnedSegments here also changes what quota.js's own `paths.readOwnedSegments` calls
   // resolve to, since quota.js did `const paths = require('./paths')` -- the same object.
+  //
+  // Scoped to `_onDisk`/`_committed` DIRECTLY (not routed through `grant`/`_charge`): Codex
+  // B3(c)'s `_hasTerminal` legitimately performs a BOUNDED content read of its own, for lifecycle
+  // detection (does a durable terminal exist), which `_charge` now also calls -- a deliberately
+  // separate concern from the fstat-only SIZE accounting this test protects (see quota.js's
+  // `_hasTerminal` comment). Stubbing readOwnedSegments to throw and then calling `grant()`
+  // wholesale would trip over that unrelated, intentional read instead of proving this invariant.
   const pathsMod = require('../paths');
   const realReadOwnedSegments = pathsMod.readOwnedSegments;
   pathsMod.readOwnedSegments = () => {
-    throw new Error('grant must not read segment CONTENTS for size accounting');
+    throw new Error('_onDisk/_committed must not read segment CONTENTS for size accounting');
   };
-  let result;
+  let onDisk;
+  let committed;
   try {
-    result = quota.grant(home, aid, 100); // must succeed using fstat-only sizing (statOwnedSegments)
+    onDisk = quota._onDisk(home, aid); // must succeed using fstat-only sizing (statOwnedSegments)
+    committed = quota._committed(home);
   } finally {
     pathsMod.readOwnedSegments = realReadOwnedSegments;
   }
-  assert.strictEqual(result, true);
 
   const realTotal = fs.readdirSync(A.activityDir(home, aid))
     .filter((f) => f.endsWith('.jsonl'))
     .reduce((s, f) => s + fs.statSync(path.join(A.activityDir(home, aid), f)).size, 0);
-  assert.strictEqual(quota._onDisk(home, aid), realTotal);
-  assert.strictEqual(quota._committed(home), realTotal);
+  assert.strictEqual(onDisk, realTotal);
+  assert.strictEqual(committed, realTotal);
+
+  // grant() itself (readOwnedSegments restored) still works normally -- its `_charge` now also
+  // calls `_hasTerminal` for lifecycle detection, a separate bounded content read, unrelated to
+  // (and not a regression of) the fstat-only size accounting proven above.
+  assert.strictEqual(quota.grant(home, aid, 100), true);
 });
 
 test('a swapped quota/ component (symlink) makes admit refuse rather than operate through it', () => {

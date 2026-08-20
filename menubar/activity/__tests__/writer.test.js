@@ -65,12 +65,20 @@ test('full lifecycle: mint, start, event, terminal settles the ledger and releas
   assert.strictEqual(types[types.length - 1], 'terminal');
   assert.strictEqual(recs[recs.length - 1].outcome, 'succeeded');
   assert.strictEqual(recs[recs.length - 1].by, ownerToken);
-  // Ruling B: Node's quota.settle() is a documented no-op on the ledger (Python's settle
-  // unlinks the entry; Node delegates that removal to a later Python prune pass -- see
-  // quota.js's header comment and quota.test.js's own "settle is a no-op" test). So unlike the
-  // Python original, the ledger entry legitimately REMAINS on disk here -- what writer.js
-  // actually owns and must get right is that the LEASE was released.
-  assert.ok(fs.existsSync(A.ledgerEntryPath(home, w.activityId)), 'Ruling B: settle() must not remove the ledger entry');
+  // Codex B3(c): quota.settle() no longer leaves the durable terminal's reservation charged --
+  // once a terminal is durable, `_charge` excludes this entry from the outstanding sum entirely
+  // (its real bytes are already covered by the on-disk segment scan; mirrors Python's post-
+  // settle state). This replaces the old Ruling-B assertion that the entry "legitimately remains
+  // on disk" with no accounting consequence -- that was exactly the false ~60 KiB live-charge
+  // bug Codex's Phase-2 gate caught (see quota-delegation.test.js's dedicated B3(c) coverage).
+  // Whether the physical ledger JSON is ALSO actually reaped here (settle's bounded delegated
+  // prune, which needs the lease free first -- see writer.js's terminal(), and a real python3)
+  // is proven with an explicit python3 skip-guard over there; this assertion is the
+  // environment-independent core of the fix, true regardless of that reap's outcome.
+  assert.strictEqual(
+    quota._charge(home), quota._committed(home),
+    'a durable terminal must no longer be charged as outstanding (Codex B3c)',
+  );
   assert.strictEqual(lease.probe(A.ownerLockPath(home, w.activityId)), lease.FREE, 'lease released after terminal()');
 });
 

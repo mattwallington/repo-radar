@@ -430,25 +430,32 @@ class ActivityWriter {
     const res = this._emit('terminal', () => ({
       outcome, summary: this._redactFields(summary), by: this._lease.ownerToken,
     }), { reserve: true, fsync: true, slot: 'terminal' });
-    // settle and release are attempted INDEPENDENTLY so a settle failure can't strand anything:
-    // release always runs in `finally`.
+    // Codex B3(c): release the lease BEFORE settle, not after -- a deliberate DIVERGENCE from
+    // writer.py's own ordering (settle-in-try, release-in-finally), justified by an asymmetry
+    // between the two languages' settle(): Python's `quota.settle()` unlinks the ledger entry
+    // directly under `quota.lock` alone and never touches the owner.lock, so its ordering
+    // genuinely doesn't matter there. Node's `quota.settle()` cannot unlink (Ruling B) -- it
+    // proactively delegates a bounded reap to the Python prune entrypoint instead, which can only
+    // reclaim a settled ledger entry once the owner.lock is actually FREE (Node's lockf and
+    // Python's flock contend on the SAME open-file-description -- see lease.js's header comment).
+    // Spawning that reap while this writer still holds the lease would therefore find it busy and
+    // skip the entry every single time. Release is thus attempted FIRST and unconditionally (its
+    // own try/catch, never skipped); settle is attempted independently after, so a settle failure
+    // still can't strand the lease -- it's already been released by the time settle runs.
     try {
-      if (res === _DURABLE) { // settle ONLY after a durable terminal
-        try {
-          quota.settle(this._home, this.activityId);
-        } catch (e) {
-          _warn(`settle failed: ${e.message}`);
-        }
-      } else {
-        _warn('terminal not durable; leaving reservation for reconciliation');
-      }
-    } finally {
+      this._releaseLease(); // adopted -> close-only, never a force-unlock
+    } catch (e) {
+      _warn(`release failed: ${e.message}`);
+    }
+    this._active = false;
+    if (res === _DURABLE) { // settle ONLY after a durable terminal
       try {
-        this._releaseLease(); // adopted -> close-only, never a force-unlock
+        quota.settle(this._home, this.activityId);
       } catch (e) {
-        _warn(`release failed: ${e.message}`);
+        _warn(`settle failed: ${e.message}`);
       }
-      this._active = false;
+    } else {
+      _warn('terminal not durable; leaving reservation for reconciliation');
     }
   }
 

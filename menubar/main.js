@@ -2654,6 +2654,29 @@ app.whenReady().then(async () => {
       // unexpected throw here take down app.whenReady().
       surfaceRuntimeError(`unexpected ensureRuntime error: ${e.message}`);
     }
+
+    // Activity History (Codex B3a): point quota.js's delegated Python-prune spawn at the SAME
+    // managed venv interpreter + repo_radar package location the runtime block above just
+    // ensured/verified for this channel, instead of the hardcoded dev-only `python3` +
+    // source-checkout REPO_ROOT default quota.js falls back to (see quota.js's header comment on
+    // Ruling B delegation) -- that default does not exist in a packaged app. `layout(...).current`
+    // is the exact `<channelDir>/current` symlink runtime/index.js's _fastCandidate/
+    // _fullVerifyCurrent and runtime/activation.js's verifyRuntime/flipCurrent all resolve
+    // against; its target directory contains BOTH `venv/bin/python` and `repo_radar/` (see
+    // runtime/provision.js's staging layout), exactly mirroring quota.js's dev-fallback shape (a
+    // root containing `repo_radar/`, with a python binary alongside it). Configured
+    // unconditionally whenever the channel resolved -- independent of ensureRuntime's outcome
+    // above -- because activity/writer.js still records `blocked` terminals (trigger-glue.js's
+    // onGuardBlock) even when the runtime failed to provision, and quota.js's spawnSync-based
+    // delegation already fails closed + now warns (Codex B3b) on a missing/broken interpreter, so
+    // pointing it at the channel's `current` unconditionally is never worse than the previous
+    // hardcoded default.
+    const activityRuntimeLayout = layout(os.homedir(), runtimeChannel);
+    activityQuota.configurePythonRunner({
+      python: path.join(activityRuntimeLayout.current, 'venv', 'bin', 'python'),
+      cwd: activityRuntimeLayout.current,
+      env: { PYTHONPATH: activityRuntimeLayout.current },
+    });
   }
 
   buildModelNoticeController();

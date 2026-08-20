@@ -20,11 +20,24 @@
 // pass": strictly READ-ONLY (never synthesizes a terminal, never removes an entry). Only the
 // separate `reconcile.js`'s `synthesizeTerminal` (Task 2.3's handoff-crash path) WRITES, and
 // only appends a terminal record -- it too never removes the ledger entry.
+//
+// Codex Phase-2 gate, B3: two corrections layered on top of the above, still without violating
+// Ruling B (Node still performs no destructive removal itself):
+//   (a) the delegated `python -m repo_radar.activity.prune` spawn must resolve the SAME managed
+//       venv interpreter + `repo_radar` package location the rest of the packaged app uses, not a
+//       hardcoded dev-only `python3` + source-checkout root (see `configurePythonRunner` below).
+//   (b) that spawn's exit status is now inspected -- a failed delegation is surfaced via a bounded
+//       warn line (`_spawnPythonPrune`), not silently swallowed.
+//   (c) `_charge` no longer double-counts a Node-written durable terminal's reservation as
+//       outstanding (see `_hasTerminal`/`_charge` below), and `settle()` proactively (but still
+//       best-effort/never-raises) delegates a bounded reap so the physical ledger entry doesn't
+//       linger indefinitely once its owner.lock is free.
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const paths = require('./paths');
 const ids = require('./ids');
+const records = require('./records');
 
 const CEILING = 64 * 1024 * 1024;
 const RESERVE = 60 * 1024;
@@ -39,9 +52,71 @@ const CORRUPT = 'CORRUPT';
 // never throws" path, then restore it to prove the real delegation path separately. Mirrors the
 // spirit of Python's own monkeypatch-friendly module globals (e.g. prune.py's comment on reading
 // `quota.RESERVE` at call time, not bind time).
+//
+// This pair is the SOURCE-CHECKOUT DEFAULT/fallback only (Codex B3a): a bare `python3` off PATH
+// plus this repo's own root only exists in a dev/test checkout. In a packaged Electron app there
+// is no guaranteed system `python3`, and the `repo_radar` package does not live at
+// `<electron-app>/../..` -- it ships under `process.resourcesPath/resources/repo_radar` (or, once
+// the managed runtime has provisioned a generation, under that generation's own directory
+// alongside its private `venv/`; see runtime/provision.js). `configurePythonRunner` below lets
+// main.js (which alone has that Electron/packaging context) supply the REAL resolved
+// interpreter+location once at startup; these two remain the fallback used whenever that hasn't
+// happened (tests, direct `node menubar/main.js` from source, ...).
 const REPO_ROOT = path.join(__dirname, '..', '..');
 let PYTHON_BIN = 'python3';
 const PRUNE_SPAWN_TIMEOUT_MS = 30000; // bounded -- generous for a reconcile+prune pass
+const PRUNE_WARN_MAX_CHARS = 300; // bounded excerpt of a failed prune's stderr in the warn line
+
+// Codex B3(a): the packaged-aware Python runner, configured once by main.js at startup via
+// `configurePythonRunner({python, cwd, env})` -- quota.js is a pure Node module with no Electron
+// context of its own, so it cannot reach `process.resourcesPath` or the managed-venv resolver
+// (menubar/runtime/*) directly; the resolved values are threaded IN instead. `null` (the initial
+// state, and what an invalid/falsy call resets to) means "not configured" -> `_resolvePythonRunner`
+// falls back to the PYTHON_BIN/REPO_ROOT pair above, read at CALL time (not bind time) so a
+// test's PYTHON_BIN monkeypatch still applies whenever no runner has been configured.
+let _pythonRunner = null;
+
+function configurePythonRunner(runner) {
+  if (!runner || typeof runner !== 'object' || typeof runner.python !== 'string' || runner.python.length === 0) {
+    _pythonRunner = null; // un-configure -> fall back to the source-checkout default
+    return;
+  }
+  _pythonRunner = {
+    python: runner.python,
+    cwd: (typeof runner.cwd === 'string' && runner.cwd) ? runner.cwd : REPO_ROOT,
+    env: (runner.env && typeof runner.env === 'object') ? { ...runner.env } : {},
+  };
+}
+
+function _resolvePythonRunner() {
+  if (_pythonRunner) return _pythonRunner;
+  return { python: PYTHON_BIN, cwd: REPO_ROOT, env: { PYTHONPATH: REPO_ROOT } };
+}
+
+// Mirrors writer.js's own `_warn` (same prefix, same `console.error` sink) -- kept as an
+// independent copy rather than a cross-require of writer.js, which would create a require cycle
+// (writer.js already requires quota.js). See trigger-glue.js's `_splitLines` comment for the same
+// duplicate-small-helper precedent elsewhere in this subsystem.
+function _warn(msg) {
+  console.error(`repo-radar: activity: ${msg}`);
+}
+
+// Codex B3(b): a bounded, human-readable description of why a prune spawn failed, or null on
+// success. Never reads unbounded output -- stdout is discarded entirely (`stdio[1] = 'ignore'`);
+// only stderr is captured, and only a bounded excerpt of it is ever logged.
+function _describeSpawnFailure(result) {
+  if (!result) return 'no result';
+  if (result.error) return `spawn error: ${result.error.message}`;
+  if (result.signal) return `terminated by signal ${result.signal}`;
+  if (typeof result.status !== 'number') return 'no exit status (timeout or spawn failure)';
+  if (result.status !== 0) {
+    let stderr = '';
+    try { stderr = result.stderr ? result.stderr.toString('utf8').trim() : ''; } catch (e) { stderr = ''; }
+    if (stderr.length > PRUNE_WARN_MAX_CHARS) stderr = `${stderr.slice(0, PRUNE_WARN_MAX_CHARS)}...(truncated)`;
+    return `exited ${result.status}${stderr ? ` -- ${stderr}` : ''}`;
+  }
+  return null; // success
+}
 
 function _quotaLockPath(home) {
   // quota.lock sits alongside quota/ (both directly under activity/), mirroring Python's
@@ -163,10 +238,48 @@ function _ledgerEntries(home) {
   return out;
 }
 
+function _splitLines(buf) {
+  const lines = [];
+  let start = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
+  }
+  lines.push(buf.subarray(start));
+  return lines;
+}
+
+// Codex B3(c): whether activity `aid` has a durable `terminal` record in its segments. A bounded
+// CONTENT read (unlike `_onDisk`'s fstat-only sizing, which the I7 fix protects) -- but bounded to
+// at most one activity's segments per ledger entry, of which there are at most a ceiling-bounded
+// number (spec's own admission cap), so this is acceptable lifecycle-data reading, distinct from
+// the per-record sizing path. Local copy of reconcile.js's own private `_topTypes`/`_hasTerminal`
+// (duplicated rather than reaching into reconcile.js's underscore-prefixed internals -- matches
+// this codebase's established precedent; see trigger-glue.js's `_splitLines` comment) --
+// requiring reconcile.js here would also risk a require cycle surface as this subsystem grows.
+function _hasTerminal(home, aid) {
+  for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
+    for (const line of _splitLines(seg.data)) {
+      if (line.length === 0) continue;
+      const rec = records.parseValid(line, aid);
+      if (rec !== null && rec.type === 'terminal') return true;
+    }
+  }
+  return false;
+}
+
 function _charge(home) {
   let total = _committed(home);
   for (const [aid, e] of _ledgerEntries(home)) {
-    total += e === CORRUPT ? PER_ACTIVITY_CAP : Math.max(0, e.reserved + e.granted - _onDisk(home, aid));
+    if (e === CORRUPT) { total += PER_ACTIVITY_CAP; continue; }
+    // Codex B3(c): a durable terminal means this entry is SETTLED -- its real bytes are already
+    // counted by `_committed`'s segment scan, and its reservation is no longer outstanding
+    // (mirrors Python's post-`settle` state, where the entry is simply gone and counted purely by
+    // the scan). Node can't remove the entry itself (Ruling B), so it is excluded from the
+    // outstanding-charge sum here instead -- this is the fix for the measured bug: a Node-written
+    // durable terminal (contention `skipped`, guard `blocked`, handoff `failed`, ...) no longer
+    // leaves a false ~60 KiB live charge against the ceiling.
+    if (_hasTerminal(home, aid)) continue;
+    total += Math.max(0, e.reserved + e.granted - _onDisk(home, aid));
   }
   return total;
 }
@@ -177,20 +290,36 @@ function _hasCorrupt(home) {
   return _ledgerEntries(home).some(([, e]) => e === CORRUPT);
 }
 
-// Best-effort delegation to the Python prune entrypoint. NEVER throws (spawnSync doesn't throw
-// for a nonzero exit / spawn failure / timeout -- it reports via the result object, which is
-// intentionally ignored here): admit re-evaluates charge/corrupt from disk regardless of whether
-// the spawn succeeded, failed to find the binary, or timed out. `home` becomes the child's HOME
-// env var so Python's `Path.home()` (which prune.py's CLI entrypoint uses) resolves to the exact
-// same directory Node is operating on -- required for tests (a tmp dir), harmless in production
-// (already the real home).
+// Best-effort delegation to the Python prune entrypoint, via whichever runner is currently
+// resolved (Codex B3a: the configured packaged/managed-venv runner, or the source-checkout
+// PYTHON_BIN/REPO_ROOT fallback). NEVER throws (spawnSync doesn't throw for a nonzero exit /
+// spawn failure / timeout -- it reports via the result object): admit re-evaluates charge/corrupt
+// from disk regardless of whether the spawn succeeded, failed to find the binary, or timed out.
+// `home` becomes the child's HOME env var so Python's `Path.home()` (which prune.py's CLI
+// entrypoint uses) resolves to the exact same directory Node is operating on -- required for
+// tests (a tmp dir), harmless in production (already the real home).
+//
+// Codex B3(b): unlike the old fire-and-forget call, the result is now inspected -- a nonzero
+// exit, missing interpreter, signal death, or timeout is surfaced via a bounded `_warn(...)` line
+// (stdout is still discarded; only a truncated stderr excerpt is ever logged) so an operator can
+// tell WHY a corrupt ledger stays wedged, instead of the failure being silently swallowed. The
+// fail-closed behavior itself is unchanged: callers (admit/settle) still just re-evaluate from
+// disk and never see this failure as a thrown exception.
 function _spawnPythonPrune(home, headroomBytes) {
-  spawnSync(PYTHON_BIN, ['-m', 'repo_radar.activity.prune', String(Math.max(0, Math.trunc(headroomBytes)))], {
-    cwd: REPO_ROOT,
-    env: { ...process.env, PYTHONPATH: REPO_ROOT, HOME: String(home) },
-    stdio: 'ignore',
-    timeout: PRUNE_SPAWN_TIMEOUT_MS,
-  });
+  const runner = _resolvePythonRunner();
+  const result = spawnSync(
+    runner.python,
+    ['-m', 'repo_radar.activity.prune', String(Math.max(0, Math.trunc(headroomBytes)))],
+    {
+      cwd: runner.cwd,
+      env: { ...process.env, ...runner.env, HOME: String(home) },
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: PRUNE_SPAWN_TIMEOUT_MS,
+    },
+  );
+  const problem = _describeSpawnFailure(result);
+  if (problem) _warn(`python prune delegation failed: ${problem}`);
+  return result;
 }
 
 // `lease` mirrors Python's admit(home, activity_id, lease) signature for call-site symmetry
@@ -244,27 +373,42 @@ function grant(home, activityId, nbytes) {
   }
 }
 
-// Ruling B: Node cannot unlink, so settle is a NO-OP on the ledger. By the time a caller invokes
-// settle(), the durable `terminal` record has already been appended to the segment (writer.js's
-// job, mirroring writer.py's call ordering), so the entry is now "settled-pending": _onDisk
-// already covers reserved+granted for that activity, so _charge's
-// `max(0, reserved+granted-onDisk)` term for it drops to ~0 immediately -- the entry stops
-// costing anything even though it is still physically present. The next Python
-// reconcile/prune pass (admit's delegation, or a scheduled maintenance call) removes it for
-// real. Provided for API-compat with the Python surface + writer.js's call sites; intentionally
-// does not spawn Python (that would make every terminal write pay a subprocess round-trip;
-// cleanup is admit's/the scheduled path's job, not settle's).
+// Ruling B: Node cannot unlink, so settle() never removes the ledger entry ITSELF. By the time a
+// caller invokes settle(), the durable `terminal` record has already been appended to the segment
+// (writer.js's job, mirroring writer.py's call ordering), so the entry is now "settled": per the
+// Codex B3(c) fix above, `_charge`'s `_hasTerminal`-gated per-entry check now excludes it from the
+// outstanding sum entirely -- the entry stops costing anything the instant the terminal is
+// durable, exactly like Python's post-`settle` state (there, `settle()` unlinks it outright and it
+// is "counted purely by the scan"; here, it's excluded from the ledger sum instead and IS the
+// scan's job to have already counted its real bytes via `_committed`).
+//
+// Codex B3(c) "bounded reap": on top of that charge fix, settle() now proactively delegates to
+// the (packaged-aware, Codex B3a) Python prune entrypoint with `need=0` -- prune_to_ceiling's own
+// `_reconcile_all_locked` pass runs unconditionally regardless of the requested headroom (see
+// repo_radar/activity/prune.py), so this reconciles/clears settled entries without requesting any
+// extra room. This is what actually removes the physical ledger JSON promptly instead of leaving
+// it to linger until the next admission-pressure prune or a restart -- callers (writer.js's
+// `terminal()`) release the owner.lock BEFORE calling settle() specifically so this delegated
+// reconcile pass can observe the lock as free and reclaim the entry for real (Python's own
+// reconcile only clears a terminal-bearing entry once its owner is confirmably gone). Status-
+// checked (B3b) and never-raises: `_spawnPythonPrune` itself doesn't throw, but this is wrapped
+// defensively anyway, matching writer.js's own belt-and-suspenders wrapping of this call.
 function settle(home, activityId) {
-  void home;
-  void activityId;
+  void activityId; // prune reaps by headroom, not by a specific activity id (mirrors admit's own delegation)
+  try {
+    _spawnPythonPrune(home, 0);
+  } catch (e) {
+    _warn(`settle reap failed: ${e.message}`);
+  }
 }
 
 module.exports = {
   CEILING, RESERVE, PER_ACTIVITY_CAP, ORDINARY_CAP, CORRUPT,
   admit, grant, settle,
+  configurePythonRunner,
   _quotaLock, _unlock,
   _parseEntry, _readEntry, _writeEntry,
-  _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt,
+  _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _hasTerminal,
   _spawnPythonPrune,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },
