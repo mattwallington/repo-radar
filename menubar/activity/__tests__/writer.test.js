@@ -424,6 +424,47 @@ test('an event is never appended when grant refuses it (grant-before-append orde
   assert.deepStrictEqual(readAll(home, w.activityId).filter((r) => r.type === 'event'), []);
 });
 
+test('event() with an explicit null 3rd argument never raises (fix round 1, Critical)', () => {
+  // event(name, level, { detail = null, ...fields } = {}) -- destructuring `null` directly in a
+  // parameter default only falls back to `{}` when the argument is `undefined`, NOT when it is
+  // explicitly `null`; a caller passing `null` would throw `TypeError: Cannot read properties of
+  // null` BEFORE the function body (and its never-raises boundary) even begins. writer.js now
+  // destructures `opts || {}` INSIDE the body (matching control()/terminal()'s existing
+  // `Object.entries(fields || {})` guard), so `null`, `undefined`, and an omitted 3rd argument
+  // must all behave identically: no throw, empty fields, null detail.
+  const home = tmpHome();
+  const wNull = mkWriter(home);
+  wNull.start();
+  assert.doesNotThrow(() => wNull.event('x', 'info', null));
+  assert.strictEqual(wNull._active, true); // writer stays active -- the exception never escaped
+
+  const eventsNull = readAll(home, wNull.activityId).filter((r) => r.type === 'event');
+  assert.strictEqual(eventsNull.length, 1);
+  assert.deepStrictEqual(eventsNull[0].fields, {});
+  assert.strictEqual(eventsNull[0].detail, null);
+
+  // must match omitting the 3rd argument entirely (same fields/detail shape, modulo seq/ts)
+  const homeOmitted = tmpHome();
+  const wOmitted = mkWriter(homeOmitted);
+  wOmitted.start();
+  wOmitted.event('x', 'info');
+  const eventsOmitted = readAll(homeOmitted, wOmitted.activityId).filter((r) => r.type === 'event');
+  assert.strictEqual(eventsOmitted.length, 1);
+  assert.deepStrictEqual(
+    { level: eventsNull[0].level, event: eventsNull[0].event, fields: eventsNull[0].fields, detail: eventsNull[0].detail },
+    { level: eventsOmitted[0].level, event: eventsOmitted[0].event, fields: eventsOmitted[0].fields, detail: eventsOmitted[0].detail },
+  );
+
+  // and must match an explicit `undefined` 3rd argument too
+  const homeUndef = tmpHome();
+  const wUndef = mkWriter(homeUndef);
+  wUndef.start();
+  assert.doesNotThrow(() => wUndef.event('x', 'info', undefined));
+  const eventsUndef = readAll(homeUndef, wUndef.activityId).filter((r) => r.type === 'event');
+  assert.deepStrictEqual(eventsUndef[0].fields, {});
+  assert.strictEqual(eventsUndef[0].detail, null);
+});
+
 test('a non-serializable field value never raises and just drops the event', () => {
   const home = tmpHome();
   const w = mkWriter(home);

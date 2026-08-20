@@ -371,8 +371,15 @@ class ActivityWriter {
   }
 
   // Node has no `**kwargs`; `{ detail = null, ...fields }` is the destructuring stand-in for
-  // writer.py's `event(self, name, level, detail=None, **fields)`.
-  event(name, level, { detail = null, ...fields } = {}) {
+  // writer.py's `event(self, name, level, detail=None, **fields)`. Destructured INSIDE the body
+  // (not in the signature) with an `opts || {}` guard, matching control()/terminal()'s existing
+  // `Object.entries(fields || {})` pattern: destructuring `null` directly in a parameter default
+  // only falls back to `{}` when the argument is `undefined`, NOT when it's explicitly `null` --
+  // `event(name, level, null)` would otherwise throw `TypeError: Cannot read properties of null`
+  // before the never-raises boundary even begins, escaping straight into the caller (fix-round-1
+  // Critical).
+  event(name, level, opts = {}) {
+    const { detail = null, ...fields } = opts || {};
     const res = this._emit('event', () => ({
       level, event: name,
       fields: this._redactFields(fields),
