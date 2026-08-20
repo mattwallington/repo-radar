@@ -216,8 +216,20 @@ class ActivityWriter {
   // _NOTHING / _WROTE / _DURABLE. No lock: see the module header comment for why writer.py's
   // RLock + under-lock `_active` re-check are not ported (single-threaded, fully synchronous --
   // no call can interleave mid-body).
-  _emit(kind, build, { reserve = false, fsync = false, slot = null } = {}) {
-    if (!this._active) return _NOTHING;
+  _emit(kind, build, { reserve = false, fsync = false, slot = null, allowHandedOff = false } = {}) {
+    // Task 2.3 addition: `allowHandedOff` is a narrow, opt-in exception used by EXACTLY one
+    // caller -- control('cancel_requested') -- so Electron can still durably record cancel
+    // intent after dropLocalReference() has deactivated ordinary writing (post-handoff,
+    // `_handedOff` true / `_active` false). Every other call site (start/ownership/event/
+    // non-cancel control/terminal) omits it, so it gets the ORIGINAL unconditional `_active`
+    // gate, unchanged -- in particular terminal() never passes it, so "terminal() is a no-op
+    // after handoff" still holds exactly as before. `_handedOff` is set ONLY by
+    // dropLocalReference() (a real terminal() finalization never sets it), so this exception
+    // can never reopen writing after a genuine terminal settle -- only after a parent-side
+    // hand-off, which is exactly the "controller-only" state cancel is meant to keep working
+    // through (writer.js has no direct Python analog for this; see the class-level comment on
+    // dropLocalReference()/_handedOff).
+    if (!this._active && !(allowHandedOff && this._handedOff)) return _NOTHING;
     if (slot !== null) { // one-shot check (finding 2)
       if (this._reserveUsed[slot]) return _NOTHING;
       this._reserveUsed[slot] = true;
@@ -394,7 +406,7 @@ class ActivityWriter {
     if (name === 'cancel_requested') {
       if (!this._cancelAuthority) return; // exclusive authority
       this._emit('control', () => ({ name, fields: this._redactFields(fields) }),
-        { reserve: true, fsync: true, slot: 'cancel' });
+        { reserve: true, fsync: true, slot: 'cancel', allowHandedOff: true });
     } else { // non-cancel = ordinary (grant-based)
       this._emit('control', () => ({ name, fields: this._redactFields(fields) }));
     }

@@ -594,6 +594,63 @@ test('dropLocalReference() on an inactive/never-active writer is a safe no-op', 
   assert.strictEqual(w._handedOff, false); // nothing to hand off -- never claims a handoff happened
 });
 
+// --- Task 2.3: control('cancel_requested') survives dropLocalReference() (allowHandedOff) -------
+// trigger-glue.js's onCancel() needs cancel_requested to still be recordable AFTER Electron has
+// handed off to a spawned child (the overwhelmingly common real-world timing: ack typically
+// happens within milliseconds of spawn, long before a user could click Stop). writer.js's _emit
+// gate now has a narrow, opt-in `allowHandedOff` exception used by EXACTLY this one caller; every
+// other _emit call site (start/ownership/event/non-cancel control/terminal) is unaffected.
+
+test('control(cancel_requested) still records after dropLocalReference() -- post-handoff cancel authority persists (Task 2.3)', () => {
+  const home = tmpHome();
+  const w = mkWriter(home);
+  w.start();
+  assert.doesNotThrow(() => w.dropLocalReference());
+  assert.strictEqual(w._handedOff, true);
+  assert.strictEqual(w._active, false);
+
+  w.control('cancel_requested');
+
+  const recs = readAll(home, w.activityId);
+  assert.ok(
+    recs.some((r) => r.type === 'control' && r.name === 'cancel_requested'),
+    'cancel_requested must be durably recorded even after the writer has handed off',
+  );
+});
+
+test('ordinary control()/event() stay no-ops after dropLocalReference() -- only cancel gets the exception', () => {
+  const home = tmpHome();
+  const w = mkWriter(home);
+  w.start();
+  w.dropLocalReference();
+  const before = readAll(home, w.activityId).length;
+
+  w.control('some-other-control');
+  w.event('x', 'info');
+  w.terminal('succeeded'); // regression: terminal() must remain a no-op after handoff, unchanged
+
+  const after = readAll(home, w.activityId).length;
+  assert.strictEqual(after, before, 'non-cancel emits must remain suppressed post-handoff');
+});
+
+test('cancel authority stays exclusive to the minter after handoff -- an adopted writer still cannot cancel', () => {
+  const home = tmpHome();
+  const minter = mkWriter(home);
+  minter.start();
+  const dupFd = fs.openSync(`/dev/fd/${minter._lease.fd}`, 'r+');
+  const adopter = new ActivityWriter(home, {
+    kind: 'sync', channel: 'stable', trigger: 'cli', producer: 'dispatcher',
+    inheritedId: minter.activityId, inheritedFd: dupFd, ownerToken: minter._lease.ownerToken,
+  });
+  adopter.dropLocalReference();
+  const before = readAll(home, minter.activityId).length;
+
+  adopter.control('cancel_requested');
+
+  const after = readAll(home, minter.activityId).length;
+  assert.strictEqual(after, before, 'a non-minter writer must never record cancel_requested, handed-off or not');
+});
+
 test('handOffEnv() shape and inactive-writer emptiness', () => {
   const home = tmpHome();
   const w = mkWriter(home);

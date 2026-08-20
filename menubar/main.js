@@ -17,6 +17,10 @@ const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
+// Activity History (Task 2.3): Electron-free trigger-glue wired into triggerSync()/stop-sync
+// below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
+const activityGlue = require('./activity/trigger-glue');
+const activityQuota = require('./activity/quota');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -1077,7 +1081,23 @@ function startStatusServer() {
 // Trigger sync
 function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {}) {
   const options = { showWindow, trigger, notBefore };
+
+  // Activity History (Task 2.3): establish activity identity + lease + `start` FIRST, before any
+  // gate below (identity-before-first-gate) -- so a contention/guard-block rejection still
+  // produces a real Activity History item (skipped/blocked) rather than vanishing silently.
+  // beginManualActivity() never throws; a refused/failed mint just yields an inactive writer
+  // whose methods are safe no-ops, so this can never change whether the sync itself proceeds.
+  // `trigger || 'manual'` mirrors the SAME fallback already used a few lines below for
+  // shellEnv.REPO_RADAR_TRIGGER -- the ordinary "Sync Now" tray click calls triggerSync() with no
+  // args at all, so the destructured `trigger` is `null` there; the `start` record's `trigger`
+  // field is schema-required to be a string, so passing the raw `null` through would silently
+  // fail to record a start (and therefore never record activity history) for that primary path.
+  const activity = activityGlue.beginManualActivity(os.homedir(), {
+    channel: runtimeChannel, trigger: trigger || 'manual',
+  });
+
   if (currentSyncProcess) {
+    activityGlue.onContention(activity.writer, 'already-syncing');
     return; // Already syncing
   }
 
@@ -1103,6 +1123,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('terminal-output', `\n⚠️ ${reason}\n`);
       }
+      activityGlue.onGuardBlock(activity.writer, reason);
       return;
     }
   }
@@ -1278,6 +1299,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   if (options && options.notBefore) shellEnv.REPO_RADAR_CATCHUP_NOT_BEFORE = options.notBefore;
   shellEnv.REPO_RADAR_CHANNEL = runtimeChannel;
 
+  // Activity History (Task 2.3): hand the activity's identity/owner-token/lease-fd-number to the
+  // child via env (handOffEnv() is empty for an inactive/refused writer, so this is a no-op
+  // then). The lock FD ITSELF is passed separately below via `lockFd` for fd-inheritance --
+  // Task 2.4 maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD to that child-side fd
+  // number; runtime.runSync() does not yet consume either (inert until then).
+  Object.assign(shellEnv, activity.writer.handOffEnv());
+
   // Sync disabled: either the build channel couldn't be resolved, or
   // ensureRuntime() failed during startup (see app.whenReady()). Surface the
   // same way a failed spawn would have, rather than silently doing nothing.
@@ -1293,6 +1321,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
     }
+    activityGlue.onGuardBlock(activity.writer, reason);
     return;
   }
 
@@ -1319,8 +1348,16 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     channel: runtimeChannel,
     env: shellEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
-    onChild: (child) => {
+    // Activity History (Task 2.3): forward the held lease fd for fd-inheritance. Not yet
+    // consumed by runSync() itself (Task 2.4's job to map it to child fd 4) -- inert today.
+    lockFd: activity.lockFd,
+    onChild: async (child) => {
       currentSyncProcess = child;
+      // Activity History (Task 2.3): tag the child with its activity writer so the separate
+      // `stop-sync` IPC handler (a persistent top-level listener with no access to this
+      // invocation's local `activity`) can find it later. Rides along with currentSyncProcess's
+      // own existing lifecycle -- no new module-level state to keep in sync with it.
+      currentSyncProcess._activityWriter = activity.writer;
       logSyncState('process-spawned');
 
       // Capture output for the UI + in-memory status
@@ -1465,6 +1502,17 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           updateTrayMenu();
         }
       });
+
+      // Activity History (Task 2.3): best-effort, bounded (<=5s) wait for the child's ack or
+      // exit. Deliberately AFTER all the listener wiring above, so the existing close/error/data
+      // handling is registered synchronously exactly as before -- this hand-off wait runs
+      // CONCURRENTLY with (not instead of) the sync actually happening, never kills a healthy
+      // child, and never blocks/alters the sync itself.
+      try {
+        await activityGlue.handOff({ writer: activity.writer, child, home: os.homedir() });
+      } catch (e) {
+        console.error('activity hand-off failed:', e);
+      }
     },
   }).catch((e) => {
     if (e && e.code === 75) {
@@ -1478,6 +1526,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           body: 'A sync is already running.'
         }).show();
       }
+      // Activity History (Task 2.3): the child never spawned, so Electron is the sole holder --
+      // same "manual contention is Electron's alone" authority as the already-syncing guard
+      // above, just discovered later (after the root exec lock rejected us).
+      activityGlue.onContention(activity.writer, 'root-busy');
       return;
     }
 
@@ -1497,6 +1549,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
 
     showErrorIcon();
     updateTrayMenu();
+    // Activity History (Task 2.3): no child ever ran -- Electron finalizes this attempt itself.
+    activity.writer.terminal('failed');
   });
 }
 
@@ -2133,8 +2187,10 @@ ipcMain.on('stop-sync', (event) => {
   });
   
   try {
-    // Try graceful SIGTERM first
-    currentSyncProcess.kill('SIGTERM');
+    // Activity History (Task 2.3): record cancel-intent BEFORE the graceful SIGTERM below, then
+    // send that SAME first SIGTERM through onCancel (not a second, separate kill call) so the
+    // existing SIGKILL/system-kill escalation timers further down are completely unchanged.
+    activityGlue.onCancel({ writer: currentSyncProcess._activityWriter, child: currentSyncProcess });
     console.log('Sent SIGTERM to sync process');
     
     // Check if process responded after 1 second
@@ -2613,6 +2669,19 @@ app.whenReady().then(async () => {
     // stable's schedule and stable's lastSync and launch a paid dev catch-up for an occurrence it
     // does not own — after which the stable app may still run the real one.
     if (runtimeChannel === SCHEDULING_CHANNEL) checkMissedSync();
+
+    // Activity History (Task 2.3): reconcile once at startup, so an activity left `start`-only
+    // by a prior crash (of Electron itself, or of a handed-off worker while we were closed) gets
+    // settled instead of sitting "running" forever. Node's activity subsystem deliberately never
+    // does this full-sweep reconciliation itself (Ruling B: Node only ever appends, via the
+    // single-activity reconcile.synthesizeTerminal path trigger-glue.js's handOff() uses) --
+    // ALL multi-activity reconcile-then-clear passes are delegated to the same Python
+    // `prune.py` entrypoint admit() already spawns on demand, which reconciles-all under one
+    // held quota.lock BEFORE it ever prunes. Headroom 0 asks it to reconcile without requesting
+    // any extra room, so it prunes only if something is already over the ceiling. Best-effort,
+    // synchronous (spawnSync, like every other prune delegation in this subsystem) and never
+    // throws; wrapped defensively anyway per this block's own established pattern.
+    try { activityQuota._spawnPythonPrune(os.homedir(), 0); } catch (e) { /* best-effort */ }
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes
