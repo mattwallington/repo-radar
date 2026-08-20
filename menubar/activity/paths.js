@@ -14,6 +14,7 @@
 // entrypoint (descriptor-relative, race-free) in a later task.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const ids = require('./ids');
 
 const PRODUCERS = new Set(['electron', 'dispatcher', 'python']);
@@ -199,8 +200,221 @@ function secureOpenAppend(targetPath, mode = 0o600) {
   );
 }
 
+// Task 2.2b additions: generic read/list/atomic-write primitives that repo_radar/activity/
+// paths.py already has (read_owned_segments, stat_owned_segments, read_owned_file,
+// list_owned_entries, list_owned_subdirs) plus one Node-only addition (writeOwnedFileAtomic,
+// standing in for Python's dir_fd-relative temp+rename since Node has no dir_fd). quota.js and
+// reconcile.js are the first Node consumers. Same validated-absolute-path style as the rest of
+// this file: no dir_fd, so every op re-validates from the owned prefix, then acts on the
+// validated path with O_NOFOLLOW on the final component. All non-destructive (Ruling B: Node
+// never unlinks a LEDGER ENTRY or SEGMENT -- see quota.js/reconcile.js); the one unlink used
+// below is exclusively for a temp file THIS function itself just created and failed to commit,
+// never for committed data.
+
+function _readFdAll(fd) {
+  const chunks = [];
+  const buf = Buffer.alloc(65536);
+  for (;;) {
+    const n = fs.readSync(fd, buf, 0, buf.length, null);
+    if (n <= 0) break;
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks);
+}
+
+// Enumerate + read files under an owned dir, never following a symlinked component or entry.
+// Returns [{name, data (Buffer), size, mtime (seconds, matching Python's st_mtime)}]; [] if
+// missing/unsafe. Mirrors `paths.read_owned_segments` (content read -- used where the actual
+// bytes are needed, e.g. reconcile.js's lifecycle parsing).
+function readOwnedSegments(directory, suffix = '.jsonl') {
+  let dir;
+  try {
+    dir = _validateOwnedDir(directory);
+  } catch (e) {
+    return [];
+  }
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    if (!name.endsWith(suffix)) continue;
+    const p = path.join(dir, name);
+    let fd;
+    try {
+      fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (e) {
+      continue; // symlink (ELOOP) / gone / denied
+    }
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) continue; // FIFO / directory / device
+      out.push({ name, data: _readFdAll(fd), size: st.size, mtime: st.mtimeMs / 1000 });
+    } catch (e) {
+      continue; // TOCTOU: entry deleted/swapped mid-scan
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  return out;
+}
+
+// Like readOwnedSegments but METADATA ONLY -- never reads content, so quota's per-event size
+// accounting never has to reread a whole segment (up to the ceiling) while holding quota.lock.
+// Mirrors `paths.stat_owned_segments` (the I7 fix). Returns [{name, size}].
+function statOwnedSegments(directory, suffix = '.jsonl') {
+  let dir;
+  try {
+    dir = _validateOwnedDir(directory);
+  } catch (e) {
+    return [];
+  }
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    if (!name.endsWith(suffix)) continue;
+    const p = path.join(dir, name);
+    let fd;
+    try {
+      fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (e) {
+      continue;
+    }
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile()) continue;
+      out.push({ name, size: st.size });
+    } catch (e) {
+      continue;
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  return out;
+}
+
+// Read one owned file's bytes via the nonblocking regular-file helper (e.g. a ledger entry).
+// Mirrors `paths.read_owned_file`.
+function readOwnedFile(filePath) {
+  const fd = openOwnedRegular(filePath, fs.constants.O_RDONLY);
+  try {
+    return _readFdAll(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Immediate entry NAMES of an owned dir -- UNFILTERED by type (a symlink/FIFO/dir name is still
+// returned as-is; no lstat classification here). Mirrors `paths.list_owned_entries`: a caller
+// doing its own per-name safety classification (quota's ledger scan) must never have a name
+// silently dropped before it gets the chance to classify it CORRUPT.
+function listOwnedEntries(directory, suffix) {
+  let dir;
+  try {
+    dir = _validateOwnedDir(directory);
+  } catch (e) {
+    return [];
+  }
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    return [];
+  }
+  return suffix === undefined ? names : names.filter((n) => n.endsWith(suffix));
+}
+
+// Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors
+// `paths.list_owned_subdirs`.
+function listOwnedSubdirs(base) {
+  let dir;
+  try {
+    dir = _validateOwnedDir(base);
+  } catch (e) {
+    return [];
+  }
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (e) {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    try {
+      if (fs.lstatSync(path.join(dir, name)).isDirectory()) out.push(name);
+    } catch (e) {
+      continue; // TOCTOU: entry deleted/swapped mid-scan
+    }
+  }
+  return out;
+}
+
+// Durable atomic create-or-replace of `name` under an owned `directory`: validated dir, temp
+// file (O_EXCL|O_NOFOLLOW so it can't land on a symlink), full-write loop, fsync, atomic
+// rename-over (Node has no dir_fd, so this is a validated-absolute-path rename rather than a
+// descriptor-relative one -- same residual TOCTOU tradeoff as the rest of this file, accepted
+// because the op is non-destructive to any EXISTING committed file: a redirected write creates
+// or replaces data, it does not delete anything), then fsync the containing directory so the
+// rename itself is durable. Temp-file cleanup on any failure -- that unlink targets ONLY the
+// temp file this call just created (never committed data; see the Ruling-B note above). Throws
+// on failure (UnsafePath / OSError-equivalent); callers fail closed. This is Node's answer to
+// Python's `quota._write_entry`'s dir_fd-relative temp+rename (the ONLY write path quota.js
+// uses -- Node never unlinks a ledger entry, only creates/replaces one).
+function writeOwnedFileAtomic(directory, name, data, mode = 0o600) {
+  const dir = _validateOwnedDir(directory); // throws UnsafePath / ENOENT -- propagate
+  const tmpName = `.${name}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const tmpPath = path.join(dir, tmpName);
+  const finalPath = path.join(dir, name);
+
+  const fd = fs.openSync(
+    tmpPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+    mode,
+  );
+  try {
+    let offset = 0;
+    while (offset < data.length) {
+      const n = fs.writeSync(fd, data, offset, data.length - offset);
+      if (n <= 0) throw new Error('zero-byte write'); // no infinite loop
+      offset += n;
+    }
+    fs.fsyncSync(fd);
+  } catch (e) {
+    fs.closeSync(fd);
+    try { fs.unlinkSync(tmpPath); } catch (_e2) { /* best-effort temp cleanup */ }
+    throw e;
+  }
+  fs.closeSync(fd);
+
+  try {
+    fs.renameSync(tmpPath, finalPath); // atomic create-or-replace
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch (_e2) { /* best-effort temp cleanup */ }
+    throw e;
+  }
+
+  let dfd;
+  try {
+    dfd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
+    fs.fsyncSync(dfd); // durable rename (dir entry)
+  } finally {
+    if (dfd !== undefined) fs.closeSync(dfd);
+  }
+}
+
 module.exports = {
   UnsafePath,
   activityDir, segmentPath, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
+  readOwnedSegments, statOwnedSegments, readOwnedFile,
+  listOwnedEntries, listOwnedSubdirs, writeOwnedFileAtomic,
 };

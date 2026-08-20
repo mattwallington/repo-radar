@@ -327,9 +327,42 @@ function encodedLen(record) {
   return encodeRecord(record).length;
 }
 
+// Task 2.2b addition: the READ-side counterpart to buildRecord/encodeRecord, needed by
+// reconcile.js's lifecycle checks (_hasStart/_hasTerminal/_cancelRequested parse EXISTING
+// segments rather than building new records). Mirrors `records.parse_valid` -- THE canonical
+// validator: parse one JSONL line and return the record ONLY if it is a SUPPORTED v1 record FOR
+// the expected activity with valid base metadata, required fields, AND type-specific enums.
+// Anything else -> null. A stray/nested/foreign/malformed record (wrong outcome, wrong
+// activity_id, unsupported schema, missing field) therefore never counts.
+//
+// `raw` may be a Buffer (the normal case -- callers read segments as raw bytes, matching
+// Python's `bytes.split(b"\n")`) or a string. Node's `JSON.parse` already rejects the bare
+// NaN/Infinity/-Infinity tokens Python's custom `parse_constant` exists to reject (Round-6 #2),
+// so no extra handling is needed there; the `1e400`-overflow case (I6) is caught downstream by
+// `_flatPrimitiveMap`'s `Number.isFinite` check on fields/summary values, exactly like Python's
+// `math.isfinite` guard in `_flat_primitive_map`.
+function parseValid(raw, expectedActivityId) {
+  let obj;
+  try {
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : raw;
+    obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+  if (obj.schema_version !== SCHEMA_VERSION || obj.activity_id !== expectedActivityId) return null;
+  try {
+    _validate(obj); // FULL v1 shape validation, same function buildRecord uses
+  } catch (e) {
+    if (e instanceof InvalidRecord) return null;
+    throw e;
+  }
+  return obj;
+}
+
 module.exports = {
   SCHEMA_VERSION, MAX_KEYS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_FIELDS_BYTES,
   MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
   RecordTooLarge, InvalidRecord,
-  buildRecord, encodeRecord, encodedLen,
+  buildRecord, encodeRecord, encodedLen, parseValid,
 };
