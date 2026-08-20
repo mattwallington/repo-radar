@@ -1302,8 +1302,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   // Activity History (Task 2.3): hand the activity's identity/owner-token/lease-fd-number to the
   // child via env (handOffEnv() is empty for an inactive/refused writer, so this is a no-op
   // then). The lock FD ITSELF is passed separately below via `lockFd` for fd-inheritance --
-  // Task 2.4 maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD to that child-side fd
-  // number; runtime.runSync() does not yet consume either (inert until then).
+  // runtime.runSync() (Task 2.4) maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD
+  // to that child-side fd number.
   Object.assign(shellEnv, activity.writer.handOffEnv());
 
   // Sync disabled: either the build channel couldn't be resolved, or
@@ -1348,8 +1348,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     channel: runtimeChannel,
     env: shellEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
-    // Activity History (Task 2.3): forward the held lease fd for fd-inheritance. Not yet
-    // consumed by runSync() itself (Task 2.4's job to map it to child fd 4) -- inert today.
+    // Activity History (Task 2.3/2.4): forward the held lease fd for fd-inheritance. runSync()
+    // maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD to that child-side number.
     lockFd: activity.lockFd,
     onChild: async (child) => {
       currentSyncProcess = child;

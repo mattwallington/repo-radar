@@ -8,7 +8,17 @@ const { layout, cliPath } = require('./paths');
 // against the resolved generation (inheriting the locked fd 9 for the child's life).
 // `channel` is baked in; everything else resolves at run time. `tail` is the args
 // appended to the launcher invocation (sync mode adds `sync --status-server`).
-function _script(channel, tail) {
+//
+// Activity History (Task 2.4, fix round 1): `withActivity` scopes the ENTIRE activity
+// lifecycle (mint-or-inherit, bootstrap, contention/guard-failure finalize, last-resort) to the
+// SYNC RUNNER only (`emitRunSync`) -- the generic CLI dispatcher (`emitCliDispatcher`, used by
+// the live user-facing `repo-radar`/`repo-radar-dev` commands for EVERY subcommand, not just
+// `sync`) must NOT mint a phantom "sync" activity for `repo-radar --version`/`analyze`/
+// `configure`/`clean`/etc -- cli.py only calls sync_mode for the literal `sync` subcommand
+// (Tasks 2.5/2.6), so a shell-forced activity there would start and never terminate. When
+// `withActivity` is false, this generates NONE of the activity additions -- exactly the
+// pre-Task-2.4 script (root exec-lock fd-9, fd-3 handshake, verify/dev-guard, exec python).
+function _script(channel, tail, { withActivity = false } = {}) {
   // dev must not touch the shared data plane unless stable is provably managed AND healthy
   // (Codex I3). Runs UNDER the root lock (no TOCTOU) and validates stable via its OWN
   // anchored verify.py — NOT ~/.local/bin/repo-radar presence (that IS the managed stable
@@ -68,28 +78,16 @@ grep -q "\\"manifestSha\\": *\\"$SMSHA\\"" "$SDES" || { echo "repo-radar-dev: st
 "$SGEN/venv/bin/python" "$SGEN/verify.py" "$SGEN" "$SDES" "$SGEN/manifest.json" \\
   || { echo "repo-radar-dev: stable runtime is not healthy; run dev in an isolated HOME" >&2; exit 1; }
 ` : '';
-  return `#!/bin/sh
-set -eu
-ROOT="$HOME/.repo-radar"
-CH="${channel}"
-# Export the channel so the Python side can scope its completion receipt: without this a dev
-# build's receipt would be written as (and could advance) the stable channel's watermark.
-export REPO_RADAR_CHANNEL="$CH"
-# Declare provenance for a direct dispatcher/CLI invocation, but never override an invoker that
-# already declared one — the LaunchAgent sets "scheduled" and that must win.
-: "\${REPO_RADAR_TRIGGER:=cli}"
-export REPO_RADAR_TRIGGER
-CUR="$ROOT/$CH/current"
-DES="$ROOT/$CH/desired.json"
-mkdir -p "$ROOT" 2>/dev/null || true
-# --- Activity History (Task 2.4): mint-or-inherit the activity lease BEFORE the root lock, so a
-# root-lock-busy reject and a later dev/verify guard failure both have identity to finalize
-# against. Manual/Electron path: REPO_RADAR_ACTIVITY_ID/_OWNER_TOKEN/_LOCK_FD already arrived via
-# env + fd-inheritance (runSync remaps the parent's held fd to child fd 4) -- inherit, never mint.
-# Scheduled/launchd/CLI path: mint our own identity and hold our own lease on fd 4 (same
-# open-then-lockf pattern as the root .exec.lock just below, on a private fd/file). Every step is
-# set -e-safe (guarded by if/&&, never a bare failing statement) and best-effort -- activity
-# recording must never abort or delay the sync itself.
+  // Activity History (Task 2.4): mint-or-inherit the activity lease BEFORE the root lock, so a
+  // root-lock-busy reject and a later dev/verify guard failure both have identity to finalize
+  // against. Manual/Electron path: REPO_RADAR_ACTIVITY_ID/_OWNER_TOKEN/_LOCK_FD already arrived
+  // via env + fd-inheritance (runSync remaps the parent's held fd to child fd 4) -- inherit,
+  // never mint. Scheduled/launchd/CLI path: mint our own identity and hold our own lease on fd 4
+  // (same open-then-lockf pattern as the root .exec.lock just below, on a private fd/file). Every
+  // step is set -e-safe (guarded by if/&&, never a bare failing statement) and best-effort --
+  // activity recording must never abort or delay the sync itself. `withActivity`-gated: see the
+  // doc comment above _script().
+  const actMint = withActivity ? `# --- Activity History (Task 2.4): mint-or-inherit the activity lease ---
 _ACT_MINTED=""
 if [ -z "\${REPO_RADAR_ACTIVITY_ID:-}" ]; then
   _AID="$(/usr/bin/uuidgen 2>/dev/null | tr 'A-F' 'a-f' || true)"
@@ -136,9 +134,13 @@ _act_last_resort() {
   mkdir -p "$(dirname "$_ELOG")" 2>/dev/null || true
   printf '%s repo-radar: activity recording unavailable (channel=%s trigger=%s stage=%s)\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)" "$CH" "$REPO_RADAR_TRIGGER" "$1" >> "$_ELOG" 2>/dev/null || true
 }
-# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
-exec 9>"$ROOT/.exec.lock"
-if /usr/bin/lockf -t 0 9; then :; else
+` : '';
+  // Root exec-lock acquisition (fd 9) -- the acquisition mechanics (`exec 9>...`; `lockf -t 0 9`)
+  // are IDENTICAL either way; only the on-contention body differs. `withActivity=false` is the
+  // exact byte-for-byte pre-Task-2.4 one-liner. `withActivity=true` adds the scheduled-path-only
+  // `skipped` finalize (Round-3 #2: manual contention is Electron's alone -- see runSync's own
+  // reject handler).
+  const rootLockAcquire = withActivity ? `if /usr/bin/lockf -t 0 9; then :; else
   # Root-lock contention: SCHEDULED path only finalizes "skipped" here -- exactly one terminal
   # authority (Round-3 #2). The manual path leaves it to Electron's own runSync reject handler, so
   # a manual double-click never produces two terminals for the same busy attempt.
@@ -151,12 +153,10 @@ if /usr/bin/lockf -t 0 9; then :; else
   fi
   echo "repo-radar: another sync is running" >&2
   exit 75
-fi
-# handshake: signal a Node parent (runSync) that the lock is ACQUIRED, via fd 3. The
-# group + 2>/dev/null makes it a clean no-op when fd 3 isn't open (launchd/CLI/direct).
-# The worker may inherit fd 3 harmlessly; runSync only needs the one byte, not the close.
-{ printf 'L' >&3; } 2>/dev/null || true
-# Activity History (Task 2.4): scheduled-path bootstrap -- BEFORE the dev guard/verify checks
+fi` : `/usr/bin/lockf -t 0 9 || { echo "repo-radar: another sync is running" >&2; exit 75; }`;
+  // Scheduled-path bootstrap (before the dev guard/verify checks) + the guard-failure EXIT trap.
+  // `withActivity`-gated: see the doc comment above _script().
+  const actBootstrapAndTrap = withActivity ? `# Activity History (Task 2.4): scheduled-path bootstrap -- BEFORE the dev guard/verify checks
 # below, so a run later BLOCKED by those guards still gets a durable \`start\` (the motivating
 # failure: "blocked before Python ever ran" must not mean "never recorded"). Manual path: never
 # bootstrap here -- the exec'd python (cli.py/sync_mode, Tasks 2.5/2.6) is the adopter, and its
@@ -184,8 +184,30 @@ _act_guard_blocked() {
   exit "$_rc"
 }
 trap _act_guard_blocked 0
-${devGuard}_ACT_PHASE="runtime_verify"
-# --- only AFTER the lock do we resolve + verify current ---
+` : '';
+  const actPhaseReset = withActivity ? `_ACT_PHASE="runtime_verify"\n` : '';
+  return `#!/bin/sh
+set -eu
+ROOT="$HOME/.repo-radar"
+CH="${channel}"
+# Export the channel so the Python side can scope its completion receipt: without this a dev
+# build's receipt would be written as (and could advance) the stable channel's watermark.
+export REPO_RADAR_CHANNEL="$CH"
+# Declare provenance for a direct dispatcher/CLI invocation, but never override an invoker that
+# already declared one — the LaunchAgent sets "scheduled" and that must win.
+: "\${REPO_RADAR_TRIGGER:=cli}"
+export REPO_RADAR_TRIGGER
+CUR="$ROOT/$CH/current"
+DES="$ROOT/$CH/desired.json"
+mkdir -p "$ROOT" 2>/dev/null || true
+${actMint}# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
+exec 9>"$ROOT/.exec.lock"
+${rootLockAcquire}
+# handshake: signal a Node parent (runSync) that the lock is ACQUIRED, via fd 3. The
+# group + 2>/dev/null makes it a clean no-op when fd 3 isn't open (launchd/CLI/direct).
+# The worker may inherit fd 3 harmlessly; runSync only needs the one byte, not the close.
+{ printf 'L' >&3; } 2>/dev/null || true
+${actBootstrapAndTrap}${devGuard}${actPhaseReset}# --- only AFTER the lock do we resolve + verify current ---
 [ -L "$CUR" ] || { echo "repo-radar: no active runtime" >&2; exit 1; }
 GEN="$(cd "$CUR" && pwd -P)"
 # containment against the CANONICALIZED generations dir (HOME may have symlinked ancestors)
@@ -212,15 +234,20 @@ function _atomicWrite(p, content, mode) {
   fs.renameSync(tmp, p);
 }
 
-// The scheduled/manual sync runner: appends `sync --status-server`.
+// The scheduled/manual sync runner: appends `sync --status-server`. The ONLY dispatcher that
+// carries the Activity History lifecycle (Task 2.4, fix round 1) -- see _script()'s doc comment.
 function emitRunSync(home, channel) {
   const p = layout(home, channel).runSync;
   fs.mkdirSync(require('path').dirname(p), { recursive: true, mode: 0o700 });
-  _atomicWrite(p, _script(channel, ' sync --status-server'), 0o700);
+  _atomicWrite(p, _script(channel, ' sync --status-server', { withActivity: true }), 0o700);
   return p;
 }
 
-// The CLI dispatcher (`repo-radar` / `repo-radar-dev`): forwards all args verbatim.
+// The CLI dispatcher (`repo-radar` / `repo-radar-dev`): forwards all args verbatim. Deliberately
+// NOT `withActivity` -- this runs for every subcommand (`--version`, `analyze`, `configure`,
+// `clean`, `sync`, ...), and only `sync` ever establishes an activity (inside cli.py itself,
+// Tasks 2.5/2.6); minting one here for a non-sync invocation would start an activity that never
+// terminates.
 function emitCliDispatcher(home, channel) {
   const p = cliPath(home, channel);
   fs.mkdirSync(require('path').dirname(p), { recursive: true, mode: 0o700 });

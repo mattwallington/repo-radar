@@ -3,9 +3,22 @@
 // establishment to Python (bootstrap before the dev/verify guards; finalize on guard-failure/
 // root-contention), and last-resorts to the System diagnostic stream when even that can't run.
 //
-// Two layers, per the brief:
+// Fix round 1: the ENTIRE activity lifecycle is scoped to the sync runner only, via
+// `_script(channel, tail, { withActivity })`. `emitRunSync` (the sync runner) passes
+// `withActivity: true`; `emitCliDispatcher` (the generic, user-facing `repo-radar`/
+// `repo-radar-dev` CLI, which runs for EVERY subcommand -- `--version`, `analyze`, `configure`,
+// `clean`, not just `sync`) passes nothing, defaulting to `false`. Getting this wrong means
+// `repo-radar --version` mints a phantom "sync" activity that starts and never terminates
+// (cli.py only calls sync_mode for the literal `sync` subcommand).
+//
+// Three layers:
 //  (1) STRING-LEVEL assertions on the generated `_script()` text (fast, exact wording/ordering).
-//  (2) A REAL-PROCESS integration that spawns the actual generated script against a STUB `python`
+//  (2) withActivity SCOPING assertions: the CLI-dispatcher rendering (withActivity: false, both
+//      via the raw flag and via the real `emitCliDispatcher`) contains NONE of the activity
+//      additions and is BYTE-FOR-BYTE identical to the pre-Task-2.4 script; the sync-runner
+//      rendering (withActivity: true, both via the raw flag and via the real `emitRunSync`)
+//      still contains everything.
+//  (3) A REAL-PROCESS integration that spawns the actual generated script against a STUB `python`
 //      planted at the resolved generation's `venv/bin/python` (the dispatcher never searches
 //      PATH for python -- it always uses the anchored `$GEN/venv/bin/python`), so the assertions
 //      prove the ordering EXECUTES, not merely that the right substrings appear in the source.
@@ -14,21 +27,21 @@
 // records (that's repo_radar.activity.bootstrap/finalize, already covered by
 // repo_radar/tests/test_activity_entrypoints.py) and the exec'd sync worker never really becomes
 // cli.py/sync_mode (Tasks 2.5/2.6 -- not yet built, so a live adopt-and-handoff chain is Task 2.7).
-// This file proves the SHELL's own ordering/branching/env/fd plumbing only.
+// This file proves the SHELL's own ordering/branching/env/fd/scoping plumbing only.
 const test = require('node:test'); const assert = require('node:assert');
 const os = require('os'); const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
 const cp = require('child_process');
-const { _script, emitRunSync } = require('../dispatchers');
+const { _script, emitRunSync, emitCliDispatcher } = require('../dispatchers');
 const { runSync } = require('../index');
-const { layout } = require('../paths');
+const { layout, cliPath } = require('../paths');
 const { withLock } = require('../lock');
 
 // ---------------------------------------------------------------------------------------------
-// Layer 1: string-level assertions on the generated script
+// Layer 1: string-level assertions on the generated script (sync runner: withActivity: true)
 // ---------------------------------------------------------------------------------------------
 
 test('scheduled script: bootstrap precedes verify; finalize handles block AND skipped', () => {
-  const s = _script('stable', ' sync --status-server');
+  const s = _script('stable', ' sync --status-server', { withActivity: true });
   const iBootstrap = s.indexOf('activity.bootstrap');
   const iVerify = s.indexOf('verify.py');
   assert.ok(iBootstrap > 0 && iVerify > 0 && iBootstrap < iVerify, 'bootstrap precedes verify');
@@ -38,14 +51,14 @@ test('scheduled script: bootstrap precedes verify; finalize handles block AND sk
 });
 
 test('last-resort writes to the System stream, not an activity segment', () => {
-  const s = _script('stable', ' sync --status-server');
+  const s = _script('stable', ' sync --status-server', { withActivity: true });
   assert.ok(s.includes('sync.error.log'), 'last-resort goes to System diagnostics');
   assert.ok(!/activity\/[^\n]*\.jsonl/.test(s.split('last-resort')[1] || ''),
             'last-resort never appends an activity segment');
 });
 
 test('mint-or-inherit: identity export and root-lock acquisition are both gated on the SAME conditional, and bootstrap/contention-finalize are gated on _ACT_MINTED (never set on the inherited/manual path)', () => {
-  const s = _script('stable', ' sync --status-server');
+  const s = _script('stable', ' sync --status-server', { withActivity: true });
   assert.match(s, /if \[ -z "\$\{REPO_RADAR_ACTIVITY_ID:-\}" \]; then/, 'mint only when identity is absent');
   assert.match(s, /_ACT_MINTED=1/, 'mint sets the scheduled-path marker');
   // Both the root-contention finalize AND the bootstrap call are inside `if [ -n "$_ACT_MINTED" ]`
@@ -57,7 +70,7 @@ test('mint-or-inherit: identity export and root-lock acquisition are both gated 
 });
 
 test('devGuard is untouched: exact original guard messages and fd-9/fd-3 handshakes survive verbatim', () => {
-  const s = _script('dev', ' sync --status-server');
+  const s = _script('dev', ' sync --status-server', { withActivity: true });
   assert.match(s, /exec 9>"\$ROOT\/\.exec\.lock"/);
   assert.match(s, /\{ printf 'L' >&3; \} 2>\/dev\/null \|\| true/);
   assert.match(s, /repo-radar-dev: legacy stable install present; run dev in an isolated HOME/);
@@ -65,10 +78,105 @@ test('devGuard is untouched: exact original guard messages and fd-9/fd-3 handsha
   assert.match(s, /exec "\$GEN\/venv\/bin\/python" "\$GEN\/repo-radar" sync --status-server "\$@"/);
 });
 
-test('CLI dispatcher (empty tail) also carries the activity additions', () => {
-  const s = _script('stable', '');
-  assert.ok(s.indexOf('activity.bootstrap') > 0);
-  assert.match(s, /exec "\$GEN\/venv\/bin\/python" "\$GEN\/repo-radar" "\$@"/);
+// ---------------------------------------------------------------------------------------------
+// Layer 2: withActivity scoping -- the bug this fix round closes. The generic CLI dispatcher
+// (emitCliDispatcher, tail='') MUST carry NONE of the activity additions, for BOTH channels, via
+// both the raw flag and the real emitter; the sync runner (emitRunSync) MUST carry all of them.
+// ---------------------------------------------------------------------------------------------
+
+function assertNoActivity(s, label) {
+  assert.ok(!s.includes('activity.bootstrap'), `${label}: no bootstrap call`);
+  assert.ok(!s.includes('--kind sync'), `${label}: no --kind sync`);
+  assert.ok(!s.includes('_act_guard_blocked'), `${label}: no guard-blocked trap`);
+  assert.ok(!/trap .* 0/.test(s), `${label}: no EXIT trap at all`);
+  assert.ok(!s.includes('activity.finalize'), `${label}: no finalize call`);
+  assert.ok(!s.includes('sync.error.log'), `${label}: no last-resort System-stream write`);
+  assert.ok(!s.includes('REPO_RADAR_ACTIVITY_ID'), `${label}: no identity export/check at all`);
+  assert.ok(!s.includes('_ACT_MINTED'), `${label}: no mint marker`);
+  assert.ok(!s.includes('owner.lock'), `${label}: no lease file`);
+}
+
+function assertHasActivity(s, label) {
+  assert.ok(s.includes('activity.bootstrap'), `${label}: has bootstrap call`);
+  assert.ok(s.includes('--kind sync'), `${label}: has --kind sync`);
+  assert.ok(s.includes('_act_guard_blocked'), `${label}: has guard-blocked trap`);
+  assert.ok(s.includes('activity.finalize'), `${label}: has finalize call`);
+  assert.ok(s.includes('sync.error.log'), `${label}: has last-resort System-stream write`);
+  assert.ok(s.includes('REPO_RADAR_ACTIVITY_ID'), `${label}: has identity export/check`);
+}
+
+test('CLI dispatcher rendering (withActivity: false, both channels): NONE of the activity additions, via the raw flag', () => {
+  assertNoActivity(_script('stable', '', { withActivity: false }), 'stable CLI (explicit false)');
+  assertNoActivity(_script('dev', '', { withActivity: false }), 'dev CLI (explicit false)');
+});
+
+test('CLI dispatcher rendering (default, no options object at all): withActivity defaults to false', () => {
+  assertNoActivity(_script('stable', ''), 'stable CLI (default)');
+  assertNoActivity(_script('dev', ''), 'dev CLI (default)');
+});
+
+test('sync-runner rendering (withActivity: true, both channels): has every activity addition', () => {
+  assertHasActivity(_script('stable', ' sync --status-server', { withActivity: true }), 'stable sync');
+  assertHasActivity(_script('dev', ' sync --status-server', { withActivity: true }), 'dev sync');
+});
+
+test('withActivity: false is byte-for-byte identical to the pre-Task-2.4 script (both channels, both a sync-shaped and an empty tail)', () => {
+  // Pinned from git show f272808:menubar/runtime/dispatchers.js (the commit immediately before
+  // Task 2.4 landed) -- the exact pre-activity generic dispatcher, byte for byte.
+  const PRE_TASK_2_4_STABLE_CLI = `#!/bin/sh
+set -eu
+ROOT="$HOME/.repo-radar"
+CH="stable"
+# Export the channel so the Python side can scope its completion receipt: without this a dev
+# build's receipt would be written as (and could advance) the stable channel's watermark.
+export REPO_RADAR_CHANNEL="$CH"
+# Declare provenance for a direct dispatcher/CLI invocation, but never override an invoker that
+# already declared one — the LaunchAgent sets "scheduled" and that must win.
+: "\${REPO_RADAR_TRIGGER:=cli}"
+export REPO_RADAR_TRIGGER
+CUR="$ROOT/$CH/current"
+DES="$ROOT/$CH/desired.json"
+mkdir -p "$ROOT" 2>/dev/null || true
+# --- acquire the ROOT execution lock FIRST (fd 9 rides the exec'd worker) ---
+exec 9>"$ROOT/.exec.lock"
+/usr/bin/lockf -t 0 9 || { echo "repo-radar: another sync is running" >&2; exit 75; }
+# handshake: signal a Node parent (runSync) that the lock is ACQUIRED, via fd 3. The
+# group + 2>/dev/null makes it a clean no-op when fd 3 isn't open (launchd/CLI/direct).
+# The worker may inherit fd 3 harmlessly; runSync only needs the one byte, not the close.
+{ printf 'L' >&3; } 2>/dev/null || true
+# --- only AFTER the lock do we resolve + verify current ---
+[ -L "$CUR" ] || { echo "repo-radar: no active runtime" >&2; exit 1; }
+GEN="$(cd "$CUR" && pwd -P)"
+# containment against the CANONICALIZED generations dir (HOME may have symlinked ancestors)
+GENS="$(cd "$ROOT/$CH/generations" 2>/dev/null && pwd -P || echo /nonexistent)"
+case "$GEN" in "$GENS/"*) : ;; *) echo "repo-radar: runtime outside tree" >&2; exit 1 ;; esac
+[ -f "$DES" ] && [ -f "$GEN/.runtime.json" ] && [ -f "$GEN/verify.py" ] && [ -f "$GEN/manifest.json" ] \\
+  || { echo "repo-radar: runtime not managed" >&2; exit 1; }
+# ANCHOR the verifier + manifest: trusted shasum vs the app-published desired.json BEFORE
+# executing the verifier, so a swapped verify.py/manifest can't bypass tamper detection.
+VSHA="$(/usr/bin/shasum -a 256 "$GEN/verify.py" | awk '{print $1}')"
+MSHA="$(/usr/bin/shasum -a 256 "$GEN/manifest.json" | awk '{print $1}')"
+grep -q "\\"verifySha\\": *\\"$VSHA\\"" "$DES" || { echo "repo-radar: verifier hash mismatch" >&2; exit 1; }
+grep -q "\\"manifestSha\\": *\\"$MSHA\\"" "$DES" || { echo "repo-radar: manifest hash mismatch" >&2; exit 1; }
+# full healthy predicate (desired ACTIVE, identity, live payload hashes, fingerprint, installed set, pip check)
+"$GEN/venv/bin/python" "$GEN/verify.py" "$GEN" "$DES" "$GEN/manifest.json" \\
+  || { echo "repo-radar: runtime failed verification" >&2; exit 1; }
+exec "$GEN/venv/bin/python" "$GEN/repo-radar" "$@"
+`;
+  assert.strictEqual(_script('stable', '', { withActivity: false }), PRE_TASK_2_4_STABLE_CLI);
+  assert.strictEqual(_script('stable', ''), PRE_TASK_2_4_STABLE_CLI); // default (no options) matches too
+});
+
+test('emitCliDispatcher (the real emitter) writes a script with none of the activity additions; emitRunSync (the real emitter) writes one with all of them', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-actscope-'));
+  const cliPathStable = emitCliDispatcher(home, 'stable');
+  const cliPathDev = emitCliDispatcher(home, 'dev');
+  const runSyncPath = emitRunSync(home, 'stable');
+  assertNoActivity(fs.readFileSync(cliPathStable, 'utf8'), 'emitCliDispatcher stable');
+  assertNoActivity(fs.readFileSync(cliPathDev, 'utf8'), 'emitCliDispatcher dev');
+  assertHasActivity(fs.readFileSync(runSyncPath, 'utf8'), 'emitRunSync stable');
+  cp.execFileSync('/bin/sh', ['-n', cliPathStable]); // still syntactically valid
+  cp.execFileSync('/bin/sh', ['-n', runSyncPath]);
 });
 
 // ---------------------------------------------------------------------------------------------
