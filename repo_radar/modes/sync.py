@@ -45,24 +45,89 @@ from repo_radar.ui import get_short_id, format_id, send_status_update
 SYNC_LOG_RETENTION = 10
 
 
+def _activity_level(name, *, is_degraded=False, is_exhausted=False):
+    """Source-owned event severity (spec Sec 3): the level is assigned BY RULE, based on what
+    the CALLER observed actually happened -- never inferred from the event's name/category.
+    Ordinary retry/wait/recovery (including transient rate-limit + network waiting) is `info`
+    (the default -- no flags set); a completed-but-degraded outcome (a repo's metadata fell back
+    to a degraded record, a receipt failed to persist, etc.) is `warn`; an exhausted retry, a
+    timeout, or an abort is `error`. `name` is accepted (and asserted on by tests) purely so a
+    call site reads naturally -- it never affects the decision. Severity never decides outcome
+    (`_finalize_outcome` below is the only place an outcome is decided).
+    """
+    if is_exhausted:
+        return "error"
+    if is_degraded:
+        return "warn"
+    return "info"
+
+
+def _finalize_outcome(errors, warns, degraded):
+    """Map a completed run's finalization STATE to one of the seven activity terminal outcomes
+    (spec Sec 3) -- never derived from "did stderr get written" or similar. `errors` is the
+    authoritative failure count (any error present makes the whole attempt `failed`, matching
+    sync_mode's own long-standing `0 if stats['errors'] == 0 else 1` exit-code rule). Absent
+    errors, `warns` (a count) or `degraded` (a flag) -- either one -- means a defined adverse
+    completion (degraded output, or a repo skipped) happened during an otherwise-successful run,
+    which maps to `succeeded-with-warnings`. Otherwise the run was clean: `succeeded`.
+    """
+    if errors:
+        return "failed"
+    if warns or degraded:
+        return "succeeded-with-warnings"
+    return "succeeded"
+
+
 class SyncLogger:
     """Terse, line-oriented log for an individual sync run.
 
     One line per meaningful event so the file is cheap for an LLM to review.
     No progress-bar output, no ANSI codes, no duplicated per-repo chatter.
     Thread-safe — callable from the git and metadata worker pools.
+
+    Also (Task 2.6) a best-effort structured sink: once bound to an ActivityWriter via
+    `set_activity_writer`, every `event()`/`error()` ALSO emits the structured `event` record
+    (with a source-owned `level` -- see `_activity_level`) through it, under the attempt's
+    identity. The writer is itself a never-raises facade; `_emit_activity` wraps it again anyway
+    so a structured-emit failure can never break this log's own line or the sync.
     """
 
     def __init__(self, log_file):
         self.log_file = log_file
         self._lock = threading.Lock()
         self._fh = open(log_file, 'w', buffering=1)  # line-buffered
+        # Bound in AFTER construction by sync_mode (see set_activity_writer) -- None (the
+        # default) means "no activity writer available", identical to pre-Task-2.6 behavior:
+        # only the human-readable line below gets written.
+        self._writer = None
 
     def _ts(self):
         return datetime.now().strftime("%H:%M:%S")
 
-    def event(self, name, **fields):
-        """Log a single-line event: [HH:MM:SS] event_name k=v k=v"""
+    def set_activity_writer(self, writer):
+        """Bind the ActivityWriter this run established/minted. Kept as a call separate from
+        the constructor so `_open_sync_logger()`'s own signature -- and every existing test that
+        replaces it wholesale with a zero-arg stub -- stays untouched."""
+        self._writer = writer
+
+    def _emit_activity(self, level, name, detail=None, fields=None):
+        """Best-effort structured emit. Never lets a writer-side failure break the human-readable
+        line (already written by the time this runs) or the sync itself."""
+        if self._writer is None:
+            return
+        try:
+            self._writer.event(name, level, detail=detail, **(fields or {}))
+        except Exception:
+            pass
+
+    def event(self, name, level="info", detail=None, **fields):
+        """Log a single-line event: [HH:MM:SS] event_name k=v k=v
+
+        `level` is source-owned (assigned BY THE CALLER per the severity rule -- see
+        `_activity_level`), defaults to "info", and is forwarded to the activity writer's
+        structured `event` record alongside this human-readable line. No existing caller passed
+        `level`/`detail` before this, so every existing line is byte-identical to before.
+        """
         parts = [f"[{self._ts()}]", name]
         for k, v in fields.items():
             if v is None or v == "":
@@ -72,9 +137,15 @@ class SyncLogger:
         with self._lock:
             if self._fh:
                 self._fh.write(line)
+        self._emit_activity(level, name, detail=detail, fields=fields)
 
-    def error(self, name, repo=None, detail=None, **fields):
-        """Log an error event with an indented detail block (e.g. git stderr)."""
+    def error(self, name, repo=None, detail=None, level="error", **fields):
+        """Log an error event with an indented detail block (e.g. git stderr).
+
+        `level` defaults to "error" (exhausted retry/timeout/abort). The git-stderr `detail` is
+        routed to the activity writer's own `detail=` (bounded/redacted separately, a larger
+        budget) rather than stuffed into `fields` (small, strictly-bounded, primitives-only).
+        """
         parts = [f"[{self._ts()}]", name]
         if repo:
             parts.append(f"repo={repo}")
@@ -94,6 +165,10 @@ class SyncLogger:
         with self._lock:
             if self._fh:
                 self._fh.write(text)
+        error_fields = dict(fields)
+        if repo:
+            error_fields.setdefault('repo', repo)
+        self._emit_activity(level, name, detail=detail, fields=error_fields)
 
     def close(self):
         with self._lock:
@@ -136,6 +211,56 @@ def _open_sync_logger():
         return SyncLogger(log_file)
     except OSError:
         return None
+
+
+def _mint_activity_writer():
+    """Best-effort fallback: mint a fresh ActivityWriter when the caller didn't already
+    establish one via `args._activity_writer` (cli.py's adopt-or-mint dance, Task 2.5). This is
+    ONLY a mint, never an adopt -- if a dispatcher/Electron parent had already claimed the
+    lease, cli.py would have adopted it and stashed the result on `args` before ever calling
+    `sync_mode`; a caller reaching here (a direct `sync_mode(args)` invocation that skipped
+    cli.py's main() -- most of this module's own test suite, and any future direct caller) owns
+    nothing to adopt.
+
+    Never raises: `ActivityWriter` is itself a never-raises facade (any construction failure
+    yields an inactive, all-no-op writer), and the surrounding glue here is wrapped too, so a
+    completely unexpected failure degrades to "no writer" -- observability must never touch the
+    real sync. Returns None on any failure, exactly like an unavailable writer.
+    """
+    try:
+        from repo_radar.activity import ActivityWriter
+        from repo_radar.cli import _secret_values
+        home = os.environ.get('HOME')
+        return ActivityWriter(home, kind='sync', channel=resolve_channel(),
+                              trigger=resolve_trigger(default='cli'), producer='python',
+                              configured_secrets=_secret_values(load_config()))
+    except Exception:
+        return None
+
+
+def _activity_start(writer):
+    """Best-effort `.start()`. Idempotent and safe to call unconditionally (a no-op on an
+    already-started or inactive writer) -- guarded anyway so a writer-side surprise can never
+    reach the real sync (ActivityWriter itself never raises; this is cheap extra insurance)."""
+    if writer is None:
+        return
+    try:
+        writer.start()
+    except Exception:
+        pass
+
+
+def _activity_terminal(writer, outcome, **summary):
+    """Best-effort authoritative terminal write -- ONE of the seven outcomes (spec Sec 3) per
+    sync_mode exit path. Never raises: a history-write failure must never change sync's exit
+    code, alter its behavior, or drop a repo (ActivityWriter.terminal() is itself never-raises;
+    this wraps it anyway, matching `_activity_start`)."""
+    if writer is None:
+        return
+    try:
+        writer.terminal(outcome, **summary)
+    except Exception:
+        pass
 
 
 def wait_for_network(host="github.com", port=443, timeout=300, interval=2, required_successes=3, on_waiting=None):
@@ -315,9 +440,12 @@ _Metadata generation degraded before completion: {reason}_
                 }, args.status_server)
             with ctx.stats_lock:
                 ctx.stats['metadata_generated'] += 1
+                ctx.stats['degraded'] = ctx.stats.get('degraded', 0) + 1
                 ctx.stats['api_cost'] += total_api_cost
             if ctx.sync_logger:
-                ctx.sync_logger.event("metadata_degraded", repo=full_name, reason=reason)
+                ctx.sync_logger.event("metadata_degraded",
+                                      level=_activity_level("metadata_degraded", is_degraded=True),
+                                      repo=full_name, reason=reason)
 
         if needs_chunk:
             # Seam (b)+(d1): authoritative partition into sendable chunks. Every returned
@@ -921,6 +1049,15 @@ def sync_mode(args):
 
         console.print = wrapped_print
 
+    # Establish (or adopt) the activity writer BEFORE the unknown-model guard below, so even the
+    # very first possible exit records a durable incident (Task 2.6). `args._activity_writer` is
+    # set by cli.py's adopt-or-mint dance (Task 2.5) for every real `sync` invocation; a direct
+    # call that skipped cli.py (most of this module's own test suite, and any future direct
+    # caller) falls back to minting its own. Best-effort throughout -- see `_activity_start` /
+    # `_activity_terminal`; a history-write failure can never alter the sync below.
+    activity_writer = getattr(args, '_activity_writer', None) or _mint_activity_writer()
+    _activity_start(activity_writer)
+
     # Fail-closed: reject an uncatalogued model before any network wait or git work. A
     # metadata-capable run (not skip_metadata, not repos_only) will eventually call the LLM, so an
     # unknown model must be caught here -- at the very top, before the 5-minute network wait and
@@ -937,6 +1074,10 @@ def sync_mode(args):
                 f"Add it to repo_radar/model_catalog.py (MODEL_CAPS) before running sync, "
                 f"or pass --skip-metadata / --repos-only to skip metadata generation.[/red]"
             )
+            # Pre-attempt early exit, before the old per-run log even exists -- still a durable
+            # System incident: `blocked` is the same bucket as a dependency-check failure or a
+            # missing/invalid config (spec Sec 3: pre-worker guard/verification block).
+            _activity_terminal(activity_writer, 'blocked', reason='unknown_model', model=model)
             return 1
 
     console.print(f"[bold]Repository Sync[/bold]")
@@ -946,6 +1087,8 @@ def sync_mode(args):
     # UI's rich console output: one line per meaningful event, no progress bars,
     # no ANSI, rotated to the most recent runs.
     sync_logger = _open_sync_logger()
+    if sync_logger is not None:
+        sync_logger.set_activity_writer(activity_writer)
     # Provenance is DECLARED by the invoker, not guessed. The old heuristic read "is a window
     # being shown", so a genuine LaunchAgent run recorded itself as "manual" and the logs could
     # not distinguish scheduled from manual. The window heuristic remains only as the default
@@ -982,7 +1125,9 @@ def sync_mode(args):
             version=REPO_RADAR_VERSION,
         )
         if sync_logger:
-            sync_logger.event("receipt_written" if written else "receipt_failed",
+            _receipt_event = "receipt_written" if written else "receipt_failed"
+            sync_logger.event(_receipt_event,
+                              level=_activity_level(_receipt_event, is_degraded=not written),
                               trigger=run_trigger, channel=run_channel, mode=run_mode_name)
 
     if sync_logger:
@@ -1018,6 +1163,7 @@ def sync_mode(args):
                     sync_logger.event("catchup_skipped", reason="already_satisfied",
                                       satisfied_at=existing['finishedAt'])
                     sync_logger.close()
+                _activity_terminal(activity_writer, 'skipped', reason='catchup_already_satisfied')
                 # Distinct from 0: nothing was synced, so the caller must not stamp a completion
                 # timestamp for this run.
                 return EXIT_SKIPPED_NO_WORK
@@ -1033,8 +1179,11 @@ def sync_mode(args):
     if not wait_for_network(on_waiting=_notify_waiting):
         console.print(f"[red]No network connectivity. Aborting sync.[/red]")
         if sync_logger:
-            sync_logger.event("sync_aborted", reason="no_network_connectivity")
+            sync_logger.event("sync_aborted",
+                              level=_activity_level("sync_aborted", is_exhausted=True),
+                              reason="no_network_connectivity")
             sync_logger.close()
+        _activity_terminal(activity_writer, 'failed', reason='no_network_connectivity')
         if args.status_server:
             send_status_update('network-timeout', {
                 'message': 'No network connectivity'
@@ -1052,6 +1201,16 @@ def sync_mode(args):
     config = load_config()
     if not config:
         console.print(f"[red]No configuration found. Run 'configure' first.[/red]")
+        # Config-abort leak fix (Task 2.6): this early return used to leave `sync_logger` open
+        # (every other pre-work abort above closes it) and record nothing durable. Same bucket
+        # as unknown-model / a dependency-check failure (spec Sec 3: pre-worker guard/
+        # verification block) -- the run never got far enough to touch a repo.
+        if sync_logger:
+            sync_logger.event("sync_aborted",
+                              level=_activity_level("sync_aborted", is_exhausted=True),
+                              reason="no_configuration")
+            sync_logger.close()
+        _activity_terminal(activity_writer, 'blocked', reason='no_configuration')
         return 1
 
     repos = config.get('repositories', [])
@@ -1064,6 +1223,7 @@ def sync_mode(args):
             sync_logger.event("sync_complete", total=0, updated=0, cloned=0, skipped=0,
                               errors=0, metadata=0, cost="$0.0000")
             sync_logger.close()
+        _activity_terminal(activity_writer, 'succeeded', reason='no_repositories_configured')
         return 0
 
     # Create directories
@@ -1081,6 +1241,7 @@ def sync_mode(args):
         'skipped': 0,
         'errors': 0,
         'metadata_generated': 0,
+        'degraded': 0,
         'api_cost': 0.0
     }
     stats_lock = threading.Lock()
@@ -1649,9 +1810,21 @@ Stack Trace:
         completion_data['qualifiesForSchedule'] = qualifies_for_schedule(run_channel, run_mode_name)
         send_status_update('complete', completion_data, args.status_server)
 
+    # Authoritative outcome for this run: mapped from the finalization STATE (error / warn /
+    # degraded counts), never from "did stderr get written" (Task 2.6, spec Sec 3). `warns` folds
+    # in a degraded metadata record and a skipped repo -- either is a defined adverse-but-completed
+    # run, distinct from a hard failure. Computed once and reused for both the summary event's
+    # severity and the authoritative terminal below, so the two can never disagree.
+    sync_warn_count = stats.get('degraded', 0) + stats.get('skipped', 0)
+    sync_outcome = _finalize_outcome(errors=stats['errors'], warns=sync_warn_count,
+                                     degraded=sync_warn_count > 0)
+
     if sync_logger:
         sync_logger.event(
             "sync_complete",
+            level=_activity_level("sync_complete",
+                                  is_degraded=(sync_outcome == 'succeeded-with-warnings'),
+                                  is_exhausted=(sync_outcome == 'failed')),
             total=stats['total'],
             updated=stats['updated'],
             cloned=stats['cloned'],
@@ -1671,5 +1844,9 @@ Stack Trace:
 
     if sync_logger:
         sync_logger.close()
+
+    _activity_terminal(activity_writer, sync_outcome, errors=stats['errors'],
+                       warnings=sync_warn_count, cloned=stats['cloned'], updated=stats['updated'],
+                       metadata_generated=stats['metadata_generated'])
 
     return 0 if stats['errors'] == 0 else 1

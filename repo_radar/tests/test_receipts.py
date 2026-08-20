@@ -231,6 +231,11 @@ def test_zero_repo_sync_mode_execution_writes_a_receipt(tmp_path, monkeypatch):
                         lambda: {'repositories': [], 'ai_model': 'claude-opus-5'})
     monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call (no
+    # args._activity_writer, exactly this test's shape) that otherwise mints for real under the
+    # real $HOME -- neutralize it here, mirroring the _open_sync_logger stub above, so this
+    # in-process test stays hermetic (no writes outside tmp_path).
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
     monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'scheduled')
     monkeypatch.setenv(receipts_mod.CHANNEL_ENV, 'stable')
 
@@ -250,6 +255,11 @@ def test_dry_run_execution_writes_no_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
     monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call (no
+    # args._activity_writer, exactly this test's shape) that otherwise mints for real under the
+    # real $HOME -- neutralize it here, mirroring the _open_sync_logger stub above, so this
+    # in-process test stays hermetic (no writes outside tmp_path).
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
     sync_mod.sync_mode(_args(dry_run=True))
     assert read_receipt(tmp_path, 'stable') is None, "a dry run must not claim a completed sync"
 
@@ -264,6 +274,11 @@ def test_catchup_execution_skips_when_already_satisfied(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
     monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call (no
+    # args._activity_writer, exactly this test's shape) that otherwise mints for real under the
+    # real $HOME -- neutralize it here, mirroring the _open_sync_logger stub above, so this
+    # in-process test stays hermetic (no writes outside tmp_path).
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
 
     # a qualifying run landed AFTER the catch-up decision was taken
     write_receipt(tmp_path, trigger='scheduled', started_at='x', stats=STATS,
@@ -291,6 +306,11 @@ def test_catchup_execution_proceeds_when_not_satisfied(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
     monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call (no
+    # args._activity_writer, exactly this test's shape) that otherwise mints for real under the
+    # real $HOME -- neutralize it here, mirroring the _open_sync_logger stub above, so this
+    # in-process test stays hermetic (no writes outside tmp_path).
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
     monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
     # the only receipt predates the decision watermark, so it cannot satisfy this catch-up
     write_receipt(tmp_path, trigger='scheduled', started_at='x', stats=STATS,
@@ -353,6 +373,7 @@ def test_guard_ignores_a_stale_qualification_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(sync_mod, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(sync_mod, "load_config", lambda: {"repositories": []})
     monkeypatch.setattr(sync_mod, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(sync_mod, "_mint_activity_writer", lambda: None)
     monkeypatch.setattr(sync_mod, "wait_for_network", lambda **kw: True)
     monkeypatch.setenv(receipts_mod.TRIGGER_ENV, "catchup")
     monkeypatch.setenv(receipts_mod.CHANNEL_ENV, "dev")
@@ -377,6 +398,11 @@ def test_guard_rejects_a_corrupt_timestamp_instead_of_declining_work(tmp_path, m
     monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
     monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call (no
+    # args._activity_writer, exactly this test's shape) that otherwise mints for real under the
+    # real $HOME -- neutralize it here, mirroring the _open_sync_logger stub above, so this
+    # in-process test stays hermetic (no writes outside tmp_path).
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
     monkeypatch.setattr(sync_mod, 'wait_for_network', lambda **kw: True)
     monkeypatch.setenv(receipts_mod.TRIGGER_ENV, 'catchup')
     monkeypatch.setenv('REPO_RADAR_CATCHUP_NOT_BEFORE', '2026-07-29T22:00:00+00:00')

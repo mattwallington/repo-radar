@@ -30,6 +30,10 @@ def _quiet(monkeypatch, tmp_path):
     monkeypatch.setattr(sync_mod, 'CONFIG_DIR', tmp_path)
     monkeypatch.setattr(sync_mod, 'load_config', lambda: {'repositories': []})
     monkeypatch.setattr(sync_mod, '_open_sync_logger', lambda: None)
+    # Task 2.6 added a fallback activity-writer mint for a direct sync_mode() call with no
+    # args._activity_writer (exactly this fixture's shape) that otherwise mints for real under
+    # the real $HOME -- neutralize it here so this in-process test stays hermetic.
+    monkeypatch.setattr(sync_mod, '_mint_activity_writer', lambda: None)
 
 
 def test_unknown_model_is_rejected_before_the_network_wait(monkeypatch, tmp_path):
