@@ -114,4 +114,13 @@ function synthesizeTerminal(home, aid) {
   }
 }
 
-module.exports = { RECONCILER, synthesizeTerminal };
+// Task 2.2c addition: writer.js needs the SAME read-only "does a durable start record already
+// exist for this activity" check quota.py's `_has_start` provides on the Python side --
+// writer.py's adopt-vs-first-producer detection (`self._first_producer = not
+// quota._has_start(home, inherited_id)`) and its `_durably_started()` upstream-adopt check both
+// depend on it. Node's quota.js deliberately has NO such function (Ruling B keeps Node's quota
+// surface to admit/grant/settle plus a strictly-read-only `_charge`/`_hasCorrupt` accounting
+// pass -- see quota.js's header comment), but reconcile.js already computes exactly this via
+// `_topTypes` for its own `synthesizeTerminal` gate. Exporting the existing private helper here
+// (no behavior change) avoids writer.js duplicating the segment-scan logic.
+module.exports = { RECONCILER, synthesizeTerminal, _hasStart };
