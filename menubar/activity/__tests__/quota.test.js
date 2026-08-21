@@ -72,7 +72,7 @@ test('admit writes a {reserved, granted} JSON ledger entry; settle leaves it in 
   assert.ok(fs.existsSync(A.ledgerEntryPath(home, aid)), 'settle must not remove an entry with no durable terminal / a still-held lease');
 });
 
-test('B3(c): a durable terminal makes _charge drop that entry\'s outstanding reserve+granted to 0 (the measured ~60 KiB false charge)', () => {
+test('Codex R2: a durable terminal ALONE (no reap yet) does NOT zero _charge -- the old _hasTerminal visibility-exclusion is removed; only settle()\'s reap (which removes the ledger entry -- see quota-delegation.test.js\'s full-lifecycle B3(c) test) can', () => {
   const home = tmpHome();
   const [aid, l] = newActivity(home);
   assert.strictEqual(quota.admit(home, aid, l), true);
@@ -84,13 +84,21 @@ test('B3(c): a durable terminal makes _charge drop that entry\'s outstanding res
   assert.ok(before - committedBefore > 50000, `outstanding should be on the order of the ~60 KiB RESERVE (got ${before - committedBefore})`);
 
   writeTerminalRecord(home, aid);
-  assert.strictEqual(quota._hasTerminal(home, aid), true);
+  assert.strictEqual(quota._hasTerminal(home, aid), true, 'the terminal is visible on disk');
+  assert.ok(fs.existsSync(A.ledgerEntryPath(home, aid)), 'terminal VISIBILITY alone must not reap the entry');
 
+  // Codex R2: terminal visibility is not settlement (Codex's own ruling) -- with no reap, this
+  // entry is still live and must be charged conservatively: committed bytes (now including the
+  // terminal's own bytes) PLUS whatever of reserved+granted isn't yet on disk. This is exactly
+  // the single-scan formula max(size, reserved+granted), never an exclusion down to 0.
+  const onDisk = quota._onDisk(home, aid);
+  const expectedOutstanding = Math.max(0, quota.RESERVE + 1000 - onDisk);
   const after = quota._charge(home);
   assert.strictEqual(
-    after, quota._committed(home),
-    'a durable terminal is SETTLED: 0 outstanding, counted purely by the on-disk scan (mirrors Python\'s post-settle state)',
+    after, quota._committed(home) + expectedOutstanding,
+    'a visible-but-not-reaped terminal must still charge conservatively (max(size, reserved+granted)), never drop to 0',
   );
+  assert.ok(expectedOutstanding > 0, 'sanity: this scenario is genuinely still outstanding, not a coincidental 0');
 });
 
 test('_hasTerminal reflects a durable terminal record on disk, not merely a start', () => {

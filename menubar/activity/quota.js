@@ -28,10 +28,20 @@
 //       hardcoded dev-only `python3` + source-checkout root (see `configurePythonRunner` below).
 //   (b) that spawn's exit status is now inspected -- a failed delegation is surfaced via a bounded
 //       warn line (`_spawnPythonPrune`), not silently swallowed.
-//   (c) `_charge` no longer double-counts a Node-written durable terminal's reservation as
-//       outstanding (see `_hasTerminal`/`_charge` below), and `settle()` proactively (but still
-//       best-effort/never-raises) delegates a bounded reap so the physical ledger entry doesn't
-//       linger indefinitely once its owner.lock is free.
+//   (c) `settle()` proactively (but still best-effort/never-raises) delegates a bounded reap so
+//       the physical ledger entry doesn't linger indefinitely once its owner.lock is free -- that
+//       reap (removing the ledger entry) is what actually zeroes a settled entry's outstanding
+//       charge, once it lands.
+//
+// Codex Phase-2 gate, ROUND 2 (BLOCKER, fixed here): B3(c)'s original `_charge` also excluded a
+// durable-terminal entry's reservation directly (a `_hasTerminal` check inside `_charge`). Codex
+// R2 found that shortcut -- and the pre-existing two-scan `_committed`+`_onDisk` structure it sat
+// on top of -- could each UNDERCOUNT a concurrent append landing mid-`_charge`, breaching the 64
+// MiB ceiling. Both are fixed in `_charge` below: a single fstat scan per activity (reused for
+// both the committed sum and the outstanding term) replaces the two-scan structure, and the
+// `_hasTerminal` exclusion is removed entirely -- `_charge` is fstat-only again, and settlement is
+// left entirely to `settle()`'s reap actually removing the ledger entry. See `_charge`'s own
+// comment for the full accounting argument.
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -248,14 +258,19 @@ function _splitLines(buf) {
   return lines;
 }
 
-// Codex B3(c): whether activity `aid` has a durable `terminal` record in its segments. A bounded
-// CONTENT read (unlike `_onDisk`'s fstat-only sizing, which the I7 fix protects) -- but bounded to
-// at most one activity's segments per ledger entry, of which there are at most a ceiling-bounded
-// number (spec's own admission cap), so this is acceptable lifecycle-data reading, distinct from
-// the per-record sizing path. Local copy of reconcile.js's own private `_topTypes`/`_hasTerminal`
+// Whether activity `aid` has a durable `terminal` record in its segments. A bounded CONTENT read
+// (unlike `_onDisk`'s fstat-only sizing, which the I7 fix protects) -- but bounded to at most one
+// activity's segments per ledger entry, of which there are at most a ceiling-bounded number
+// (spec's own admission cap), so this is acceptable lifecycle-data reading, distinct from the
+// per-record sizing path. Local copy of reconcile.js's own private `_topTypes`/`_hasTerminal`
 // (duplicated rather than reaching into reconcile.js's underscore-prefixed internals -- matches
 // this codebase's established precedent; see trigger-glue.js's `_splitLines` comment) --
 // requiring reconcile.js here would also risk a require cycle surface as this subsystem grows.
+//
+// Codex R2: this is intentionally NOT called from `_charge` anymore -- a terminal becoming
+// VISIBLE here mid-`_charge` (readable, but not proven fsync-durable) was a second undercount
+// path when `_charge` used it to zero out a live entry's reservation (see `_charge`'s comment).
+// Kept for callers that need pure lifecycle introspection (and exercised directly by tests).
 function _hasTerminal(home, aid) {
   for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
     for (const line of _splitLines(seg.data)) {
@@ -267,19 +282,45 @@ function _hasTerminal(home, aid) {
   return false;
 }
 
+// Codex R2 fix (fix-review round 2 BLOCKER): SINGLE fstat scan per activity, reused for BOTH the
+// committed sum and the per-entry outstanding term. The prior version called _committed(home)
+// (one scan of every activity's segments) and then, separately, _onDisk(home, aid) per ledger
+// entry (a SECOND scan of just that activity's segments) -- two scans of the SAME activity at two
+// DIFFERENT times. A concurrent writer's append (writers release quota.lock before appending)
+// landing between those two scans was excluded from `committed` (scanned before the append) AND
+// subtracted out of `outstanding` via the stale-vs-fresh mismatch (scanned after) -- a
+// double-miss undercount (measured repro: charged 498 vs committed 687). Scanning each activity
+// exactly once and reusing that one value for both terms makes an append either fully counted or
+// fully deferred to the NEXT _charge() call -- it can never be split across the two. Per-activity
+// result is always Math.max(size, reserved+granted), the same conservative liability as before
+// for the non-interleaved case -- never an undercount.
+//
+// This ALSO removes the `_hasTerminal` reservation-exclusion Fix-B/B3(c) previously added here:
+// that exclusion was a SECOND, independent undercount path -- a terminal record can become
+// VISIBLE (readable) between this function's committed scan and the `_hasTerminal` content scan,
+// so the terminal's bytes were missed by `committed` AND its whole reservation was dropped by the
+// exclusion (measured repro: charged 498 vs committed 687). Codex: terminal *visibility* alone is
+// not proof of durability and must never be treated as settlement. `_charge` is fstat-only again
+// as a result (never calls `_hasTerminal`'s content read). Settlement is instead handled entirely
+// by `settle()`'s existing delegated, durability-gated reap: once the reap actually REMOVES the
+// ledger entry, it simply no longer appears in `_ledgerEntries(home)` and contributes 0 here --
+// naturally, not via an exclusion. A durable-but-not-yet-reaped entry now charges conservatively
+// (Math.max(size, reserved+granted)) -- an overcount, never an undercount. `_hasTerminal` itself
+// is kept (not removed) for lifecycle introspection/tests; it is simply no longer called here.
 function _charge(home) {
-  let total = _committed(home);
+  const base = path.dirname(paths.quotaDir(home));
+  const sizes = new Map();
+  for (const name of paths.listOwnedSubdirs(base)) {
+    if (name === 'quota') continue;
+    let size = 0;
+    for (const seg of paths.statOwnedSegments(path.join(base, name))) size += seg.size;
+    sizes.set(name, size);
+  }
+  let total = 0;
+  for (const size of sizes.values()) total += size;
   for (const [aid, e] of _ledgerEntries(home)) {
     if (e === CORRUPT) { total += PER_ACTIVITY_CAP; continue; }
-    // Codex B3(c): a durable terminal means this entry is SETTLED -- its real bytes are already
-    // counted by `_committed`'s segment scan, and its reservation is no longer outstanding
-    // (mirrors Python's post-`settle` state, where the entry is simply gone and counted purely by
-    // the scan). Node can't remove the entry itself (Ruling B), so it is excluded from the
-    // outstanding-charge sum here instead -- this is the fix for the measured bug: a Node-written
-    // durable terminal (contention `skipped`, guard `blocked`, handoff `failed`, ...) no longer
-    // leaves a false ~60 KiB live charge against the ceiling.
-    if (_hasTerminal(home, aid)) continue;
-    total += Math.max(0, e.reserved + e.granted - _onDisk(home, aid));
+    total += Math.max(0, e.reserved + e.granted - (sizes.get(aid) || 0));
   }
   return total;
 }
@@ -373,18 +414,21 @@ function grant(home, activityId, nbytes) {
   }
 }
 
-// Ruling B: Node cannot unlink, so settle() never removes the ledger entry ITSELF. By the time a
-// caller invokes settle(), the durable `terminal` record has already been appended to the segment
-// (writer.js's job, mirroring writer.py's call ordering), so the entry is now "settled": per the
-// Codex B3(c) fix above, `_charge`'s `_hasTerminal`-gated per-entry check now excludes it from the
-// outstanding sum entirely -- the entry stops costing anything the instant the terminal is
-// durable, exactly like Python's post-`settle` state (there, `settle()` unlinks it outright and it
-// is "counted purely by the scan"; here, it's excluded from the ledger sum instead and IS the
-// scan's job to have already counted its real bytes via `_committed`).
+// Ruling B: Node cannot unlink, so settle() never removes the ledger entry ITSELF -- it delegates
+// that to the (packaged-aware, Codex B3a) Python prune entrypoint below. Codex R2: `_charge` no
+// longer has a terminal-VISIBILITY shortcut of its own (that was a second undercount path -- see
+// `_charge`'s comment), so a durable terminal alone does NOT stop an entry from being charged.
+// Settlement now happens ENTIRELY through the reap below: once the delegated Python prune pass
+// actually REMOVES the ledger entry (Python's `_reconcile_all_locked`, unchanged), the entry
+// simply no longer appears in `_ledgerEntries(home)` and `_charge` naturally counts 0 outstanding
+// for it -- exactly like Python's own post-`settle` state (there, `settle()` unlinks it outright
+// too). Until that reap lands (e.g. lease still held, or the packaged prune failed -- surfaced by
+// B3b's warn), a durable-but-not-yet-reaped entry charges conservatively
+// (Math.max(size, reserved+granted)) -- an overcount, never an undercount.
 //
-// Codex B3(c) "bounded reap": on top of that charge fix, settle() now proactively delegates to
-// the (packaged-aware, Codex B3a) Python prune entrypoint with `need=0` -- prune_to_ceiling's own
-// `_reconcile_all_locked` pass runs unconditionally regardless of the requested headroom (see
+// Codex B3(c) "bounded reap": settle() proactively delegates to the Python prune entrypoint with
+// `need=0` -- prune_to_ceiling's own `_reconcile_all_locked` pass runs unconditionally regardless
+// of the requested headroom (see
 // repo_radar/activity/prune.py), so this reconciles/clears settled entries without requesting any
 // extra room. This is what actually removes the physical ledger JSON promptly instead of leaving
 // it to linger until the next admission-pressure prune or a restart -- callers (writer.js's

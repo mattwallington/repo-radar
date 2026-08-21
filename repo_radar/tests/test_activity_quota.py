@@ -423,3 +423,90 @@ def test_cleared_directory_ledger_resumes_admission_at_real_ceiling(tmp_path):
 
     fresh, fl = _new_activity(tmp_path)
     assert quota.admit(tmp_path, fresh, fl) is True          # charge trustworthy again -> resumes
+
+# --- Codex fix-review round 2 (BLOCKER): _charge must not undercount a concurrent append
+# landing mid-scan -----------------------------------------------------------------------------
+#
+# Writers get their grant under quota.lock, RELEASE the lock, THEN append -- so a real append can
+# land concurrently with a later _charge() call. The pre-fix _charge scanned _committed() (every
+# activity's bytes) and then separately re-scanned one activity's bytes via _on_disk() -- two
+# scans of the SAME activity at two DIFFERENT times. An append landing between them was excluded
+# from `committed` (scanned before) AND netted out of `outstanding` via the now-larger _on_disk
+# read (scanned after) -- a double-miss undercount. These tests reproduce that interleaving
+# deterministically by hooking `paths.stat_owned_segments` (the ONLY primitive _charge uses for
+# sizing) so that the FIRST scan of the target activity's directory performs a REAL append
+# immediately afterward -- simulating the concurrent writer -- before returning its (pre-append)
+# result. Against the pre-fix two-scan _charge this reproduces the exact undercount; against the
+# fixed single-scan _charge there is only one call per activity, so the append is either fully
+# counted or fully deferred to the next _charge() call, never split.
+
+def _hook_stat_owned_segments_append_once(monkeypatch, target_dir, do_append):
+    real = paths.stat_owned_segments
+    state = {"fired": False}
+    def hooked(directory, suffix=".jsonl"):
+        result = real(directory, suffix)             # snapshot BEFORE the simulated append
+        if not state["fired"] and str(directory) == str(target_dir):
+            state["fired"] = True
+            do_append()                               # concurrent writer's append lands NOW
+        return result
+    monkeypatch.setattr(paths, "stat_owned_segments", hooked)
+    return state
+
+def test_charge_does_not_undercount_ordinary_append_landing_mid_scan(tmp_path, monkeypatch):
+    # Codex R2 repro shape (Python, ordinary append): charged 61940 vs true 62120 (undercount
+    # 180). Reproduces the exact _committed()/_on_disk() double-scan interleaving deterministically.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    assert quota.grant(tmp_path, aid, 2000) is True          # headroom for the "concurrent" append
+
+    seg = paths.segment_path(tmp_path, aid, "python", "cafebabe")
+    appended = {"n": 0}
+    def do_append():
+        rec = json.dumps({"schema_version": 1, "activity_id": aid, "type": "event", "seq": 1,
+                           "ts": "2026-08-14T00:00:00-07:00", "level": "info",
+                           "event": "concurrent-append"}) + "\n"
+        fd = paths.secure_open_append(seg)
+        os.write(fd, rec.encode()); os.close(fd)
+        appended["n"] = len(rec.encode())
+
+    state = _hook_stat_owned_segments_append_once(monkeypatch, paths.activity_dir(tmp_path, aid), do_append)
+    charge = quota._charge(tmp_path)
+    monkeypatch.undo()
+
+    assert state["fired"] and appended["n"] > 0, "the interleaving hook must actually have fired"
+    true_committed = quota._committed(tmp_path)               # fresh rescan, real function restored
+    assert charge >= true_committed, \
+        f"_charge undercounted a mid-scan append: charged {charge} < true committed {true_committed}"
+    assert charge >= quota.RESERVE + 2000, \
+        f"_charge undercounted vs the entry's own reservation ceiling: charged {charge} < {quota.RESERVE + 2000}"
+
+def test_charge_does_not_undercount_terminal_append_landing_mid_scan(tmp_path, monkeypatch):
+    # Cross-language pair with Node's terminal repro (charged 498 vs committed 687). Python's
+    # _charge has no terminal-visibility shortcut (that second undercount path is Node-only), so
+    # this exercises the same single-scan fix with a terminal-shaped append instead of an
+    # ordinary one, proving the fix is agnostic to record type.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    assert quota.grant(tmp_path, aid, 2000) is True
+
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    appended = {"n": 0}
+    def do_append():
+        rec = json.dumps({"schema_version": 1, "activity_id": aid, "type": "terminal", "seq": 9,
+                           "ts": "2026-08-14T00:00:00-07:00", "outcome": "succeeded",
+                           "summary": {}, "by": "deadbeef"}) + "\n"
+        fd = paths.secure_open_append(seg)
+        os.write(fd, rec.encode()); os.close(fd)
+        appended["n"] = len(rec.encode())
+
+    state = _hook_stat_owned_segments_append_once(monkeypatch, paths.activity_dir(tmp_path, aid), do_append)
+    charge = quota._charge(tmp_path)
+    monkeypatch.undo()
+
+    assert state["fired"] and appended["n"] > 0
+    assert quota._has_terminal(tmp_path, aid) is True          # the terminal really landed
+    true_committed = quota._committed(tmp_path)
+    assert charge >= true_committed, \
+        f"_charge undercounted a mid-scan terminal append: charged {charge} < true committed {true_committed}"
+    assert charge >= quota.RESERVE + 2000, \
+        f"_charge undercounted vs the entry's own reservation ceiling: charged {charge} < {quota.RESERVE + 2000}"

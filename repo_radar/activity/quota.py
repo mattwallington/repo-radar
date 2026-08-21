@@ -172,10 +172,30 @@ def _ledger_entries(home):
     return out
 
 def _charge(home):
-    total = _committed(home)
+    """Codex R2 fix (fix-review round 2 BLOCKER): SINGLE fstat scan per activity, reused for
+    BOTH the committed sum and the per-entry outstanding term. The prior version called
+    _committed(home) (one scan of every activity's segments) and then, separately, this
+    function's own _on_disk(home, aid) (a SECOND scan of just aid's segments) — two scans of the
+    SAME activity at two DIFFERENT times. A concurrent writer's append (writers release
+    quota.lock before appending, per the module's lifecycle) landing between those two scans was
+    excluded from `committed` (scanned before the append) AND subtracted out of `outstanding` via
+    the stale-vs-fresh mismatch in _on_disk (scanned after) — a double-miss undercount (measured
+    repro: charged 61940 vs true 62120). Scanning each activity exactly once and reusing that one
+    value for both terms makes an append either fully counted (both terms see the post-append
+    size) or fully deferred to the NEXT _charge() call (both terms see the pre-append size) — it
+    can never be split across the two. Per-activity result is always max(size, reserved+granted),
+    the same conservative liability as before non-interleaved — never an undercount. Still
+    fstat-only (finding 7/I7): never reads segment CONTENT here."""
+    base = paths.quota_dir(home).parent
+    sizes = {}
+    for name in paths.list_owned_subdirs(base):
+        if name == "quota":
+            continue
+        sizes[name] = sum(sz for _n, sz in paths.stat_owned_segments(base / name))
+    total = sum(sizes.values())
     for aid, e in _ledger_entries(home):
         total += PER_ACTIVITY_CAP if e == "CORRUPT" \
-            else max(0, e["reserved"] + e["granted"] - _on_disk(home, aid))
+            else max(0, e["reserved"] + e["granted"] - sizes.get(aid, 0))
     return total
 
 def _has_corrupt(home):
