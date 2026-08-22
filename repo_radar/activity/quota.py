@@ -403,8 +403,11 @@ def _retain_locked(home):
 
     newest_keep = NEWEST_KEEP                                # read at call time (monkeypatch-friendly)
     protected = {
+        # secondary tiebreaker (aid) makes the boundary deterministic on a true mtime tie --
+        # `candidates` is built from a `set` (hash-randomized iteration order), so sorting on
+        # mtime alone could break a tie differently between runs (Fix R1).
         aid for aid, _k, _mt in
-        sorted(candidates, key=lambda c: c[2], reverse=True)[:newest_keep]
+        sorted(candidates, key=lambda c: (c[2], c[0]), reverse=True)[:newest_keep]
     }
     problems = [c for c in candidates if c[1] == "problem"]
     newest_problem = max(problems, key=lambda c: c[2])[0] if problems else None
@@ -413,6 +416,10 @@ def _retain_locked(home):
     routine_max_age = ROUTINE_MAX_AGE_S
     problem_max_age = PROBLEM_MAX_AGE_S
     for aid, kind, mtime in candidates:
+        # `newest_problem` is shielded here unconditionally -- a SAFE SUPERSET of spec §7, which
+        # ties "always preserve the newest problem" to the ceiling-override specifically. Shielding
+        # it in the age pass too means the most recent problem is never lost to age-pruning either,
+        # never a spec deviation (Fix R1 comment).
         if aid in protected or aid == newest_problem:
             continue
         age = now - mtime
