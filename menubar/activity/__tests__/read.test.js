@@ -337,3 +337,75 @@ test('validateFilter: rejects an invalid level, an over-length search, and is us
     cleanup(home);
   }
 });
+
+// -----------------------------------------------------------------------------------------------
+// Review R1 fixes (base commit a5f319c):
+//   I1 -- channel/trigger/kind bypassed the redactor.
+//   I2 -- the store-root probe followed symlinks (statSync), misreporting a symlinked root as
+//         normal empty history instead of unavailable.
+//   I3 -- validateFilter's limit/offset rejection paths were untested.
+// -----------------------------------------------------------------------------------------------
+
+test('listActivities/buildExport: redacts a configured secret embedded in channel/trigger (I1)', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-000000000012';
+    const secret = 'channel-secret-value-1';
+    seedSegment(home, aid, [
+      startRec(aid, 0, '2026-08-14T00:00:00-07:00', {
+        channel: `stable-${secret}`,
+        trigger: `cli-${secret}`,
+      }),
+      terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded'),
+    ]);
+
+    const result = read.listActivities(home, {}, { configuredSecrets: [secret] });
+    const item = result.items[0];
+    assert.ok(!item.channel.includes(secret), 'DTO channel must be masked');
+    assert.ok(item.channel.includes('[REDACTED]'));
+    assert.ok(!item.trigger.includes(secret), 'DTO trigger must be masked');
+    assert.ok(item.trigger.includes('[REDACTED]'));
+
+    const text = read.buildExport(home, {}, { configuredSecrets: [secret] });
+    assert.ok(!text.includes(secret), 'export text must not leak the secret via channel/trigger');
+    assert.ok(text.includes('[REDACTED]'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('listActivities: a symlinked activity root is reported unavailable, not empty history (I2)', () => {
+  const home = tmpHome();
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-read-symtarget-'));
+  try {
+    const parentDir = path.join(home, 'Library', 'Logs', 'repo-radar');
+    fs.mkdirSync(parentDir, { recursive: true });
+    const base = path.join(parentDir, 'activity');
+    fs.symlinkSync(target, base, 'dir'); // the root itself is a symlink, not a real directory
+
+    const result = read.listActivities(home);
+    assert.strictEqual(result.available, false);
+    assert.deepStrictEqual(result.items, []);
+    assert.strictEqual(result.truncated, false);
+    assert.strictEqual(result.incomplete, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true }); // removes the symlink entry, not its target
+    fs.rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test('validateFilter: rejects limit > LIST_MAX, negative limit, and negative offset (I3)', () => {
+  assert.throws(() => read.validateFilter({ limit: limits.LIST_MAX + 1 }), read.InvalidFilter);
+  assert.throws(() => read.validateFilter({ limit: -1 }), read.InvalidFilter);
+  assert.throws(() => read.validateFilter({ offset: -1 }), read.InvalidFilter);
+  assert.doesNotThrow(() => read.validateFilter({ limit: limits.LIST_MAX, offset: 0 }));
+
+  const home = tmpHome();
+  try {
+    assert.throws(() => read.listActivities(home, { limit: limits.LIST_MAX + 1 }), read.InvalidFilter);
+    assert.throws(() => read.listActivities(home, { offset: -1 }), read.InvalidFilter);
+    assert.throws(() => read.buildExport(home, { limit: -1 }), read.InvalidFilter);
+  } finally {
+    cleanup(home);
+  }
+});

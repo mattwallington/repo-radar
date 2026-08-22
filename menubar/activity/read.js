@@ -109,14 +109,22 @@ function _activityRoot(home) {
   return path.dirname(paths.quotaDir(home));
 }
 
+// Review R1 / I2: `lstatSync` (never `statSync`) so a symlinked root is seen AS a symlink rather
+// than silently followed to whatever it points at -- matching the O_NOFOLLOW posture everywhere
+// else in paths.js and spec §2's "reject any target that exists as a non-directory or symlink."
+// A symlinked (or otherwise non-directory) root is reported UNREADABLE (`available:false`), never
+// available-empty -- a symlink swapped in for the real root must never be misreported as ordinary
+// first-run empty history. Only a genuinely ABSENT path (`ENOENT`) is "missing" (normal empty
+// history); every other stat failure (EACCES on an ancestor, etc) is "unreadable" too.
 function _probeRoot(base) {
   let st;
   try {
-    st = fs.statSync(base);
+    st = fs.lstatSync(base);
   } catch (e) {
     return e.code === 'ENOENT' ? 'missing' : 'unreadable';
   }
-  if (!st.isDirectory()) return 'unreadable'; // e.g. a file/symlink squatting on the path
+  if (st.isSymbolicLink()) return 'unreadable'; // never follow -- see comment above
+  if (!st.isDirectory()) return 'unreadable'; // e.g. a plain file squatting on the path
   try {
     fs.readdirSync(base);
   } catch (e) {
@@ -279,9 +287,14 @@ function _buildItem(home, aid, filter, redactor) {
     startedAt,
     endedAt,
     duration,
-    channel: startRecord ? startRecord.channel : null,
-    trigger: startRecord ? startRecord.trigger : null,
-    kind: startRecord ? startRecord.kind : null,
+    // Review R1 / I1: records.js only enum-constrains `kind` -- `channel`/`trigger` are
+    // contract-wise just producer-supplied strings, so the read-time redaction backstop (spec
+    // §4) must cover them exactly like every other rendered string, not just event/detail/fields.
+    // `buildExport` renders these DTO fields verbatim (never re-reads the raw record), so fixing
+    // it here covers both output surfaces.
+    channel: startRecord ? redactor.scrub(startRecord.channel) : null,
+    trigger: startRecord ? redactor.scrub(startRecord.trigger) : null,
+    kind: startRecord ? redactor.scrub(startRecord.kind) : null,
     errorCount,
     warnCount,
     mtime,
