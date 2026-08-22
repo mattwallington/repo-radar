@@ -114,13 +114,48 @@ function onGuardBlock(writer, reason) {
 // `quota.lock` settlement removes the entry under while it re-checks and (only if still live)
 // performs the append. A settled/missing ledger -> the append is skipped, but SIGTERM still
 // proceeds unconditionally either way -- killing an already-exited child is a harmless no-op.
-// `appendReserveIfLive` never throws, so this stays never-raises/best-effort like the rest of this
-// module.
+//
+// Codex R4 (BLOCKER, "Fix-G", fixed here): the R3 fix above serialized the append against
+// settlement using quota.lock's BLOCKING acquisition -- which meant a contended quota.lock (held
+// by settlement or a prune pass, up to their own ~30s spawn timeout) sat directly between this
+// function and `child.kill('SIGTERM')`, freezing Electron's main thread and delaying/preventing
+// cancellation. Codex reproduced: holding quota.lock 1.5s in another process delayed SIGTERM by
+// 1.511s. Activity observability must NEVER change sync/cancel behavior -- this is a hard
+// invariant, not a tradeoff. Two changes close it:
+//   (1) `quota.appendReserveIfLive` is now called with `{ nonblocking: true }`, which acquires
+//       quota.lock via the same non-blocking `-t 0` lockf mode lease.js's `probe`/`acquire` use --
+//       FREE, it behaves exactly like the R3 fix (re-read under the lock, append only if live);
+//       BUSY, it skips the append immediately instead of waiting. A skipped append writes zero
+//       bytes, so it can never undercount; the only cost is a rare contended cancel loses its
+//       `cancel_requested` record (the run may finalize `interrupted` instead of `cancelled`) --
+//       an accepted best-effort observability degradation, not a correctness defect.
+//   (2) `child.kill('SIGTERM')` moved into an OUTER `finally`, so it fires unconditionally even if
+//       the best-effort cancel append somehow throws, hangs its caller, or otherwise misbehaves --
+//       `appendReserveIfLive` is already guaranteed never to throw (see its own comment), so this
+//       is a second, independent backstop for the exact same guarantee, not a substitute for it.
+// `appendReserveIfLive` never throws, so the `try/catch` below is defense-in-depth, not a
+// load-bearing requirement -- this stays never-raises/best-effort like the rest of this module.
+//
+// Wording note (Codex R4, residual): a cancel append CAN still land after a terminal is durable
+// but before settlement's reap actually runs (the terminal write itself is outside quota.lock) --
+// that is harmless (the still-live ledger entry's reservation covers it, and reconcile settles the
+// run normally as usual). Nothing here enforces or assumes "terminal must be last"; the only
+// invariant this function guarantees is that a cancel append never undercounts the ledger.
 function onCancel({ writer, child, home } = {}) {
-  if (writer && typeof writer.control === 'function') {
-    quota.appendReserveIfLive(home, writer.activityId, () => writer.control('cancel_requested'));
+  try {
+    if (writer && typeof writer.control === 'function' && home) {
+      quota.appendReserveIfLive(
+        home,
+        writer.activityId,
+        () => writer.control('cancel_requested'),
+        { nonblocking: true },
+      );
+    }
+  } catch (e) {
+    // best-effort: Activity observability must never affect cancellation (see comment above).
+  } finally {
+    if (child && typeof child.kill === 'function') child.kill('SIGTERM'); // ALWAYS fires
   }
-  if (child && typeof child.kill === 'function') child.kill('SIGTERM');
 }
 
 // --- hand-off state machine -----------------------------------------------------------------

@@ -238,6 +238,152 @@ test('cancel is a NO-OP on a settled (reaped) activity -- SIGTERM still proceeds
   }
 });
 
+// === Codex R4 (BLOCKER, "Fix-G"): onCancel must never block on quota.lock contention ===========
+//
+// Codex reproduced the R3 fix's regression concretely: holding quota.lock 1.5s in ANOTHER process
+// delayed onCancel's SIGTERM by 1.511s. The prior "cannot acquire quota.lock" coverage
+// (quota-cancel-settle-race.test.js's broken-home/ENOTDIR case) only proves the never-throws
+// contract on a setup FAILURE, not genuine cross-process LOCK CONTENTION -- Codex called that
+// insufficient. These tests reproduce the real contention scenario and the two failure-injection
+// scenarios Fix-G also closes (a hard append failure, and a lock-release/close failure), all
+// asserting the one hard invariant: Activity observability must NEVER change sync/cancel behavior.
+
+// Genuinely holds quota.lock (home-wide, shared by every activity under `home` -- see
+// `_quotaLockPath`) in a SEPARATE OS process via quota.js's own `_quotaLock`/`_unlock` (the exact
+// blocking lockf mechanism `admit`/`grant`/`settle` use), for `holdMs` milliseconds, mirroring
+// Codex's own repro mechanism exactly. Signals genuine acquisition by writing `markerPath` -- a
+// synchronous write that can only happen AFTER `_quotaLock` has actually returned the held fd --
+// so the caller can poll for it instead of guessing a fixed delay. Returns the spawned
+// ChildProcess so the caller can guarantee it is killed/reaped (no lingering process).
+function spawnQuotaLockHolder(home, markerPath, holdMs) {
+  const quotaModulePath = path.join(__dirname, '..', 'activity', 'quota');
+  const script = [
+    `const quota = require(${JSON.stringify(quotaModulePath)});`,
+    `const fs = require('fs');`,
+    `const fd = quota._quotaLock(${JSON.stringify(home)});`, // blocks until acquired -- uncontended here, returns promptly
+    `fs.writeFileSync(${JSON.stringify(markerPath)}, 'locked');`, // signal: the lock is genuinely held now
+    `setTimeout(() => { try { quota._unlock(fd); } catch (e) { /* best-effort */ } process.exit(0); }, ${holdMs});`,
+  ].join('\n');
+  return spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+}
+
+// Bounded poll for `markerPath` to appear -- proof the lock-holder child genuinely holds
+// quota.lock before the test proceeds to measure onCancel's promptness against it.
+async function waitForMarker(markerPath, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(markerPath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`lock-holder marker never appeared: ${markerPath}`);
+}
+
+test('[real child] onCancel sends SIGTERM PROMPTLY even while quota.lock is genuinely held by another process (Codex R4 repro)', async () => {
+  const home = tmpHome();
+  const markerPath = path.join(home, '.lock-holder-ready');
+  let lockHolder = null;
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const l = A.acquire(A.ownerLockPath(home, aid));
+    assert.strictEqual(A.quota.admit(home, aid, l), true, 'ledger entry must be live for a realistic repro');
+
+    lockHolder = spawnQuotaLockHolder(home, markerPath, 1500); // mirrors Codex's exact 1.5s repro
+    await waitForMarker(markerPath);
+
+    const calls = [];
+    const writer = { activityId: aid, control: (n) => calls.push('control:' + n) };
+    const child = { kill: (sig) => calls.push('kill:' + sig) };
+
+    const t0 = Date.now();
+    onCancel({ writer, child, home });
+    const elapsedMs = Date.now() - t0;
+
+    assert.ok(calls.includes('kill:SIGTERM'), 'SIGTERM must fire even under quota.lock contention');
+    assert.ok(
+      elapsedMs < 200,
+      `onCancel must not block on a contended quota.lock: took ${elapsedMs}ms (Codex's pre-fix repro measured ~1511ms)`,
+    );
+  } finally {
+    if (lockHolder) {
+      lockHolder.kill('SIGKILL'); // test cleanup only -- not part of the behavior under test
+      await new Promise((resolve) => { if (lockHolder.exitCode !== null) resolve(); else lockHolder.once('exit', resolve); });
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Fix 3 (Codex R4): `appendReserveIfLive`'s own "never throws" contract must hold even when
+// RELEASING the lock (the `finally`'s `_unlock(fd)` -> `fs.closeSync`) fails -- not just when
+// ACQUIRING it fails. `secureMkdir`/`openOwnedRegular`'s own owned-dir validation walk makes
+// several `fs.closeSync` calls of its own on unrelated (directory) fds before the ledger-lock
+// fd's own release ever happens, so a fixed call-index guess would be fragile/wrong. Instead the
+// stub is ARMED from inside the synthetic `appendFn` itself (the very first thing the REAL
+// `appendFn` does once the lock is confirmed live) -- it throws on the NEXT `fs.closeSync` call
+// after that, which is guaranteed to be quota.lock's own release (the synthetic `appendFn` does
+// no I/O of its own, so nothing else can call `closeSync` in between). The append itself (and its
+// return value) must be unaffected by a release failure that happens strictly AFTER the append
+// already succeeded.
+test('appendReserveIfLive: a release/close failure after a successful append never throws, and the append still counts (Codex R4)', () => {
+  const home = tmpHome();
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const l = A.acquire(A.ownerLockPath(home, aid));
+    assert.strictEqual(A.quota.admit(home, aid, l), true);
+
+    const realCloseSync = fs.closeSync;
+    let armed = false;
+    fs.closeSync = (...args) => {
+      if (armed) {
+        armed = false; // throw exactly once -- the very next close after the append ran
+        throw new Error('simulated quota.lock release/close failure');
+      }
+      return realCloseSync(...args);
+    };
+
+    let appended = false;
+    let result;
+    try {
+      assert.doesNotThrow(() => {
+        result = A.quota.appendReserveIfLive(home, aid, () => { appended = true; armed = true; }, { nonblocking: true });
+      });
+    } finally {
+      fs.closeSync = realCloseSync;
+    }
+
+    assert.strictEqual(appended, true, 'the append itself must have run before the release failure');
+    assert.strictEqual(result, true, 'a post-append release failure must not flip the reported result to false');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Fix 2 (Codex R4): `onCancel`'s SIGTERM must be GUARANTEED regardless of ANY Activity-side
+// failure, not merely the specific close-failure shape above -- this is the outer-`finally`
+// backstop, proven independently of `appendReserveIfLive`'s own internals by making the whole
+// call throw outright (a stand-in for "best-effort cancel append misbehaves in some way its own
+// contract didn't anticipate"). `A.quota` and trigger-glue.js's internal `quota` reference the
+// SAME module-cache singleton object, so reassigning this property here is visible to onCancel's
+// `quota.appendReserveIfLive(...)` call.
+test('onCancel ALWAYS sends SIGTERM even if the best-effort cancel append throws outright (Codex R4 outer finally)', () => {
+  const home = tmpHome();
+  const originalAppendReserveIfLive = A.quota.appendReserveIfLive;
+  try {
+    A.quota.appendReserveIfLive = () => { throw new Error('simulated total append failure'); };
+
+    const calls = [];
+    const writer = { activityId: 'irrelevant-for-this-test', control: () => { throw new Error('must never be reached'); } };
+    const child = { kill: (sig) => calls.push(sig) };
+
+    assert.doesNotThrow(() => onCancel({ writer, child, home }));
+    assert.deepStrictEqual(calls, ['SIGTERM'], 'SIGTERM must fire even when the append call itself throws');
+  } finally {
+    A.quota.appendReserveIfLive = originalAppendReserveIfLive;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('contention finalizes the attempt as skipped (terminal owns release)', () => {
   const calls = [];
   const writer = { terminal: (o) => calls.push('terminal:' + o) }; // terminal() itself releases

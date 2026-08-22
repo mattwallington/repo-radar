@@ -42,6 +42,23 @@
 // `_hasTerminal` exclusion is removed entirely -- `_charge` is fstat-only again, and settlement is
 // left entirely to `settle()`'s reap actually removing the ledger entry. See `_charge`'s own
 // comment for the full accounting argument.
+//
+// Codex Phase-2 gate, ROUND 3 (BLOCKER, fixed here): a post-handoff cancel append
+// (`control{cancel_requested}`) could race the owner's own terminal+settle reap and silently
+// escape accounting (measured undercount 174). Fixed by `appendReserveIfLive`, which serializes
+// its read-then-write against settlement under the SAME cross-process `quota.lock`. See that
+// function's own comment for the full argument.
+//
+// Codex Phase-2 gate, ROUND 4 (BLOCKER, fixed here, "Fix-G"): the ROUND 3 fix used quota.lock's
+// BLOCKING acquisition for that serialization, which put a potentially ~30s wait directly between
+// Electron's cancel handler and `child.kill('SIGTERM')` -- a contended lock could freeze the main
+// thread and delay/prevent cancellation (measured: a 1.5s held lock delayed SIGTERM by 1.511s).
+// Activity observability must NEVER change sync/cancel behavior. Fixed by giving the cancel path
+// (only) a NON-BLOCKING acquisition mode (`_quotaLockNonblocking`, `appendReserveIfLive`'s
+// `{ nonblocking: true }` option) that skips the append outright on contention instead of waiting,
+// plus (in trigger-glue.js) moving `child.kill('SIGTERM')` into an outer `finally` so it fires
+// unconditionally regardless of any Activity-side failure. See `appendReserveIfLive`'s own
+// comment for the full argument.
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -148,6 +165,23 @@ function _lockfBlocking(fd) {
   return r.status;
 }
 
+// NON-BLOCKING lockf on activity/quota.lock -- the exact `-t 0` mode lease.js's `_lockf` uses for
+// owner.lock (Codex R4 fix, "Fix-G"): fails IMMEDIATELY (status 75/EX_TEMPFAIL) instead of
+// waiting if quota.lock is currently held by another process, rather than blocking until it can
+// acquire like `_lockfBlocking` above. This exists ONLY for the cancel path's best-effort ledger
+// append (`appendReserveIfLive`'s `{ nonblocking: true }` mode) -- `admit`/`grant`/`settle`
+// legitimately need to WAIT for exclusive access to the accounting ledger and keep using
+// `_lockfBlocking`/`_quotaLock` unchanged. See `_quotaLockNonblocking` below for why the cancel
+// path specifically must never wait on this lock.
+function _lockfNonblocking(fd) {
+  const r = spawnSync('/usr/bin/lockf', ['-t', '0', '3'], {
+    stdio: ['ignore', 'ignore', 'ignore', fd],
+    timeout: PRUNE_SPAWN_TIMEOUT_MS,
+  });
+  if (r.error || typeof r.status !== 'number') return null;
+  return r.status;
+}
+
 // Opens (creating if needed) + locks quota.lock; validates it's a regular file (fail closed on
 // a swapped component, mirroring Python's S_ISREG check) via paths.openOwnedRegular, which
 // already does this. Returns the held fd. Throws (UnsafePath / OSError-equivalent) on failure --
@@ -160,6 +194,34 @@ function _quotaLock(home) {
   if (status !== 0) {
     fs.closeSync(fd);
     throw new Error(`quota.lock: lockf did not report success (status=${status})`);
+  }
+  return fd;
+}
+
+// Codex R4 (BLOCKER, "Fix-G"): the NON-BLOCKING sibling of `_quotaLock`, used ONLY by
+// `appendReserveIfLive`'s `{ nonblocking: true }` mode (the cancel path). The R3 fix above made
+// `appendReserveIfLive` correct for the undercount invariant by serializing its decision+write
+// against settlement under the BLOCKING `quota.lock` -- but Codex found that blocking acquisition
+// sits directly in `onCancel`'s path to `child.kill('SIGTERM')`: a contended lock (settlement or
+// a prune pass can hold it for up to the ~30s spawn timeout) freezes Electron's main thread and
+// delays/prevents cancellation. Repro: holding quota.lock 1.5s in another process delayed
+// onCancel's SIGTERM by 1.511s. Activity observability must NEVER change sync/cancel behavior.
+//
+// Returns the held fd on a FREE lock (acquired), or `null` on BUSY (contended) -- deliberately
+// NEVER waits, unlike `_quotaLock`. `null` is also returned for a spawn/status anomaly (`_lockf`
+// treats "can't tell" the same as busy here: skipping a best-effort append is always safe, so
+// there is no reason to risk any wait). A genuine setup failure (bad `home`, unsafe path, mkdir
+// failure) still THROWS here exactly like `_quotaLock` -- that is a real error, not contention,
+// and the caller (`appendReserveIfLive`) already wraps the whole acquisition in a try/catch that
+// treats any thrown error the same as "could not confirm live" (skip, never raise).
+function _quotaLockNonblocking(home) {
+  paths.secureMkdir(paths.quotaDir(home)); // ensures activity/ + quota/ exist
+  const lockPath = _quotaLockPath(home);
+  const fd = paths.openOwnedRegular(lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
+  const status = _lockfNonblocking(fd);
+  if (status !== 0) {
+    fs.closeSync(fd);
+    return null; // BUSY (75) or any other non-success -- skip immediately, never wait
   }
   return fd;
 }
@@ -450,10 +512,50 @@ function grant(home, activityId, nbytes) {
 // stays lock-free, exactly as before. Never throws (any failure -- lock acquisition, entry read,
 // `appendFn` itself -- is treated as "could not confirm live", so the append is skipped and the
 // caller still proceeds to SIGTERM regardless; see trigger-glue.js's `onCancel`).
-function appendReserveIfLive(home, aid, appendFn) {
+//
+// Codex R4 (BLOCKER, "Fix-G", fixed here): the paragraphs above describe *what* serializes the
+// append against settlement, but the R3 fix used the BLOCKING `_quotaLock` to do it -- which put
+// a synchronous, potentially ~30s wait directly between `onCancel` and `child.kill('SIGTERM')`.
+// Codex reproduced holding quota.lock 1.5s in another process delaying SIGTERM by 1.511s. Activity
+// observability must NEVER change sync/cancel behavior; a contended lock freezing Electron's main
+// thread and postponing cancellation is exactly that.
+//
+// The fix: an OPT-IN `{ nonblocking: true }` mode (used only by trigger-glue.js's `onCancel`) that
+// acquires quota.lock via `_quotaLockNonblocking` (the `-t 0` non-blocking lockf, same mode
+// lease.js's `probe`/`acquire` use) instead of `_quotaLock`. `admit`/`grant`/`settle` are
+// UNCHANGED -- they legitimately need to wait for exclusive ledger access and keep calling
+// `_quotaLock` directly.
+//   - lock FREE -> acquired exactly as before: re-read the ledger under the lock, append only if
+//     still live, release. Serialization/correctness is IDENTICAL to the R3 fix in this case.
+//   - lock BUSY (contended) -> do NOT wait: return `false` immediately, same as a settled/corrupt
+//     entry. The cancel record is best-effort observability; SIGTERM must never wait on it.
+// This is still correct for the undercount invariant: a skipped append writes zero bytes, so it
+// can never undercount. The append only ever happens while THIS process holds quota.lock (a free,
+// self-acquired hold), which is mutually exclusive with settlement's own blocking acquisition of
+// the SAME lock -- so the R3 serialization guarantee is fully preserved when the lock is free. The
+// only observable behavior change is that a RARE contended cancel skips its `cancel_requested`
+// record, so the reconciler may later finalize the run as `interrupted` instead of `cancelled` --
+// an accepted best-effort observability degradation, never an accounting or cancellation defect.
+//
+// Wording note (Codex R4, residual): the terminal append itself happens OUTSIDE quota.lock, so a
+// cancel append CAN still land after a terminal is durable but before settlement's reap runs --
+// that is harmless (the still-live ledger entry's reservation covers it, and reconcile settles the
+// run normally); this function makes no attempt to detect or forbid that ordering, and nothing
+// here should be read as claiming a post-terminal cancel record can never occur. The only
+// invariant this function (and its callers) actually guarantee is: no undercount, ever.
+//
+// Fix-G also closes two more BLOCKER findings, both inside this function regardless of mode:
+//   - the OUTER `try` around `appendFn()` already makes the WHOLE function never-raise; Fix-G adds
+//     a matching inner guard around the `finally`'s own `_unlock(fd)` so a close/flock-release
+//     failure can't escape either -- see the `finally` block below.
+//   - `onCancel` (trigger-glue.js) now sends SIGTERM from an OUTER `finally` of its own, so even if
+//     this function's "never throws" contract somehow failed to hold, cancellation still proceeds.
+function appendReserveIfLive(home, aid, appendFn, opts) {
+  const nonblocking = Boolean(opts && opts.nonblocking);
   let fd = null;
   try {
-    fd = _quotaLock(home);
+    fd = nonblocking ? _quotaLockNonblocking(home) : _quotaLock(home);
+    if (fd === null) return false; // nonblocking only: lock BUSY (or spawn anomaly) -> skip, never wait
     const e = _readEntry(paths.ledgerEntryPath(home, aid));
     if (e === CORRUPT) return false; // settled (missing) or genuinely corrupt -> no-op
     appendFn(); // ledger still live -- its reservation covers this reserve-consuming append
@@ -461,7 +563,13 @@ function appendReserveIfLive(home, aid, appendFn) {
   } catch (e) {
     return false; // never-raises (best-effort cancel)
   } finally {
-    if (fd !== null) _unlock(fd);
+    // Fix-G (Codex R4): a release/close failure here must never escape -- it would otherwise
+    // defeat this function's "never throws" contract at the exact moment its caller (onCancel)
+    // is relying on that contract to guarantee SIGTERM still fires. `onCancel`'s own outer
+    // `finally` is a second, independent backstop for the same guarantee.
+    if (fd !== null) {
+      try { _unlock(fd); } catch (e) { /* best-effort: a stuck/failed release must not propagate */ }
+    }
   }
 }
 
@@ -501,7 +609,7 @@ module.exports = {
   CEILING, RESERVE, PER_ACTIVITY_CAP, ORDINARY_CAP, CORRUPT,
   admit, grant, settle, appendReserveIfLive,
   configurePythonRunner,
-  _quotaLock, _unlock,
+  _quotaLock, _quotaLockNonblocking, _unlock,
   _parseEntry, _readEntry, _writeEntry,
   _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _hasTerminal,
   _spawnPythonPrune,
