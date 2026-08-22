@@ -10,6 +10,7 @@ const path = require('path');
 
 const {
   writer: writerMod,
+  quota,
   reconcile,
   activityDir,
   readOwnedSegments,
@@ -103,8 +104,22 @@ function onGuardBlock(writer, reason) {
 // the MINTER -- always Electron here -- has it); it durably records even AFTER handOff() has
 // dropped Electron's local reference (writer.js's `allowHandedOff` exception, Task 2.3), because
 // cancel is a controller-only permission that outlives full ownership, unlike terminal().
-function onCancel({ writer, child } = {}) {
-  if (writer && typeof writer.control === 'function') writer.control('cancel_requested');
+//
+// Codex R3 (BLOCKER): post-handoff, this append can race the Python child's own terminal+settle,
+// which reaps (removes) the ledger entry once the owner.lock is free -- a settled activity has no
+// reservation left to cover a cancel append, so an ungated append would silently escape `_charge`'s
+// accounting (see quota.js's `appendReserveIfLive` comment for the full argument). A "does the
+// ledger exist?" precheck is insufficient (the reap can land in the gap), so the decision AND the
+// write are serialized through `quota.appendReserveIfLive`, which holds the SAME cross-process
+// `quota.lock` settlement removes the entry under while it re-checks and (only if still live)
+// performs the append. A settled/missing ledger -> the append is skipped, but SIGTERM still
+// proceeds unconditionally either way -- killing an already-exited child is a harmless no-op.
+// `appendReserveIfLive` never throws, so this stays never-raises/best-effort like the rest of this
+// module.
+function onCancel({ writer, child, home } = {}) {
+  if (writer && typeof writer.control === 'function') {
+    quota.appendReserveIfLive(home, writer.activityId, () => writer.control('cancel_requested'));
+  }
   if (child && typeof child.kill === 'function') child.kill('SIGTERM');
 }
 

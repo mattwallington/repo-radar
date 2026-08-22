@@ -2190,7 +2190,7 @@ ipcMain.on('stop-sync', (event) => {
     // Activity History (Task 2.3): record cancel-intent BEFORE the graceful SIGTERM below, then
     // send that SAME first SIGTERM through onCancel (not a second, separate kill call) so the
     // existing SIGKILL/system-kill escalation timers further down are completely unchanged.
-    activityGlue.onCancel({ writer: currentSyncProcess._activityWriter, child: currentSyncProcess });
+    activityGlue.onCancel({ writer: currentSyncProcess._activityWriter, child: currentSyncProcess, home: os.homedir() });
     console.log('Sent SIGTERM to sync process');
     
     // Check if process responded after 1 second

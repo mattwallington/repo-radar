@@ -539,7 +539,7 @@ async function crashScenario(t, { cancelFirst }) {
   assert.strictEqual(handoffRec.owner_token, ownerToken, 'the adopted owner_token is the same one Electron minted, even in the crash path');
 
   if (cancelFirst) {
-    glue.onCancel({ writer }); // records control(cancel_requested); no child passed -> no signal sent here
+    glue.onCancel({ writer, home }); // records control(cancel_requested); no child passed -> no signal sent here
     await waitFor(() => readAllRecords(home, activityId).some((r) => r.type === 'control' && r.name === 'cancel_requested'));
   }
 

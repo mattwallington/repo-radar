@@ -414,6 +414,57 @@ function grant(home, activityId, nbytes) {
   }
 }
 
+// Codex R3 (BLOCKER, fixed here): post-handoff, Electron retains authority to write
+// `control{cancel_requested}` (writer.js's `allowHandedOff` exception) even AFTER
+// `dropLocalReference()`. Meanwhile the Python child (the executing owner) can durably write its
+// `terminal` and `settle()` -- which reaps (removes) the ledger entry -- BEFORE Electron observes
+// the child's exit. A "does the ledger entry still exist?" PRECHECK is insufficient: the reap can
+// land in the gap between that check and the append itself (settle()'s delegated prune runs under
+// its OWN fresh `quota.lock` acquisition, entirely independent of any check Electron performed a
+// moment earlier). A settled activity's only remaining charge term is its on-disk `committed` size
+// (fstat-only, `_charge` above) -- an append landing AFTER that ledger entry is gone has NO
+// liability term to catch it, so it silently escapes accounting (Codex's measured repro: charge
+// 687 vs actual committed 861, undercount 174).
+//
+// The fix: serialize the DECISION and the WRITE against settlement, using the exact same
+// cross-process `quota.lock` settlement itself is removed under (Python's `settle()` acquires it
+// directly; the reap's `_reconcile_one_locked` runs under the prune's held `quota.lock` too -- see
+// this module's own header comment on Node's `_quotaLock` interoperating with that same BSD flock,
+// proven in Task 2.2a). Acquire `quota.lock`, read the ledger entry AT THAT MOMENT (under the
+// lock), and only if it is still a valid, live (unsettled) entry run `appendFn` -- all inside the
+// SAME lock hold, so the whole read-then-write is atomic and mutually exclusive with settlement
+// across processes. A settled (reaped/missing) or otherwise corrupt entry -> `_readEntry` already
+// returns CORRUPT for a missing file (the FileNotFoundError path) -- no-op, correctly.
+//
+// No deadlock: `appendFn` (writer.control('cancel_requested')) does NOT itself acquire
+// `quota.lock` -- reserve-consuming control writes skip `quota.grant` entirely (writer.js's
+// `control()`, `{ reserve: true }`) -- and its `_emit` appends to a SEGMENT file via
+// `secureOpenAppend`, never the ledger, so running it inside this lock hold is safe (no
+// nested/re-entrant `quota.lock` acquisition). Electron's writer has already `dropLocalReference()`d
+// its lease by the time this runs post-handoff; appending a segment record needs no lease, only
+// filesystem access to the activity dir.
+//
+// Deliberately narrow: only the Electron post-handoff cancel write races settlement this way (the
+// owner itself always writes `terminal`/`integrity` BEFORE it settles, so those never race their
+// own settlement). This is NOT broadened to every reserve write -- the owner's own terminal path
+// stays lock-free, exactly as before. Never throws (any failure -- lock acquisition, entry read,
+// `appendFn` itself -- is treated as "could not confirm live", so the append is skipped and the
+// caller still proceeds to SIGTERM regardless; see trigger-glue.js's `onCancel`).
+function appendReserveIfLive(home, aid, appendFn) {
+  let fd = null;
+  try {
+    fd = _quotaLock(home);
+    const e = _readEntry(paths.ledgerEntryPath(home, aid));
+    if (e === CORRUPT) return false; // settled (missing) or genuinely corrupt -> no-op
+    appendFn(); // ledger still live -- its reservation covers this reserve-consuming append
+    return true;
+  } catch (e) {
+    return false; // never-raises (best-effort cancel)
+  } finally {
+    if (fd !== null) _unlock(fd);
+  }
+}
+
 // Ruling B: Node cannot unlink, so settle() never removes the ledger entry ITSELF -- it delegates
 // that to the (packaged-aware, Codex B3a) Python prune entrypoint below. Codex R2: `_charge` no
 // longer has a terminal-VISIBILITY shortcut of its own (that was a second undercount path -- see
@@ -448,7 +499,7 @@ function settle(home, activityId) {
 
 module.exports = {
   CEILING, RESERVE, PER_ACTIVITY_CAP, ORDINARY_CAP, CORRUPT,
-  admit, grant, settle,
+  admit, grant, settle, appendReserveIfLive,
   configurePythonRunner,
   _quotaLock, _unlock,
   _parseEntry, _readEntry, _writeEntry,

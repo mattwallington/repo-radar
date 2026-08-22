@@ -182,12 +182,60 @@ test('beginManualActivity falls back to a valid channel for every non-string/emp
 
 // === onCancel / onContention / onGuardBlock (brief's sketch, verbatim shape) ===================
 
-test('cancel appends control{cancel_requested} BEFORE SIGTERM', () => {
-  const calls = [];
-  const writer = { control: (n) => calls.push('control:' + n), _handedOff: true };
-  const child = { kill: (sig) => calls.push('kill:' + sig) };
-  onCancel({ writer, child });
-  assert.deepStrictEqual(calls, ['control:cancel_requested', 'kill:SIGTERM']);
+// Codex R3: onCancel now routes the append through quota.appendReserveIfLive(home,
+// writer.activityId, ...), so proving the ordering requires a REAL ledger entry backing
+// `writer.activityId` (a bare fake with no `home`/ledger would be treated as "can't confirm live"
+// and skipped -- see the companion settled-activity test below). This is the LIVE-activity case:
+// admit() leaves a live ledger entry in place, so the serialized check finds it live and the
+// append proceeds, preserving the exact same cancel-before-SIGTERM ordering as before.
+test('cancel appends control{cancel_requested} BEFORE SIGTERM (still-live activity: ledger present)', () => {
+  const home = tmpHome();
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const l = A.acquire(A.ownerLockPath(home, aid));
+    assert.strictEqual(A.quota.admit(home, aid, l), true, 'ledger entry must be live for this case');
+
+    const calls = [];
+    const writer = { activityId: aid, control: (n) => calls.push('control:' + n), _handedOff: true };
+    const child = { kill: (sig) => calls.push('kill:' + sig) };
+    onCancel({ writer, child, home });
+    assert.deepStrictEqual(calls, ['control:cancel_requested', 'kill:SIGTERM']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Codex R3 (BLOCKER) regression at the trigger-glue wiring level: an activity whose ledger has
+// already been reaped (settled) -- simulating the Python child having durably terminalized and
+// settle()'d BEFORE Electron's post-handoff stop handler runs -- must have its cancel append
+// skipped entirely (no reservation left to cover it), while the SIGTERM still proceeds
+// unconditionally (killing an already-exited child is a harmless no-op).
+test('cancel is a NO-OP on a settled (reaped) activity -- SIGTERM still proceeds (Codex R3)', () => {
+  const home = tmpHome();
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const l = A.acquire(A.ownerLockPath(home, aid));
+    assert.strictEqual(A.quota.admit(home, aid, l), true);
+    // Simulate the Python child's own terminal+settle reap having already completed: the ledger
+    // entry is gone. (Node itself never unlinks -- Ruling B -- this stands in for the delegated
+    // Python-side reap actually landing.)
+    fs.unlinkSync(A.ledgerEntryPath(home, aid));
+    assert.strictEqual(fs.existsSync(A.ledgerEntryPath(home, aid)), false);
+
+    const calls = [];
+    const writer = { activityId: aid, control: (n) => calls.push('control:' + n), _handedOff: true };
+    const child = { kill: (sig) => calls.push('kill:' + sig) };
+    onCancel({ writer, child, home });
+    assert.deepStrictEqual(
+      calls,
+      ['kill:SIGTERM'],
+      'a settled activity must get no cancel append, but SIGTERM must still proceed',
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('contention finalizes the attempt as skipped (terminal owns release)', () => {
