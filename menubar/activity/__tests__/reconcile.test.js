@@ -9,7 +9,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const A = require('../index');
-const { reconcile } = A;
+// Local var name kept distinct from the Task 3.3 read-side `reconcile` FUNCTION imported below
+// (`../reconcile`'s own `reconcile` export) -- this one is the reconcile.js MODULE namespace, as
+// re-exported (namespaced, not flattened) by index.js.
+const { reconcile: reconcileMod } = A;
 
 function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'rr-reconcile-'));
@@ -54,7 +57,7 @@ test('synthesizes an interrupted terminal when the lease is free and a start is 
   writeStart(home, aid);
   l.release(); // crash after start, before terminal
 
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), true);
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), true);
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), [['interrupted', 'reconciler']]);
 
   // the lease was released again -> a fresh acquire must succeed
@@ -70,7 +73,7 @@ test('synthesizes a cancelled terminal when a cancel_requested control record is
   writeRecord(home, aid, { type: 'control', seq: 1, name: 'cancel_requested' });
   l.release();
 
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), true);
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), true);
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), [['cancelled', 'reconciler']]);
 });
 
@@ -78,7 +81,7 @@ test('preserves (does not write) when the lease is still held', () => {
   const home = tmpHome();
   const [aid, l] = newActivity(home); // lease still HELD, no crash
   writeStart(home, aid);
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), false);
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), false);
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), []);
   l.release();
 });
@@ -87,7 +90,7 @@ test('nothing to synthesize when there is no durable start at all (owner-gone-pr
   const home = tmpHome();
   const [aid, l] = newActivity(home); // no start record written
   l.release();
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), false);
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), false);
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), []);
 });
 
@@ -97,7 +100,7 @@ test('nothing to synthesize when a terminal already exists (idempotent, no doubl
   writeStart(home, aid);
   writeRecord(home, aid, { type: 'terminal', seq: 9, outcome: 'succeeded', summary: {}, by: 'deadbeef' });
   l.release();
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), false);
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), false);
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), [['succeeded', 'deadbeef']]); // unchanged
 });
 
@@ -111,7 +114,7 @@ test('fs error path returns false, never throws, and still releases the lease it
   fs.fsyncSync = () => { throw new Error('no fsync'); };
   let result;
   try {
-    result = reconcile.synthesizeTerminal(home, aid);
+    result = reconcileMod.synthesizeTerminal(home, aid);
   } finally {
     fs.fsyncSync = realFsync;
   }
@@ -131,6 +134,135 @@ test('a top-level start whose fields nest type:"terminal" is not mistaken for a 
     fields: { type: 'terminal' },
   });
   l.release();
-  assert.strictEqual(reconcile.synthesizeTerminal(home, aid), true); // still synthesizes
+  assert.strictEqual(reconcileMod.synthesizeTerminal(home, aid), true); // still synthesizes
   assert.deepStrictEqual(topTerminalOutcomes(home, aid), [['interrupted', 'reconciler']]);
+});
+
+// Task 3.3: reconcile(home, activityId, { _probe } = {}) -- the READ-side counterpart, mirroring
+// the Step-1 scenarios from task-3.3-brief.md verbatim (tri-state lease.probe branching,
+// duplicate/conflicting terminal handling). Every test below creates its own tmp `home` via
+// `fresh()` and removes it in a `finally` (and releases any lease it holds) -- no leaked scratch
+// dirs, per this repo's post-incident tmp-dir-cleanup policy.
+const { reconcile } = require('../reconcile');
+const { activityDir, ownerLockPath, segmentPath, secureMkdir } = require('../paths');
+const { acquire } = require('../lease');
+
+const AID = '00000000-0000-4000-8000-000000000000';
+// seed FULLY VALID v1 records (Round-5 #6) so the canonical parser accepts them
+const START = { schema_version:1, activity_id:AID, type:'start', seq:0, ts:'2026-08-14T00:00:00-07:00',
+                kind:'sync', channel:'stable', trigger:'cli', created_by:'python' };
+function seed(home, lines) {
+  secureMkdir(activityDir(home, AID));
+  fs.writeFileSync(segmentPath(home, AID, 'python', 'deadbeef'),
+    lines.map(o => JSON.stringify(o)).join('\n') + '\n');
+}
+// enumerate ALL segments (the reconciler writes its OWN writer-instance segment)
+function allText(home) {
+  const d = activityDir(home, AID);
+  return fs.readdirSync(d).filter(f => f.endsWith('.jsonl'))
+    .map(f => fs.readFileSync(path.join(d, f), 'utf8')).join('');
+}
+const fresh = () => fs.mkdtempSync(path.join(os.tmpdir(), 'act-'));
+
+test('freed lock + no cancel => interrupted (synthesized, durable, in a NEW segment)', () => {
+  const home = fresh();
+  try {
+    seed(home, [START]);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'interrupted'); assert.ok(r.synthesized);
+    assert.match(allText(home), /"type":"terminal".*"by":"reconciler"/);   // scan ALL segments
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('held lock => stays running', () => {
+  const home = fresh();
+  let held = null;
+  try {
+    seed(home, [START]);
+    held = acquire(ownerLockPath(home, AID));
+    assert.strictEqual(reconcile(home, AID).outcome, null);
+  } finally {
+    if (held) held.release();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+const control = () => ({ schema_version:1, activity_id:AID, type:'control', seq:1,
+  ts:'2026-08-14T00:00:00-07:00', name:'cancel_requested', fields:{} });
+const term = (seq, outcome, by='deadbeef') => ({ schema_version:1, activity_id:AID, type:'terminal',
+  seq, ts:'2026-08-14T00:00:00-07:00', outcome, summary:{}, by });
+
+test('cancel_requested + freed lock => cancelled', () => {
+  const home = fresh();
+  try {
+    seed(home, [START, control()]);
+    assert.strictEqual(reconcile(home, AID).outcome, 'cancelled');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('UNCERTAIN probe => stays running + a System integrity Problem', () => {
+  const home = fresh();
+  try {
+    seed(home, [START]);
+    // reconcile exposes a `_probe` injection seam (default: lease.probe); force UNCERTAIN
+    const r = reconcile(home, AID, { _probe: () => 'uncertain' });
+    assert.strictEqual(r.outcome, null);                  // never guesses a dead owner
+    assert.ok(r.problems.some(p => /uncertain/i.test(p.kind || String(p))));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('duplicate terminals (same outcome) group with a count', () => {
+  const home = fresh();
+  try {
+    seed(home, [START, term(1,'succeeded'), term(2,'succeeded')]);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'succeeded');
+    assert.ok(r.duplicateTerminalCounts.succeeded >= 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('conflicting terminals (different outcomes) => interrupted + integrity Problem', () => {
+  const home = fresh();
+  try {
+    seed(home, [START, term(1,'succeeded'), term(2,'failed')]);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'interrupted'); assert.ok(r.problems.length >= 1);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Extra coverage beyond the brief's 6 (an explicit-injected-probe BUSY branch, and confirming
+// duplicateTerminalCounts is populated on the conflict path too -- both branches the 6 above
+// exercise only implicitly or not at all).
+test('explicit BUSY probe => stays running (case-insensitive injected value)', () => {
+  const home = fresh();
+  try {
+    seed(home, [START]);
+    const r = reconcile(home, AID, { _probe: () => 'BUSY' });
+    assert.strictEqual(r.outcome, null);
+    assert.strictEqual(r.synthesized, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('conflicting terminals also populate duplicateTerminalCounts per outcome', () => {
+  const home = fresh();
+  try {
+    seed(home, [START, term(1, 'succeeded'), term(2, 'failed')]);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.duplicateTerminalCounts.succeeded, 1);
+    assert.strictEqual(r.duplicateTerminalCounts.failed, 1);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
