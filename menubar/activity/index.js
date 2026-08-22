@@ -10,6 +10,8 @@ const quota = require('./quota');
 const reconcile = require('./reconcile');
 const redact = require('./redact');
 const writer = require('./writer');
+const read = require('./read');
+const limits = require('./limits');
 
 // Mirrors repo_radar/activity/__init__.py's HANDOFF_REJECTED_EXIT: the adopter's exit code that
 // authorizes Electron's trigger-glue.js `handOff` (Task 2.3) to finalize `failed` itself. Defined
@@ -25,5 +27,11 @@ module.exports = {
   // Stateful subsystems with several generically-named functions and/or internal test seams --
   // namespaced to avoid top-level collisions, matching the existing quota/reconcile precedent.
   quota, reconcile, writer,
+  // Task 3.6: the reader facade -- namespaced (not flattened) since `listActivities`/
+  // `buildExport`/`validateFilter`/`InvalidFilter` are generic names that would otherwise risk
+  // colliding with a future top-level export, same reasoning as quota/reconcile/writer above.
+  // `limits` is exposed too (Task 4.1's IPC handler validates against the same bounds read.js
+  // enforces internally, and needs the shared constants object, not a private copy).
+  read, limits,
   HANDOFF_REJECTED_EXIT,
 };
