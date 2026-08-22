@@ -425,6 +425,29 @@ function _spawnPythonPrune(home, headroomBytes) {
   return result;
 }
 
+// Task 3.5: sibling of `_spawnPythonPrune` that invokes the §7 age/newest-50 retention entrypoint
+// (`python -m repo_radar.activity.retain`) instead of the ceiling-only `prune`. Same configured
+// runner seam (Codex B3a), same cwd/env/HOME/timeout/stdio shape, same bounded-warn-on-failure
+// contract (B3b) -- Node's role here is STRICTLY to spawn; it performs no filesystem deletion of
+// its own (Ruling B). No byte-count argument (retain's matrix is age/count-driven, not a headroom
+// request). Deliberately NOT wired to any cadence/timer here -- Task 5.2 owns when this is called.
+function _spawnPythonRetain(home) {
+  const runner = _resolvePythonRunner();
+  const result = spawnSync(
+    runner.python,
+    ['-m', 'repo_radar.activity.retain'],
+    {
+      cwd: runner.cwd,
+      env: { ...process.env, ...runner.env, HOME: String(home) },
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: PRUNE_SPAWN_TIMEOUT_MS,
+    },
+  );
+  const problem = _describeSpawnFailure(result);
+  if (problem) _warn(`python retain delegation failed: ${problem}`);
+  return result;
+}
+
 // `lease` mirrors Python's admit(home, activity_id, lease) signature for call-site symmetry
 // (writer.js will call this with the lease it just acquired, exactly as writer.py does) but,
 // like the current Python, does not itself inspect it -- kept for API compatibility.
@@ -612,7 +635,7 @@ module.exports = {
   _quotaLock, _quotaLockNonblocking, _unlock,
   _parseEntry, _readEntry, _writeEntry,
   _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _hasTerminal,
-  _spawnPythonPrune,
+  _spawnPythonPrune, _spawnPythonRetain,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },
 };

@@ -1,4 +1,4 @@
-import fcntl, json, os, stat
+import fcntl, json, os, stat, time
 from repo_radar.activity import paths, records, ids
 from repo_radar.activity import lease as lease_mod
 from repo_radar.activity import reconcile as reconcile_mod
@@ -7,6 +7,15 @@ CEILING = 64 * 1024 * 1024
 RESERVE = 60 * 1024
 PER_ACTIVITY_CAP = 4 * 1024 * 1024
 ORDINARY_CAP = PER_ACTIVITY_CAP - RESERVE
+
+# spec §7 retention matrix (Task 3.5): the newest NEWEST_KEEP settled items are PROTECTED from
+# age-based pruning regardless of kind; a routine/problem item outside that protected window is
+# only prunable once it exceeds its own age threshold. All three are read at CALL time inside
+# `retain` (not bind time) so a test can monkeypatch them, exactly like CEILING/RESERVE elsewhere
+# in this module (see test_ceiling_override_keeps_newest_problem's own CEILING monkeypatch).
+NEWEST_KEEP = 50
+ROUTINE_MAX_AGE_S = 14 * 86400
+PROBLEM_MAX_AGE_S = 90 * 86400
 
 def _open_quota_dir(home):
     paths.secure_mkdir(paths.quota_dir(home))              # ensure activity/ + quota/ exist
@@ -371,6 +380,61 @@ def prune(home, need_bytes):
         return _prune_locked(home, need_bytes)
     except (OSError, paths.UnsafePath):
         return 0                                     # fail closed on lock failure (fix round 1, Minor 2)
+    finally:
+        if fd is not None:
+            _unlock(fd)
+
+def _retain_locked(home):
+    """CALLER HOLDS quota.lock. Applies the spec §7 age/newest-50 retention matrix, then the
+    ceiling-override (which MAY prune within the protected newest-50 window, per spec -- the
+    ceiling always wins). Returns the list of pruned activity ids."""
+    base = paths.quota_dir(home).parent
+    live = {aid for aid, _e in _ledger_entries(home)}
+    before = set(paths.list_owned_subdirs(base))            # pre-deletion snapshot (Round-6 #6)
+
+    candidates = []
+    for aid in before:
+        if aid == "quota" or aid in live:
+            continue
+        kind, mtime = _classify(home, aid)
+        if kind == "running":
+            continue                                         # never prune running/unreconciled
+        candidates.append((aid, kind, mtime))
+
+    newest_keep = NEWEST_KEEP                                # read at call time (monkeypatch-friendly)
+    protected = {
+        aid for aid, _k, _mt in
+        sorted(candidates, key=lambda c: c[2], reverse=True)[:newest_keep]
+    }
+    problems = [c for c in candidates if c[1] == "problem"]
+    newest_problem = max(problems, key=lambda c: c[2])[0] if problems else None
+
+    now = time.time()
+    routine_max_age = ROUTINE_MAX_AGE_S
+    problem_max_age = PROBLEM_MAX_AGE_S
+    for aid, kind, mtime in candidates:
+        if aid in protected or aid == newest_problem:
+            continue
+        age = now - mtime
+        prunable = (kind == "routine" and age > routine_max_age) or \
+                   (kind == "problem" and age > problem_max_age)
+        if prunable:
+            paths.unlink_owned_tree(paths.activity_dir(home, aid))
+
+    over = _charge(home) - CEILING
+    if over > 0:
+        _prune_locked(home, over)                            # ceiling overrides newest-50 (spec §7)
+
+    return sorted(before - set(paths.list_owned_subdirs(base)))
+
+def retain(home):
+    fd = None
+    try:
+        fd = _quota_lock(home)
+        _reconcile_all_locked(home)                          # settle newly-dead owners first
+        return _retain_locked(home)
+    except (OSError, paths.UnsafePath):
+        return []                                             # fail closed on lock failure
     finally:
         if fd is not None:
             _unlock(fd)
