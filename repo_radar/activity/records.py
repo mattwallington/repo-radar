@@ -147,7 +147,7 @@ def parse_valid(raw, expected_activity_id):
         return None
     if not isinstance(obj, dict):
         return None
-    if obj.get("schema_version") != SCHEMA_VERSION or obj.get("activity_id") != expected_activity_id:
+    if type(obj.get("schema_version")) is not int or obj.get("schema_version") != SCHEMA_VERSION or obj.get("activity_id") != expected_activity_id:
         return None
     try:
         _validate(obj)                 # FULL v1 shape validation (Round-5 #3)

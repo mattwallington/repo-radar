@@ -230,5 +230,10 @@
     "accept": false,
     "why": "seq is a non-integer JSON literal via exponent notation (1e0) -- see the 1.0 case above for why 'raw_text' (not 'raw') is used",
     "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1e0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "schema_version is the non-integer JSON literal 1.0 -- Python's `1.0 != 1` is False so an untyped check accepts it while Node rejects the literal; both must reject (type-strict int, Ruling 53)",
+    "raw_text": "{\"schema_version\":1.0,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
   }
 ]
