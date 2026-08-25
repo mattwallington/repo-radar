@@ -118,6 +118,73 @@ def test_scan_view_uncertain_false_for_bad_name_only(tmp_path):
     assert scan.view_uncertain is False
     assert scan.rejected == [{"name": "junk.jsonl", "reason": "bad-name"}]
 
+# --- gate recheck under the lease (Codex R2 B2 recheck) ------------------------------------
+# `_reconcile_one_locked`'s own `_scan` call runs BEFORE any lease is acquired -- it only decides
+# whether to CALL `synthesize_terminal` at all. That decision can go stale by the time
+# `synthesize_terminal` actually acquires the owner lease and is about to write: a conforming
+# segment could become unreadable, or a terminal could land, in the gap. `synthesize_terminal`'s
+# `gate` (== quota._synth_gate, a fresh `_scan`) is re-evaluated UNDER that lease to close the
+# window; a gate that comes back negative must block the write entirely.
+
+def test_reconcile_one_locked_gate_recheck_blocks_stale_synthesis(tmp_path, monkeypatch):
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    l.release()                                            # owner gone; lock now free
+
+    # First `_scan` call is `_reconcile_one_locked`'s own PRE-lease scan: certain, has a start,
+    # no terminal -- it must decide to call synthesize_terminal. Every call AFTER that (i.e. the
+    # gate's own re-scan, made UNDER the lease synthesize_terminal acquires) reports an uncertain
+    # view, simulating a conforming segment going unreadable in the interim.
+    certain_has_start = quota.Scan(records=[{"type": "start"}], findings=[], rejected=[],
+                                    view_uncertain=False)
+    now_uncertain = quota.Scan(records=[], findings=[],
+                                rejected=[{"name": "x", "reason": "denied"}], view_uncertain=True)
+    calls = {"n": 0}
+    def fake_scan(home, a):
+        calls["n"] += 1
+        return certain_has_start if calls["n"] == 1 else now_uncertain
+    monkeypatch.setattr(quota, "_scan", fake_scan)
+
+    quota._reconcile_one_locked(tmp_path, aid)
+
+    assert calls["n"] == 2                                  # pre-lease scan + the gate's rescan
+    assert paths.ledger_entry_path(tmp_path, aid).exists()  # NOT settled -- gate blocked the write
+    # nothing was written, and the lease synthesize_terminal acquired was released
+    fresh = lease.acquire(paths.owner_lock_path(tmp_path, aid))
+    assert fresh is not None
+    fresh.release()
+
+def test_reconcile_one_locked_gate_recheck_allows_synthesis_when_view_still_holds(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    l.release()                                            # owner gone; lock now free
+
+    quota._reconcile_one_locked(tmp_path, aid)
+
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()  # settled: gate reaffirmed, synth wrote
+
+def test_reconcile_one_locked_passes_callable_gate_reflecting_fresh_scan(tmp_path, monkeypatch):
+    # Direct check that `_reconcile_one_locked` wires a `gate` kwarg through to
+    # `synthesize_terminal` at all, and that the gate it builds (`_synth_gate`) evaluates to the
+    # expected bool for a still-certain, has-start/no-terminal view.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    l.release()
+
+    captured = {}
+    def fake_synthesize_terminal(home, a, gate=None):
+        captured["gate"] = gate
+        return False                                       # decline; don't actually write here
+    monkeypatch.setattr(quota.reconcile_mod, "synthesize_terminal", fake_synthesize_terminal)
+
+    quota._reconcile_one_locked(tmp_path, aid)
+
+    assert callable(captured.get("gate"))
+    assert captured["gate"]() is True                       # certain view, start, no terminal
+
 def test_scan_view_uncertain_false_when_activity_dir_never_created(tmp_path):
     # mirrors _owner_lock_absent's FileNotFoundError-vs-other split: a directory that PROVABLY
     # never existed is a definite "nothing here", not uncertainty. The shared

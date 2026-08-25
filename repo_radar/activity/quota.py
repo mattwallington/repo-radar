@@ -398,6 +398,22 @@ def _owner_lock_absent(home, aid):
     finally:
         os.close(d)
 
+def _synth_gate(home, aid):
+    """Re-run `_scan` -- called as `reconcile.synthesize_terminal`'s `gate`, i.e. UNDER the owner
+    lease that function has already acquired -- so the has-start/no-terminal/view-certain verdict
+    that gates the synthesized write is fresh AT WRITE TIME, not stale from
+    `_reconcile_one_locked`'s own pre-lease scan below (Codex R2 B2 recheck: that first scan runs
+    before any lease is held, so a conforming segment could go unreadable, or a terminal could
+    land, in the window between it and the write -- this closes that window by re-deriving the
+    same verdict from a brand-new scan taken while nothing else can be racing the write). Mirrors
+    Node's `synthesizeTerminal`, which re-scans under its own lease directly rather than trusting
+    a caller's earlier scan."""
+    scan = _scan(home, aid)
+    if scan.view_uncertain:
+        return False
+    types = {r.get("type") for r in scan.records}
+    return "start" in types and "terminal" not in types
+
 def _reconcile_one_locked(home, aid):
     lock = paths.owner_lock_path(home, aid)
     scan = _scan(home, aid)                         # Ruling 38: ONE scan gates every branch below,
@@ -429,8 +445,12 @@ def _reconcile_one_locked(home, aid):
     # has start, no terminal, view NOT uncertain (checked above, before this point is ever
     # reached): provably-dead owner -> synthesize interrupted/cancelled + settle. synthesize_
     # terminal acquires the owner.lock itself (its own free/busy gate); returns False if
-    # BUSY/UNCERTAIN or the write fails, in which case we preserve the charge (safe bias).
-    if reconcile_mod.synthesize_terminal(home, aid):
+    # BUSY/UNCERTAIN or the write fails, in which case we preserve the charge (safe bias). The
+    # `gate` re-runs this same has-start/no-terminal/view-certain check from a FRESH scan taken
+    # under the lease synthesize_terminal just acquired (Codex R2 B2 recheck) -- the scan above
+    # ran before any lease was held, so it alone can't be trusted to still hold true at write
+    # time.
+    if reconcile_mod.synthesize_terminal(home, aid, gate=lambda: _synth_gate(home, aid)):
         _unlink_entry(home, aid)
 
 def _reconcile_all_locked(home):

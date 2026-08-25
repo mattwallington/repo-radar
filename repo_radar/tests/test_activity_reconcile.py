@@ -81,3 +81,25 @@ def test_fs_error_path_returns_false_never_raises(tmp_path, monkeypatch):
     fresh = lease.acquire(paths.owner_lock_path(tmp_path, aid))
     assert fresh is not None
     fresh.release()
+
+# --- `gate` (Codex R2 B2 recheck): re-evaluated UNDER the just-acquired lease, before any write --
+
+def test_gate_false_blocks_write_and_releases_lease(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid)
+    l.release()                                   # crash after start, before terminal
+    # a gate that declines (as if a fresh under-lease rescan no longer supports synthesis) must
+    # write NOTHING and still release the lease it acquired.
+    assert reconcile.synthesize_terminal(tmp_path, aid, gate=lambda: False) is False
+    assert "terminal" not in _top_types(tmp_path, aid)
+    fresh = lease.acquire(paths.owner_lock_path(tmp_path, aid))
+    assert fresh is not None
+    fresh.release()
+
+def test_gate_true_behaves_like_no_gate(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid)
+    l.release()
+    # a gate that affirms must behave exactly like the gate=None (default) path.
+    assert reconcile.synthesize_terminal(tmp_path, aid, gate=lambda: True) is True
+    assert _top_terminal_outcomes(tmp_path, aid) == [("interrupted", "reconciler")]
