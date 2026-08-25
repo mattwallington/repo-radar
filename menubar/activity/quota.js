@@ -64,7 +64,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const paths = require('./paths');
 const ids = require('./ids');
-const records = require('./records');
+const parse = require('./parse');
 
 const CEILING = 64 * 1024 * 1024;
 const RESERVE = 60 * 1024;
@@ -122,8 +122,8 @@ function _resolvePythonRunner() {
 
 // Mirrors writer.js's own `_warn` (same prefix, same `console.error` sink) -- kept as an
 // independent copy rather than a cross-require of writer.js, which would create a require cycle
-// (writer.js already requires quota.js). See trigger-glue.js's `_splitLines` comment for the same
-// duplicate-small-helper precedent elsewhere in this subsystem.
+// (writer.js already requires quota.js) -- the same duplicate-small-helper precedent used
+// elsewhere in this subsystem.
 function _warn(msg) {
   console.error(`repo-radar: activity: ${msg}`);
 }
@@ -310,35 +310,27 @@ function _ledgerEntries(home) {
   return out;
 }
 
-function _splitLines(buf) {
-  const lines = [];
-  let start = 0;
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
-  }
-  lines.push(buf.subarray(start));
-  return lines;
-}
-
 // Whether activity `aid` has a durable `terminal` record in its segments. A bounded CONTENT read
 // (unlike `_onDisk`'s fstat-only sizing, which the I7 fix protects) -- but bounded to at most one
 // activity's segments per ledger entry, of which there are at most a ceiling-bounded number
 // (spec's own admission cap), so this is acceptable lifecycle-data reading, distinct from the
-// per-record sizing path. Local copy of reconcile.js's own private `_topTypes`/`_hasTerminal`
-// (duplicated rather than reaching into reconcile.js's underscore-prefixed internals -- matches
-// this codebase's established precedent; see trigger-glue.js's `_splitLines` comment) --
-// requiring reconcile.js here would also risk a require cycle surface as this subsystem grows.
+// per-record sizing path.
 //
 // Codex R2: this is intentionally NOT called from `_charge` anymore -- a terminal becoming
 // VISIBLE here mid-`_charge` (readable, but not proven fsync-durable) was a second undercount
 // path when `_charge` used it to zero out a live entry's reservation (see `_charge`'s comment).
 // Kept for callers that need pure lifecycle introspection (and exercised directly by tests).
+//
+// Ruling 41 / Codex G3-Node2: segment bytes are parsed via `parse.parseSegment` -- the ONE
+// implementation of the line-split + trailing-line rule (an unterminated final line is ignored
+// unconditionally, even when it happens to be valid JSON; the durability contract is
+// record+`\n`). A private byte-split here previously accepted a newline-less-but-parseable
+// terminal that `parse.js`'s callers (reconcile.js, read.js) would ignore, so this introspection
+// helper could disagree with the rest of the subsystem about whether a terminal existed.
 function _hasTerminal(home, aid) {
   for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
-    for (const line of _splitLines(seg.data)) {
-      if (line.length === 0) continue;
-      const rec = records.parseValid(line, aid);
-      if (rec !== null && rec.type === 'terminal') return true;
+    for (const rec of parse.parseSegment(seg.data, aid).records) {
+      if (rec.type === 'terminal') return true;
     }
   }
   return false;

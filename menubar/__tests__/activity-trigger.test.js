@@ -405,6 +405,81 @@ test('onContention/onGuardBlock/onCancel are safe no-ops without a writer (never
   assert.doesNotThrow(() => onCancel({}));
 });
 
+// === _hasAckSignal: Ruling 41 trailing-line contract ============================================
+// Codex G3-Node2: `_hasAckSignal` previously carried its own private byte-splitter, which would
+// accept a newline-less-but-valid-JSON tail as an ack -- a torn `ownership`/`terminal` write could
+// therefore wrongly tell Electron a dead handoff child HAD acknowledged. It now routes through
+// `parse.parseSegment` (menubar/activity/parse.js), the one shared implementation of the
+// trailing-line rule: a segment's final remainder that lacks a terminating `\n` is ignored
+// unconditionally, even when it is otherwise valid JSON (the durability contract is record+`\n`;
+// a missing newline is a torn write, not a finding).
+
+test('Ruling 41: _hasAckSignal ignores an ownership{role:handoff} record with no trailing newline (torn write), then sees it once the newline lands', () => {
+  const home = tmpHome();
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const rec = {
+      schema_version: 1, activity_id: aid, type: 'ownership', seq: 1,
+      ts: '2026-08-14T00:00:00-07:00', role: 'handoff', owner_token: A.mintToken(),
+      producer: 'dispatcher', pid: 4242, boot_id: 'boot-abc', proc_birth: '2026-08-14T00:00:00-07:00',
+    };
+    const seg = A.segmentPath(home, aid, 'dispatcher', 'deadbeef');
+    const fd = A.secureOpenAppend(seg);
+    fs.writeSync(fd, Buffer.from(JSON.stringify(rec))); // NO trailing \n -- a torn write
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    assert.strictEqual(
+      triggerGlue._hasAckSignal(home, aid), false,
+      'a newline-less-but-valid-JSON ownership{handoff} tail must not count as an ack',
+    );
+
+    // The exact same record bytes, now durably terminated with the missing `\n`.
+    const fd2 = A.secureOpenAppend(seg);
+    fs.writeSync(fd2, Buffer.from('\n'));
+    fs.fsyncSync(fd2);
+    fs.closeSync(fd2);
+    assert.strictEqual(
+      triggerGlue._hasAckSignal(home, aid), true,
+      'once `\\n`-terminated, the same ownership{handoff} record counts as an ack',
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Ruling 41: _hasAckSignal ignores a terminal record with no trailing newline (torn write), then sees it once the newline lands', () => {
+  const home = tmpHome();
+  try {
+    const aid = A.mintActivityId();
+    A.secureMkdir(A.activityDir(home, aid));
+    const rec = {
+      schema_version: 1, activity_id: aid, type: 'terminal', seq: 1,
+      ts: '2026-08-14T00:00:00-07:00', outcome: 'succeeded', summary: {}, by: A.mintToken(),
+    };
+    const seg = A.segmentPath(home, aid, 'python', 'cafebabe');
+    const fd = A.secureOpenAppend(seg);
+    fs.writeSync(fd, Buffer.from(JSON.stringify(rec))); // NO trailing \n -- a torn write
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    assert.strictEqual(
+      triggerGlue._hasAckSignal(home, aid), false,
+      'a newline-less-but-valid-JSON terminal tail must not count as an ack',
+    );
+
+    const fd2 = A.secureOpenAppend(seg);
+    fs.writeSync(fd2, Buffer.from('\n'));
+    fs.fsyncSync(fd2);
+    fs.closeSync(fd2);
+    assert.strictEqual(
+      triggerGlue._hasAckSignal(home, aid), true,
+      'once `\\n`-terminated, the same terminal record counts as an ack',
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // === handOff: seam-based state machine (brief's sketch) =========================================
 
 test('handOff outcome keyed on the exit SIGNAL, not merely exit (findings 3 & 4)', async () => {

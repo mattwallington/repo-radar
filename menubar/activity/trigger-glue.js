@@ -14,9 +14,9 @@ const {
   reconcile,
   activityDir,
   readOwnedSegments,
-  parseValid,
   HANDOFF_REJECTED_EXIT,
 } = require('./index');
+const parse = require('./parse');
 const { ActivityWriter } = writerMod;
 
 // Bounded wait for the spawned worker's ack (Task 2.3 spec: "waits (bounded, <=5s)"). Exported as
@@ -160,29 +160,19 @@ function onCancel({ writer, child, home } = {}) {
 
 // --- hand-off state machine -----------------------------------------------------------------
 
-function _splitLines(buf) {
-  // Local byte-split mirror of reconcile.js's own private _splitLines: kept as its own small
-  // copy (Buffer-safe, never mangles a multi-byte UTF-8 record straddling the split point)
-  // rather than reaching into another module's underscore-prefixed internal, matching this
-  // codebase's existing precedent (e.g. writer.js's own _strictStringify mirror of records.js's).
-  const lines = [];
-  let start = 0;
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === 0x0a) { lines.push(buf.subarray(start, i)); start = i + 1; }
-  }
-  lines.push(buf.subarray(start));
-  return lines;
-}
-
 // Ack signal: the child durably wrote an `ownership{role:'handoff'}` record, OR any `terminal`
 // (a fast successful/failed run that finished before Electron even noticed). Scans ALL segments
 // for the activity (any producer), mirroring reconcile.js's own _topTypes scan.
+//
+// Ruling 41 / Codex G3-Node2: segment bytes are parsed via `parse.parseSegment` -- the ONE
+// implementation of the line-split + trailing-line rule (an unterminated final line is ignored
+// unconditionally, even when it happens to be valid JSON; the durability contract is
+// record+`\n`). A private byte-split here previously accepted a newline-less-but-parseable
+// ownership/terminal record as an ack, which could wrongly tell Electron a dead handoff child
+// had acknowledged on a torn write.
 function _hasAckSignal(home, activityId) {
   for (const seg of readOwnedSegments(activityDir(home, activityId))) {
-    for (const line of _splitLines(seg.data)) {
-      if (line.length === 0) continue;
-      const rec = parseValid(line, activityId);
-      if (rec === null) continue;
+    for (const rec of parse.parseSegment(seg.data, activityId).records) {
       if (rec.type === 'terminal') return true;
       if (rec.type === 'ownership' && rec.role === 'handoff') return true;
     }

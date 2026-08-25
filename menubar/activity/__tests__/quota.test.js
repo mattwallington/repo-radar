@@ -120,6 +120,36 @@ test('_hasTerminal reflects a durable terminal record on disk, not merely a star
   assert.strictEqual(quota._hasTerminal(home, aid), true);
 });
 
+// Ruling 41 (trailing-line contract, universal): a segment's final remainder that lacks a
+// terminating `\n` is IGNORED everywhere, even when it happens to be valid JSON -- the
+// durability contract is record+`\n`, and a missing newline is a torn write. `_hasTerminal` now
+// routes through `parse.parseSegment`, the one shared implementation of this rule (previously it
+// had its own private byte-splitter that would accept a newline-less-but-parseable tail).
+test('Ruling 41: _hasTerminal ignores a terminal record with no trailing newline (torn write), then sees it once the newline lands', () => {
+  const home = tmpHome();
+  const [aid] = newActivity(home);
+  const rec = {
+    schema_version: 1, activity_id: aid, type: 'terminal', seq: 1,
+    ts: '2026-08-14T00:00:00-07:00', outcome: 'succeeded', summary: {}, by: A.mintToken(),
+  };
+  const seg = A.segmentPath(home, aid, 'electron', 'deadbeef');
+  const fd = A.secureOpenAppend(seg);
+  fs.writeSync(fd, Buffer.from(JSON.stringify(rec))); // NO trailing \n -- a torn write
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  assert.strictEqual(
+    quota._hasTerminal(home, aid), false,
+    'a newline-less-but-valid-JSON tail must be ignored, not counted as a durable terminal',
+  );
+
+  // The exact same record bytes, now durably terminated with the missing `\n`.
+  const fd2 = A.secureOpenAppend(seg);
+  fs.writeSync(fd2, Buffer.from('\n'));
+  fs.fsyncSync(fd2);
+  fs.closeSync(fd2);
+  assert.strictEqual(quota._hasTerminal(home, aid), true, 'once `\\n`-terminated, the same record is seen');
+});
+
 test('configurePythonRunner is a function; a falsy/invalid value un-configures back to the source-checkout default (never throws)', () => {
   assert.strictEqual(typeof quota.configurePythonRunner, 'function');
   assert.doesNotThrow(() => quota.configurePythonRunner(null));
