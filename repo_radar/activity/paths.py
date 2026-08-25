@@ -208,38 +208,71 @@ def read_owned_segments(directory, suffix=".jsonl"):
     implementation. Returns [(name, data_bytes, size, mtime)]; [] if missing."""
     return read_owned_segments_detailed(directory, suffix)[0]
 
-def stat_owned_segments(directory, suffix=".jsonl"):
-    """Like read_owned_segments but METADATA ONLY (Codex gate round 1, finding 7): returns
-    [(name, size)] WITHOUT reading file contents, so quota's per-event size accounting never
-    has to reread an entire segment (up to the 64 MiB ceiling) while holding quota.lock.
+def stat_owned_segments_detailed(directory, suffix=".jsonl"):
+    """METADATA-ONLY enumeration (Codex gate round 1, finding 7 / Ruling 40): sizes are taken
+    WITHOUT opening any entry -- a descriptor-relative lstat (`os.stat(name, dir_fd=dfd,
+    follow_symlinks=False)`) on each suffix-matching entry of the validated dir. Returns
+    `(entries, uncertain)`:
+      entries -- exactly what `stat_owned_segments` returns: [(name, size)].
+      uncertain -- Ruling 45 (Codex R4 B1, BLOCKER): the DIRECTORY-level counterpart of Ruling
+        40's per-entry fix. `entries` alone can't tell "genuinely nothing here" apart from
+        "couldn't measure what's actually there", and the prior single-return shape silently
+        treated both as `[]` -- so an activity dir that exists but can't be traversed (chmod 000,
+        ELOOP, a non-directory squatting on the name) counted as 0 bytes in `quota._charge` while
+        its segments persisted on disk (Codex repro: 16 x 4 MiB settled, chmod 000 one dir ->
+        charge drops to 60 MiB -> a reservation is wrongly admitted -> restore -> 67,170,304
+        bytes, over the ceiling). `uncertain` is:
+          False + entries=[] -- the directory does NOT exist (FileNotFoundError on a path
+            component = proven gone; nothing on disk to count).
+          False -- the directory WAS listed and every suffix-matching entry was either sized or
+            itself proven gone (FileNotFoundError racing away mid-scan).
+          True -- the directory exists but its bytes could not be fully measured: `open_owned_dir`
+            refused it (UnsafePath: EACCES/ELOOP/ENOTDIR/symlink), `os.scandir` failed, or an
+            entry's lstat failed with anything OTHER than FileNotFoundError (ENOENT = raced away,
+            proven gone; any other errno leaves that entry's existence/size unproven). `entries`
+            still carries whatever WAS provable in this case -- never discarded.
 
-    Ruling 40 (Codex R3 B1, BLOCKER): sizes are taken WITHOUT opening the entry -- a
-    descriptor-relative lstat (`os.stat(name, dir_fd=dfd, follow_symlinks=False)`) on each
-    suffix-matching entry of the validated dir. The previous open-then-fstat form silently
-    dropped any segment it could not open (e.g. a settled segment chmod 000), so its bytes
-    vanished from `_on_disk`/`_committed`/`_charge` while the payload persisted on disk -- a
-    quota undercount. A permission-denied REGULAR file keeps its provable size here; only
-    symlinks and other non-regular entries (never ours) are skipped, and an entry that vanishes
-    mid-scan is simply omitted."""
+    Ruling 38 / Codex R2-1 naming convention (mirrors `read_owned_segments_detailed` above):
+    `stat_owned_segments` below is the `entries`-only wrapper -- single implementation, existing
+    signature/behavior for its many callers unchanged. Callers that must never undercount a
+    settled activity's byte liability (quota's `_charge`/`_accounting_uncertain`) use this
+    detailed form directly; symlinks and other non-regular entries (never ours) are still simply
+    skipped, not uncertain -- their absence IS provable (a lstat that resolves to non-regular is
+    not "unmeasured", it's "not a segment")."""
     try:
         dfd = open_owned_dir(directory)
-    except (UnsafePath, FileNotFoundError):
-        return []
+    except FileNotFoundError:
+        return [], False
+    except (UnsafePath, OSError):
+        return [], True
     out = []
+    uncertain = False
     try:
-        for entry in os.scandir(dfd):
+        try:
+            entries = list(os.scandir(dfd))
+        except OSError:
+            return [], True
+        for entry in entries:
             if not entry.name.endswith(suffix):
                 continue
             try:
                 st = os.stat(entry.name, dir_fd=dfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue                                          # raced away -- proven gone
             except OSError:
-                continue                                          # gone mid-scan
+                uncertain = True; continue                        # refused -- bytes unproven
             if not stat.S_ISREG(st.st_mode):
                 continue                                           # symlink / FIFO / dir / device
             out.append((entry.name, st.st_size))
     finally:
         os.close(dfd)
-    return out
+    return out, uncertain
+
+def stat_owned_segments(directory, suffix=".jsonl"):
+    """Thin `entries`-only wrapper over `stat_owned_segments_detailed` (Ruling 45): see there for
+    the single implementation. Returns [(name, size)]; [] if missing or unmeasurable -- UNCHANGED
+    behavior for existing callers that don't need to distinguish "gone" from "uncertain"."""
+    return stat_owned_segments_detailed(directory, suffix)[0]
 
 def fsync_owned_segments(directory, suffix=".jsonl"):
     """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT

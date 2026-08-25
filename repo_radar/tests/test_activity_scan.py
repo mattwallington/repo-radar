@@ -1,8 +1,13 @@
 """Codex R3 (B1-B4): the shared trusted scan (`repo_radar.activity.scan`), its cross-language
 scan-GENERATION parity fixture (`data/scan_vectors.json`, Ruling 44 -- the Node suite drives the
 SAME file against `menubar/activity/parse.js`), the reconciler's cancel-from-trusted-view rule
-(Ruling 41/42), and lstat-based quota accounting (Ruling 40)."""
-import json, os, pathlib, time
+(Ruling 41/42), and lstat-based quota accounting (Ruling 40).
+
+Ruling 47 (Codex R4 B3): a fixture segment carries EXACTLY ONE of `"text"` (a UTF-8-safe JSON
+string, the original shape) or `"bytes_b64"` (base64 of arbitrary RAW bytes, e.g. invalid UTF-8
+that couldn't survive being embedded as a JSON string literal in the fixture file itself, which
+must stay valid UTF-8 JSON). See `_segment_bytes` below."""
+import base64, json, os, pathlib, time
 import pytest
 from repo_radar.activity import quota, paths, lease, ids, reconcile
 from repo_radar.activity import scan as scan_mod
@@ -46,6 +51,14 @@ def _terminal_outcomes(home, aid):
 
 # --- Ruling 44: scan-generation parity fixture ----------------------------------------------
 
+def _segment_bytes(s):
+    """Ruling 47 (Codex R4 B3): a segment carries exactly one of `"text"` (encode as UTF-8) or
+    `"bytes_b64"` (base64 of raw bytes, possibly invalid UTF-8 -- the ONLY way to get an
+    unrepresentable byte sequence into a fixture file that must itself stay valid UTF-8 JSON)."""
+    if "bytes_b64" in s:
+        return base64.b64decode(s["bytes_b64"])
+    return s["text"].encode()
+
 def test_scan_vectors_fixture_schema():
     # Contract the Node suite relies on: only conforming names, exact key set per case.
     assert VECTORS, "fixture must not be empty"
@@ -55,7 +68,7 @@ def test_scan_vectors_fixture_schema():
         assert case["expected"]["types"] == sorted(set(case["expected"]["types"]))
         assert case["expected"]["findings"] == sorted(case["expected"]["findings"])
         for s in case["segments"]:
-            assert set(s) == {"name", "text"}
+            assert set(s) == {"name", "text"} or set(s) == {"name", "bytes_b64"}, (case["name"], s)
             assert paths.parse_segment_name(s["name"]) is not None, (case["name"], s["name"])
 
 @pytest.mark.parametrize("case", VECTORS, ids=[c["name"] for c in VECTORS])
@@ -63,7 +76,7 @@ def test_scan_vectors(tmp_path, case):
     _mk(tmp_path, AID)
     d = paths.activity_dir(tmp_path, AID)
     for s in case["segments"]:
-        (d / s["name"]).write_bytes(s["text"].encode())
+        (d / s["name"]).write_bytes(_segment_bytes(s))
     try:
         scan = scan_mod.scan_activity(tmp_path, AID)
         exp = case["expected"]
@@ -118,6 +131,24 @@ def test_scan_unsupported_schema_finding_and_missing_schema_version(tmp_path):
     assert [r["type"] for r in scan.records] == ["start"]
     assert sorted(f["kind"] for f in scan.findings) == \
         ["corrupt-record", "corrupt-record", "unsupported-schema", "unsupported-schema"]
+
+def test_scan_parse_segment_bytes_classifies_invalid_utf8_line_as_corrupt_record():
+    # Ruling 47 (Codex R4 B3, BLOCKER fixture half): Node's `parseSegment` currently decodes with
+    # lossy `toString('utf8')` (the Node agent is making it fatal, mirroring this). Python's
+    # `json.loads(bytes)` already raises UnicodeDecodeError on an invalid byte -- `_classify_line`
+    # catches that as any other unparseable line -> `corrupt-record`, never silently substituting
+    # a replacement character. Directly exercises `parse_segment_bytes` (no filesystem needed),
+    # per Codex's explicit ask, on top of the shared `scan_vectors.json` "invalid-utf8-terminal-
+    # line" case (Ruling 47) that `test_scan_vectors` above already drives end to end.
+    aid = ids.mint_activity_id()
+    terminal_bytes = _line(aid, "terminal", 1, outcome="succeeded", summary={}, by="deadbeef").encode()
+    bad_terminal_bytes = terminal_bytes[:1] + b"\xff" + terminal_bytes[1:]   # invalid UTF-8 start byte
+    with pytest.raises(UnicodeDecodeError):
+        bad_terminal_bytes.decode("utf-8")                                   # sanity: genuinely invalid
+    data = _start_line(aid).encode() + b"\n" + bad_terminal_bytes + b"\n"
+    records_out, findings = scan_mod.parse_segment_bytes(data, aid)
+    assert [r["type"] for r in records_out] == ["start"]
+    assert findings == [{"kind": scan_mod.CORRUPT_RECORD}]
 
 def test_scan_cancel_requested_only_from_accepted_records(tmp_path):
     aid = ids.mint_activity_id(); _mk(tmp_path, aid)
@@ -245,3 +276,87 @@ def test_charge_counts_permission_denied_segment_and_skips_symlink(tmp_path):
             {"python-deadbeef.jsonl": size}
     finally:
         os.chmod(seg, 0o600)                              # restore perms before teardown
+
+# --- R4-1 / Ruling 45: an unreadable activity DIRECTORY must never vanish from the ceiling ----
+
+def test_missing_activity_directory_is_not_uncertain(tmp_path):
+    # A directory that PROVABLY never existed is "nothing here", not "couldn't tell" -- only
+    # "exists but can't be measured" (chmod 000, ELOOP, ...) is `uncertain`. The surrounding
+    # `activity/` parent (and `quota/`) is created FIRST so the missing piece is genuinely just
+    # the aid-specific subdirectory (a real FileNotFoundError on that one path component) rather
+    # than the shared prefix itself being absent, which `open_owned_dir` reports as UnsafePath --
+    # a separate, pre-existing distinction this fix does not change.
+    paths.secure_mkdir(paths.quota_dir(tmp_path))          # activity/ + quota/ exist; no aid dir
+    aid = ids.mint_activity_id()
+    entries, uncertain = paths.stat_owned_segments_detailed(paths.activity_dir(tmp_path, aid))
+    assert entries == [] and uncertain is False
+    assert quota._on_disk_detailed(tmp_path, aid) == (0, False)
+    assert quota._accounting_uncertain(tmp_path) is False
+    assert quota._charge(tmp_path) == 0
+
+def test_unreadable_activity_directory_does_not_vanish_from_the_ceiling(tmp_path, monkeypatch):
+    """R4-1 (Codex R4 B1, BLOCKER): `stat_owned_segments` used to return `[]` both when an
+    activity dir was genuinely gone AND when it existed but couldn't be traversed (EACCES/ELOOP),
+    so `_charge` silently counted an unlistable SETTLED activity as 0 bytes. Codex's exact repro:
+    16 settled x 4 MiB = 64 MiB; chmod 000 one activity dir -> charge drops to 60 MiB -> a 60 KiB
+    reservation is wrongly admitted -> restore -> 67,170,304 bytes, over the hard ceiling.
+
+    Scaled down 1024x here for test speed, with RESERVE/PER_ACTIVITY_CAP/ORDINARY_CAP/CEILING
+    monkeypatched CONSISTENTLY: all four are read at CALL time (exactly like the module's
+    existing CEILING-only monkeypatch convention -- see test_activity_prune.py/test_activity_
+    quota.py), extended here to the other three since PER_ACTIVITY_CAP must stay >= RESERVE for
+    a ledger entry to validate (`_parse_entry`). CEILING is deliberately re-monkeypatched TWICE
+    below: once EXACTLY at the real (settled + live) total -- zero headroom, mirroring Codex's
+    own numbers -- to make "_charge does not drop below the ceiling" a meaningful assertion, and
+    once with a little headroom afterward to prove admissions actually resume once the
+    accounting is trustworthy again (not "refused forever")."""
+    monkeypatch.setattr(quota, "RESERVE", 60)
+    monkeypatch.setattr(quota, "PER_ACTIVITY_CAP", 4096)
+    monkeypatch.setattr(quota, "ORDINARY_CAP", 4096 - 60)
+    monkeypatch.setattr(quota, "CEILING", 10 ** 9)          # generous ceiling for this one admit
+
+    # A live activity, admitted while the accounting is still fully trustworthy (nothing else
+    # exists yet) -- used below to prove an UNRELATED grant is refused too.
+    live_aid, live_lease = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live_aid, live_lease) is True
+
+    # 16 settled activities (no ledger entry -- bytes counted purely by the directory scan), each
+    # exactly PER_ACTIVITY_CAP (4096) bytes: mirrors a maximally-full real activity's lifetime
+    # cap, and matches Codex's own numbers exactly (16 x cap == the tight ceiling below).
+    settled_aids = []
+    for _ in range(16):
+        aid = ids.mint_activity_id()
+        paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+        paths.segment_path(tmp_path, aid, "python", "deadbeef").write_bytes(b"x" * 4096)
+        settled_aids.append(aid)
+    broken_dir = paths.activity_dir(tmp_path, settled_aids[0])
+
+    real_charge = 16 * 4096 + quota.RESERVE          # settled bytes + live's outstanding reserve
+    monkeypatch.setattr(quota, "CEILING", real_charge)   # ceiling now EXACTLY full: zero headroom
+    assert quota._charge(tmp_path) == real_charge
+    assert quota._accounting_uncertain(tmp_path) is False
+
+    os.chmod(broken_dir, 0o000)
+    try:
+        assert quota._accounting_uncertain(tmp_path) is True
+        charge_after = quota._charge(tmp_path)
+        assert charge_after >= quota.CEILING, (
+            f"_charge dropped below the ceiling once a settled activity dir became unreadable: "
+            f"{charge_after} < {quota.CEILING}"
+        )
+        fresh_aid, fresh_lease = _new_activity(tmp_path)
+        assert quota.admit(tmp_path, fresh_aid, fresh_lease) is False   # would wrongly succeed pre-fix
+        assert quota.grant(tmp_path, live_aid, 1) is False              # unrelated grant refused too
+    finally:
+        os.chmod(broken_dir, 0o700)                                     # restore before any more scans
+
+    assert quota._accounting_uncertain(tmp_path) is False
+    restored_charge = quota._charge(tmp_path)
+    assert restored_charge == real_charge                # recomputed to the exact real total
+    assert restored_charge <= quota.CEILING
+
+    # accounting is trustworthy again -- with a LITTLE headroom, a fresh admission now succeeds
+    # (proving "cleared -> resumes", not "stays refused forever" once bytes are measurable again)
+    monkeypatch.setattr(quota, "CEILING", real_charge + quota.RESERVE)
+    fresh_aid2, fresh_lease2 = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh_aid2, fresh_lease2) is True

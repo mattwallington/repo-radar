@@ -433,15 +433,19 @@ def test_cleared_directory_ledger_resumes_admission_at_real_ceiling(tmp_path):
 # scans of the SAME activity at two DIFFERENT times. An append landing between them was excluded
 # from `committed` (scanned before) AND netted out of `outstanding` via the now-larger _on_disk
 # read (scanned after) -- a double-miss undercount. These tests reproduce that interleaving
-# deterministically by hooking `paths.stat_owned_segments` (the ONLY primitive _charge uses for
-# sizing) so that the FIRST scan of the target activity's directory performs a REAL append
-# immediately afterward -- simulating the concurrent writer -- before returning its (pre-append)
-# result. Against the pre-fix two-scan _charge this reproduces the exact undercount; against the
-# fixed single-scan _charge there is only one call per activity, so the append is either fully
-# counted or fully deferred to the next _charge() call, never split.
+# deterministically by hooking `paths.stat_owned_segments_detailed` (the ONLY primitive _charge
+# uses for sizing as of Ruling 45 -- R4-1's fail-closed-accounting fix moved _charge from the
+# `[(name, size)]`-only `stat_owned_segments` onto the `(entries, uncertain)` detailed form so it
+# can also detect an unmeasurable directory in that SAME single pass; `stat_owned_segments` is now
+# a thin wrapper over it, so hooking the detailed primitive is the equivalent, still-single-scan
+# interception point) so that the FIRST scan of the target activity's directory performs a REAL
+# append immediately afterward -- simulating the concurrent writer -- before returning its
+# (pre-append) result. Against the pre-fix two-scan _charge this reproduces the exact undercount;
+# against the fixed single-scan _charge there is only one call per activity, so the append is
+# either fully counted or fully deferred to the next _charge() call, never split.
 
 def _hook_stat_owned_segments_append_once(monkeypatch, target_dir, do_append):
-    real = paths.stat_owned_segments
+    real = paths.stat_owned_segments_detailed
     state = {"fired": False}
     def hooked(directory, suffix=".jsonl"):
         result = real(directory, suffix)             # snapshot BEFORE the simulated append
@@ -449,7 +453,7 @@ def _hook_stat_owned_segments_append_once(monkeypatch, target_dir, do_append):
             state["fired"] = True
             do_append()                               # concurrent writer's append lands NOW
         return result
-    monkeypatch.setattr(paths, "stat_owned_segments", hooked)
+    monkeypatch.setattr(paths, "stat_owned_segments_detailed", hooked)
     return state
 
 def test_charge_does_not_undercount_ordinary_append_landing_mid_scan(tmp_path, monkeypatch):

@@ -2,6 +2,14 @@ import json, math, re
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
+# Ruling 48 (Codex R4 I4): the SHARED safe integer range for `seq`, 0..2^53-1
+# (Number.MAX_SAFE_INTEGER). Node's `JSON.parse` silently ROUNDS any integer literal above this
+# to the nearest representable double -- 9007199254740992 and 9007199254740993 both parse to the
+# same JS number -- so two Python-distinct seqs on the wire would collide on the Node side,
+# producing a spurious `seq-regression` finding Python never emits. Rejecting anything outside
+# this range on BOTH sides (menubar/activity/records.js mirrors this exactly) keeps `seq`
+# meaningful cross-language instead of silently losing precision past the boundary.
+MAX_SAFE_SEQ = 9007199254740991
 MAX_KEYS = 32
 MAX_KEY_BYTES = 64
 MAX_VALUE_BYTES = 1024
@@ -72,8 +80,9 @@ def _validate(rec):
     for k in _REQUIRED.get(t, ()):
         if k not in rec:
             raise InvalidRecord(f"missing {k!r} for {t}")
-    if isinstance(rec.get("seq"), bool) or not isinstance(rec.get("seq"), int) or rec["seq"] < 0:
-        raise InvalidRecord("seq")
+    seq = rec.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > MAX_SAFE_SEQ:
+        raise InvalidRecord("seq")           # Ruling 48: shared 0..2^53-1 safe range
     if not isinstance(rec.get("ts"), str) or not _ISO_RE.fullmatch(rec["ts"]):
         raise InvalidRecord("ts")
     try:

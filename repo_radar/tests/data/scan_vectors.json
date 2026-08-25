@@ -171,5 +171,24 @@
       "findings": [],
       "cancel_requested": false
     }
+  },
+  {
+    "name": "invalid-utf8-terminal-line",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "bytes_b64": "eyJzY2hlbWFfdmVyc2lvbiI6IDEsICJhY3Rpdml0eV9pZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDAiLCAidHlwZSI6ICJzdGFydCIsICJzZXEiOiAwLCAidHMiOiAiMjAyNi0wOC0xNFQwMDowMDowMC0wNzowMCIsICJraW5kIjogInN5bmMiLCAiY2hhbm5lbCI6ICJzdGFibGUiLCAidHJpZ2dlciI6ICJjbGkiLCAiY3JlYXRlZF9ieSI6ICJweXRob24ifQp7/yJzY2hlbWFfdmVyc2lvbiI6IDEsICJhY3Rpdml0eV9pZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDAiLCAidHlwZSI6ICJ0ZXJtaW5hbCIsICJzZXEiOiAxLCAidHMiOiAiMjAyNi0wOC0xNFQwMDowMDowMC0wNzowMCIsICJvdXRjb21lIjogInN1Y2NlZWRlZCIsICJzdW1tYXJ5Ijoge30sICJieSI6ICJkZWFkYmVlZiJ9Cg=="
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [
+        "corrupt-record"
+      ],
+      "cancel_requested": false
+    }
   }
 ]

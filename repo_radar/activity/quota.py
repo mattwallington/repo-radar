@@ -168,16 +168,38 @@ def _has_terminal(home, aid): return "terminal" in _top_types(home, aid)
 # reserved for the lifecycle path above -- _top_types/_has_start/_has_terminal -- where the
 # actual bytes are needed to parse records; a per-event grant() must never reread a whole
 # segment, up to the 64 MiB ceiling, while holding quota.lock and excluding other producers).
-def _on_disk(home, aid):      return sum(sz for _n, sz in paths.stat_owned_segments(paths.activity_dir(home, aid)))
+def _on_disk_detailed(home, aid):
+    """(bytes, uncertain) companion to `_on_disk` (Ruling 45): `bytes` is the REAL measured total
+    (no max-liability substitution -- that belongs to `_charge`'s ceiling math below, not to this
+    "what's actually on disk" accessor); `uncertain` is True iff `aid`'s directory couldn't be
+    fully validated/listed/stat'd this pass (see `paths.stat_owned_segments_detailed`)."""
+    entries, uncertain = paths.stat_owned_segments_detailed(paths.activity_dir(home, aid))
+    return sum(sz for _n, sz in entries), uncertain
 
-def _committed(home):
+def _on_disk(home, aid):
+    """Thin wrapper over `_on_disk_detailed` (Ruling 45): unchanged shape/behavior."""
+    return _on_disk_detailed(home, aid)[0]
+
+def _committed_detailed(home):
+    """(bytes, uncertain_aids) companion to `_committed` (Ruling 45): `bytes` is the REAL
+    measured total across every activity directory (settled or live) -- no max-liability
+    substitution. `uncertain_aids` is the set of activity-id directory names that couldn't be
+    fully validated/listed/stat'd this pass."""
     base = paths.quota_dir(home).parent
     total = 0
+    uncertain_aids = set()
     for name in paths.list_owned_subdirs(base):    # dir-fd-safe subdir names (Round-4 #3)
         if name == "quota":
             continue
-        total += sum(sz for _n, sz in paths.stat_owned_segments(base / name))
-    return total
+        entries, uncertain = paths.stat_owned_segments_detailed(base / name)
+        total += sum(sz for _n, sz in entries)
+        if uncertain:
+            uncertain_aids.add(name)
+    return total, uncertain_aids
+
+def _committed(home):
+    """Thin wrapper over `_committed_detailed` (Ruling 45): unchanged shape/behavior."""
+    return _committed_detailed(home)[0]
 
 def _ledger_entries(home):
     # (aid, entry-or-CORRUPT) pairs for every valid-UUID-named ledger entry in the quota dir. A
@@ -209,13 +231,28 @@ def _charge(home):
     size) or fully deferred to the NEXT _charge() call (both terms see the pre-append size) — it
     can never be split across the two. Per-activity result is always max(size, reserved+granted),
     the same conservative liability as before non-interleaved — never an undercount. Still
-    fstat-only (finding 7/I7): never reads segment CONTENT here."""
+    fstat-only (finding 7/I7): never reads segment CONTENT here.
+
+    Ruling 45 (Codex R4 B1, BLOCKER): a directory that EXISTS but can't be measured this pass
+    (`paths.stat_owned_segments_detailed`'s `uncertain`) used to contribute its bare (possibly 0,
+    possibly partial) measured bytes here -- exactly the Ruling-40 undercount one level up (Codex
+    repro: 16 x 4 MiB settled, chmod 000 one dir -> charge drops to 60 MiB -> a reservation is
+    wrongly admitted -> restore -> 67,170,304 bytes on disk, over the ceiling). Such a directory
+    is now charged its MAXIMUM liability, max(measured, PER_ACTIVITY_CAP) -- the same
+    max-liability rule a torn/corrupt ledger entry already gets below, and max(...) (not a flat
+    replace) so any bytes that WERE provable before the failure are never discarded even if they
+    somehow exceed the cap. A directory PROVEN absent (FileNotFoundError) still contributes 0, as
+    before. `admit`/`grant` additionally refuse outright while ANY activity is unmeasurable (see
+    `_accounting_uncertain`), since a max-liability guess is a floor for the charge, not a
+    trustworthy measurement to admit new liability against."""
     base = paths.quota_dir(home).parent
     sizes = {}
     for name in paths.list_owned_subdirs(base):
         if name == "quota":
             continue
-        sizes[name] = sum(sz for _n, sz in paths.stat_owned_segments(base / name))
+        entries, uncertain = paths.stat_owned_segments_detailed(base / name)
+        size = sum(sz for _n, sz in entries)
+        sizes[name] = max(size, PER_ACTIVITY_CAP) if uncertain else size
     total = sum(sizes.values())
     for aid, e in _ledger_entries(home):
         total += PER_ACTIVITY_CAP if e == "CORRUPT" \
@@ -227,6 +264,22 @@ def _has_corrupt(home):
     # new admissions/grants while it stands (Codex fix-review B2, Gap 1).
     return any(e == "CORRUPT" for _aid, e in _ledger_entries(home))
 
+def _accounting_uncertain(home):
+    """Ruling 45 (Codex R4 B1): whether ANY activity directory's byte accounting is currently
+    untrustworthy -- its directory exists but couldn't be validated/opened/listed, or a contained
+    entry's lstat couldn't be resolved to gone-vs-present this pass. Mirrors `_has_corrupt`'s
+    role: `admit`/`grant` refuse best-effort (no exception, warn once, sync itself proceeds) while
+    it stands -- `_charge`'s max-liability substitution above only bounds the OVERCOUNT floor; it
+    can't prove the ceiling math is safe to admit new liability against. A directory PROVEN
+    absent (FileNotFoundError) is never uncertain."""
+    base = paths.quota_dir(home).parent
+    for name in paths.list_owned_subdirs(base):
+        if name == "quota":
+            continue
+        if paths.stat_owned_segments_detailed(base / name)[1]:
+            return True
+    return False
+
 def admit(home, activity_id, lease):
     fd = None
     try:
@@ -234,6 +287,8 @@ def admit(home, activity_id, lease):
         _reconcile_all_locked(home)                            # reconcile BEFORE charge
         if _has_corrupt(home):
             return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
+        if _accounting_uncertain(home):
+            return False        # Ruling 45: refuse new admissions while any activity dir is unmeasurable
         if _charge(home) + RESERVE > CEILING:
             _prune_locked(home, (_charge(home) + RESERVE) - CEILING)   # prune FIRST
             if _charge(home) + RESERVE > CEILING:
@@ -252,6 +307,8 @@ def grant(home, activity_id, nbytes):
         fd = _quota_lock(home)
         if _has_corrupt(home):
             return False        # spec §7: refuse grants while any corrupt entry stands
+        if _accounting_uncertain(home):
+            return False        # Ruling 45: refuse grants while any activity dir is unmeasurable
         p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
         if e == "CORRUPT":
             return False
