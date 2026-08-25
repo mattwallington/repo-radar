@@ -16,6 +16,21 @@ def _settled(home, outcome="succeeded", age_days=0.0):
     old = time.time() - age_days*86400; os.utime(seg, (old, old))     # backdate for the age policy
     return aid
 
+def _settled_with_event(home, outcome="succeeded", age_days=0.0, event_level=None):
+    # Same shape as _settled but with an optional `event` record (Ruling 33 predicate part (a))
+    # inserted before the terminal, on the SAME segment file (paths.segment_path is deterministic
+    # per producer/writer_id -- see _rec), so backdating the last-written segment's mtime backdates
+    # every record it holds, exactly like _settled.
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(home, aid))
+    l = lease.acquire(paths.owner_lock_path(home, aid)); quota.admit(home, aid, l)
+    _rec(home, aid, type="start", seq=0, kind="sync", channel="stable", trigger="cli", created_by="python")
+    if event_level is not None:
+        _rec(home, aid, type="event", seq=1, level=event_level, event="x", fields={})
+    seg = _rec(home, aid, type="terminal", seq=9, outcome=outcome, summary={}, by="deadbeef")
+    l.release(); quota.settle(home, aid)
+    old = time.time() - age_days*86400; os.utime(seg, (old, old))
+    return aid
+
 def test_routine_older_than_14d_outside_newest_50_pruned_but_13d_kept(tmp_path, monkeypatch):
     # Spec §7's newest-50 is PROTECTIVE (shields the 50 most-recent items from age-pruning); with
     # only 2 items seeded, both are within a newest-50 window, so the 20d item would never be
@@ -82,3 +97,42 @@ def test_prune_skips_items_in_the_live_ledger(tmp_path):
     l = lease.acquire(paths.owner_lock_path(tmp_path, aid)); quota.admit(tmp_path, aid, l)
     quota._prune_locked(tmp_path, need_bytes=10**9)          # a live-ledger item is never a candidate
     assert paths.activity_dir(tmp_path, aid).exists(); l.release()
+
+def test_error_event_makes_succeeded_activity_problem_bearing_and_governs_90d_not_14d(tmp_path, monkeypatch):
+    # Codex R1 finding B1: a `succeeded` terminal carrying a `level:error` event must classify as
+    # 'problem' (Ruling 33 predicate part (a)), so it's governed by the 90-day problem rule, not
+    # the 14-day routine rule. Both items are 20d old and forced genuinely outside the protected
+    # window (NEWEST_KEEP=0) so age is the only thing deciding either outcome: the error-bearing
+    # one must survive (20d < 90d) while the identical item minus the event is pruned (20d > 14d).
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    with_error = _settled_with_event(tmp_path, "succeeded", 20, event_level="error")
+    without_error = _settled(tmp_path, "succeeded", 20)
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, with_error).exists()
+    assert not paths.activity_dir(tmp_path, without_error).exists()
+
+def test_warn_event_also_makes_activity_problem_bearing(tmp_path, monkeypatch):
+    # Ruling 33 part (a) covers BOTH warn and error levels, not just error.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled_with_event(tmp_path, "succeeded", 20, event_level="warn")
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, aid).exists()
+
+def test_info_level_event_does_not_make_activity_problem_bearing(tmp_path, monkeypatch):
+    # An info-level event is routine noise, not a problem signal -- still governed by the 14-day
+    # routine rule and pruned at 20d.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled_with_event(tmp_path, "succeeded", 20, event_level="info")
+    quota.retain(tmp_path)
+    assert not paths.activity_dir(tmp_path, aid).exists()
+
+def test_sole_old_problem_is_pruned_by_age_pass_not_shielded(tmp_path, monkeypatch):
+    # Codex R1 finding I1: the age pass must NOT unconditionally shield `newest_problem` -- spec
+    # §7 ties "always preserve the newest problem" to the ceiling-override only (test below still
+    # covers that). A sole 100d-old failed activity, forced genuinely outside the protected window
+    # (NEWEST_KEEP=0), exceeds the 90-day problem rule and must actually be pruned by `retain`.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled(tmp_path, "failed", 100)
+    pruned = quota.retain(tmp_path)
+    assert not paths.activity_dir(tmp_path, aid).exists()
+    assert aid in pruned

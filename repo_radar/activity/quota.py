@@ -330,6 +330,32 @@ def reconcile(home):
         if fd is not None:
             _unlock(fd)
 
+# Ruling 33 (Codex R1 finding B1): the shared PROBLEM-BEARING contract, mirrored 1:1 by the Node
+# reader over the same wire records. An activity is problem-bearing iff ANY of: (a) an `event`
+# record with level in {warn, error}; (b) a `terminal` record with outcome in {failed, blocked,
+# interrupted, succeeded-with-warnings} (`succeeded`/`cancelled`/`skipped` are routine -- cancel
+# is user-initiated); (c) an `integrity` record (top-level type). §7/§9's Problems lens is
+# "warn/error + failure diagnostics", broader than terminal outcome alone -- see
+# test_activity_problem_bearing.py / data/problem_bearing_vectors.json for the shared parity
+# fixture the Node side drives against this identical predicate.
+_PROBLEM_EVENT_LEVELS = {"warn", "error"}
+_PROBLEM_OUTCOMES = {"failed", "blocked", "interrupted", "succeeded-with-warnings"}
+
+def is_problem_bearing(parsed_records) -> bool:
+    """Single reusable predicate over parsed top-level records for ONE activity. See the Ruling
+    33 contract above; `_classify` is the sole in-repo caller but this stays a public, dependency-
+    free function (dicts in, bool out) so it's trivially unit-testable against the shared fixture
+    and easy for the Node reader to mirror."""
+    for obj in parsed_records:
+        t = obj.get("type")
+        if t == "event" and obj.get("level") in _PROBLEM_EVENT_LEVELS:
+            return True
+        if t == "terminal" and obj.get("outcome") in _PROBLEM_OUTCOMES:
+            return True
+        if t == "integrity":
+            return True
+    return False
+
 def _classify(home, aid):
     """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — parsed top-level."""
     segs = _segments_data(home, aid)
@@ -337,16 +363,15 @@ def _classify(home, aid):
     types = _top_types(home, aid)
     if "terminal" not in types:
         return ("running", mtime)
-    outcomes = []
+    parsed = []
     for _n, data, _sz, _mt in segs:
         for line in data.split(b"\n"):
             if not line:
                 continue
             obj = records.parse_valid(line, aid)
-            if obj is not None and obj["type"] == "terminal":
-                outcomes.append(obj.get("outcome"))
-    problem = ("integrity" in types) or any(
-        o in ("failed", "blocked", "interrupted", "succeeded-with-warnings") for o in outcomes)
+            if obj is not None:
+                parsed.append(obj)
+    problem = is_problem_bearing(parsed)
     return ("problem" if problem else "routine", mtime)
 
 def _prune_locked(home, need_bytes):
@@ -409,18 +434,16 @@ def _retain_locked(home):
         aid for aid, _k, _mt in
         sorted(candidates, key=lambda c: (c[2], c[0]), reverse=True)[:newest_keep]
     }
-    problems = [c for c in candidates if c[1] == "problem"]
-    newest_problem = max(problems, key=lambda c: c[2])[0] if problems else None
-
     now = time.time()
     routine_max_age = ROUTINE_MAX_AGE_S
     problem_max_age = PROBLEM_MAX_AGE_S
     for aid, kind, mtime in candidates:
-        # `newest_problem` is shielded here unconditionally -- a SAFE SUPERSET of spec §7, which
-        # ties "always preserve the newest problem" to the ceiling-override specifically. Shielding
-        # it in the age pass too means the most recent problem is never lost to age-pruning either,
-        # never a spec deviation (Fix R1 comment).
-        if aid in protected or aid == newest_problem:
+        # Codex R1 finding I1: the newest problem is NOT shielded here. Spec §7 ties "always
+        # preserve the newest problem" to the ceiling-override specifically (see _prune_locked,
+        # unchanged); the age pass applies age AND outside-newest-50 uniformly to routine and
+        # problem items alike -- a sole/newest problem older than PROBLEM_MAX_AGE_S and outside
+        # the protected window is prunable here, just like any other candidate.
+        if aid in protected:
             continue
         age = now - mtime
         prunable = (kind == "routine" and age > routine_max_age) or \
