@@ -21,7 +21,12 @@ function scanNode(segments) {
   const records = [];
   const findings = [];
   for (const seg of segments) {
-    const r = parseSegment(Buffer.from(seg.text, 'utf8'), AID);
+    // Ruling 47: a vector may carry raw bytes (`bytes_b64`, e.g. an invalid-UTF-8 byte) instead
+    // of `text`, since JSON strings cannot represent non-UTF-8 bytes.
+    const bytes = typeof seg.bytes_b64 === 'string'
+      ? Buffer.from(seg.bytes_b64, 'base64')
+      : Buffer.from(seg.text, 'utf8');
+    const r = parseSegment(bytes, AID);
     records.push(...r.records);
     findings.push(...r.integrity);
   }

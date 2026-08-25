@@ -10,7 +10,7 @@
 // AND netted out of `outstanding` via the now-larger `_onDisk` read (scanned after) -- a
 // double-miss undercount (Codex's measured Node terminal repro: charged 498 vs committed 687).
 //
-// These tests reproduce that interleaving deterministically by hooking `paths.statOwnedSegments`
+// These tests reproduce that interleaving deterministically by hooking `paths.statOwnedSegmentsDetailed`
 // (the ONLY primitive `_charge` uses for sizing) so that the FIRST scan of the target activity's
 // directory performs a REAL append immediately afterward -- simulating a concurrent writer that
 // released quota.lock and appended -- before returning its (pre-append) result. Against the
@@ -47,15 +47,15 @@ function newActivity(home) {
   return [aid, l];
 }
 
-// Hooks `paths.statOwnedSegments` (the shared module object -- quota.js's own `paths` reference
+// Hooks `paths.statOwnedSegmentsDetailed` (the shared module object -- quota.js's own `paths` reference
 // resolves to the SAME object via Node's require cache) so that the FIRST call whose `directory`
 // argument matches `targetDir` performs `doAppend()` right after computing that call's (pre-
 // append) result, then returns that already-computed result. Returns a restore function and a
 // state object with `fired`.
-function hookStatOwnedSegmentsAppendOnce(targetDir, doAppend) {
-  const real = pathsMod.statOwnedSegments;
+function hookStatOwnedSegmentsDetailedAppendOnce(targetDir, doAppend) {
+  const real = pathsMod.statOwnedSegmentsDetailed;
   const state = { fired: false };
-  pathsMod.statOwnedSegments = (directory, suffix) => {
+  pathsMod.statOwnedSegmentsDetailed = (directory, suffix) => {
     const result = real(directory, suffix); // snapshot BEFORE the simulated concurrent append
     if (!state.fired && directory === targetDir) {
       state.fired = true;
@@ -63,7 +63,7 @@ function hookStatOwnedSegmentsAppendOnce(targetDir, doAppend) {
     }
     return result;
   };
-  return { state, restore: () => { pathsMod.statOwnedSegments = real; } };
+  return { state, restore: () => { pathsMod.statOwnedSegmentsDetailed = real; } };
 }
 
 function writeOrdinaryEvent(home, aid) {
@@ -102,7 +102,7 @@ test('Codex R2: _charge does not undercount an ORDINARY event append landing mid
 
   const targetDir = A.activityDir(home, aid);
   let appendedBytes = 0;
-  const { state, restore } = hookStatOwnedSegmentsAppendOnce(targetDir, () => {
+  const { state, restore } = hookStatOwnedSegmentsDetailedAppendOnce(targetDir, () => {
     appendedBytes = writeOrdinaryEvent(home, aid);
   });
   let charge;
@@ -127,7 +127,7 @@ test('Codex R2: _charge does not undercount a TERMINAL append landing mid-scan (
 
   const targetDir = A.activityDir(home, aid);
   let appendedBytes = 0;
-  const { state, restore } = hookStatOwnedSegmentsAppendOnce(targetDir, () => {
+  const { state, restore } = hookStatOwnedSegmentsDetailedAppendOnce(targetDir, () => {
     appendedBytes = writeTerminalEvent(home, aid);
   });
   let charge;

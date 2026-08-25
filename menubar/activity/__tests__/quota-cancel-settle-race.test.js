@@ -15,7 +15,7 @@
 // if it is still live -- all inside one lock hold.
 //
 // These tests reproduce Codex's exact scenario deterministically, reusing the interleaving-hook
-// technique from quota-charge-interleaving.test.js (hooking `paths.statOwnedSegments` -- the sole
+// technique from quota-charge-interleaving.test.js (hooking `paths.statOwnedSegmentsDetailed` -- the sole
 // primitive `_charge` uses for sizing -- so a "concurrent" cancel-append attempt can be triggered
 // at the exact moment `_charge` scans the target activity's segments):
 //   1. NEGATIVE (the race itself): admit+grant+write real committed bytes, write a durable
@@ -59,15 +59,15 @@ function newActivity(home) {
   return [aid, l];
 }
 
-// Local copy of quota-charge-interleaving.test.js's own hook (same shared `pathsMod.statOwnedSegments`
+// Local copy of quota-charge-interleaving.test.js's own hook (same shared `pathsMod.statOwnedSegmentsDetailed`
 // object via Node's require cache -- quota.js's own `paths` reference resolves to it too). Kept as
 // an independent copy rather than importing the sibling test file's internals, matching this
 // codebase's established "duplicate small test helper" precedent (see trigger-glue.js's
 // `_splitLines` comment for the production-code analog).
-function hookStatOwnedSegmentsAppendOnce(targetDir, doInterleave) {
-  const real = pathsMod.statOwnedSegments;
+function hookStatOwnedSegmentsDetailedAppendOnce(targetDir, doInterleave) {
+  const real = pathsMod.statOwnedSegmentsDetailed;
   const state = { fired: false };
-  pathsMod.statOwnedSegments = (directory, suffix) => {
+  pathsMod.statOwnedSegmentsDetailed = (directory, suffix) => {
     const result = real(directory, suffix); // snapshot BEFORE the simulated concurrent action
     if (!state.fired && directory === targetDir) {
       state.fired = true;
@@ -75,7 +75,7 @@ function hookStatOwnedSegmentsAppendOnce(targetDir, doInterleave) {
     }
     return result;
   };
-  return { state, restore: () => { pathsMod.statOwnedSegments = real; } };
+  return { state, restore: () => { pathsMod.statOwnedSegmentsDetailed = real; } };
 }
 
 function writeOrdinaryEvent(home, aid) {
@@ -154,7 +154,7 @@ test('Codex R3: a settled (reaped) activity\'s handed-off cancel is a NO-OP, and
   const targetDir = A.activityDir(home, aid);
   let cancelAttempted = false;
   let cancelApplied = null;
-  const { state, restore } = hookStatOwnedSegmentsAppendOnce(targetDir, () => {
+  const { state, restore } = hookStatOwnedSegmentsDetailedAppendOnce(targetDir, () => {
     // The exact handed-off cancel path (trigger-glue.js's onCancel), firing WHILE _charge's single
     // fstat scan of this activity is in flight -- the precise race window Codex identified.
     cancelAttempted = true;
@@ -194,7 +194,7 @@ test('Codex R3: a cancel on a still-LIVE (unsettled, ledger-present) activity DO
 
   const targetDir = A.activityDir(home, aid);
   let cancelApplied = null;
-  const { state, restore } = hookStatOwnedSegmentsAppendOnce(targetDir, () => {
+  const { state, restore } = hookStatOwnedSegmentsDetailedAppendOnce(targetDir, () => {
     cancelApplied = quota.appendReserveIfLive(home, aid, () => writeCancelRequestedRecord(home, aid));
   });
   let charge;

@@ -89,9 +89,19 @@ function parseSegment(bytes, expectedActivityId) {
       continue; // a genuinely empty interior line -- silent, nothing to classify
     }
 
+    // Ruling 47: decode FATALLY, once -- invalid UTF-8 is `corrupt-record`, never U+FFFD-repaired
+    // into something `JSON.parse` would then accept (Python's `json.loads(bytes)` rejects it).
+    let text;
+    try {
+      text = records.decodeUtf8Fatal(line);
+    } catch (e) {
+      integrity.push(_finding(CORRUPT_RECORD, i, 'invalid UTF-8'));
+      continue;
+    }
+
     let obj;
     try {
-      obj = JSON.parse(line.toString('utf8'));
+      obj = JSON.parse(text);
     } catch (e) {
       integrity.push(_finding(CORRUPT_RECORD, i, `JSON.parse failed: ${e.message}`));
       continue;
@@ -107,7 +117,7 @@ function parseSegment(bytes, expectedActivityId) {
       continue;
     }
 
-    const rec = records.parseValid(line, expectedActivityId);
+    const rec = records.parseValid(text, expectedActivityId); // already fatally decoded above
     if (rec === null) {
       integrity.push(_finding(CORRUPT_RECORD, i, 'failed v1 schema/enum validation'));
       continue;

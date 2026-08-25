@@ -14,6 +14,7 @@ const {
   reconcile,
   activityDir,
   readOwnedSegments,
+  parseSegmentName,
   HANDOFF_REJECTED_EXIT,
 } = require('./index');
 const parse = require('./parse');
@@ -170,8 +171,13 @@ function onCancel({ writer, child, home } = {}) {
 // record+`\n`). A private byte-split here previously accepted a newline-less-but-parseable
 // ownership/terminal record as an ack, which could wrongly tell Electron a dead handoff child
 // had acknowledged on a torn write.
+// Codex R4 B2 / Ruling 46: only CONFORMING segment names are parsed (`parseSegmentName`, the
+// same filter reconcile.js/read.js/quota.js apply). A `junk.jsonl` carrying ownership{handoff}
+// previously counted as an ack -- Electron would have dropped its local lease reference on the
+// strength of a file that is not a segment at all.
 function _hasAckSignal(home, activityId) {
   for (const seg of readOwnedSegments(activityDir(home, activityId))) {
+    if (parseSegmentName(seg.name) === null) continue; // bad-name: never parsed
     for (const rec of parse.parseSegment(seg.data, activityId).records) {
       if (rec.type === 'terminal') return true;
       if (rec.type === 'ownership' && rec.role === 'handoff') return true;

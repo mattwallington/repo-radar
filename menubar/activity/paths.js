@@ -141,7 +141,11 @@ function _validateOwnedDir(targetDir) {
   try {
     fd = _openDirNofollow(prefix);
   } catch (e) {
-    throw new UnsafePath(`unsafe prefix ${prefix}: ${e.message}`);
+    const err = new UnsafePath(`unsafe prefix ${prefix}: ${e.message}`);
+    // Ruling 45: a MISSING prefix is "proven gone", not "refused" -- carry the code so
+    // `statOwnedSegmentsDetailed` can tell the two apart (still an UnsafePath, mirroring Python).
+    if (e.code === 'ENOENT') err.code = 'ENOENT';
+    throw err;
   }
   fs.closeSync(fd);
 
@@ -336,7 +340,8 @@ function readOwnedSegments(directory, suffix = '.jsonl') {
 
 // Like readOwnedSegments but METADATA ONLY -- never reads content, so quota's per-event size
 // accounting never has to reread a whole segment (up to the ceiling) while holding quota.lock.
-// Mirrors `paths.stat_owned_segments` (the I7 fix). Returns [{name, size}].
+// Mirrors `paths.stat_owned_segments` (the I7 fix). Returns `{ entries: [{name, size}],
+// uncertain }`.
 //
 // Codex R3 B1 / Ruling 40: sized WITHOUT opening. The previous open(O_RDONLY)+fstat shape
 // silently `continue`d on EACCES, so a settled segment chmod 000 dropped straight out of
@@ -346,32 +351,57 @@ function readOwnedSegments(directory, suffix = '.jsonl') {
 // provable size. `lstat` reports the link ITSELF for a symlink (never follows it), so a
 // `.jsonl`-named symlink is skipped along with every other non-regular entry (FIFO / dir /
 // device) -- exactly what the O_NOFOLLOW+S_ISREG check excluded before, minus the open.
-function statOwnedSegments(directory, suffix = '.jsonl') {
+//
+// Codex R4 B1 / Ruling 45: the DIRECTORY-level counterpart of that fix. `statOwnedSegments`
+// returned `[]` for a missing dir AND for one that exists but cannot be validated/listed (chmod
+// 000, ELOOP, a non-directory squatting on the name) -- so an unlistable settled activity
+// counted as 0 bytes in `quota._charge` while its segments persisted on disk (Codex's repro:
+// 16 x 4 MiB settled, chmod 000 one dir -> charge 60 MiB -> a reservation admitted -> restore ->
+// 67,170,304 bytes > ceiling). `uncertain` tells those two apart:
+//   - `false` + `[]`: the dir does NOT exist (ENOENT on a component = proven gone, nothing on
+//     disk to count), or it was listed and every entry was sized (or was itself proven gone).
+//   - `true`: the dir exists but its bytes could not be measured -- validation refused it
+//     (UnsafePath: symlink/ELOOP/ENOTDIR/EACCES on the open), readdir failed, or an entry's
+//     `lstat` failed with anything other than ENOENT (an entry that vanished mid-scan is proven
+//     gone, not unmeasurable). `entries` still carries whatever WAS provable.
+// quota.js charges an uncertain activity its maximum liability (PER_ACTIVITY_CAP) and refuses
+// admissions/grants while any committed activity is unmeasurable (the same fail-closed outcome
+// as a corrupt ledger entry). `statOwnedSegments` below is the `.entries`-only wrapper --
+// single implementation, existing signature/behavior for its callers unchanged.
+function statOwnedSegmentsDetailed(directory, suffix = '.jsonl') {
   let dir;
   try {
     dir = _validateOwnedDir(directory);
   } catch (e) {
-    return [];
+    // ENOENT on a component: the dir is proven absent. Anything else (UnsafePath wrapping
+    // EACCES/ELOOP/ENOTDIR, or an unexpected error) means it may exist with unmeasured bytes.
+    return { entries: [], uncertain: e.code !== 'ENOENT' };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return [];
+    return { entries: [], uncertain: e.code !== 'ENOENT' };
   }
-  const out = [];
+  const entries = [];
+  let uncertain = false;
   for (const name of names) {
     if (!name.endsWith(suffix)) continue;
     let st;
     try {
       st = fs.lstatSync(path.join(dir, name));
     } catch (e) {
+      if (e.code !== 'ENOENT') uncertain = true; // refused, not gone: bytes may persist unmeasured
       continue; // gone mid-scan: nothing provable to count
     }
     if (st.isSymbolicLink() || !st.isFile()) continue;
-    out.push({ name, size: st.size });
+    entries.push({ name, size: st.size });
   }
-  return out;
+  return { entries, uncertain };
+}
+
+function statOwnedSegments(directory, suffix = '.jsonl') {
+  return statOwnedSegmentsDetailed(directory, suffix).entries;
 }
 
 // Read one owned file's bytes via the nonblocking regular-file helper (e.g. a ledger entry).
@@ -516,6 +546,6 @@ module.exports = {
   PRODUCERS: _readonlySet(PRODUCERS),
   activityDir, segmentPath, parseSegmentName, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
-  readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, readOwnedFile,
+  readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, statOwnedSegmentsDetailed, readOwnedFile,
   listOwnedEntries, listOwnedSubdirs, listOwnedSubdirsDetailed, writeOwnedFileAtomic,
 };

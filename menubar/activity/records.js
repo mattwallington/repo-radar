@@ -121,8 +121,13 @@ function _validate(rec) {
   for (const k of REQUIRED[t] || []) {
     if (!(k in rec)) throw new InvalidRecord(`missing ${JSON.stringify(k)} for ${t}`);
   }
+  // Codex R4 I4 / Ruling 48: `seq` must be an integer in the SHARED safe range
+  // 0..Number.MAX_SAFE_INTEGER (2^53-1). `JSON.parse` has already rounded anything above that
+  // (9007199254740992 and ...993 both parse to the same double), so accepting it produced a
+  // spurious `seq-regression` Python never emits; Python enforces the identical range.
   const seq = rec.seq;
-  if (typeof seq === 'boolean' || typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) {
+  if (typeof seq === 'boolean' || typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0 ||
+      seq > Number.MAX_SAFE_INTEGER) {
     throw new InvalidRecord('seq');
   }
   if (!_validTimestamp(rec.ts)) {
@@ -327,6 +332,14 @@ function encodedLen(record) {
   return encodeRecord(record).length;
 }
 
+// Strict UTF-8 decode: throws TypeError on any invalid sequence (no U+FFFD substitution), keeps a
+// leading BOM in the output. Shared by parseValid (below) and parse.js's per-line classifier so
+// there is exactly one decode rule on the read path (Ruling 47).
+const _FATAL_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+function _decodeUtf8Fatal(buf) {
+  return _FATAL_UTF8.decode(buf);
+}
+
 // Task 2.2b addition: the READ-side counterpart to buildRecord/encodeRecord, needed by
 // reconcile.js's lifecycle checks (_hasStart/_hasTerminal/_cancelRequested parse EXISTING
 // segments rather than building new records). Mirrors `records.parse_valid` -- THE canonical
@@ -341,13 +354,20 @@ function encodedLen(record) {
 // so no extra handling is needed there; the `1e400`-overflow case (I6) is caught downstream by
 // `_flatPrimitiveMap`'s `Number.isFinite` check on fields/summary values, exactly like Python's
 // `math.isfinite` guard in `_flat_primitive_map`.
+//
+// Codex R4 B3 / Ruling 47: a Buffer is decoded FATALLY (`TextDecoder('utf-8', { fatal: true })`),
+// never with the lossy `Buffer#toString('utf8')`, which silently replaces invalid bytes with
+// U+FFFD -- so a line carrying a raw 0xff byte parsed as a perfectly valid record here while
+// Python's `json.loads(bytes)` rejected it (a terminal `succeeded` on Node, `corrupt-record` ->
+// `interrupted` on Python: a cross-language conflict). Invalid UTF-8 is an invalid record. The
+// decoder keeps a leading BOM (`ignoreBOM: true`) so `JSON.parse` rejects it, as Python does.
 function parseValid(raw, expectedActivityId) {
   let obj;
   try {
-    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : raw;
+    const text = Buffer.isBuffer(raw) ? _decodeUtf8Fatal(raw) : raw;
     obj = JSON.parse(text);
   } catch (e) {
-    return null;
+    return null; // invalid UTF-8 (TypeError) or invalid JSON (SyntaxError)
   }
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
   if (obj.schema_version !== SCHEMA_VERSION || obj.activity_id !== expectedActivityId) return null;
@@ -364,5 +384,5 @@ module.exports = {
   SCHEMA_VERSION, MAX_KEYS, MAX_KEY_BYTES, MAX_VALUE_BYTES, MAX_FIELDS_BYTES,
   MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
   RecordTooLarge, InvalidRecord,
-  buildRecord, encodeRecord, encodedLen, parseValid,
+  buildRecord, encodeRecord, encodedLen, parseValid, decodeUtf8Fatal: _decodeUtf8Fatal,
 };

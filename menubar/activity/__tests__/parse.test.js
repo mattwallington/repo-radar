@@ -106,7 +106,7 @@ test('invalid-outcome OR foreign-activity terminal is NOT a valid record (Round-
 test('cross-language validator parity: record_validation_vectors.json', () => {
   const vectorsPath = path.join(__dirname, '../../../repo_radar/tests/data/record_validation_vectors.json');
   const vectors = require(vectorsPath);
-  assert.strictEqual(vectors.length, 11);
+  assert.ok(vectors.length >= 11, `expected at least the 11 original vectors, got ${vectors.length}`);
   for (const v of vectors) {
     const accepted = records.parseValid(JSON.stringify(v.raw), '00000000-0000-4000-8000-000000000000') !== null;
     assert.strictEqual(accepted, v.accept, v.why);

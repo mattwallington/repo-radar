@@ -327,8 +327,13 @@ function _ledgerEntries(home) {
 // record+`\n`). A private byte-split here previously accepted a newline-less-but-parseable
 // terminal that `parse.js`'s callers (reconcile.js, read.js) would ignore, so this introspection
 // helper could disagree with the rest of the subsystem about whether a terminal existed.
+//
+// Codex R4 B2 / Ruling 46: only CONFORMING segment names are parsed (`paths.parseSegmentName`,
+// the same filter reconcile.js/read.js apply) -- a `junk.jsonl` holding a terminal is not a
+// segment and must not satisfy this helper.
 function _hasTerminal(home, aid) {
   for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
+    if (paths.parseSegmentName(seg.name) === null) continue; // bad-name: never parsed
     for (const rec of parse.parseSegment(seg.data, aid).records) {
       if (rec.type === 'terminal') return true;
     }
@@ -361,14 +366,26 @@ function _hasTerminal(home, aid) {
 // naturally, not via an exclusion. A durable-but-not-yet-reaped entry now charges conservatively
 // (Math.max(size, reserved+granted)) -- an overcount, never an undercount. `_hasTerminal` itself
 // is kept (not removed) for lifecycle introspection/tests; it is simply no longer called here.
+//
+// Codex R4 B1 / Ruling 45: an activity dir that EXISTS but cannot be measured (chmod 000, ELOOP,
+// an entry whose lstat is refused -- `paths.statOwnedSegmentsDetailed`'s `uncertain`) used to
+// contribute 0 here, exactly the Ruling-40 undercount one level up (Codex's repro: 16 x 4 MiB
+// settled, chmod 000 one dir -> charge 60 MiB -> a reservation admitted -> restore -> 67,170,304
+// bytes on disk > ceiling). Such an activity is now charged its MAXIMUM liability,
+// PER_ACTIVITY_CAP -- the same max-liability rule a torn/corrupt ledger entry gets below -- so the
+// charge can never drop below the bytes that may actually be there. (An activity dir that is
+// proven absent -- ENOENT -- still contributes 0, as before.) `admit`/`grant` additionally refuse
+// outright while any activity is unmeasurable (see `_accountingUncertain`), since a max-liability
+// guess is a floor for the charge, not a measurement.
 function _charge(home) {
   const base = path.dirname(paths.quotaDir(home));
   const sizes = new Map();
   for (const name of paths.listOwnedSubdirs(base)) {
     if (name === 'quota') continue;
+    const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
     let size = 0;
-    for (const seg of paths.statOwnedSegments(path.join(base, name))) size += seg.size;
-    sizes.set(name, size);
+    for (const seg of scan.entries) size += seg.size;
+    sizes.set(name, scan.uncertain ? Math.max(size, PER_ACTIVITY_CAP) : size);
   }
   let total = 0;
   for (const size of sizes.values()) total += size;
@@ -383,6 +400,20 @@ function _charge(home) {
 // admissions/grants while it stands.
 function _hasCorrupt(home) {
   return _ledgerEntries(home).some(([, e]) => e === CORRUPT);
+}
+
+// Ruling 45: whether ANY committed activity's bytes are currently unmeasurable (its dir exists
+// but cannot be validated/listed, or an entry's lstat was refused). While this stands `admit` and
+// `grant` refuse best-effort, exactly like `_hasCorrupt` (no throw; bounded warn; sync itself is
+// unaffected) -- an admission decided against a guessed floor could still overrun the ceiling
+// once the bytes become measurable again. A dir proven absent (ENOENT) is NOT uncertain.
+function _accountingUncertain(home) {
+  const base = path.dirname(paths.quotaDir(home));
+  for (const name of paths.listOwnedSubdirs(base)) {
+    if (name === 'quota') continue;
+    if (paths.statOwnedSegmentsDetailed(path.join(base, name)).uncertain) return true;
+  }
+  return false;
 }
 
 // Best-effort delegation to the Python prune entrypoint, via whichever runner is currently
@@ -450,7 +481,8 @@ function admit(home, activityId, lease) {
     fd = _quotaLock(home);
     let charge = _charge(home);
     let corrupt = _hasCorrupt(home);
-    if (corrupt || charge + RESERVE > CEILING) {
+    let uncertain = _accountingUncertain(home);
+    if (corrupt || uncertain || charge + RESERVE > CEILING) {
       const headroom = Math.max(RESERVE, charge + RESERVE - CEILING);
       _unlock(fd);
       fd = null;
@@ -458,6 +490,11 @@ function admit(home, activityId, lease) {
       fd = _quotaLock(home);
       charge = _charge(home);
       corrupt = _hasCorrupt(home);
+      uncertain = _accountingUncertain(home);
+    }
+    if (uncertain) {
+      _warn('quota: an activity directory is unmeasurable (unlistable); refusing admission (Ruling 45)');
+      return false; // best-effort refuse, same outcome path as a corrupt ledger entry
     }
     if (corrupt || charge + RESERVE > CEILING) {
       return false; // best-effort refuse
@@ -478,6 +515,7 @@ function grant(home, activityId, nbytes) {
   try {
     fd = _quotaLock(home);
     if (_hasCorrupt(home)) return false;
+    if (_accountingUncertain(home)) return false; // Ruling 45: unmeasurable bytes -> refuse, like corrupt
     const e = _readEntry(paths.ledgerEntryPath(home, activityId));
     if (e === CORRUPT) return false;
     if (e.granted + nbytes > ORDINARY_CAP) return false; // per-activity cap
@@ -626,7 +664,7 @@ module.exports = {
   configurePythonRunner,
   _quotaLock, _quotaLockNonblocking, _unlock,
   _parseEntry, _readEntry, _writeEntry,
-  _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _hasTerminal,
+  _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
   _spawnPythonPrune, _spawnPythonRetain,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },
