@@ -360,3 +360,44 @@ test('conflicting terminals also populate duplicateTerminalCounts per outcome', 
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// F-E parity fix: a non-conforming filename (not `${producer}-${writerId}.jsonl` for a known
+// producer + 8-hex token) must NEVER be treated as a real segment by the lifecycle helpers, even
+// though `readOwnedSegments` itself will happily read its bytes (it has no naming opinion). Write
+// a `start` record directly into a bad-named file (bypassing `segmentPath`'s own validation,
+// which would refuse to construct such a path) and confirm the lock-absent/FREE path does NOT
+// synthesize off the back of it.
+function seedBadName(home, name, lines) {
+  secureMkdir(activityDir(home, AID));
+  fs.writeFileSync(
+    path.join(activityDir(home, AID), name),
+    lines.map((o) => JSON.stringify(o)).join('\n') + '\n',
+  );
+}
+
+test('a bad-named segment holding a start is ignored: synthesizeTerminal writes nothing, no lock needed', () => {
+  const home = fresh();
+  try {
+    seedBadName(home, 'python-s3cr3t.jsonl', [START]); // "producer-writerId" but writerId isn't valid hex
+    // no owner.lock ever created -> lease-free
+    assert.strictEqual(reconcileMod.synthesizeTerminal(home, AID), false);
+    const before = fs.readdirSync(activityDir(home, AID)).filter((f) => f.endsWith('.jsonl'));
+    assert.deepStrictEqual(before, ['python-s3cr3t.jsonl']); // no new segment appeared
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a bad-named segment holding a start is ignored by reconcile(): outcome null, not synthesized', () => {
+  const home = fresh();
+  try {
+    seedBadName(home, 'junk.jsonl', [START]); // not even producer-shaped
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, null);
+    assert.strictEqual(r.synthesized, false);
+    const after = fs.readdirSync(activityDir(home, AID)).filter((f) => f.endsWith('.jsonl'));
+    assert.deepStrictEqual(after, ['junk.jsonl']); // still no new segment
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -22,6 +22,33 @@ def segment_path(home, activity_id, producer, writer_id) -> Path:
         raise UnsafePath(f"invalid writer_id: {writer_id!r}")
     return activity_dir(home, activity_id) / f"{producer}-{writer_id}.jsonl"
 
+_SEGMENT_SUFFIX = ".jsonl"
+
+def parse_segment_name(name):
+    """F-E parity fix (mirrors Node's `paths.parseSegmentName`): the single authority for "is
+    this a conforming segment filename" (`${producer}-${writer_id}.jsonl`). Returns
+    `(producer, writer_id)` iff `name` ends with `.jsonl`, the part before the LAST '-' is a
+    known producer (PRODUCERS contains none with a '-' of their own, so the last dash is always
+    the producer/writerId boundary for a genuinely valid name), the part after it is a valid
+    8-hex token (`ids.valid_token`), AND the reconstructed name round-trips EXACTLY back to
+    `name`. Returns None otherwise -- never raises. Used by quota.py's lifecycle helpers
+    (`_segments_data`) to filter out non-conforming entries (e.g. `python-s3cr3t.jsonl`,
+    `junk.jsonl`) before they're treated as real segments."""
+    if not isinstance(name, str) or not name.endswith(_SEGMENT_SUFFIX):
+        return None
+    stem = name[: -len(_SEGMENT_SUFFIX)]
+    idx = stem.rfind("-")
+    if idx == -1:
+        return None
+    producer, writer_id = stem[:idx], stem[idx + 1:]
+    if producer not in PRODUCERS:
+        return None
+    if not ids.valid_token(writer_id):
+        return None
+    if f"{producer}-{writer_id}{_SEGMENT_SUFFIX}" != name:
+        return None
+    return (producer, writer_id)
+
 def owner_lock_path(home, activity_id) -> Path:
     return activity_dir(home, activity_id) / "owner.lock"
 

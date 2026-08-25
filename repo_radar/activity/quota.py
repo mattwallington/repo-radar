@@ -130,8 +130,19 @@ def _unlink_entry(home, activity_id):
         os.close(qfd)
 
 def _segments_data(home, activity_id):
-    # descriptor-relative enumerate+read: (name, data, size, mtime) tuples (Round-4 #3)
-    return paths.read_owned_segments(paths.activity_dir(home, activity_id))
+    # descriptor-relative enumerate+read: (name, data, size, mtime) tuples (Round-4 #3).
+    # F-E parity fix: filtered to CONFORMING segment names only (`paths.parse_segment_name`) --
+    # this is the single source `_top_types`/`_classify` (and, through them,
+    # `_reconcile_one_locked`/`retain`) read from, so a non-conforming file sitting in the
+    # activity dir (e.g. `python-s3cr3t.jsonl`, or plain `junk.jsonl`) can no longer masquerade
+    # as a real segment and drive lifecycle/classification decisions. Byte-accounting helpers
+    # (`_on_disk`/`_committed`/`_charge`) intentionally do NOT go through this function -- they
+    # use `paths.stat_owned_segments` directly and stay unfiltered on purpose (a bad-named file
+    # still counts toward the quota ceiling).
+    return [
+        seg for seg in paths.read_owned_segments(paths.activity_dir(home, activity_id))
+        if paths.parse_segment_name(seg[0]) is not None
+    ]
 
 def _top_types(home, aid):
     """Types of VALID v1 records for THIS activity (Round-4 #5) — via the canonical validator,

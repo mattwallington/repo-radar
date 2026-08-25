@@ -23,6 +23,19 @@ const quota = require('./quota');
 
 const RECONCILER = 'reconciler';
 
+// F-E parity fix: every lifecycle helper below reads segments via `readOwnedSegments`, which
+// (correctly) has no naming opinion of its own -- it reads any `*.jsonl` entry that survives the
+// symlink/non-regular safety checks. Left unfiltered here, a non-conforming file sitting in the
+// activity dir (e.g. `python-s3cr3t.jsonl`, or plain `junk.jsonl`) that happens to contain a
+// `start`/`terminal`-shaped record would still drive `_hasStart`/`_hasTerminal`/`_cancelRequested`
+// -- and, via those, `synthesizeTerminal` could WRITE a synthetic terminal (and `reconcile()`
+// derive a displayed outcome) off the back of a file nothing in this codebase ever wrote as a
+// real segment. `_ownedSegments` is the one choke point: every `readOwnedSegments` call in this
+// file goes through it, filtering to entries `paths.parseSegmentName` accepts as conforming.
+function _ownedSegments(directory) {
+  return paths.readOwnedSegments(directory).filter((seg) => paths.parseSegmentName(seg.name) !== null);
+}
+
 function _splitLines(buf) {
   const lines = [];
   let start = 0;
@@ -41,7 +54,7 @@ function _splitLines(buf) {
 // state is DERIVED from parsed segments, never a ledger flag.
 function _topTypes(home, aid) {
   const types = [];
-  for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
+  for (const seg of _ownedSegments(paths.activityDir(home, aid))) {
     for (const line of _splitLines(seg.data)) {
       if (line.length === 0) continue;
       const obj = records.parseValid(line, aid);
@@ -60,7 +73,7 @@ function _hasTerminal(home, aid) {
 }
 
 function _cancelRequested(home, aid) {
-  for (const seg of paths.readOwnedSegments(paths.activityDir(home, aid))) {
+  for (const seg of _ownedSegments(paths.activityDir(home, aid))) {
     for (const line of _splitLines(seg.data)) {
       if (line.length === 0) continue;
       const obj = records.parseValid(line, aid);
@@ -172,7 +185,7 @@ function _writerIdFromSegmentName(name) {
 function _assemble(home, activityId, problems) {
   let segs;
   try {
-    segs = paths.readOwnedSegments(paths.activityDir(home, activityId));
+    segs = _ownedSegments(paths.activityDir(home, activityId));
   } catch (e) {
     problems.push({ kind: 'reconcile-internal-error', reason: `segment enumeration failed: ${e.message}` });
     return [];
@@ -202,7 +215,7 @@ function _assemble(home, activityId, problems) {
 // of whether this re-read can see it).
 function _findReconcilerOutcome(home, activityId) {
   try {
-    for (const seg of paths.readOwnedSegments(paths.activityDir(home, activityId))) {
+    for (const seg of _ownedSegments(paths.activityDir(home, activityId))) {
       const { records: recs } = parse.parseSegment(seg.data, activityId);
       for (const r of recs) {
         if (r.type === 'terminal' && r.by === RECONCILER) return r.outcome;

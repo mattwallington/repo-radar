@@ -145,3 +145,51 @@ test('path constructors compose the expected layout', () => {
   assert.strictEqual(paths.quotaDir(home), path.join('/H', 'Library', 'Logs', 'repo-radar', 'activity', 'quota'));
   assert.strictEqual(paths.ledgerEntryPath(home, VALID), path.join(paths.quotaDir(home), `${VALID}.json`));
 });
+
+// F-E parity fix: parseSegmentName is the single authority reconcile.js's lifecycle helpers use
+// to decide whether a `*.jsonl` entry is a REAL segment (`${producer}-${writerId}.jsonl`) or
+// something else that merely happens to live in the same directory.
+test('parseSegmentName accepts every producer with a valid 8-hex writerId', () => {
+  for (const producer of ['electron', 'dispatcher', 'python']) {
+    assert.deepStrictEqual(paths.parseSegmentName(`${producer}-deadbeef.jsonl`), { producer, writerId: 'deadbeef' });
+  }
+});
+
+test('parseSegmentName rejects a bad producer', () => {
+  assert.strictEqual(paths.parseSegmentName('hacker-deadbeef.jsonl'), null);
+  assert.strictEqual(paths.parseSegmentName('junk.jsonl'), null); // no dash at all
+});
+
+test('parseSegmentName rejects a bad (non-8-hex) writerId', () => {
+  assert.strictEqual(paths.parseSegmentName('python-s3cr3t.jsonl'), null); // not hex
+  assert.strictEqual(paths.parseSegmentName('python-deadbee.jsonl'), null); // 7 hex chars
+  assert.strictEqual(paths.parseSegmentName('python-deadbeefff.jsonl'), null); // 10 hex chars
+});
+
+test('parseSegmentName rejects an extra dash between producer and writerId', () => {
+  assert.strictEqual(paths.parseSegmentName('electron-extra-deadbeef.jsonl'), null);
+});
+
+test('parseSegmentName rejects a missing/wrong suffix', () => {
+  assert.strictEqual(paths.parseSegmentName('python-deadbeef'), null); // no .jsonl at all
+  assert.strictEqual(paths.parseSegmentName('python-deadbeef.json'), null); // wrong suffix
+  assert.strictEqual(paths.parseSegmentName('python-deadbeef.jsonl.bak'), null); // trailing garbage
+});
+
+test('parseSegmentName rejects non-string input without throwing', () => {
+  assert.strictEqual(paths.parseSegmentName(undefined), null);
+  assert.strictEqual(paths.parseSegmentName(null), null);
+});
+
+test('PRODUCERS is exported and read-only (has() works, mutation is rejected)', () => {
+  assert.strictEqual(paths.PRODUCERS.has('electron'), true);
+  assert.strictEqual(paths.PRODUCERS.has('dispatcher'), true);
+  assert.strictEqual(paths.PRODUCERS.has('python'), true);
+  assert.strictEqual(paths.PRODUCERS.has('hacker'), false);
+  assert.throws(() => paths.PRODUCERS.add('hacker'), TypeError);
+  assert.throws(() => paths.PRODUCERS.delete('electron'), TypeError);
+  assert.throws(() => paths.PRODUCERS.clear(), TypeError);
+  // mutation attempts must not have leaked through to the real validation set
+  assert.strictEqual(paths.PRODUCERS.has('hacker'), false);
+  assert.strictEqual(paths.PRODUCERS.has('electron'), true);
+});

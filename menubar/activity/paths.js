@@ -19,6 +19,27 @@ const ids = require('./ids');
 
 const PRODUCERS = new Set(['electron', 'dispatcher', 'python']);
 
+// Read-only view of PRODUCERS for external consumers (F-E parity fix): callers (e.g. the
+// lifecycle filters below/in reconcile.js and quota.py's Node mirror) need to know the producer
+// enum without being able to mutate the internal Set this module validates against. A plain
+// `module.exports.PRODUCERS = PRODUCERS` would hand out the SAME mutable Set object -- freezing a
+// Set does not actually block `.add()`/`.delete()` (V8 lets those through on a frozen Set/Map
+// instance), so this wraps it in a Proxy that throws on the three mutating methods and forwards
+// everything else (bound to the real target, since Set's methods rely on an internal slot that
+// only the real Set object carries -- calling them with the Proxy as `this` throws
+// "not a Set"). Internal code in this file keeps using the real, mutable `PRODUCERS` directly.
+function _readonlySet(set) {
+  return new Proxy(set, {
+    get(target, prop, _receiver) {
+      if (prop === 'add' || prop === 'delete' || prop === 'clear') {
+        return () => { throw new TypeError('PRODUCERS is read-only'); };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 class UnsafePath extends Error {}
 
 function _base(home) {
@@ -40,6 +61,29 @@ function segmentPath(home, activityId, producer, writerId) {
     throw new UnsafePath(`invalid writer_id: ${JSON.stringify(writerId)}`);
   }
   return path.join(activityDir(home, activityId), `${producer}-${writerId}.jsonl`);
+}
+
+// F-E parity fix: the single authority for "is this a conforming segment filename" -- returns
+// `{ producer, writerId }` iff `name` ends with `.jsonl`, the part before the LAST '-' is a known
+// producer, the part after it is a valid 8-hex token, AND the reconstructed name round-trips
+// EXACTLY back to `name` (guards against e.g. a producer-like prefix that isn't actually in
+// PRODUCERS, or a token with extra/odd characters that a looser split would still accept).
+// Returns null otherwise -- never throws. Used by reconcile.js's lifecycle helpers (and the
+// Python mirror `parse_segment_name` in repo_radar/activity/paths.py) to filter out non-conforming
+// entries (e.g. `python-s3cr3t.jsonl`, `junk.jsonl`) before they're treated as real segments.
+const SUFFIX = '.jsonl';
+
+function parseSegmentName(name) {
+  if (typeof name !== 'string' || !name.endsWith(SUFFIX)) return null;
+  const stem = name.slice(0, -SUFFIX.length);
+  const idx = stem.lastIndexOf('-');
+  if (idx === -1) return null;
+  const producer = stem.slice(0, idx);
+  const writerId = stem.slice(idx + 1);
+  if (!PRODUCERS.has(producer)) return null;
+  if (!ids.validToken(writerId)) return null;
+  if (`${producer}-${writerId}${SUFFIX}` !== name) return null; // exact round-trip
+  return { producer, writerId };
 }
 
 function ownerLockPath(home, activityId) {
@@ -441,7 +485,8 @@ function writeOwnedFileAtomic(directory, name, data, mode = 0o600) {
 
 module.exports = {
   UnsafePath,
-  activityDir, segmentPath, ownerLockPath, quotaDir, ledgerEntryPath,
+  PRODUCERS: _readonlySet(PRODUCERS),
+  activityDir, segmentPath, parseSegmentName, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
   readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, readOwnedFile,
   listOwnedEntries, listOwnedSubdirs, writeOwnedFileAtomic,

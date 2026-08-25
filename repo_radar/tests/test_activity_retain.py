@@ -126,6 +126,24 @@ def test_info_level_event_does_not_make_activity_problem_bearing(tmp_path, monke
     quota.retain(tmp_path)
     assert not paths.activity_dir(tmp_path, aid).exists()
 
+def test_bad_named_segment_holding_a_failure_terminal_does_not_make_classify_return_problem(tmp_path):
+    # F-E parity fix: a non-conforming filename (not `${producer}-${writer_id}.jsonl` for a
+    # known producer + 8-hex token) must NEVER be treated as a real segment by `_classify` (via
+    # `_segments_data`), even though `paths.read_owned_segments` itself will happily read its
+    # bytes -- it has no naming opinion of its own. Write a failure-like terminal directly into a
+    # bad-named file (bypassing `paths.segment_path`'s own validation, which would refuse to
+    # construct such a path) and confirm `_classify` does not see it at all: no types are parsed,
+    # so "terminal" not in types -> ('running', mtime), never 'problem'.
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    bad = paths.activity_dir(tmp_path, aid) / "python-s3cr3t.jsonl"
+    rec = dict(schema_version=1, activity_id=aid, ts="2026-08-14T00:00:00-07:00",
+                type="terminal", seq=9, outcome="failed", summary={}, by="deadbeef")
+    bad.write_text(json.dumps(rec) + "\n")
+    kind, _mtime = quota._classify(tmp_path, aid)
+    assert kind != "problem"
+    assert kind == "running"                          # no conforming segment -> no types at all
+    assert quota._segments_data(tmp_path, aid) == []   # the bad-named file never enters the lifecycle view
+
 def test_sole_old_problem_is_pruned_by_age_pass_not_shielded(tmp_path, monkeypatch):
     # Codex R1 finding I1: the age pass must NOT unconditionally shield `newest_problem` -- spec
     # §7 ties "always preserve the newest problem" to the ceiling-override only (test below still

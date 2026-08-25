@@ -156,3 +156,32 @@ def test_owned_opens_reject_a_fifo_without_blocking(tmp_path):
             paths.secure_open_append(fifo)
     finally:
         signal.alarm(0); signal.signal(signal.SIGALRM, old)
+
+# F-E parity fix: parse_segment_name is the single authority quota.py's lifecycle helpers use to
+# decide whether a `*.jsonl` entry is a REAL segment (`${producer}-${writer_id}.jsonl`) or
+# something else that merely happens to live in the same directory. Mirrors Node's
+# `paths.parseSegmentName` test coverage in menubar/activity/__tests__/paths.test.js.
+def test_parse_segment_name_accepts_every_producer_with_a_valid_8_hex_writer_id():
+    for producer in ("electron", "dispatcher", "python"):
+        assert paths.parse_segment_name(f"{producer}-deadbeef.jsonl") == (producer, "deadbeef")
+
+def test_parse_segment_name_rejects_a_bad_producer():
+    assert paths.parse_segment_name("hacker-deadbeef.jsonl") is None
+    assert paths.parse_segment_name("junk.jsonl") is None                # no dash at all
+
+def test_parse_segment_name_rejects_a_bad_writer_id():
+    assert paths.parse_segment_name("python-s3cr3t.jsonl") is None       # not hex
+    assert paths.parse_segment_name("python-deadbee.jsonl") is None      # 7 hex chars
+    assert paths.parse_segment_name("python-deadbeefff.jsonl") is None   # 10 hex chars
+
+def test_parse_segment_name_rejects_an_extra_dash_between_producer_and_writer_id():
+    assert paths.parse_segment_name("electron-extra-deadbeef.jsonl") is None
+
+def test_parse_segment_name_rejects_a_missing_or_wrong_suffix():
+    assert paths.parse_segment_name("python-deadbeef") is None           # no .jsonl at all
+    assert paths.parse_segment_name("python-deadbeef.json") is None      # wrong suffix
+    assert paths.parse_segment_name("python-deadbeef.jsonl.bak") is None # trailing garbage
+
+def test_parse_segment_name_rejects_non_string_input_without_raising():
+    assert paths.parse_segment_name(None) is None
+    assert paths.parse_segment_name(123) is None
