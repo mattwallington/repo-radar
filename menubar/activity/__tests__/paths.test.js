@@ -93,6 +93,51 @@ test('secureOpenAppend rejects a missing parent directory', () => {
   assert.throws(() => paths.secureOpenAppend(seg));
 });
 
+test('readOwnedSegments (I3): a throwing per-entry close is contained, scan is not aborted', () => {
+  const home = tmpHome();
+  try {
+    const d = paths.activityDir(home, VALID);
+    paths.secureMkdir(d);
+    const segA = paths.segmentPath(home, VALID, 'python', 'deadbeef');
+    const segB = paths.segmentPath(home, VALID, 'dispatcher', 'cafebabe');
+    fs.writeFileSync(segA, 'a\n');
+    fs.writeFileSync(segB, 'b\n');
+
+    const realOpenSync = fs.openSync;
+    const realCloseSync = fs.closeSync;
+    let targetFd = null;
+    // Tag the fd opened for segA specifically (rather than throwing on every close), so the
+    // unrelated closeSync calls _validateOwnedDir makes while walking to `d` are unaffected.
+    fs.openSync = function patchedOpenSync(p, ...rest) {
+      const fd = realOpenSync.call(fs, p, ...rest);
+      if (p === segA && targetFd === null) targetFd = fd;
+      return fd;
+    };
+    fs.closeSync = function patchedCloseSync(fd) {
+      if (fd === targetFd) {
+        targetFd = null;
+        realCloseSync.call(fs, fd); // actually close it -- no fd leak
+        throw new Error('boom: simulated EBADF on close');
+      }
+      return realCloseSync.call(fs, fd);
+    };
+
+    let segs;
+    try {
+      segs = paths.readOwnedSegments(d);
+    } finally {
+      fs.openSync = realOpenSync;
+      fs.closeSync = realCloseSync;
+    }
+
+    const byName = Object.fromEntries(segs.map((s) => [s.name, s.data.toString('utf8')]));
+    assert.strictEqual(byName[path.basename(segA)], 'a\n'); // data still read despite the throwing close
+    assert.strictEqual(byName[path.basename(segB)], 'b\n'); // scan continued past it to the next entry
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('path constructors compose the expected layout', () => {
   const home = '/H';
   assert.strictEqual(paths.activityDir(home, VALID), path.join('/H', 'Library', 'Logs', 'repo-radar', 'activity', VALID));

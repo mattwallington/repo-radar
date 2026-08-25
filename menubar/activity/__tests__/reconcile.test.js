@@ -150,6 +150,41 @@ test('fs error path returns false, never throws, and still releases the lease it
   }
 });
 
+test('a throwing lease.release() is contained: synthesizeTerminal still returns true for a durable write, never throws', () => {
+  const home = tmpHome();
+  const leaseModule = require('../lease');
+  const realAcquire = leaseModule.acquire;
+  try {
+    const [aid, l] = newActivity(home);
+    writeStart(home, aid);
+    l.release(); // crash after start, before terminal -- lease is free for synthesizeTerminal to acquire
+
+    // Monkeypatch lease.acquire (the SAME cached module reconcile.js itself requires) to hand
+    // back a Lease whose release() actually closes the fd (no leak) but then throws -- simulating
+    // fs.closeSync raising EIO/EBADF, per the I3 finding.
+    leaseModule.acquire = (lockPath) => {
+      const real = realAcquire(lockPath);
+      if (real === null) return null;
+      const originalRelease = real.release.bind(real);
+      real.release = () => {
+        originalRelease();
+        throw new Error('boom: simulated EIO on lease release');
+      };
+      return real;
+    };
+
+    let result;
+    assert.doesNotThrow(() => { result = reconcileMod.synthesizeTerminal(home, aid); });
+    // The terminal was already durably written (fsync'd) before release() ran, so a contained
+    // release failure must NOT downgrade the result -- the terminal IS durable.
+    assert.strictEqual(result, true);
+    assert.deepStrictEqual(topTerminalOutcomes(home, aid), [['interrupted', 'reconciler']]);
+  } finally {
+    leaseModule.acquire = realAcquire;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a top-level start whose fields nest type:"terminal" is not mistaken for a real terminal', () => {
   const home = tmpHome();
   try {
@@ -280,6 +315,36 @@ test('explicit BUSY probe => stays running (case-insensitive injected value)', (
     assert.strictEqual(r.synthesized, false);
     assert.strictEqual(r.problems.length, 0);
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconcile() does not throw when the internal synthesizeTerminal lease release throws', () => {
+  const home = fresh();
+  const leaseModule = require('../lease');
+  const realAcquire = leaseModule.acquire;
+  try {
+    seed(home, [START]);
+    // Same seam as the synthesizeTerminal-level test above: reconcile()'s FREE-lease path calls
+    // synthesizeTerminal internally, which calls lease.acquire -- patch it to hand back a Lease
+    // whose release() throws after actually closing.
+    leaseModule.acquire = (lockPath) => {
+      const real = realAcquire(lockPath);
+      if (real === null) return null;
+      const originalRelease = real.release.bind(real);
+      real.release = () => {
+        originalRelease();
+        throw new Error('boom: simulated EIO on lease release');
+      };
+      return real;
+    };
+
+    let r;
+    assert.doesNotThrow(() => { r = reconcile(home, AID); });
+    assert.strictEqual(r.outcome, 'interrupted');
+    assert.ok(r.synthesized);
+  } finally {
+    leaseModule.acquire = realAcquire;
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

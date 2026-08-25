@@ -113,7 +113,21 @@ function synthesizeTerminal(home, aid) {
   } catch (e) {
     return false;
   } finally {
-    acquired.release();
+    // I3 fix (Codex R1): acquired.release() ultimately calls fs.closeSync, which CAN throw
+    // (EIO/EBADF on a genuinely broken fd). A `finally` block that itself throws REPLACES
+    // whatever return value the try/catch above already computed with that exception instead --
+    // which would break synthesizeTerminal's documented never-throws boundary (and therefore
+    // reconcile()'s, since reconcile() calls this directly). Contained here rather than by
+    // changing Lease.release() itself: the lease fd is being discarded either way (this function
+    // is exiting), so a release failure is swallowed, never rethrown. The conservative return
+    // value already selected above -- true iff the terminal write+fsync already completed
+    // durably (the terminal IS durable, release failing after that changes nothing about that
+    // fact), false otherwise -- is left untouched.
+    try {
+      acquired.release();
+    } catch (e) {
+      // swallow -- see comment above; nothing more can be done with a lease fd we're discarding
+    }
   }
 }
 

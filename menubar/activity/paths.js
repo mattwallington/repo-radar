@@ -223,23 +223,34 @@ function _readFdAll(fd) {
 }
 
 // Enumerate + read files under an owned dir, never following a symlinked component or entry.
-// Returns [{name, data (Buffer), size, mtime (seconds, matching Python's st_mtime)}]; [] if
-// missing/unsafe. Mirrors `paths.read_owned_segments` (content read -- used where the actual
-// bytes are needed, e.g. reconcile.js's lifecycle parsing).
-function readOwnedSegments(directory, suffix = '.jsonl') {
+// Returns { segments: [{name, data (Buffer), size, mtime (seconds, matching Python's
+// st_mtime)}], rejected: [{name, reason}] }. `rejected` lists every suffix-matching entry that
+// was refused, with a short stable `reason`: 'symlink' (ELOOP via O_NOFOLLOW), 'not-regular'
+// (FIFO/dir/device), 'denied' (EACCES), 'gone' (removed between readdir and open, or a
+// TOCTOU-mid-scan failure after open), or 'read-failed' (any other open/fstat/read failure).
+// If the DIRECTORY itself is invalid/unreadable, `segments` is still `[]` (unchanged contract)
+// but `rejected` is `[{ name: '', reason: 'dir-unreadable' }]` so a caller can tell "no entries"
+// apart from "couldn't list" (Codex R1 B2: a reader must be able to surface "I refused to read
+// this" as an integrity condition, not silently fold it into "no data").
+//
+// Mirrors `paths.read_owned_segments` (content read -- used where the actual bytes are needed,
+// e.g. reconcile.js's lifecycle parsing). `readOwnedSegments` below is a thin wrapper returning
+// just `.segments`, preserving its existing signature/behavior for its many callers unchanged.
+function readOwnedSegmentsDetailed(directory, suffix = '.jsonl') {
   let dir;
   try {
     dir = _validateOwnedDir(directory);
   } catch (e) {
-    return [];
+    return { segments: [], rejected: [{ name: '', reason: 'dir-unreadable' }] };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return [];
+    return { segments: [], rejected: [{ name: '', reason: 'dir-unreadable' }] };
   }
-  const out = [];
+  const segments = [];
+  const rejected = [];
   for (const name of names) {
     if (!name.endsWith(suffix)) continue;
     const p = path.join(dir, name);
@@ -247,19 +258,36 @@ function readOwnedSegments(directory, suffix = '.jsonl') {
     try {
       fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (e) {
-      continue; // symlink (ELOOP) / gone / denied
+      if (e.code === 'ELOOP') rejected.push({ name, reason: 'symlink' });
+      else if (e.code === 'EACCES') rejected.push({ name, reason: 'denied' });
+      else if (e.code === 'ENOENT') rejected.push({ name, reason: 'gone' });
+      else rejected.push({ name, reason: 'read-failed' });
+      continue;
     }
     try {
       const st = fs.fstatSync(fd);
-      if (!st.isFile()) continue; // FIFO / directory / device
-      out.push({ name, data: _readFdAll(fd), size: st.size, mtime: st.mtimeMs / 1000 });
+      if (!st.isFile()) { rejected.push({ name, reason: 'not-regular' }); continue; } // FIFO / directory / device
+      segments.push({ name, data: _readFdAll(fd), size: st.size, mtime: st.mtimeMs / 1000 });
     } catch (e) {
-      continue; // TOCTOU: entry deleted/swapped mid-scan
+      rejected.push({ name, reason: 'read-failed' }); // TOCTOU: entry deleted/swapped mid-scan
+      continue;
     } finally {
-      fs.closeSync(fd);
+      // I3 fix (Codex R1): a throwing close on a read-only fd must not abort the whole
+      // enumeration -- we already have (or already gave up on) this entry's data by the time we
+      // reach here, so a close failure changes nothing about what to report for it. Contained,
+      // never rethrown.
+      try {
+        fs.closeSync(fd);
+      } catch (e) {
+        // swallow -- see comment above
+      }
     }
   }
-  return out;
+  return { segments, rejected };
+}
+
+function readOwnedSegments(directory, suffix = '.jsonl') {
+  return readOwnedSegmentsDetailed(directory, suffix).segments;
 }
 
 // Like readOwnedSegments but METADATA ONLY -- never reads content, so quota's per-event size
@@ -415,6 +443,6 @@ module.exports = {
   UnsafePath,
   activityDir, segmentPath, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
-  readOwnedSegments, statOwnedSegments, readOwnedFile,
+  readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, readOwnedFile,
   listOwnedEntries, listOwnedSubdirs, writeOwnedFileAtomic,
 };
