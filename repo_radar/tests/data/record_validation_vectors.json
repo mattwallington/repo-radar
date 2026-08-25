@@ -235,5 +235,10 @@
     "accept": false,
     "why": "schema_version is the non-integer JSON literal 1.0 -- Python's `1.0 != 1` is False so an untyped check accepts it while Node rejects the literal; both must reject (type-strict int, Ruling 53)",
     "raw_text": "{\"schema_version\":1.0,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "ownership pid is the non-integer JSON literal 1.0 -- Python's isinstance(1.0, int) is already False so this is rejected by type either way, but (like the seq/schema_version 1.0 cases above) 'raw' can't carry the exact literal spelling since round-tripping a parsed object loses the int/float distinction on the Node side; 'raw_text' carries the literal JSON line text verbatim so both languages' parsers see the identical source bytes (Codex R6-3 fixture half)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"ownership\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"owner_token\":\"deadbeef\",\"role\":\"initial\",\"producer\":\"python\",\"pid\":1.0,\"boot_id\":\"a1b2c3d4e5f60718\",\"proc_birth\":\"2026-08-14T00:00:00-07:00\"}"
   }
 ]

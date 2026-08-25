@@ -190,20 +190,19 @@ def _on_disk(home, aid):
     return _on_disk_detailed(home, aid)[0]
 
 def _sized_subdirs(home):
-    """ONE root-enumeration + per-activity stat pass (Ruling 49/50), shared by
-    `_accounting_snapshot` and `_committed_detailed` so neither maintains its own independent copy
-    of "list subdirs, skip quota/, stat each one, fold in whatever's uncertain". Root enumeration
-    goes through `paths.list_owned_subdirs_detailed` (Ruling 49) so a hidden/unmeasurable
-    activity-id entry at the ROOT level (EIO, EACCES, a symlink or file squatting on the name)
-    folds into `uncertain_names` here too, not just a per-activity directory's own stat failure --
-    a root-rejected entry never even reaches `sizes` (it was never a listable, stat-able directory
-    this pass), so `_accounting_snapshot` below must treat it exactly like a directory whose OWN
-    `stat_owned_segments_detailed` came back uncertain: `name in uncertain_names` with NO entry in
-    `sizes` (measured baseline 0) still gets the max-liability charge, never silently 0.
+    """ONE root-enumeration + per-activity stat pass (Ruling 49/50), used by `_committed_detailed`
+    below for "list subdirs, skip quota/, stat each one, fold in whatever's uncertain". (As of
+    Ruling 56 / Codex R6-4, `_accounting_snapshot`'s OWN root-gathering lives in `_gather_
+    accounting` instead -- it needs `root_listable` as a signal distinct from a single rejected
+    entry, which this function's single conflated `uncertain` flag can't expose; see there.) Root
+    enumeration goes through `paths.list_owned_subdirs_detailed` (Ruling 49) so a hidden/
+    unmeasurable activity-id entry at the ROOT level (EIO, EACCES, a symlink or file squatting on
+    the name) folds into `uncertain_names` here too, not just a per-activity directory's own stat
+    failure.
 
     Returns `(sizes, uncertain, uncertain_names)`:
       sizes -- {name: REAL measured bytes}, for names whose directory WAS actually listed/stat'd
-        this pass -- no max-liability substitution (that's `_accounting_snapshot`'s job).
+        this pass -- no max-liability substitution.
       uncertain -- True iff the root enumeration itself was uncertain (couldn't validate/list the
         base), OR any name in `uncertain_names` below is non-empty.
       uncertain_names -- every activity-id whose bytes couldn't be fully measured this pass: a
@@ -239,6 +238,28 @@ def _committed(home):
     """Thin wrapper over `_committed_detailed` (Ruling 45): unchanged shape/behavior."""
     return _committed_detailed(home)[0]
 
+def _ledger_entries_detailed(home):
+    """(entries, uncertain) companion to `_ledger_entries` (Ruling 54 / Codex R6-1, BLOCKER):
+    `paths.list_owned_entries` collapsed EVERY ledger-directory listing failure to `[]` -- "no
+    ledgers" -- indistinguishable from a genuinely empty/never-created quota dir. A transient EIO
+    while enumerating `quota/` therefore silently dropped every live reservation's liability from
+    the charge for that pass (no live ledger => no liability counted), exactly the bug class
+    Ruling 40/45/49 already fixed one layer in (segment reads, activity-directory/root
+    enumeration) -- now closed for the LEDGER directory itself too.
+
+    `uncertain` is False + entries=[] iff the quota dir provably never existed (no admission has
+    ever happened -- a proven state); True iff it exists but couldn't be validated/listed this
+    pass (see `paths.list_owned_entries_detailed`). Feeds `_gather_accounting` below; `admit`/
+    `grant` must refuse outright while `uncertain` (an unlistable ledger means "how much is
+    reserved right now" is entirely unknowable, not merely undercounted)."""
+    names, uncertain = paths.list_owned_entries_detailed(paths.quota_dir(home), suffix=".json")
+    out = []
+    for name in names:
+        aid = name[:-5]
+        if ids.valid_activity_id(aid):
+            out.append((aid, _read_entry(paths.ledger_entry_path(home, aid))))
+    return out, uncertain
+
 def _ledger_entries(home):
     # (aid, entry-or-CORRUPT) pairs for every valid-UUID-named ledger entry in the quota dir. A
     # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path —
@@ -248,59 +269,186 @@ def _ledger_entries(home):
     # enumeration entirely, undercounting the charge — fail-open). `_read_entry` already opens
     # each entry descriptor-relative with the O_NOFOLLOW|O_NONBLOCK + fstat(S_ISREG) safe-open
     # and returns "CORRUPT" for anything that isn't a safe, well-formed regular JSON ledger.
-    out = []
-    for name in paths.list_owned_entries(paths.quota_dir(home), suffix=".json"):
-        aid = name[:-5]
-        if ids.valid_activity_id(aid):
-            out.append((aid, _read_entry(paths.ledger_entry_path(home, aid))))
-    return out
+    #
+    # Thin `[0]` wrapper over `_ledger_entries_detailed` (Ruling 54): unchanged shape/behavior
+    # for existing callers (`_reconcile_all_locked`, `_prune_locked`, `_retain_locked`,
+    # `_has_corrupt`, tests) that don't need the listing-uncertainty flag.
+    return _ledger_entries_detailed(home)[0]
 
 @dataclass
 class Snapshot:
-    """The unified accounting read (Ruling 50 / Codex R5-3, IMPORTANT): `charge` and `uncertain`
-    as computed from the SAME single filesystem+ledger pass. See `_accounting_snapshot` below."""
+    """The unified accounting read (Ruling 50 / Codex R5-3, IMPORTANT; extended with `corrupt` by
+    Ruling 55 / Codex R6-2, BLOCKER): `charge`, `uncertain` AND `corrupt` all computed from the
+    SAME single filesystem+ledger pass (`_gather_accounting` + `_compute_snapshot` below), so a
+    decision can never combine a corrupt/uncertain verdict read at one moment with a charge total
+    read at another. See `_accounting_snapshot` below."""
     charge: int
     uncertain: bool
+    corrupt: bool
+
+@dataclass
+class ActivityInput:
+    """One root-listed activity directory's byte measurement, as gathered by `_gather_accounting`
+    (Ruling 56 / Codex R6-4, IMPORTANT). `on_disk` is the REAL measured byte total, or `None` if
+    that directory's OWN `stat_owned_segments_detailed` pass came back uncertain (exists, but
+    couldn't be fully measured -- EACCES/ELOOP/ENOTDIR/a failed lstat on some entry within it)."""
+    aid: str
+    on_disk: int | None
+
+@dataclass
+class LedgerInput:
+    """One ledger entry for the accounting pass: either a live, well-formed reservation
+    (`reserved`/`granted`) or a `corrupt` entry (unsafe/unreadable/malformed — see
+    `_parse_entry`/`_read_entry`). A `corrupt` entry's `reserved`/`granted` are unused (left at
+    their 0 default)."""
+    aid: str
+    reserved: int = 0
+    granted: int = 0
+    corrupt: bool = False
+
+@dataclass
+class AccountingInputs:
+    """Pure snapshot of everything `_compute_snapshot` needs (Ruling 56 / Codex R6-4, IMPORTANT):
+    every filesystem/ledger read for one accounting decision happens in `_gather_accounting`
+    below, exactly once, producing this plain-data record. `_compute_snapshot` then derives
+    `charge`/`uncertain`/`corrupt` from it with NO further I/O -- the exact rule
+    `repo_radar/tests/data/accounting_vectors.json` pins byte-for-byte (the Node agent implements
+    the identical function against the same fixture).
+
+      root_listable -- False iff the activity ROOT itself (the `activity/` dir, `quota/` aside)
+        could not be validated/opened/listed this pass -- mirrors `paths.list_owned_subdirs_
+        detailed`'s own base-level failure, NOT a single rejected entry (see `rejected_root_ids`
+        for that).
+      ledger_listable -- False iff the LEDGER dir (`quota/`) could not be validated/listed this
+        pass (Ruling 54 / Codex R6-1, BLOCKER) -- as opposed to one that provably never existed
+        yet (no admission has ever happened): that is `ledger_listable=True` with an empty
+        `ledger` list, a proven state, not a failure.
+      activities -- one `ActivityInput` per root-listed, real activity directory (`quota/`
+        excluded), in no particular order.
+      rejected_root_ids -- valid-activity-id-shaped root entries REJECTED for a reason other than
+        'gone' (a symlink, a non-directory squatting on the name, denied, or an unexplained stat
+        failure) -- these never became a listed activity directory this pass, so they carry no
+        `on_disk` measurement at all.
+      ledger -- one `LedgerInput` per valid-activity-id-shaped ledger entry actually read this
+        pass (empty if `ledger_listable` is False)."""
+    root_listable: bool
+    ledger_listable: bool
+    activities: list
+    rejected_root_ids: list
+    ledger: list
+
+def _gather_accounting(home):
+    """ALL filesystem + ledger reads for one accounting decision, in a single pass (Ruling 56 /
+    Codex R6-4, IMPORTANT) -- `_compute_snapshot` below is pure and does none of its own I/O.
+
+    Root enumeration goes through `paths.list_owned_subdirs_detailed` DIRECTLY (not the
+    `_sized_subdirs`/`_committed_detailed` primitive, which folds root-level and per-entry
+    uncertainty into one flag) so `root_listable` stays a distinct signal from a single rejected
+    entry. `list_owned_subdirs_detailed`'s own `uncertain` conflates "the base itself couldn't be
+    validated/opened/listed" with "some individual entry was rejected" -- but every branch that
+    rejects an INDIVIDUAL entry also appends it to `rejected` (see paths.py), so a base-level
+    failure is the one case that reaches here with `uncertain=True` and `rejected` still empty
+    (subdirs is always `[]` there too, since that return happens before any entry is examined) --
+    that is the exact, and only, signal `root_listable` below relies on.
+
+    Each real activity directory is `stat_owned_segments_detailed`'d exactly once -- the same
+    hook seam existing tests (e.g. test_admit_refuses_from_a_single_snapshot_not_two_separate_
+    scans) monkeypatch directly. Ledger entries come from `_ledger_entries_detailed` (Ruling 54)."""
+    base = paths.quota_dir(home).parent
+    subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
+    root_listable = not (root_uncertain and not rejected)
+
+    activities = []
+    for name in subdirs:
+        if name == "quota":
+            continue
+        entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
+        on_disk = None if dir_uncertain else sum(sz for _n, sz in entries)
+        activities.append(ActivityInput(aid=name, on_disk=on_disk))
+    rejected_root_ids = [name for name, reason in rejected if reason != "gone"]
+
+    ledger_entries, ledger_uncertain = _ledger_entries_detailed(home)
+    ledger = [
+        LedgerInput(aid=aid, corrupt=True) if e == "CORRUPT"
+        else LedgerInput(aid=aid, reserved=e["reserved"], granted=e["granted"])
+        for aid, e in ledger_entries
+    ]
+    return AccountingInputs(
+        root_listable=root_listable,
+        ledger_listable=not ledger_uncertain,
+        activities=activities,
+        rejected_root_ids=rejected_root_ids,
+        ledger=ledger,
+    )
+
+def _compute_snapshot(inputs):
+    """PURE function (Ruling 56 / Codex R6-4, IMPORTANT): no I/O of any kind -- everything it
+    needs is already gathered in `inputs` by `_gather_accounting`. Constants (`CEILING`/
+    `PER_ACTIVITY_CAP`) are read as MODULE GLOBALS at call time (never bound as default arguments),
+    exactly like every other constant this module already treats this way (see `NEWEST_KEEP`
+    etc.), so a test's `monkeypatch.setattr(quota, "CEILING", ...)` is honored here too.
+
+    The shared cross-language rule (mirrored 1:1 by the Node agent; pinned by
+    `repo_radar/tests/data/accounting_vectors.json`):
+      charge = sum(term(aid) for aid over every non-corrupt aid) + PER_ACTIVITY_CAP * (# corrupt
+        ledger entries).
+      term(aid) is exactly PER_ACTIVITY_CAP (no separate on_disk/liability term added on top) if
+        aid is UNCERTAIN: a rejected valid-activity-id root entry (a non-'gone' rejection), OR a
+        root-listed activity directory whose own byte measurement came back uncertain
+        (`on_disk is None`). Its live-ledger liability, if any, is NOT added on top -- by
+        construction a valid (non-corrupt) ledger entry always has `reserved + granted <=
+        PER_ACTIVITY_CAP` (see `_parse_entry`), so max(0, reserved+granted-PER_ACTIVITY_CAP) is
+        always 0 anyway.
+      Otherwise term(aid) = on_disk(aid) + (max(0, reserved+granted-on_disk(aid)) if aid has a
+        live non-corrupt ledger entry, else 0). An aid with no directory at all (e.g.
+        reserve-before-start, before `secure_mkdir` ever ran) has on_disk(aid) == 0 by
+        construction -- it's simply absent from `inputs.activities`.
+      A corrupt ledger entry's aid contributes exactly PER_ACTIVITY_CAP total, no separate
+        on_disk term even if that same aid also has a real, measured activity directory --
+        excluded from the `term(aid)` domain entirely, counted only via the flat sum above.
+      uncertain = (not root_listable) or (not ledger_listable) or any term(aid) above took the
+        uncertain branch.
+      corrupt = any corrupt entry in `inputs.ledger` -- computed UNCONDITIONALLY, even when root/
+        ledger enumeration itself failed (a corrupt entry that WAS actually read this pass is
+        still corrupt, independent of whether some OTHER part of the pass was unmeasurable).
+      An unlistable root OR an unlistable ledger flattens the WHOLE charge to CEILING (not just
+        its own portion) -- "how much is reserved right now" becomes entirely unknowable, so
+        nothing less than the hard ceiling is a safe number to admit/grant new liability against."""
+    corrupt = any(entry.corrupt for entry in inputs.ledger)
+    if not inputs.root_listable or not inputs.ledger_listable:
+        return Snapshot(charge=CEILING, uncertain=True, corrupt=corrupt)
+
+    on_disk_by_aid = {a.aid: a.on_disk for a in inputs.activities}
+    rejected_root = set(inputs.rejected_root_ids)
+    corrupt_aids = {e.aid for e in inputs.ledger if e.corrupt}
+    live_ledger = {e.aid: e for e in inputs.ledger if not e.corrupt}
+
+    aids = (set(on_disk_by_aid) | rejected_root | set(live_ledger)) - corrupt_aids
+    uncertain = False
+    total = 0
+    for aid in aids:
+        if aid in rejected_root or (aid in on_disk_by_aid and on_disk_by_aid[aid] is None):
+            uncertain = True
+            total += PER_ACTIVITY_CAP
+            continue
+        disk = on_disk_by_aid.get(aid, 0)
+        liability = 0
+        if aid in live_ledger:
+            e = live_ledger[aid]
+            liability = max(0, e.reserved + e.granted - disk)
+        total += disk + liability
+    total += PER_ACTIVITY_CAP * len(corrupt_aids)
+    return Snapshot(charge=total, uncertain=uncertain, corrupt=corrupt)
 
 def _accounting_snapshot(home):
-    """Codex R2 fix (fix-review round 2 BLOCKER) + Ruling 45 (Codex R4 B1) + Ruling 50 (Codex R5-3,
-    IMPORTANT), now unified into ONE pass. Pre-R5-3, `_charge` and `_accounting_uncertain` were
-    each their OWN independent full scan (root enumeration + one `stat_owned_segments_detailed`
-    per activity); `admit`/`grant` called them back-to-back. A directory's measurability could
-    change BETWEEN those two independent scans, combining a max-liability fallback charge from
-    ONE scan with an `uncertain=False` verdict from the OTHER, later scan of the same moment --
-    admitting on a charge/uncertainty pair that never coexisted in reality. This function is now
-    the SINGLE source both `_charge` and `_accounting_uncertain` (thin wrappers below) read from,
-    and `admit`/`grant` call it exactly once per decision (never `_charge`+`_accounting_uncertain`
-    separately), so the two numbers are always a matched pair from one instant.
-
-    Root enumeration is `paths.list_owned_subdirs_detailed` (Ruling 49): its own `uncertain` folds
-    into this snapshot's `uncertain` up front (a hidden/unmeasurable activity-id entry at the ROOT
-    level must refuse exactly like an unmeasurable per-activity directory does). Each activity
-    directory is `stat_owned_segments_detailed`'d EXACTLY ONCE via the shared `_sized_subdirs`
-    primitive -- kept as its own patchable seam for existing hook-based tests (mid-scan-append
-    undercount, etc.) that monkeypatch `paths.stat_owned_segments_detailed` directly. An uncertain
-    activity contributes its MAXIMUM liability, max(measured, PER_ACTIVITY_CAP) -- the same
-    max-liability rule a torn/corrupt ledger entry gets below, and max(...) (not a flat replace) so
-    any bytes that WERE provable before the failure are never discarded even if they somehow
-    exceed the cap. A ROOT-rejected entry (Ruling 49: never even reached `sizes`, e.g. an EIO'd
-    lstat) gets the SAME treatment with a measured baseline of 0 -- i.e. flatly PER_ACTIVITY_CAP --
-    so it can never silently vanish from the charge the way it did pre-fix (Codex repro: charge
-    drops to 60 MiB with `uncertain=False`, a reservation wrongly admitted). Ledger entries are
-    read once via `_ledger_entries`; a CORRUPT entry still contributes its own PER_ACTIVITY_CAP max
-    liability exactly once, unchanged from before. `admit`/`grant` additionally refuse outright
-    while `snap.uncertain` (a max-liability guess is a floor for the charge, not a trustworthy
-    measurement to admit new liability against)."""
-    sizes, uncertain, uncertain_names = _sized_subdirs(home)
-    charged_sizes = {
-        name: (max(sizes.get(name, 0), PER_ACTIVITY_CAP) if name in uncertain_names else sizes[name])
-        for name in set(sizes) | uncertain_names
-    }
-    total = sum(charged_sizes.values())
-    for aid, e in _ledger_entries(home):
-        total += PER_ACTIVITY_CAP if e == "CORRUPT" \
-            else max(0, e["reserved"] + e["granted"] - charged_sizes.get(aid, 0))
-    return Snapshot(charge=total, uncertain=uncertain)
+    """The single source `_charge`/`_accounting_uncertain`/`admit`/`grant` all read from, so
+    `charge`, `uncertain` and `corrupt` are always a matched triple from one instant -- never
+    `_charge`+`_accounting_uncertain` as two separate scans (Ruling 50 / Codex R5-3), and never a
+    separate `_has_corrupt()` pre-check ahead of this snapshot's own pass (Ruling 55 / Codex R6-2,
+    BLOCKER: that let a staged clean->corrupt ledger read admit with a corrupt entry inside the
+    actual decision snapshot). Now a thin composition of `_gather_accounting` (all I/O, one pass)
+    and `_compute_snapshot` (pure) -- Ruling 56 / Codex R6-4, IMPORTANT."""
+    return _compute_snapshot(_gather_accounting(home))
 
 def _charge(home):
     """Thin wrapper over `_accounting_snapshot` (Ruling 50): unchanged shape/behavior, kept for
@@ -308,14 +456,17 @@ def _charge(home):
     return _accounting_snapshot(home).charge
 
 def _has_corrupt(home):
-    # spec §7: whether ANY ledger entry is currently untrustworthy. Used to fail-closed refuse
-    # new admissions/grants while it stands (Codex fix-review B2, Gap 1).
+    # spec §7: whether ANY ledger entry is currently untrustworthy. Kept as a thin, independent
+    # pass for tests/introspection (Ruling 55 / Codex R6-2) -- `admit`/`grant` no longer call this
+    # separately; they consume `Snapshot.corrupt` from their own single `_accounting_snapshot`
+    # pass instead (see there).
     return any(e == "CORRUPT" for _aid, e in _ledger_entries(home))
 
 def _accounting_uncertain(home):
     """Thin wrapper over `_accounting_snapshot` (Ruling 45/50): unchanged shape/behavior, kept for
     tests/introspection that only need the uncertainty flag. See `_accounting_snapshot` for what
-    folds into it -- root-enumeration uncertainty (Ruling 49) and every per-activity directory's."""
+    folds into it -- root-enumeration uncertainty (Ruling 49), every per-activity directory's, and
+    the LEDGER directory's own listing (Ruling 54)."""
     return _accounting_snapshot(home).uncertain
 
 def admit(home, activity_id, lease):
@@ -323,17 +474,20 @@ def admit(home, activity_id, lease):
     try:
         fd = _quota_lock(home)                                 # may raise UnsafePath (swapped component)
         _reconcile_all_locked(home)                            # reconcile BEFORE charge
-        if _has_corrupt(home):
-            return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
-        # Ruling 50: ONE unified snapshot -- charge and uncertain are a matched pair from the
-        # SAME pass, never `_charge(home)` and `_accounting_uncertain(home)` as two separate scans.
+        # Ruling 50/55: ONE unified snapshot -- charge, uncertain AND corrupt are a matched triple
+        # from the SAME pass, never `_charge(home)`+`_accounting_uncertain(home)` as two separate
+        # scans, and never a separate `_has_corrupt(home)` pre-check ahead of this snapshot's own
+        # pass (that let a staged clean->corrupt ledger read admit with a corrupt entry inside the
+        # actual decision snapshot -- Codex R6-2, BLOCKER).
         snap = _accounting_snapshot(home)
+        if snap.corrupt:
+            return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
         if snap.uncertain:
             return False        # Ruling 45: refuse new admissions while any activity dir is unmeasurable
         if snap.charge + RESERVE > CEILING:
             _prune_locked(home, (snap.charge + RESERVE) - CEILING)   # prune FIRST
             snap = _accounting_snapshot(home)           # FRESH unified snapshot before re-deciding
-            if snap.uncertain or snap.charge + RESERVE > CEILING:
+            if snap.corrupt or snap.uncertain or snap.charge + RESERVE > CEILING:
                 return False                                   # best-effort refuse
         _write_entry(home, activity_id, RESERVE, 0)            # durable, descriptor-relative
         return True
@@ -347,10 +501,11 @@ def grant(home, activity_id, nbytes):
     fd = None
     try:
         fd = _quota_lock(home)
-        if _has_corrupt(home):
-            return False        # spec §7: refuse grants while any corrupt entry stands
-        # Ruling 50: ONE unified snapshot -- see admit() above for why this must not be two calls.
+        # Ruling 50/55: ONE unified snapshot -- see admit() above for why this must not be a
+        # separate `_has_corrupt()` call plus its own `_accounting_snapshot()` pass.
         snap = _accounting_snapshot(home)
+        if snap.corrupt:
+            return False        # spec §7: refuse grants while any corrupt entry stands
         if snap.uncertain:
             return False        # Ruling 45: refuse grants while any activity dir is unmeasurable
         p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)

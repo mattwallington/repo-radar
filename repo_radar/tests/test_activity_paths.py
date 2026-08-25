@@ -347,3 +347,40 @@ def test_list_owned_subdirs_detailed_ignores_non_uuid_names_in_rejected(tmp_path
     assert set(subdirs) == {"quota"}
     assert rejected == []
     assert uncertain is False
+
+# --- Ruling 54 (Codex R6-1, BLOCKER): list_owned_entries_detailed must never collapse a LEDGER-
+# directory listing failure to the same "[]" a genuinely-empty/never-created dir returns ---------
+
+def test_list_owned_entries_detailed_missing_dir_not_uncertain(tmp_path):
+    # the shared prefix (`activity/`) exists for real; only `quota/` itself was never created --
+    # a proven "no ledgers yet" state (no admission has ever happened), not a failure.
+    paths.secure_mkdir(paths.quota_dir(tmp_path).parent)
+    entries, uncertain = paths.list_owned_entries_detailed(paths.quota_dir(tmp_path))
+    assert entries == [] and uncertain is False
+
+def test_list_owned_entries_detailed_scandir_failure_is_uncertain(tmp_path, monkeypatch):
+    # Codex R6-1's exact defect: `list_owned_entries` collapsed this to `[]`, indistinguishable
+    # from "no ledgers" -- so quota's ledger scan silently dropped every live reservation's
+    # liability during a transient EIO instead of refusing.
+    d = paths.quota_dir(tmp_path); paths.secure_mkdir(d)
+    def boom(fd):
+        raise OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(paths.os, "scandir", boom)
+    entries, uncertain = paths.list_owned_entries_detailed(d)
+    assert entries == [] and uncertain is True
+
+def test_list_owned_entries_detailed_unsafe_dir_is_uncertain(tmp_path):
+    # the quota dir itself is a symlink -- exists, but unsafe to open (UnsafePath), never "empty".
+    outside = tmp_path / "outside"; outside.mkdir()
+    paths.secure_mkdir(paths.quota_dir(tmp_path).parent)
+    os.symlink(outside, paths.quota_dir(tmp_path))
+    entries, uncertain = paths.list_owned_entries_detailed(paths.quota_dir(tmp_path))
+    assert entries == [] and uncertain is True
+
+def test_list_owned_entries_is_a_thin_wrapper_over_detailed(tmp_path):
+    d = paths.quota_dir(tmp_path); paths.secure_mkdir(d)
+    (d / "00000000-0000-4000-8000-000000000000.json").write_text("{}")
+    (d / "junk.txt").write_text("x")
+    assert paths.list_owned_entries(d, suffix=".json") == \
+        paths.list_owned_entries_detailed(d, suffix=".json")[0]
+    assert paths.list_owned_entries(d) == paths.list_owned_entries_detailed(d)[0]

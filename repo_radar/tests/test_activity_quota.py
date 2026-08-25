@@ -693,3 +693,107 @@ def test_ledger_vectors_valid_entry_uses_the_real_reserve_constant():
     assert valid_cases, "fixture must contain at least one accepted case"
     for c in valid_cases:
         assert c["expected"]["reserved"] == quota.RESERVE, c["name"]
+
+# --- Codex R6-1 (BLOCKER) / Ruling 54: a LEDGER-directory listing failure must never collapse to
+# "no ledgers" -- charge flattens to the ceiling and admissions/grants refuse outright -----------
+
+def test_ledger_dir_listing_failure_is_uncertain_and_charge_is_the_ceiling(tmp_path, monkeypatch):
+    """`paths.list_owned_entries` (pre-fix) collapsed ANY listing failure on the LEDGER dir
+    (`quota/`) to `[]` -- indistinguishable from a genuinely empty/never-created one -- so
+    `_ledger_entries` silently dropped every live reservation's liability from the charge during a
+    transient EIO instead of refusing. `_gather_accounting` must read this as `ledger_listable=
+    False` and `_compute_snapshot` must flatten the WHOLE charge to CEILING (not just the ledger's
+    own portion), since "how much is reserved right now" becomes entirely unknowable."""
+    live, ll = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live, ll) is True     # a real, live reservation in the ledger
+
+    real = paths.list_owned_entries_detailed
+    def hooked(directory, suffix=None):
+        if str(directory) == str(paths.quota_dir(tmp_path)):
+            return [], True                            # simulate paths.py's own EIO verdict
+        return real(directory, suffix)
+    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+
+    snap = quota._accounting_snapshot(tmp_path)
+    assert snap.uncertain is True
+    assert snap.charge == quota.CEILING
+
+def test_ledger_dir_listing_failure_refuses_admit_and_grant(tmp_path, monkeypatch):
+    live, ll = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live, ll) is True
+
+    real = paths.list_owned_entries_detailed
+    def hooked(directory, suffix=None):
+        if str(directory) == str(paths.quota_dir(tmp_path)):
+            return [], True
+        return real(directory, suffix)
+    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+
+    fresh, fl = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh, fl) is False    # refused: ledger dir unmeasurable
+    assert quota.grant(tmp_path, live, 1) is False       # unrelated grant refused too
+
+def test_ledger_dir_enoent_charges_from_segments_only_not_uncertain(tmp_path):
+    # ENOENT quota dir (no admission has ever happened yet) is a proven "no ledgers" state, not a
+    # failure -- charge comes purely from whatever real bytes are already on disk.
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+    paths.segment_path(tmp_path, aid, "python", "deadbeef").write_bytes(b"x" * 4096)
+    assert not paths.quota_dir(tmp_path).exists()
+
+    snap = quota._accounting_snapshot(tmp_path)
+    assert snap.uncertain is False
+    assert snap.corrupt is False
+    assert snap.charge == 4096
+
+# --- Codex R6-2 (BLOCKER) / Ruling 55: Snapshot.corrupt comes from the SAME ledger-entries pass
+# as charge/uncertain -- never a separate `_has_corrupt()` pre-check ahead of it ------------------
+
+def test_admit_uses_one_ledger_entries_pass_per_decision_snapshot(tmp_path, monkeypatch):
+    """Pre-fix, `admit()` called `_has_corrupt()` SEPARATELY, before `_accounting_snapshot()` --
+    two INDEPENDENT `_ledger_entries` passes for one decision. A ledger read that flips between
+    those two passes let a corrupt entry slip into the actual decision snapshot while the earlier
+    `_has_corrupt()` pre-check still saw clean data and passed, silently admitting alongside a
+    corrupt entry. `held`'s owner.lock stays HELD (no start ever written) so `_reconcile_all_
+    locked`'s own pass over the ledger (an unrelated, expected EARLIER pass -- it settles dead
+    owners, not the decision itself) can't clear the entry out from under this test: reconcile
+    tries to acquire the lock, finds it busy, and leaves the entry in place. `calls["n"] == 2`
+    proves the DECISION itself took exactly one further pass -- not a third, separate corrupt-
+    only check in addition to it."""
+    held, hl = _new_activity(tmp_path)                      # owner.lock HELD (never released below)
+    paths.ledger_entry_path(tmp_path, held).write_text(
+        json.dumps({"reserved": quota.RESERVE, "granted": 0}))   # a real, CLEAN ledger entry
+
+    real = quota._ledger_entries_detailed
+    calls = {"n": 0}
+    def staged(home):
+        calls["n"] += 1
+        entries, uncertain = real(home)
+        if calls["n"] == 1:
+            return entries, uncertain                       # call #1 (reconcile's iteration): clean
+        # call #2 onward (the actual decision snapshot): force `held`'s entry CORRUPT
+        return [(a, "CORRUPT" if a == held else e) for a, e in entries], uncertain
+    monkeypatch.setattr(quota, "_ledger_entries_detailed", staged)
+
+    try:
+        fresh, fl = _new_activity(tmp_path)
+        assert quota.admit(tmp_path, fresh, fl) is False    # refused: the decision snapshot saw corrupt
+        assert calls["n"] == 2, (
+            f"expected exactly 2 ledger-entries passes (1 reconcile iteration + 1 decision "
+            f"snapshot), saw {calls['n']} -- an extra pass means a separate corrupt-only check "
+            f"still exists"
+        )
+    finally:
+        hl.release()
+
+def test_grant_refuses_when_its_own_decision_snapshot_finds_corrupt(tmp_path, monkeypatch):
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+
+    real = quota._ledger_entries_detailed
+    def staged(home):
+        entries, uncertain = real(home)
+        return [(a, "CORRUPT" if a == aid else e) for a, e in entries], uncertain
+    monkeypatch.setattr(quota, "_ledger_entries_detailed", staged)
+
+    assert quota.grant(tmp_path, aid, 1) is False

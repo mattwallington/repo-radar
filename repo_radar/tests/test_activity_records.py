@@ -165,6 +165,17 @@ def test_parse_valid_rejects_utf8_bom_prefixed_bytes():   # Ruling 51 (Codex R5-
     bom_prefixed = b"\xef\xbb\xbf" + raw.encode("utf-8")
     assert R.parse_valid(bom_prefixed, AID) is None                     # BOM-prefixed: rejected
 
+def test_ownership_rejects_non_integer_pid_literal_1_0():   # Codex R6-3 fixture half
+    # direct confirmation (the generic vectors driver above already covers this via the
+    # 'raw_text' case added to record_validation_vectors.json): pid must be an EXACT int, not the
+    # JSON literal 1.0 -- isinstance(1.0, int) is False in Python, so this is already rejected by
+    # type; the fixture exists to pin the exact literal spelling for the Node cross-runtime driver.
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"ownership","seq":1,'
+           '"ts":"2026-08-14T00:00:00-07:00","owner_token":"deadbeef","role":"initial",'
+           '"producer":"python","pid":1.0,"boot_id":"a1b2c3d4e5f60718",'
+           '"proc_birth":"2026-08-14T00:00:00-07:00"}') % AID
+    assert R.parse_valid(raw, AID) is None
+
 def test_parse_valid_rejects_utf16le_encoded_bytes():      # Ruling 51 (Codex R5-2, BLOCKER)
     raw = ('{"schema_version":1,"activity_id":"%s","type":"terminal","seq":9,'
            '"ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded","summary":{},'

@@ -228,5 +228,43 @@
       ],
       "cancel_requested": false
     }
+  },
+  {
+    "name": "schema-version-true-line",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": true, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [
+        "unsupported-schema"
+      ],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "schema-version-float-line",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1.0, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [
+        "unsupported-schema"
+      ],
+      "cancel_requested": false
+    }
   }
 ]

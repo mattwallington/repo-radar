@@ -150,6 +150,28 @@ def test_scan_parse_segment_bytes_classifies_invalid_utf8_line_as_corrupt_record
     assert [r["type"] for r in records_out] == ["start"]
     assert findings == [{"kind": scan_mod.CORRUPT_RECORD}]
 
+def test_classify_line_rejects_non_integer_schema_version_literals():
+    # Ruling 57 (Codex R6-5, IMPORTANT): `obj.get("schema_version") != SCHEMA_VERSION` alone lets
+    # Python's `True == 1` slip a bool `schema_version` through as though it were the int 1 --
+    # falling through to `records.parse_valid` (-> corrupt-record) instead of the shared
+    # `unsupported-schema` verdict Node emits for it. The rule is type-strict: not EXACTLY the
+    # integer 1 (bool, float, string, any other int, or missing) -> _UNSUPPORTED, always.
+    aid = ids.mint_activity_id()
+    terminal_fields = ('"activity_id": "%s", "type": "terminal", "seq": 1, '
+                       '"ts": "%s", "outcome": "succeeded", "summary": {}, "by": "deadbeef"') % (aid, TS)
+    for literal in ("true", "1.0", '"1"', "2"):
+        line = ('{"schema_version": %s, %s}' % (literal, terminal_fields)).encode()
+        assert scan_mod._classify_line(line, aid) is scan_mod._UNSUPPORTED, literal
+    # sanity: the real integer 1 is still accepted (a valid record, not _UNSUPPORTED/None)
+    ok_line = ('{"schema_version": 1, %s}' % terminal_fields).encode()
+    assert scan_mod._classify_line(ok_line, aid) not in (scan_mod._UNSUPPORTED, None)
+
+def test_classify_line_missing_schema_version_is_still_unsupported():
+    aid = ids.mint_activity_id()
+    line = ('{"activity_id": "%s", "type": "event", "seq": 0, "ts": "%s", '
+           '"level": "info", "event": "x", "fields": {}}' % (aid, TS)).encode()
+    assert scan_mod._classify_line(line, aid) is scan_mod._UNSUPPORTED
+
 def test_scan_parse_segment_bytes_classifies_bom_and_utf16_lines_as_corrupt_never_unsupported():
     # Ruling 51 (Codex R5-2, BLOCKER): `json.loads(bytes)` auto-detects UTF-16/32 and silently
     # accepts/strips a leading UTF-8 BOM -- so a BOM-prefixed or UTF-16LE-encoded line used to

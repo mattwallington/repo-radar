@@ -316,22 +316,46 @@ def read_owned_file(path):
     finally:
         os.close(fd)
 
-def list_owned_entries(directory, suffix=None):
-    """Immediate entry NAMES of an owned dir via a validated dir fd -- UNFILTERED by type (a
-    symlink/FIFO/dir name is still returned as-is, no lstat classification here). Codex gate
-    round 1, finding 2: a caller that does its own per-name safety classification (e.g. quota's
-    ledger scan) must never have a name silently dropped before it gets the chance to classify
-    it CORRUPT; `read_owned_segments`' skip-unsafe-entries behavior is right for SEGMENT
-    reads/scans but wrong for that use, so this is a separate, unfiltered listing. `suffix`, if
-    given, filters by name suffix only (no fs access, so it can't itself hide an unsafe entry)."""
+def list_owned_entries_detailed(directory, suffix=None):
+    """(entries, uncertain) companion to `list_owned_entries` (Ruling 54 / Codex R6-1, BLOCKER):
+    the plain `list_owned_entries` collapsed EVERY listing failure -- a directory that provably
+    never existed yet AND a directory that exists but couldn't be validated/opened/listed (a
+    transient EIO, EACCES, ELOOP, a non-directory squatting on the name) -- to the SAME `[]`.
+    Quota's ledger scan (`_ledger_entries`) fed straight off that `[]`, so a transient failure
+    enumerating `quota/` read as "no ledgers at all": every live reservation's liability vanished
+    from the charge for that pass, exactly the class of bug Ruling 40/45/49 already fixed for
+    segment reads and activity-directory/root enumeration, just one layer further out (the
+    LEDGER directory itself, not an activity directory).
+
+    Returns `(entries, uncertain)`:
+      entries -- exactly what `list_owned_entries` returns: unfiltered entry NAMES (a
+        symlink/FIFO/dir name is still returned as-is; `suffix`, if given, filters by name suffix
+        only -- no fs access, so it can't itself hide an unsafe entry).
+      uncertain -- False + entries=[] -- `directory` does NOT exist (`FileNotFoundError`): a
+          proven state (e.g. no admission has ever happened yet), not a failure.
+        False -- `directory` was validated, opened, AND listed successfully.
+        True -- `directory` exists but couldn't be fully validated/opened/listed this pass
+          (`open_owned_dir` refused it -- `UnsafePath`/other `OSError` -- or `os.scandir` itself
+          failed): the true entry set is UNPROVEN, never treated as "empty"."""
     try:
         dfd = open_owned_dir(directory)
-    except (UnsafePath, FileNotFoundError):
-        return []
+    except FileNotFoundError:
+        return [], False                # directory provably never existed -- nothing here yet
+    except (UnsafePath, OSError):
+        return [], True                 # exists but unsafe/inaccessible -- entry set unproven
     try:
-        return [e.name for e in os.scandir(dfd) if suffix is None or e.name.endswith(suffix)]
+        try:
+            entries = list(os.scandir(dfd))
+        except OSError:
+            return [], True             # opened fine but couldn't be listed -- unproven
+        return [e.name for e in entries if suffix is None or e.name.endswith(suffix)], False
     finally:
         os.close(dfd)
+
+def list_owned_entries(directory, suffix=None):
+    """Thin `[0]` wrapper over `list_owned_entries_detailed` (Ruling 54): unchanged signature/
+    behavior for existing callers that don't need to distinguish "gone" from "uncertain"."""
+    return list_owned_entries_detailed(directory, suffix)[0]
 
 def list_owned_subdirs_detailed(base):
     """Immediate real subdir NAMES of an owned base via a validated dir fd (no symlink follow),

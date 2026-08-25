@@ -21,8 +21,9 @@ fixture `repo_radar/tests/data/scan_vectors.json` (Ruling 44), which both test s
     a missing newline is a torn write, not a record and not a finding. Empty lines are skipped.
   * Findings (canonical kinds, exact strings): an interior non-empty line that fails
     `records.parse_valid` is `{"kind": "corrupt-record"}`, except that a line which parses as a
-    JSON object whose `schema_version` is not 1 (mirroring parse.js's `obj.schema_version !== 1`,
-    which also covers a MISSING schema_version) is `{"kind": "unsupported-schema"}`.
+    JSON object whose `schema_version` is not EXACTLY the integer 1 -- a bool, a float (`1.0`),
+    a string (`"1"`), any other int, or MISSING entirely (Ruling 57 / Codex R6-5: type-strict,
+    mirroring parse.js's own strict check) -- is `{"kind": "unsupported-schema"}`.
   * seq-regression (Ruling 42): per segment, over ACCEPTED records, `last_seq` starts at -1 and
     tracks the most recently accepted record's own `seq` (NOT a running max); an accepted record
     with `seq <= last_seq` yields `{"kind": "seq-regression"}` and is STILL accepted. Reset per
@@ -69,8 +70,15 @@ def _classify_line(line, aid):
         obj = json.loads(text, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
     except Exception:
         obj = None
-    if isinstance(obj, dict) and obj.get("schema_version") != records.SCHEMA_VERSION:
-        return _UNSUPPORTED
+    if isinstance(obj, dict):
+        # Ruling 57 (Codex R6-5, IMPORTANT): the shared rule is "not EXACTLY the integer 1" --
+        # `!=` alone lets Python's `True == 1` slip a bool `schema_version` through as if it were
+        # the int 1 (Node's `!==`-shaped check has no such coercion and emits `unsupported-schema`
+        # for it), so this must be a type-strict `type(sv) is not int` check FIRST, exactly like
+        # `records.parse_valid`'s own schema_version check (kept consistent with it here).
+        sv = obj.get("schema_version")
+        if type(sv) is not int or sv != records.SCHEMA_VERSION:
+            return _UNSUPPORTED
     return records.parse_valid(text, aid)
 
 def parse_segment_bytes(data, aid):
