@@ -27,8 +27,9 @@ module.exports = {
   // Stateful subsystems with several generically-named functions and/or internal test seams --
   // namespaced to avoid top-level collisions, matching the existing quota/reconcile precedent.
   quota, reconcile, writer,
-  // Task 3.6: the reader facade -- namespaced (not flattened) since `listActivities`/
-  // `buildExport`/`validateFilter`/`InvalidFilter` are generic names that would otherwise risk
+  // Task 3.6: the reader facade -- namespaced (not flattened) since `listActivities` (summaries)/
+  // `getActivity` (one full detail item)/`buildExport`/`validateFilter`/`InvalidFilter`/
+  // `InvalidActivityId`/`isProblemBearing` are generic names that would otherwise risk
   // colliding with a future top-level export, same reasoning as quota/reconcile/writer above.
   // `limits` is exposed too (Task 4.1's IPC handler validates against the same bounds read.js
   // enforces internally, and needs the shared constants object, not a private copy).

@@ -20,9 +20,24 @@ const LIST_MAX = 200;
 const DETAIL_MAX_ROWS = 2000;
 const DETAIL_MAX_BYTES = 2 * 1024 * 1024;
 
-// Every individual rendered string field (event name, detail, a fields value, a problem reason)
-// is capped at this many UTF-8 bytes, independent of the aggregate DETAIL_MAX_BYTES above.
+// Every individual rendered string field (event name, detail, a fields KEY or value, a terminal
+// summary entry, channel/trigger/kind, a problem reason/name, a writerId/producer) is capped at
+// this many UTF-8 bytes, independent of the aggregate DETAIL_MAX_BYTES above.
 const FIELD_MAX_BYTES = 8 * 1024;
+
+// Per-item Problems-lens row cap (Codex R1 B4). Problems SHARE the per-item DETAIL_MAX_BYTES
+// budget with the Events lens; rows past either cap are dropped and represented by one visible
+// `{ kind:'truncated', dropped:n }` marker row, while `problemCount` keeps the pre-truncation
+// total.
+const PROBLEMS_MAX_ROWS = 500;
+
+// listActivities returns SUMMARY DTOs only (no lens arrays). Each summary must serialize to at
+// most this many bytes, so a full page is bounded at LIST_MAX * SUMMARY_MAX_BYTES (~800 KiB).
+// The only free-form strings on a summary (channel/trigger/kind) are bounded to
+// SUMMARY_FIELD_MAX_BYTES each so the summary cap is met by construction; SUMMARY_MAX_BYTES is
+// then a guard read.js asserts, not a bound it relies on hitting.
+const SUMMARY_MAX_BYTES = 4096;
+const SUMMARY_FIELD_MAX_BYTES = 1024;
 
 // `filter.search` is a literal substring match (never a regex), capped at this many characters.
 const SEARCH_MAX = 256;
@@ -38,6 +53,8 @@ module.exports = {
   LIST_MAX,
   DETAIL_MAX_ROWS, DETAIL_MAX_BYTES,
   FIELD_MAX_BYTES,
+  PROBLEMS_MAX_ROWS,
+  SUMMARY_MAX_BYTES, SUMMARY_FIELD_MAX_BYTES,
   SEARCH_MAX,
   EXPORT_MAX_BYTES,
   LEVELS,

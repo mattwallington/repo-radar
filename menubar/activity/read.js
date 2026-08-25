@@ -1,36 +1,84 @@
 'use strict';
 // Task 3.6: read.js -- the Phase-3 reader capstone. Composes parse.js (Task 3.1) + merge.js
 // (Task 3.2) + reconcile.js (Task 3.3) + redact.js (Task 2.2c) into bounded, already-redacted,
-// reader-facing DTOs. `main` (Task 4.1) calls `listActivities`/`buildExport`; the renderer only
-// ever sees the DTOs this module returns, never raw segment bytes.
+// reader-facing DTOs. `main` (Task 4.1) calls `listActivities` (summaries), `getActivity` (one
+// full detail item) and `buildExport`; the renderer only ever sees the DTOs this module returns,
+// never raw segment bytes.
 //
 // Ruling B (carried over from every sibling module): read.js never deletes/mutates/truncates
 // committed data. The only writes it can cause are the synthetic-terminal appends already
 // sanctioned INSIDE reconcile.js/synthesizeTerminal (called per-activity below, before that
 // activity's segments are read) -- this file itself performs no fs write of any kind.
 //
-// Redaction is defense-in-depth (spec §4): every user-derived string that reaches a DTO or the
-// export text -- event names, `detail`, `fields` values, problem reasons -- is run through a
-// SINGLE `redact.Redactor` built once per call from `opts.configuredSecrets`, before it is
-// returned. Nothing here ever hands back an un-redacted field.
+// Redaction is defense-in-depth (spec §4): EVERY user- or filesystem-derived string that reaches
+// a DTO or the export text -- event names, `detail`, `fields` keys AND values, terminal
+// `summary`, channel/trigger/kind, problem reasons, and every filename-derived string (writerId,
+// producer, a rejected entry's name) -- is run through a SINGLE `redact.Redactor` built once per
+// call from `opts.configuredSecrets`, then bounded to `limits.FIELD_MAX_BYTES`, before it is
+// returned. Nothing here ever hands back an un-redacted or unbounded string (Codex R1 B3/B4).
+//
+// Summary vs detail (Codex R1 B4 / Ruling 35): `listActivities` returns SUMMARY DTOs only (no
+// lens arrays, each <= limits.SUMMARY_MAX_BYTES); `getActivity` returns ONE full detail item
+// (summary fields + Events lens + Problems lens + duplicateTerminals) never larger than
+// limits.DETAIL_MAX_BYTES. `buildExport` iterates detail items under EXPORT_MAX_BYTES.
+//
+// Lifecycle honesty (Codex R1 B2 / Ruling 34): `running` is emitted ONLY for a valid `start`
+// with no terminal (spec §3). A directory with no records, no rejected entries and no reconcile
+// problems is a live reserve-before-start and is NOT an Activity item at all (skipped). Anything
+// else without a valid start is `unknown` + an integrity problem + `incomplete`.
+//
+// Problem-bearing (Codex R1 B1 / Ruling 33): `isProblemBearing` mirrors quota.py's
+// `is_problem_bearing` exactly (shared fixture: repo_radar/tests/data/problem_bearing_vectors.json,
+// exercised by __tests__/problem-bearing.test.js). The Problems lens carries every warn/error
+// event, every failure-like terminal (with its `summary` -- that's where a blocked/failed reason
+// lives), every integrity record/finding, and the reconcile-level problems.
 const fs = require('fs');
 const path = require('path');
 const paths = require('./paths');
 const parseMod = require('./parse');
 const mergeMod = require('./merge');
 const redactMod = require('./redact');
-const reconcileMod = require('./reconcile');
+const reconcileMod = require('./reconcile'); // referenced as `reconcileMod.reconcile` at call
+// time (never destructured) so a test can inject a failing reconcile by monkeypatching the
+// module export -- the I3 failure-injection seam.
 const idsMod = require('./ids');
 const limits = require('./limits'); // referenced as `limits.FOO` at call sites throughout (never
 // destructured) so a test monkeypatching a bound (`limits.LIST_MAX = 2`) is observed immediately --
 // see limits.js's own header comment.
 
 class InvalidFilter extends Error {}
+// A malformed activity id passed to `getActivity`. Subclasses InvalidFilter so Task 4.1's IPC
+// handler can reject BOTH caller-input failures with a single `instanceof InvalidFilter` check.
+class InvalidActivityId extends InvalidFilter {}
+
+// -------------------------------------------------------------------------------------------
+// Shared PROBLEM-BEARING predicate (Ruling 33). Byte-for-byte the same rule as quota.py's
+// `is_problem_bearing`: over parsed TOP-LEVEL records of one activity, true iff any
+//   (a) `event` with level in {warn, error};
+//   (b) `terminal` with outcome in {failed, blocked, interrupted, succeeded-with-warnings}
+//       (succeeded / cancelled / skipped are routine);
+//   (c) `integrity` record.
+// Pure: records in, bool out; no filesystem, no redaction. Parse/reconcile integrity FINDINGS
+// (which are not records) are folded in by `_buildItem` via `problemCount` -- see `hasProblems`.
+// -------------------------------------------------------------------------------------------
+const PROBLEM_EVENT_LEVELS = new Set(['warn', 'error']);
+const PROBLEM_OUTCOMES = new Set(['failed', 'blocked', 'interrupted', 'succeeded-with-warnings']);
+
+function isProblemBearing(records) {
+  if (!Array.isArray(records)) return false;
+  for (const r of records) {
+    if (!r || typeof r !== 'object') continue;
+    if (r.type === 'event' && PROBLEM_EVENT_LEVELS.has(r.level)) return true;
+    if (r.type === 'terminal' && PROBLEM_OUTCOMES.has(r.outcome)) return true;
+    if (r.type === 'integrity') return true;
+  }
+  return false;
+}
 
 // -------------------------------------------------------------------------------------------
 // Filter validation (brief: "throws a typed error ... Task 4.1's IPC handler will call it to
-// REJECT (not silently clamp) a bad filter"). listActivities/buildExport both call this on
-// entry; an empty/omitted filter is valid (no filtering, default paging).
+// REJECT (not silently clamp) a bad filter"). Every public entry point calls this; an
+// empty/omitted filter is valid (no filtering, default paging).
 // -------------------------------------------------------------------------------------------
 function validateFilter(filter = {}) {
   if (filter === null || typeof filter !== 'object' || Array.isArray(filter)) {
@@ -88,8 +136,8 @@ function _utf8SafeSlice(buf, n) {
 }
 
 // Bound a rendered string to `maxBytes` UTF-8 bytes, marking truncation visibly. Used for every
-// field/detail/reason string placed on a DTO (limits.FIELD_MAX_BYTES) and for the export text as
-// a whole (limits.EXPORT_MAX_BYTES, with its own caller-supplied marker).
+// string placed on a DTO (limits.FIELD_MAX_BYTES) and for the export text as a whole
+// (limits.EXPORT_MAX_BYTES, with its own caller-supplied marker).
 function _boundStr(s, maxBytes, marker = '…[truncated]') {
   if (typeof s !== 'string') return { value: s, truncated: false };
   const buf = Buffer.from(s, 'utf8');
@@ -98,6 +146,18 @@ function _boundStr(s, maxBytes, marker = '…[truncated]') {
   const keepBytes = Math.max(0, maxBytes - markerBytes);
   const kept = _utf8SafeSlice(buf, keepBytes).toString('utf8');
   return { value: kept + marker, truncated: true };
+}
+
+// The one path every returned string takes: scrub, then bound. `null`/`undefined` pass through
+// (a field that is absent stays absent); anything else is stringified first so a non-string
+// never bypasses redaction.
+function _safeStr(v, redactor, maxBytes = limits.FIELD_MAX_BYTES) {
+  if (v === null || v === undefined) return null;
+  return _boundStr(redactor.scrub(String(v)), maxBytes).value;
+}
+
+function _bytesOf(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
 // -------------------------------------------------------------------------------------------
@@ -134,14 +194,32 @@ function _probeRoot(base) {
 }
 
 // -------------------------------------------------------------------------------------------
-// Per-activity assembly. `_writerIdFromName` mirrors reconcile.js's own private helper of the
-// same name (not exported there) -- filenames are `${producer}-${writerId}.jsonl` and PRODUCERS
-// never themselves contain '-', so the last '-'-delimited component is always the writerId.
+// Segment filename contract (Codex R1 B3). A segment is `${producer}-${writerId}.jsonl` with
+// producer in paths.js's PRODUCERS and writerId an 8-hex token (ids.validToken). Anything else
+// is NOT parsed as a segment: it becomes a `rejected-segment` problem with reason `bad-name`
+// (name scrubbed + bounded) and marks the item incomplete. Previously the last '-'-delimited
+// component was copied into `writerId` unvalidated, so `python-s3cr3t.jsonl` leaked "s3cr3t"
+// into the DTO and the export.
+//
+// paths.js keeps PRODUCERS private, so rather than copy the enum here (and let it drift) a
+// candidate name is validated by ROUND-TRIPPING it through `paths.segmentPath` -- the single
+// authority on segment naming, which throws for an unknown producer -- and requiring the
+// resulting basename to equal the name exactly.
 // -------------------------------------------------------------------------------------------
-function _writerIdFromName(name) {
-  const stem = name.endsWith('.jsonl') ? name.slice(0, -'.jsonl'.length) : name;
-  const idx = stem.lastIndexOf('-');
-  return idx === -1 ? stem : stem.slice(idx + 1);
+const _SEGMENT_NAME_RE = /^([a-z]+)-([0-9a-f]{8})\.jsonl$/;
+
+function _parseSegmentName(home, aid, name) {
+  const m = _SEGMENT_NAME_RE.exec(name);
+  if (!m) return null;
+  const producer = m[1];
+  const writerId = m[2];
+  if (!idsMod.validToken(writerId)) return null;
+  try {
+    if (path.basename(paths.segmentPath(home, aid, producer, writerId)) !== name) return null;
+  } catch (e) {
+    return null; // UnsafePath: unknown producer
+  }
+  return { producer, writerId };
 }
 
 // The exact `parse.js` integrity finding kinds (its own header comment enumerates them) -- used
@@ -155,107 +233,311 @@ const _PARSE_INTEGRITY_KINDS = new Set([
   'corrupt-json', 'corrupt-shape', 'unsupported-schema', 'invalid-record', 'seq-regression',
 ]);
 
-// Redact + bound one rendered `fields` map (string values only -- numbers/bools/null pass
-// through unchanged, matching records.js's own flat-primitive contract for `fields`).
+// Reconcile-level problem kinds that mean "this item's state could not be fully established" and
+// therefore mark the item (and the response) `incomplete` (Codex R1 B2).
+const _INCOMPLETE_RECONCILE_KINDS = new Set([
+  'reconcile-probe-uncertain', 'reconcile-internal-error', 'reconcile-synthesize-raced',
+  'reconcile-settle-failed',
+]);
+
+// Redact + bound one flat primitive map (`fields` on an event, `summary` on a terminal). Both
+// KEYS and string values are scrubbed and bounded (Codex R1 B3: a configured secret used as a
+// field key previously reached the DTO and export untouched). Numbers/bools/null pass through
+// unchanged, matching records.js's own flat-primitive contract.
 function _renderFields(fields, redactor) {
   const out = {};
-  if (!fields || typeof fields !== 'object') return out;
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return out;
   for (const [k, v] of Object.entries(fields)) {
+    const key = _safeStr(k, redactor);
     if (typeof v === 'string') {
-      out[k] = _boundStr(redactor.scrub(v), limits.FIELD_MAX_BYTES).value;
+      out[key] = _safeStr(v, redactor);
+    } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
+      out[key] = v;
     } else {
-      out[k] = v;
+      out[key] = _safeStr(JSON.stringify(v), redactor); // never a nested object on a DTO
     }
   }
   return out;
 }
 
+function _renderEvent(r, redactor) {
+  return {
+    ts: r.ts,
+    seq: r.seq,
+    level: r.level,
+    writerId: r.writerId,
+    producer: r.producer,
+    event: _safeStr(r.event, redactor),
+    detail: _safeStr(r.detail, redactor),
+    fields: _renderFields(r.fields, redactor),
+  };
+}
+
 // Redact + bound + filter (level/search) the `event` records into the Events-lens row list,
-// capped at DETAIL_MAX_ROWS rows AND DETAIL_MAX_BYTES cumulative rendered bytes -- whichever
-// limit is hit first stops further rows and sets `truncated`.
-function _buildEventsLens(rawEvents, filter, redactor) {
+// capped at DETAIL_MAX_ROWS rows AND `byteBudget` cumulative rendered bytes (the per-item
+// DETAIL_MAX_BYTES budget, less whatever the Problems lens already consumed) -- whichever limit
+// is hit first stops further rows and sets `truncated`. Returns the per-row byte sizes too so the
+// whole-item fitting pass can drop rows without re-measuring the entire item each time.
+function _buildEventsLens(rawEvents, filter, redactor, byteBudget) {
   const rows = [];
+  const sizes = [];
   let truncated = false;
   let totalBytes = 0;
 
   for (const r of rawEvents) {
-    const eventName = _boundStr(redactor.scrub(String(r.event)), limits.FIELD_MAX_BYTES).value;
-    const detail = r.detail != null
-      ? _boundStr(redactor.scrub(String(r.detail)), limits.FIELD_MAX_BYTES).value
-      : null;
-    const renderedFields = _renderFields(r.fields, redactor);
+    const row = _renderEvent(r, redactor);
 
     if (filter.level && r.level !== filter.level) continue;
     if (filter.search) {
-      const haystack = `${eventName}\n${detail || ''}\n${JSON.stringify(renderedFields)}`;
+      const haystack = `${row.event}\n${row.detail || ''}\n${JSON.stringify(row.fields)}`;
       if (!haystack.includes(filter.search)) continue;
     }
 
-    const row = {
-      ts: r.ts,
-      level: r.level,
-      writerId: r.writerId,
-      event: eventName,
-      detail,
-      fields: renderedFields,
-    };
-    const rowBytes = Buffer.byteLength(JSON.stringify(row), 'utf8');
-    if (rows.length >= limits.DETAIL_MAX_ROWS || totalBytes + rowBytes > limits.DETAIL_MAX_BYTES) {
+    const rowBytes = _bytesOf(row);
+    if (rows.length >= limits.DETAIL_MAX_ROWS || totalBytes + rowBytes > byteBudget) {
       truncated = true;
       break;
     }
     totalBytes += rowBytes;
     rows.push(row);
+    sizes.push(rowBytes);
   }
 
-  return { rows, truncated };
+  return { rows, sizes, truncated, bytes: totalBytes };
 }
 
-function _renderProblem(p, redactor) {
-  const kind = p && p.kind ? String(p.kind) : 'unknown';
-  const reason = p && p.reason != null
-    ? _boundStr(redactor.scrub(String(p.reason)), limits.FIELD_MAX_BYTES).value
-    : undefined;
-  const out = { kind, reason };
+// A parse/reconcile integrity FINDING (not a record) rendered as a Problems-lens row. Provenance
+// (`writerId`/`producer`) is attached when the finding came from a named segment.
+function _renderFinding(p, redactor, prov) {
+  const out = {
+    kind: p && p.kind ? _safeStr(p.kind, redactor) : 'unknown',
+    reason: p && p.reason != null ? _safeStr(p.reason, redactor) : undefined,
+  };
   if (p && typeof p.index === 'number') out.index = p.index;
+  if (prov) {
+    out.writerId = prov.writerId;
+    out.producer = prov.producer;
+  }
   return out;
 }
 
-// Build one activity's DTO. Step order matters (task brief's Phase-3 gate): `reconcile()` runs
-// FIRST -- performing the read-triggered reconciliation, possibly appending a durable synthetic
-// terminal for a crashed `running` attempt -- and only THEN are this activity's segments read for
-// DTO assembly, so a just-synthesized terminal is already visible in `merged` below.
+// Problems lens (Codex R1 B1): structural/integrity problems first (few, and the most important
+// to keep under truncation), then record-derived rows in merged order. Capped at
+// PROBLEMS_MAX_ROWS rows and `byteBudget` bytes; anything dropped is represented by ONE visible
+// `{ kind:'truncated', dropped:n }` marker row. `total` is the pre-truncation count (the item's
+// `problemCount`).
+function _buildProblemsLens(structural, merged, redactor, byteBudget) {
+  const candidates = structural.slice();
+  for (const r of merged) {
+    if (r.type === 'event' && PROBLEM_EVENT_LEVELS.has(r.level)) {
+      candidates.push(Object.assign({ kind: 'event' }, _renderEvent(r, redactor)));
+    } else if (r.type === 'terminal' && PROBLEM_OUTCOMES.has(r.outcome)) {
+      candidates.push({
+        kind: 'terminal',
+        outcome: r.outcome,
+        ts: r.ts,
+        seq: r.seq,
+        by: _safeStr(r.by, redactor),
+        summary: _renderFields(r.summary, redactor),
+        writerId: r.writerId,
+        producer: r.producer,
+      });
+    } else if (r.type === 'integrity') {
+      candidates.push({
+        kind: 'integrity',
+        reason: _safeStr(r.kind, redactor),
+        detail: _safeStr(r.detail, redactor),
+        ts: r.ts,
+        seq: r.seq,
+        writerId: r.writerId,
+        producer: r.producer,
+      });
+    }
+  }
+
+  const rows = [];
+  const sizes = [];
+  let totalBytes = 0;
+  let dropped = 0;
+  for (const c of candidates) {
+    const bytes = _bytesOf(c);
+    if (dropped > 0 || rows.length >= limits.PROBLEMS_MAX_ROWS || totalBytes + bytes > byteBudget) {
+      dropped += 1;
+      continue;
+    }
+    rows.push(c);
+    sizes.push(bytes);
+    totalBytes += bytes;
+  }
+  return { rows, sizes, dropped, total: candidates.length, bytes: totalBytes };
+}
+
+// Marker row appended to the Problems lens when rows were dropped. Kept tiny and fixed-shape so
+// its own byte cost is always affordable.
+function _truncationMarker(dropped) {
+  return { kind: 'truncated', dropped };
+}
+
+// Whole-item cap (Codex R1 B4): the assembled detail item must never exceed DETAIL_MAX_BYTES.
+// Drops trailing events first, then trailing problems (maintaining the visible markers), using
+// the per-row sizes to estimate progress and re-measuring the real serialized item after each
+// pass, until it fits. Mutates `item` in place.
+function _fitItem(item, eventSizes, problemSizes, problemsDropped) {
+  const max = limits.DETAIL_MAX_BYTES;
+  let dropped = problemsDropped;
+  let measured = _bytesOf(item);
+  for (let guard = 0; measured > max && guard < 64; guard++) {
+    let excess = measured - max;
+    while (excess > 0 && item.events.length > 0) {
+      item.events.pop();
+      excess -= eventSizes.pop() + 1;
+      item.truncatedEvents = true;
+    }
+    while (excess > 0 && problemSizes.length > 0) {
+      // The marker (if any) is always the last row; strip it, drop a real row, re-add it below.
+      if (dropped > 0) item.problems.pop();
+      item.problems.pop();
+      excess -= problemSizes.pop() + 1;
+      dropped += 1;
+      item.problems.push(_truncationMarker(dropped));
+    }
+    measured = _bytesOf(item);
+    if (item.events.length === 0 && problemSizes.length === 0) break;
+  }
+  if (measured > max) {
+    // Only the fixed summary fields + a marker row remain; every string among them is already
+    // FIELD_MAX_BYTES-bounded, so this is unreachable at the shipped constants. Fail closed
+    // rather than return an over-budget item.
+    item.events = [];
+    item.truncatedEvents = true;
+    item.problems = [_truncationMarker(item.problemCount)];
+  }
+  return dropped;
+}
+
+// -------------------------------------------------------------------------------------------
+// Per-activity assembly.
+// -------------------------------------------------------------------------------------------
+
+// Everything a caller can learn about one activity, split into the SUMMARY (what listActivities
+// returns per item) and the lenses only getActivity/buildExport hand back.
+function _summaryOf(full) {
+  return {
+    id: full.id,
+    outcome: full.outcome,
+    startedAt: full.startedAt,
+    endedAt: full.endedAt,
+    duration: full.duration,
+    // Re-bounded tighter than the detail item's FIELD_MAX_BYTES so a summary meets
+    // SUMMARY_MAX_BYTES by construction (see limits.js).
+    channel: _boundStr(full.channel, limits.SUMMARY_FIELD_MAX_BYTES).value,
+    trigger: _boundStr(full.trigger, limits.SUMMARY_FIELD_MAX_BYTES).value,
+    kind: _boundStr(full.kind, limits.SUMMARY_FIELD_MAX_BYTES).value,
+    errorCount: full.errorCount,
+    warnCount: full.warnCount,
+    problemCount: full.problemCount,
+    hasProblems: full.hasProblems,
+    incomplete: full.incomplete,
+    synthesized: full.synthesized,
+  };
+}
+
+// Guard the summary contract (SUMMARY_MAX_BYTES). channel/trigger/kind are the only free-form
+// strings on a summary and are already bounded to SUMMARY_FIELD_MAX_BYTES; if a summary is
+// STILL over budget something structural changed, so squeeze those three hard rather than ever
+// hand back an over-budget summary.
+function _boundSummary(summary) {
+  if (_bytesOf(summary) <= limits.SUMMARY_MAX_BYTES) return summary;
+  for (const k of ['channel', 'trigger', 'kind']) {
+    summary[k] = _boundStr(summary[k], 64).value;
+  }
+  if (_bytesOf(summary) > limits.SUMMARY_MAX_BYTES) {
+    throw new Error('activity summary exceeds SUMMARY_MAX_BYTES after bounding'); // caller bug
+  }
+  return summary;
+}
+
+// Build one activity's full detail item. Step order matters (task brief's Phase-3 gate):
+// `reconcile()` runs FIRST -- performing the read-triggered reconciliation, possibly appending a
+// durable synthetic terminal for a crashed `running` attempt -- and only THEN are this activity's
+// segments read for DTO assembly, so a just-synthesized terminal is already visible in `merged`.
+//
+// Returns `null` when the directory is a live reserve-before-start (no segments, no rejected
+// entries, no reconcile problems): a producer has been admitted but hasn't written `start` yet,
+// so there is nothing to show as history (Codex R1 B2). Every other state yields an item.
 function _buildItem(home, aid, filter, redactor) {
   const rec = reconcileMod.reconcile(home, aid);
 
-  const problems = [];
-  let hasParseIntegrity = false;
+  const structural = []; // integrity-class problems, rendered
+  let incomplete = false;
   let mtime = 0;
   const perSegment = [];
 
-  const segs = paths.readOwnedSegments(paths.activityDir(home, aid));
-  for (const seg of segs) {
+  const { segments, rejected } = paths.readOwnedSegmentsDetailed(paths.activityDir(home, aid));
+  let dirUnreadable = false;
+  for (const rj of rejected) {
+    if (rj.reason === 'dir-unreadable') dirUnreadable = true;
+    structural.push({
+      kind: 'rejected-segment',
+      name: _safeStr(rj.name, redactor),
+      reason: _safeStr(rj.reason, redactor),
+    });
+    incomplete = true;
+  }
+
+  let badNames = 0;
+  for (const seg of segments) {
+    const prov = _parseSegmentName(home, aid, seg.name);
+    if (prov === null) {
+      structural.push({ kind: 'rejected-segment', name: _safeStr(seg.name, redactor), reason: 'bad-name' });
+      incomplete = true;
+      badNames += 1;
+      continue; // never parsed: an unvalidated name is not a segment
+    }
     if (seg.mtime > mtime) mtime = seg.mtime;
-    const writerId = _writerIdFromName(seg.name);
     const { records: recs, integrity } = parseMod.parseSegment(seg.data, aid);
-    if (integrity.length > 0) hasParseIntegrity = true;
-    for (const finding of integrity) problems.push(finding);
-    perSegment.push(recs.map((r) => Object.assign({}, r, { writerId })));
+    if (integrity.length > 0) incomplete = true;
+    for (const finding of integrity) structural.push(_renderFinding(finding, redactor, prov));
+    perSegment.push(recs.map((r) => Object.assign({}, r, prov)));
   }
   const merged = mergeMod.mergeHeads(perSegment);
 
-  let hasUncertain = false;
   for (const p of rec.problems || []) {
     const kind = String((p && p.kind) || '');
     if (_PARSE_INTEGRITY_KINDS.has(kind)) continue; // already represented by the fresh scan above
-    problems.push(p);
-    if (kind === 'reconcile-probe-uncertain') hasUncertain = true;
+    structural.push(_renderFinding(p, redactor, null));
+    if (_INCOMPLETE_RECONCILE_KINDS.has(kind)) incomplete = true;
   }
 
   const startRecord = merged.find((r) => r.type === 'start') || null;
   const terminalRecord = merged.find((r) => r.type === 'terminal') || null;
 
-  const outcome = rec.outcome === null ? 'running' : rec.outcome;
+  // Reserve-before-start: nothing on disk yet beyond the directory itself -- not history.
+  if (segments.length === 0 && rejected.length === 0 && structural.length === 0 && rec.outcome === null) {
+    return null;
+  }
+
+  // Lifecycle (spec §3, Ruling 34): a reconciled terminal outcome wins; otherwise `running`
+  // ONLY with a valid start; otherwise the state is genuinely unknown and says so.
+  let outcome;
+  if (!startRecord) {
+    outcome = 'unknown';
+    structural.push({
+      kind: 'integrity',
+      reason: 'no-start',
+      detail: dirUnreadable
+        ? 'activity directory could not be read'
+        : (badNames > 0 && merged.length === 0
+          ? 'no valid start record (only unparseable segment names present)'
+          : 'no valid start record found'),
+    });
+    incomplete = true;
+  } else if (rec.outcome !== null && rec.outcome !== undefined) {
+    outcome = String(rec.outcome);
+  } else {
+    outcome = 'running';
+  }
+
   const startedAt = startRecord ? startRecord.ts : null;
   const endedAt = terminalRecord ? terminalRecord.ts : null;
   let duration = null;
@@ -275,47 +557,94 @@ function _buildItem(home, aid, filter, redactor) {
     rawEvents.push(r);
   }
 
-  const { rows: events, truncated: truncatedEvents } = _buildEventsLens(rawEvents, filter, redactor);
+  // Problems get first claim on the per-item byte budget (they are the diagnostics the lens
+  // exists for, and are row-capped at PROBLEMS_MAX_ROWS); events take the remainder.
+  const problemsLens = _buildProblemsLens(structural, merged, redactor, limits.DETAIL_MAX_BYTES);
+  const eventsLens = _buildEventsLens(
+    rawEvents, filter, redactor, Math.max(0, limits.DETAIL_MAX_BYTES - problemsLens.bytes),
+  );
 
   const duplicateTerminals = Object.entries(rec.duplicateTerminalCounts || {})
     .filter(([, count]) => count > 1)
-    .map(([dupOutcome, count]) => ({ outcome: dupOutcome, count }));
+    .map(([dupOutcome, count]) => ({ outcome: _safeStr(dupOutcome, redactor), count }));
 
-  const dto = {
+  const problems = problemsLens.rows.slice();
+  if (problemsLens.dropped > 0) problems.push(_truncationMarker(problemsLens.dropped));
+
+  const item = {
     id: aid,
     outcome,
     startedAt,
     endedAt,
     duration,
-    // Review R1 / I1: records.js only enum-constrains `kind` -- `channel`/`trigger` are
-    // contract-wise just producer-supplied strings, so the read-time redaction backstop (spec
-    // §4) must cover them exactly like every other rendered string, not just event/detail/fields.
-    // `buildExport` renders these DTO fields verbatim (never re-reads the raw record), so fixing
-    // it here covers both output surfaces.
-    channel: startRecord ? redactor.scrub(startRecord.channel) : null,
-    trigger: startRecord ? redactor.scrub(startRecord.trigger) : null,
-    kind: startRecord ? redactor.scrub(startRecord.kind) : null,
+    // records.js only enum-constrains `kind` -- `channel`/`trigger` are producer-supplied
+    // strings, so they are scrubbed AND bounded exactly like every other rendered string.
+    channel: startRecord ? _safeStr(startRecord.channel, redactor) : null,
+    trigger: startRecord ? _safeStr(startRecord.trigger, redactor) : null,
+    kind: startRecord ? _safeStr(startRecord.kind, redactor) : null,
     errorCount,
     warnCount,
-    mtime,
-    events,
-    truncatedEvents,
+    problemCount: problemsLens.total,
+    // Equivalent to `isProblemBearing(merged) || <any integrity finding>`: every record the
+    // predicate counts produces a Problems row, and every finding does too.
+    hasProblems: problemsLens.total > 0,
+    incomplete,
+    synthesized: Boolean(rec.synthesized),
+    events: eventsLens.rows,
+    truncatedEvents: eventsLens.truncated,
     duplicateTerminals,
-    problems: problems.map((p) => _renderProblem(p, redactor)),
+    problems,
   };
 
-  return { dto, hasIncompleteSignal: hasParseIntegrity || hasUncertain };
+  _fitItem(item, eventsLens.sizes, problemsLens.sizes, problemsLens.dropped);
+
+  return { item, mtime };
 }
 
-function _sortKey(item) {
-  const t = item.startedAt ? Date.parse(item.startedAt) : NaN;
+// I3 (Codex R1): per-activity assembly is contained. An unexpected exception from reconcile(),
+// a segment read, or DTO assembly becomes an `unknown` item carrying an `internal-error`
+// problem (message scrubbed + bounded) and marked incomplete -- it never escapes to the caller.
+// Only caller bugs (invalid filter/id) throw, and those are rejected before this is reached.
+function _safeBuildItem(home, aid, filter, redactor) {
+  try {
+    return _buildItem(home, aid, filter, redactor);
+  } catch (e) {
+    const message = _safeStr((e && e.message) || String(e), redactor);
+    return {
+      mtime: 0,
+      item: {
+        id: aid,
+        outcome: 'unknown',
+        startedAt: null,
+        endedAt: null,
+        duration: null,
+        channel: null,
+        trigger: null,
+        kind: null,
+        errorCount: 0,
+        warnCount: 0,
+        problemCount: 1,
+        hasProblems: true,
+        incomplete: true,
+        synthesized: false,
+        events: [],
+        truncatedEvents: false,
+        duplicateTerminals: [],
+        problems: [{ kind: 'internal-error', reason: message }],
+      },
+    };
+  }
+}
+
+function _sortKey(entry) {
+  const t = entry.item.startedAt ? Date.parse(entry.item.startedAt) : NaN;
   if (Number.isFinite(t)) return t;
-  return (item.mtime || 0) * 1000; // mtime is in seconds (paths.js); scale to the same ms axis
+  return (entry.mtime || 0) * 1000; // mtime is in seconds (paths.js); scale to the same ms axis
 }
 
-// Enumerate + assemble every valid activity under `home`, unbounded by LIST_MAX/offset/limit --
-// the shared core both listActivities (which then pages) and buildExport (which does not) build
-// on. Never throws (mirrors the read-only, best-effort contract every sibling module keeps).
+// Enumerate + assemble every valid activity under `home` as full detail items, unbounded by
+// LIST_MAX/offset/limit -- the shared core listActivities (which then summarizes + pages) and
+// buildExport (which does not) build on. Never throws for a data/IO condition.
 function _collectItems(home, filter, redactor) {
   const base = _activityRoot(home);
   const state = _probeRoot(base);
@@ -326,19 +655,24 @@ function _collectItems(home, filter, redactor) {
   const aids = subdirs.filter((name) => name !== 'quota' && idsMod.validActivityId(name));
 
   let incomplete = false;
-  const items = [];
+  const entries = [];
   for (const aid of aids) {
-    const { dto, hasIncompleteSignal } = _buildItem(home, aid, filter, redactor);
-    items.push(dto);
-    if (hasIncompleteSignal) incomplete = true;
+    const built = _safeBuildItem(home, aid, filter, redactor);
+    if (built === null) continue; // reserve-before-start: not history yet
+    entries.push(built);
+    if (built.item.incomplete) incomplete = true;
   }
-  items.sort((a, b) => _sortKey(b) - _sortKey(a));
-  return { items, available: true, incomplete };
+  entries.sort((a, b) => _sortKey(b) - _sortKey(a));
+  return { items: entries.map((e) => e.item), available: true, incomplete };
 }
 
 // -------------------------------------------------------------------------------------------
 // Public API
 // -------------------------------------------------------------------------------------------
+
+// Summary DTOs only (no `events`/`problems`/`duplicateTerminals`), each <= SUMMARY_MAX_BYTES,
+// at most LIST_MAX per call. `filter.level`/`filter.search` are validated here but only affect
+// the Events lens (getActivity/buildExport); they never remove items from the list.
 function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   validateFilter(filter);
   const redactor = new redactMod.Redactor(configuredSecrets);
@@ -350,14 +684,73 @@ function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
 
   const offset = filter.offset || 0;
   const limit = Math.min(filter.limit !== undefined ? filter.limit : limits.LIST_MAX, limits.LIST_MAX);
-  const sliced = items.slice(offset, offset + limit);
+  const sliced = items.slice(offset, offset + limit).map((full) => _boundSummary(_summaryOf(full)));
   const truncated = offset + sliced.length < items.length;
 
   return { items: sliced, truncated, available, incomplete };
 }
 
-// Renders the same reconciled+redacted data as a stable, human-readable text document. Never
-// reads renderer input -- `filter`/`opts` are the only inputs, exactly like listActivities.
+// One full detail item (summary fields + Events lens + Problems lens + duplicateTerminals),
+// never larger than DETAIL_MAX_BYTES. `filter.level`/`filter.search` filter the Events lens.
+//
+// Contract: a malformed `activityId` THROWS `InvalidActivityId` (an InvalidFilter subclass) --
+// it is caller input, exactly like a bad filter, and Task 4.1's handler rejects it the same way.
+// Every data/IO condition instead returns `{ item: null, available, reason }`:
+//   reason 'unavailable'  -- the activity root is unreadable (available:false)
+//   reason 'missing'      -- no such activity directory (ENOENT)
+//   reason 'unreadable'   -- the path exists but is not a real directory (symlink/file/EACCES)
+//   reason 'not-started'  -- a live reserve-before-start directory (not history yet)
+function getActivity(home, activityId, { configuredSecrets = [], filter = {} } = {}) {
+  if (!idsMod.validActivityId(activityId)) {
+    throw new InvalidActivityId('invalid activity id');
+  }
+  validateFilter(filter);
+  const redactor = new redactMod.Redactor(configuredSecrets);
+
+  const state = _probeRoot(_activityRoot(home));
+  if (state === 'unreadable') return { item: null, available: false, reason: 'unavailable' };
+  if (state === 'missing') return { item: null, available: true, reason: 'missing' };
+
+  let st;
+  try {
+    st = fs.lstatSync(paths.activityDir(home, activityId));
+  } catch (e) {
+    return { item: null, available: true, reason: e.code === 'ENOENT' ? 'missing' : 'unreadable' };
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    return { item: null, available: true, reason: 'unreadable' };
+  }
+
+  const built = _safeBuildItem(home, activityId, filter, redactor);
+  if (built === null) return { item: null, available: true, reason: 'not-started' };
+  return { item: built.item, available: true };
+}
+
+function _describeProblem(p) {
+  switch (p.kind) {
+    case 'event': {
+      const suffix = p.detail ? ` -- ${p.detail}` : '';
+      const fields = p.fields && Object.keys(p.fields).length > 0 ? `  fields: ${JSON.stringify(p.fields)}` : '';
+      return `[event] [${p.ts}] ${String(p.level || '').toUpperCase()} ${p.event}${suffix}${fields}`;
+    }
+    case 'terminal': {
+      const summary = p.summary && Object.keys(p.summary).length > 0 ? `  summary: ${JSON.stringify(p.summary)}` : '';
+      return `[terminal] [${p.ts}] ${p.outcome} by ${p.by}${summary}`;
+    }
+    case 'rejected-segment':
+      return `[rejected-segment] ${p.reason}: ${p.name || '(directory)'}`;
+    case 'truncated':
+      return `[truncated] ${p.dropped} further problem(s) not shown`;
+    default: {
+      const detail = p.detail ? ` -- ${p.detail}` : '';
+      const where = typeof p.index === 'number' ? ` (line ${p.index})` : '';
+      return `[${p.kind}] ${p.reason || ''}${detail}${where}`;
+    }
+  }
+}
+
+// Renders the same reconciled+redacted detail items as a stable, human-readable text document.
+// Never reads renderer input -- `filter`/`opts` are the only inputs, exactly like listActivities.
 // Ignores LIST_MAX item paging (that bound is about a single IPC response's item-summary count;
 // an export is a deliberate full-history dump), enforcing only the total-byte cap instead.
 function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
@@ -382,9 +775,11 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   for (const item of items) {
     lines.push('='.repeat(72));
     lines.push(`Activity ${item.id}`);
-    lines.push(`outcome: ${item.outcome}    started: ${item.startedAt || '(unknown)'}    ended: ${item.endedAt || '(running)'}`);
+    const ended = item.endedAt || (item.outcome === 'running' ? '(running)' : '(unknown)');
+    lines.push(`outcome: ${item.outcome}    started: ${item.startedAt || '(unknown)'}    ended: ${ended}`);
     lines.push(`channel: ${item.channel || '-'}  trigger: ${item.trigger || '-'}  kind: ${item.kind || '-'}`);
-    lines.push(`duration_ms: ${item.duration === null ? '-' : item.duration}    errors: ${item.errorCount}    warnings: ${item.warnCount}`);
+    lines.push(`duration_ms: ${item.duration === null ? '-' : item.duration}    errors: ${item.errorCount}    warnings: ${item.warnCount}    problems: ${item.problemCount}`);
+    if (item.incomplete) lines.push('(this item is incomplete: some data could not be read or verified)');
     if (item.truncatedEvents) lines.push('(events truncated for this item)');
 
     lines.push('-- Events --');
@@ -405,7 +800,7 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
       lines.push('  (none)');
     } else {
       for (const p of item.problems) {
-        lines.push(`  [${p.kind}] ${p.reason || ''}`);
+        lines.push(`  ${_describeProblem(p)}`);
       }
       for (const d of item.duplicateTerminals) {
         lines.push(`  duplicate terminal: ${d.outcome} x${d.count}`);
@@ -428,7 +823,12 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
 
 module.exports = {
   InvalidFilter,
+  InvalidActivityId,
   validateFilter,
+  isProblemBearing,
+  PROBLEM_EVENT_LEVELS,
+  PROBLEM_OUTCOMES,
   listActivities,
+  getActivity,
   buildExport,
 };
