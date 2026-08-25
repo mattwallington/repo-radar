@@ -314,15 +314,27 @@ function _onDisk(home, aid) {
 // symlink/FIFO/dir entry out of the enumeration -- undercounting the charge, fail-open); every
 // valid-UUID name is CLASSIFIED via `_readEntry`, never silently skipped (mirrors Python's B2
 // enumeration fix).
-function _ledgerEntries(home) {
-  const out = [];
-  for (const name of paths.listOwnedEntries(paths.quotaDir(home), '.json')) {
+//
+// Codex R6 B1 / Ruling 54: enumerated through `paths.listOwnedEntriesDetailed`, whose
+// `uncertain` says the ledger dir EXISTS but could not be listed (EIO / EACCES / ELOOP / a non-dir
+// squatting on `quota/`). The lossy `listOwnedEntries` collapsed that to `[]` -- "no ledgers" --
+// so every outstanding reservation vanished from the charge during a transient failure and a new
+// reservation was admitted (Codex repro: 67,170,304 bytes after restore). A MISSING quota dir
+// (ENOENT) is still proven "no ledgers yet". `_ledgerEntries` is the `.entries`-only wrapper.
+function _ledgerEntriesDetailed(home) {
+  const listing = paths.listOwnedEntriesDetailed(paths.quotaDir(home), '.json');
+  const entries = [];
+  for (const name of listing.entries) {
     const aid = name.slice(0, -5); // strip ".json"
     if (ids.validActivityId(aid)) {
-      out.push([aid, _readEntry(paths.ledgerEntryPath(home, aid))]);
+      entries.push([aid, _readEntry(paths.ledgerEntryPath(home, aid))]);
     }
   }
-  return out;
+  return { entries, uncertain: Boolean(listing.uncertain) };
+}
+
+function _ledgerEntries(home) {
+  return _ledgerEntriesDetailed(home).entries;
 }
 
 // Whether activity `aid` has a durable `terminal` record in its segments. A bounded CONTENT read
@@ -407,34 +419,105 @@ function _hasTerminal(home, aid) {
 // `statOwnedSegmentsDetailed` per listed activity. `admit`/`grant` consume `charge`, `corrupt`
 // and `uncertain` from the SAME snapshot; `_charge`/`_accountingUncertain` are thin wrappers
 // kept for their callers/tests.
-function _accountingSnapshot(home) {
+//
+// Codex R6 B1+I4 / Rulings 54+56: split into `_gatherAccounting` (ALL the I/O, one pass -- the
+// `statOwnedSegmentsDetailed` hook seam the interleaving/cancel-settle/staged tests wrap is still
+// the one call per listed activity) and the PURE `_computeSnapshot` (no I/O, shared
+// vector-driven charge arithmetic; see `accounting-parity.test.js` and the Python mirror
+// `quota._compute_snapshot`). Two divergences from Python were normalized away:
+//   - a REJECTED valid-activity-id root entry (EIO on its lstat) was charged PER_ACTIVITY_CAP AND
+//     its live ledger liability (`reserved+granted - 0`): 4,255,844 on Node vs Python's
+//     4,194,304 for the same disk state. Now an UNCERTAIN activity is charged EXACTLY
+//     PER_ACTIVITY_CAP -- its maximum liability already covers any reservation.
+//   - an unlistable root floored the charge at CEILING only when no root entry was rejected,
+//     while Python reported 0. Now an unlistable root OR ledger dir is EXACTLY CEILING (and
+//     uncertain) on both sides.
+//
+// Gathered inputs (the shape `accounting_vectors.json` describes, camelCased):
+//   { rootListable, ledgerListable,
+//     activities: [{ aid, onDisk: int | null }],   // listed activity dirs; null = unmeasurable
+//     rejectedRootIds: [aid],                        // valid-activity-id root entries refused (not 'gone')
+//     ledger: [{ aid, reserved, granted } | { aid, corrupt: true }] }
+function _gatherAccounting(home) {
   const base = path.dirname(paths.quotaDir(home));
   const root = paths.listOwnedSubdirsDetailed(base);
-  let uncertain = Boolean(root.uncertain);
-  const sizes = new Map();
+  const activities = [];
   for (const name of root.subdirs) {
     if (name === 'quota') continue;
     const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
     let size = 0;
     for (const seg of scan.entries) size += seg.size;
-    if (scan.uncertain) { uncertain = true; size = Math.max(size, PER_ACTIVITY_CAP); }
-    sizes.set(name, size);
+    activities.push({ aid: name, onDisk: scan.uncertain ? null : size });
   }
-  let total = 0;
-  for (const size of sizes.values()) total += size;
-  let hidden = 0; // activity-shaped root entries refused (not proven gone): max liability each
+  const rejectedRootIds = [];
   for (const rj of root.rejected) {
-    if (rj.reason === 'gone') continue;
-    hidden += 1;
-    total += PER_ACTIVITY_CAP;
+    if (rj.reason !== 'gone') rejectedRootIds.push(rj.name); // proven gone hides nothing
   }
-  if (root.uncertain && hidden === 0) total = Math.max(total, CEILING); // base itself unlistable
-  let corrupt = false;
-  for (const [aid, e] of _ledgerEntries(home)) {
-    if (e === CORRUPT) { corrupt = true; total += PER_ACTIVITY_CAP; continue; }
-    total += Math.max(0, e.reserved + e.granted - (sizes.get(aid) || 0));
+  // `listOwnedSubdirsDetailed.uncertain` covers BOTH "the base could not be validated/listed"
+  // (early return: `subdirs` and `rejected` both empty) AND "an activity-shaped entry was refused"
+  // (the base WAS listed; the entry is in `rejected`). Only the former is "root unlistable" here --
+  // the latter is per-activity uncertainty (`rejectedRootIds`), charged PER_ACTIVITY_CAP each.
+  const rootListable = !(root.uncertain && rejectedRootIds.length === 0);
+  const led = _ledgerEntriesDetailed(home);
+  const ledger = [];
+  for (const [aid, e] of led.entries) {
+    ledger.push(e === CORRUPT ? { aid, corrupt: true } : { aid, reserved: e.reserved, granted: e.granted });
   }
-  return { charge: total, uncertain, corrupt };
+  return {
+    rootListable, ledgerListable: !led.uncertain,
+    activities, rejectedRootIds, ledger,
+  };
+}
+
+// PURE (Ruling 56 -- the ONE charge rule, identical in Python's `quota._compute_snapshot`):
+//   charge = SUM_aid term(aid) + SUM_{corrupt ledger entries} PER_ACTIVITY_CAP
+//   term(aid) = PER_ACTIVITY_CAP                        if aid is UNCERTAIN (rejected at the root
+//                                                       for a non-gone reason, or its stat was
+//                                                       unmeasurable) -- NO ledger liability added
+//             = on_disk + max(0, reserved+granted - on_disk)   if aid has a live non-corrupt entry
+//             = on_disk                                  otherwise
+//   a corrupt entry's aid contributes exactly PER_ACTIVITY_CAP in total (no on_disk term);
+//   unlistable root OR unlistable ledger dir -> charge = CEILING, uncertain = true;
+//   uncertain = !rootListable || !ledgerListable || any activity uncertain;
+//   corrupt   = any corrupt ledger entry.
+// `constants` (CEILING / PER_ACTIVITY_CAP) defaults to module state; the vector driver overrides.
+function _computeSnapshot(inputs, constants) {
+  const ceiling = constants && constants.CEILING !== undefined ? constants.CEILING : CEILING;
+  const cap = constants && constants.PER_ACTIVITY_CAP !== undefined ? constants.PER_ACTIVITY_CAP : PER_ACTIVITY_CAP;
+
+  const corrupt = inputs.ledger.some((e) => e.corrupt === true);
+  const uncertainIds = new Set(inputs.rejectedRootIds);
+  for (const a of inputs.activities) {
+    if (a.onDisk === null || a.onDisk === undefined) uncertainIds.add(a.aid);
+  }
+  const uncertain = !inputs.rootListable || !inputs.ledgerListable || uncertainIds.size > 0;
+  if (!inputs.rootListable || !inputs.ledgerListable) return { charge: ceiling, uncertain, corrupt };
+
+  const onDisk = new Map();
+  for (const a of inputs.activities) {
+    if (!uncertainIds.has(a.aid)) onDisk.set(a.aid, a.onDisk);
+  }
+  const live = new Map(); // aid -> reserved+granted (non-corrupt entries only)
+  const corruptIds = new Set();
+  for (const e of inputs.ledger) {
+    if (e.corrupt === true) corruptIds.add(e.aid);
+    else live.set(e.aid, e.reserved + e.granted);
+  }
+  const aids = new Set([...uncertainIds, ...onDisk.keys(), ...live.keys()]);
+  let charge = 0;
+  for (const aid of aids) {
+    if (corruptIds.has(aid)) continue; // charged once below, as PER_ACTIVITY_CAP total
+    if (uncertainIds.has(aid)) { charge += cap; continue; }
+    const disk = onDisk.get(aid) || 0;
+    charge += disk;
+    if (live.has(aid)) charge += Math.max(0, live.get(aid) - disk);
+  }
+  charge += corruptIds.size * cap;
+  return { charge, uncertain, corrupt };
+}
+
+function _accountingSnapshot(home) {
+  return _computeSnapshot(_gatherAccounting(home));
 }
 
 function _charge(home) {
@@ -703,7 +786,8 @@ module.exports = {
   configurePythonRunner,
   _quotaLock, _quotaLockNonblocking, _unlock,
   _parseEntry, _readEntry, _writeEntry,
-  _committed, _onDisk, _ledgerEntries, _accountingSnapshot, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
+  _committed, _onDisk, _ledgerEntries, _ledgerEntriesDetailed,
+  _gatherAccounting, _computeSnapshot, _accountingSnapshot, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
   _spawnPythonPrune, _spawnPythonRetain,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },

@@ -27,8 +27,9 @@
 //     a JSON object, or fails v1 validation is corruption: emit a `corrupt-record` integrity
 //     finding (the `reason` distinguishes the sub-cause) and keep going -- one bad interior line
 //     must never hide later valid lines.
-//   - A JSON-parseable object whose `schema_version !== 1` is an `unsupported-schema` integrity
-//     finding and is NOT parsed as v1 (never handed to `records.parseValid`).
+//   - A JSON-parseable object whose top-level `schema_version` is not EXACTLY the integer
+//     literal `1` (`true`, `1.0`, `"1"`, missing, `2` -- Ruling 57) is an `unsupported-schema`
+//     integrity finding and is NOT parsed as v1 (never handed to `records.parseValid`).
 //   - A JSON-parseable, schema_version===1 candidate is handed to `records.parseValid` for the
 //     full v1 verdict (activity_id match, required fields, enum shapes, etc.) -- `null` back is a
 //     `corrupt-record` finding, a record back is accepted.
@@ -99,12 +100,27 @@ function parseSegment(bytes, expectedActivityId) {
       continue;
     }
 
+    // Codex R6 I5 / Ruling 57: the schema_version verdict is taken on the STRICT-LITERAL view.
+    // Shared rule: a JSON object whose top-level `schema_version` is not EXACTLY the integer
+    // literal 1 (`true`, `1.0`, `"1"`, missing, `2`) is `unsupported-schema`. A bare `JSON.parse`
+    // collapses `1.0` to `1` (`1.0 === 1`), so that line used to fall through to
+    // `records.parseValid`'s strict-literal rejection and surface as `corrupt-record` -- diverging
+    // from Python, where `1.0` is a float, not `int` 1, and is `unsupported-schema`. So parse via
+    // `parseJsonStrictIntegers` with only `schema_version` strict: an `InvalidRecord` from it
+    // means exactly "top-level schema_version is a non-integer literal" -> unsupported-schema.
+    // (Only an OBJECT can carry a top-level key, so the not-an-object classification below is
+    // unaffected: the strict check never fires for arrays/scalars.)
     let obj;
+    let schemaLiteralNonInteger = false;
     try {
-      obj = JSON.parse(text);
+      obj = records.parseJsonStrictIntegers(text, ['schema_version']);
     } catch (e) {
-      integrity.push(_finding(CORRUPT_RECORD, i, `JSON.parse failed: ${e.message}`));
-      continue;
+      if (!(e instanceof records.InvalidRecord)) {
+        integrity.push(_finding(CORRUPT_RECORD, i, `JSON.parse failed: ${e.message}`));
+        continue;
+      }
+      schemaLiteralNonInteger = true;
+      obj = JSON.parse(text); // parses (the strict parse only failed on the literal shape)
     }
 
     if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
@@ -112,7 +128,7 @@ function parseSegment(bytes, expectedActivityId) {
       continue;
     }
 
-    if (obj.schema_version !== records.SCHEMA_VERSION) {
+    if (schemaLiteralNonInteger || obj.schema_version !== records.SCHEMA_VERSION) {
       integrity.push(_finding(UNSUPPORTED_SCHEMA, i, `schema_version=${JSON.stringify(obj.schema_version)}`));
       continue;
     }

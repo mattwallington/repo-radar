@@ -436,12 +436,19 @@ function _tokenizeJsonForFallback(text) {
   return tokens;
 }
 
-// Returns the first offending key name, or null if every top-level (object-nesting-depth-1)
-// occurrence of an `integerKeys` name has a pure-integer literal source.
+// Returns an offending key name, or null if every `integerKeys` name's LAST top-level
+// (object-nesting-depth-1) occurrence has a pure-integer literal source.
+//
+// Codex R6 S6 / Ruling 59: duplicate keys. `JSON.parse` (and Python's `json.loads`) keep the
+// LAST occurrence of a duplicated key, and the reviver path sees only that final value/source --
+// so `{"seq":1.0,"seq":1}` is accepted there (seq is the integer 1) while this fallback used to
+// reject on the FIRST occurrence. It now records the last value token seen per key at depth 1 and
+// decides on that, agreeing with the reviver path and Python.
 function _findTopLevelIntegerViolation(text, integerKeys) {
   const tokens = _tokenizeJsonForFallback(text);
   if (tokens === null) return null;
   const keySet = new Set(integerKeys);
+  const lastToken = new Map(); // key -> the value token of its LAST top-level occurrence
   let depth = 0;
   let expectingValueForKey = null;
   for (let i = 0; i < tokens.length; i++) {
@@ -453,13 +460,16 @@ function _findTopLevelIntegerViolation(text, integerKeys) {
     if (depth === 1 && expectingValueForKey !== null) {
       const key = expectingValueForKey;
       expectingValueForKey = null;
-      if (keySet.has(key) && /^-?[0-9]/.test(tok) && !INT_LITERAL_RE.test(tok)) return key;
+      if (keySet.has(key)) lastToken.set(key, tok);
       continue;
     }
     if (depth === 1 && tok[0] === '"' && tokens[i + 1] === ':') {
       expectingValueForKey = JSON.parse(tok);
       continue;
     }
+  }
+  for (const [key, tok] of lastToken) {
+    if (/^-?[0-9]/.test(tok) && !INT_LITERAL_RE.test(tok)) return key;
   }
   return null;
 }
@@ -507,11 +517,20 @@ function parseJsonStrictIntegers(text, integerKeys) {
 // G5-Node2: `seq`/`schema_version` are parsed via `parseJsonStrictIntegers` (not a bare
 // `JSON.parse`) so a non-integer literal (`1.0`, `1e0`) is rejected here, at parse time, instead
 // of silently collapsing to the equal-valued integer the way plain `JSON.parse` would.
+//
+// Codex R6 B3 / Ruling 58: `pid` joins that set. It is the THIRD (and last) top-level
+// integer-typed field in the v1 shape (`_validate`: `seq` for every type, `pid` for `ownership`;
+// `schema_version` is checked here) -- Python's `isinstance(pid, int)` rejects `1.0`, so an
+// `ownership{pid:1.0}` record was valid on Node only, and `trigger-glue._hasAckSignal` counted a
+// handoff ack Python would never have seen. The check is TOP-LEVEL ONLY, like the others (a
+// `fields.pid` float is a legitimate flat-primitive value).
+const STRICT_INTEGER_KEYS = Object.freeze(['seq', 'schema_version', 'pid']);
+
 function parseValid(raw, expectedActivityId) {
   let obj;
   try {
     const text = Buffer.isBuffer(raw) ? _decodeUtf8Fatal(raw) : raw;
-    obj = parseJsonStrictIntegers(text, ['seq', 'schema_version']);
+    obj = parseJsonStrictIntegers(text, STRICT_INTEGER_KEYS);
   } catch (e) {
     return null; // invalid UTF-8 (TypeError), invalid JSON (SyntaxError), or InvalidRecord literal
   }

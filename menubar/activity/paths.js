@@ -419,20 +419,38 @@ function readOwnedFile(filePath) {
 // returned as-is; no lstat classification here). Mirrors `paths.list_owned_entries`: a caller
 // doing its own per-name safety classification (quota's ledger scan) must never have a name
 // silently dropped before it gets the chance to classify it CORRUPT.
-function listOwnedEntries(directory, suffix) {
+//
+// Codex R6 B1 / Ruling 54: the LEDGER-DIRECTORY counterpart of `statOwnedSegmentsDetailed` /
+// `listOwnedSubdirsDetailed`'s `uncertain`. `listOwnedEntries` mapped EVERY validate/readdir
+// failure to `[]`, so a transient EIO (or chmod 000 / ELOOP / a non-dir squatting on `quota/`)
+// on the ledger dir read as "no ledgers" -> no outstanding liability -> quota's snapshot
+// `{ charge: 0, uncertain: false, corrupt: false }` -> a reservation admitted -> restore ->
+// 67,170,304 bytes > ceiling (Codex repro). Returns `{ entries, uncertain }`:
+//   - `uncertain: false` + `[]`: the dir does NOT exist (ENOENT on a component = "no ledgers
+//     yet" is PROVEN, nothing is hidden), or it was listed.
+//   - `uncertain: true`: the dir may exist with entries that could not be enumerated --
+//     validation refused it (UnsafePath wrapping EACCES/ELOOP/ENOTDIR) or readdir failed with
+//     anything other than ENOENT.
+// quota.js floors the charge at CEILING and refuses admit/grant while the ledger dir is
+// unlistable. `listOwnedEntries` below is the `.entries`-only wrapper (single implementation).
+function listOwnedEntriesDetailed(directory, suffix) {
   let dir;
   try {
     dir = _validateOwnedDir(directory);
   } catch (e) {
-    return [];
+    return { entries: [], uncertain: e.code !== 'ENOENT' };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return [];
+    return { entries: [], uncertain: e.code !== 'ENOENT' };
   }
-  return suffix === undefined ? names : names.filter((n) => n.endsWith(suffix));
+  return { entries: suffix === undefined ? names : names.filter((n) => n.endsWith(suffix)), uncertain: false };
+}
+
+function listOwnedEntries(directory, suffix) {
+  return listOwnedEntriesDetailed(directory, suffix).entries;
 }
 
 // Immediate real subdir NAMES of an owned base (no symlink follow), PLUS the activity-shaped
@@ -568,5 +586,5 @@ module.exports = {
   activityDir, segmentPath, parseSegmentName, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
   readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, statOwnedSegmentsDetailed, readOwnedFile,
-  listOwnedEntries, listOwnedSubdirs, listOwnedSubdirsDetailed, writeOwnedFileAtomic,
+  listOwnedEntries, listOwnedEntriesDetailed, listOwnedSubdirs, listOwnedSubdirsDetailed, writeOwnedFileAtomic,
 };
