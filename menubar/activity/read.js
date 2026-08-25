@@ -133,8 +133,7 @@ function validateFilter(filter = {}) {
 // -------------------------------------------------------------------------------------------
 // Small pure helpers (UTF-8-safe truncation, mirrors records.js's private `_utf8SafePrefix` --
 // not exported there, so reimplemented here at the same small scope, matching this codebase's
-// existing precedent of each module owning its own copy of these tiny primitives, e.g.
-// `_splitLines` in both parse.js and reconcile.js).
+// existing precedent of each module owning its own copy of these tiny primitives).
 // -------------------------------------------------------------------------------------------
 function _utf8SafeSlice(buf, n) {
   n = Math.max(0, Math.min(n, buf.length));
@@ -248,9 +247,7 @@ function _parseSegmentName(home, aid, name) {
 // again. Only reconcile()'s own RECONCILE-SPECIFIC problems (probe-uncertain, terminal-conflict,
 // synthesize-raced, internal-error, settle-failed -- all prefixed `reconcile-`) are merged in from
 // `rec.problems`; the parse-level kinds are taken exclusively from this function's own fresh scan.
-const _PARSE_INTEGRITY_KINDS = new Set([
-  'corrupt-json', 'corrupt-shape', 'unsupported-schema', 'invalid-record', 'seq-regression',
-]);
+const _PARSE_INTEGRITY_KINDS = new Set(parseMod.FINDING_KINDS); // corrupt-record | unsupported-schema | seq-regression
 
 // Reconcile-level problem kinds that mean "this item's state could not be fully established" and
 // therefore mark the item (and the response) `incomplete` (Codex R1 B2).
@@ -902,15 +899,16 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
       }
     }
 
+    // Codex R3 I / duplicate terminals: the Problems lens ALREADY carries one grouped
+    // `duplicate-terminal` row per duplicated outcome (with its count), so that is the export's
+    // single representation. `item.duplicateTerminals[]` stays on the detail DTO for the UI but
+    // is deliberately NOT rendered again here -- doing both printed the same anomaly twice.
     lines.push('-- Problems --');
-    if (item.problems.length === 0 && item.duplicateTerminals.length === 0) {
+    if (item.problems.length === 0) {
       lines.push('  (none)');
     } else {
       for (const p of item.problems) {
         lines.push(`  ${_describeProblem(p)}`);
-      }
-      for (const d of item.duplicateTerminals) {
-        lines.push(`  duplicate terminal: ${d.outcome} x${d.count}`);
       }
     }
     lines.push('');

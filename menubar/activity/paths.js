@@ -337,6 +337,15 @@ function readOwnedSegments(directory, suffix = '.jsonl') {
 // Like readOwnedSegments but METADATA ONLY -- never reads content, so quota's per-event size
 // accounting never has to reread a whole segment (up to the ceiling) while holding quota.lock.
 // Mirrors `paths.stat_owned_segments` (the I7 fix). Returns [{name, size}].
+//
+// Codex R3 B1 / Ruling 40: sized WITHOUT opening. The previous open(O_RDONLY)+fstat shape
+// silently `continue`d on EACCES, so a settled segment chmod 000 dropped straight out of
+// quota's 64 MiB accounting (1 MiB -> 0) while its bytes persisted on disk -- an undercount that
+// let new admissions proceed past the ceiling. `lstat` needs no read permission on the entry
+// itself (only search permission on the validated dir), so a denied regular file keeps its
+// provable size. `lstat` reports the link ITSELF for a symlink (never follows it), so a
+// `.jsonl`-named symlink is skipped along with every other non-regular entry (FIFO / dir /
+// device) -- exactly what the O_NOFOLLOW+S_ISREG check excluded before, minus the open.
 function statOwnedSegments(directory, suffix = '.jsonl') {
   let dir;
   try {
@@ -353,22 +362,14 @@ function statOwnedSegments(directory, suffix = '.jsonl') {
   const out = [];
   for (const name of names) {
     if (!name.endsWith(suffix)) continue;
-    const p = path.join(dir, name);
-    let fd;
+    let st;
     try {
-      fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      st = fs.lstatSync(path.join(dir, name));
     } catch (e) {
-      continue;
+      continue; // gone mid-scan: nothing provable to count
     }
-    try {
-      const st = fs.fstatSync(fd);
-      if (!st.isFile()) continue;
-      out.push({ name, size: st.size });
-    } catch (e) {
-      continue;
-    } finally {
-      fs.closeSync(fd);
-    }
+    if (st.isSymbolicLink() || !st.isFile()) continue;
+    out.push({ name, size: st.size });
   }
   return out;
 }

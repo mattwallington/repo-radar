@@ -7,35 +7,47 @@
 // `records.parseValid` (Task 2.1/2.2b, `./records.js`) is THE canonical v1 shape validator -- the
 // reviewed mirror of Python's `records.parse_valid` -- and is reused here verbatim rather than
 // reimplemented. But `parseValid` only ever answers "valid record, or null" -- it doesn't say
-// WHY a candidate line was rejected. Log-viewer surfacing needs that reason (truncation vs.
-// interior corruption vs. unsupported schema vs. seq regression vs. a plain schema-validation
-// failure), so `parseSegment` does its own `JSON.parse` per line first to classify the failure,
-// then defers the full v1 verdict to `records.parseValid` once the shape is known to be
-// JSON-parseable v1.
+// WHY a candidate line was rejected. Log-viewer surfacing needs that reason (interior corruption
+// vs. unsupported schema vs. seq regression vs. a plain schema-validation failure), so
+// `parseSegment` does its own `JSON.parse` per line first to classify the failure, then defers
+// the full v1 verdict to `records.parseValid` once the shape is known to be JSON-parseable v1.
 //
-// Rules (brief §2, §6):
+// Rules (brief §2, §6; Codex R3 B2 / Ruling 41):
 //   - Split on raw `\n` BYTES (mirrors Python's `bytes.split(b"\n")`), not on decoded text, so a
 //     multi-byte UTF-8 sequence straddling the split point is never mis-split.
-//   - A truncated TRAILING line (the buffer did not end with `\n`, i.e. the last split element is
-//     a non-empty partial write) is dropped SILENTLY -- no integrity finding. This is the normal
-//     shape of an in-progress writer's last write landing mid-record.
-//   - Any INTERIOR line (every split element except the last) that fails to `JSON.parse` is
-//     corruption: emit an `integrity` finding and keep going -- one bad interior line must never
-//     hide later valid lines.
+//   - The durability contract is record+`\n`. The final split element is the remainder after the
+//     last `\n`: empty when the buffer ended with `\n` (nothing to do), non-empty when it did not.
+//     A non-empty remainder is IGNORED UNCONDITIONALLY -- even when it happens to be valid JSON --
+//     and is NOT an integrity finding (truncation tolerance: a missing terminating newline is a
+//     torn write, the normal shape of an in-progress writer's last write landing mid-record).
+//     This is exactly Python quota.py `_scan`'s `interior = lines[:-1]` rule; Node accepting a
+//     newline-less-but-parseable tail while Python ignored it made the two runtimes disagree on
+//     whether a terminal existed (Python synthesized `interrupted`, Node then saw a conflict).
+//   - Any INTERIOR line (every split element except the last) that fails to `JSON.parse`, is not
+//     a JSON object, or fails v1 validation is corruption: emit a `corrupt-record` integrity
+//     finding (the `reason` distinguishes the sub-cause) and keep going -- one bad interior line
+//     must never hide later valid lines.
 //   - A JSON-parseable object whose `schema_version !== 1` is an `unsupported-schema` integrity
 //     finding and is NOT parsed as v1 (never handed to `records.parseValid`).
 //   - A JSON-parseable, schema_version===1 candidate is handed to `records.parseValid` for the
-//     full v1 verdict (activity_id match, required fields, enum shapes, etc.) -- `null` back is an
-//     integrity finding, a record back is accepted.
-//   - Accepted records must have a strictly increasing `seq` (tracked across the whole segment);
-//     a non-increasing `seq` is an integrity finding whose `kind` contains "seq". The record
-//     itself is still not double-counted -- the seq-regression finding does not additionally
-//     duplicate the "already accepted" record push.
+//     full v1 verdict (activity_id match, required fields, enum shapes, etc.) -- `null` back is a
+//     `corrupt-record` finding, a record back is accepted.
+//   - Seq rule (Ruling 42): per segment, over accepted records with a numeric `seq`, a record whose
+//     `seq <= lastSeq` is a `seq-regression` finding -- the record is STILL accepted (never
+//     double-counted, never dropped), and `lastSeq` is always the last accepted record's own seq
+//     (not a running max), so a regression is flagged where it happens without cascading.
+//
+// Canonical finding kinds (shared with Python's `_scan` findings and read.js's problem lens):
+//   `corrupt-record` | `unsupported-schema` | `seq-regression`
 const records = require('./records');
 
-// Split raw segment bytes on `\n` (0x0a), byte-wise -- mirrors reconcile.js's `_splitLines` /
-// Python's `bytes.split(b"\n")`. The final element is the trailing (possibly empty) remainder
-// after the last newline; a non-empty trailing element means the buffer did NOT end with `\n`.
+const CORRUPT_RECORD = 'corrupt-record';
+const UNSUPPORTED_SCHEMA = 'unsupported-schema';
+const SEQ_REGRESSION = 'seq-regression';
+
+// Split raw segment bytes on `\n` (0x0a), byte-wise -- mirrors Python's `bytes.split(b"\n")`.
+// The final element is the trailing (possibly empty) remainder after the last newline; a
+// non-empty trailing element means the buffer did NOT end with `\n`.
 function _splitLines(buf) {
   const lines = [];
   let start = 0;
@@ -49,63 +61,64 @@ function _splitLines(buf) {
   return lines;
 }
 
+// The COMMITTED lines of a segment: every `\n`-terminated line, in order. The unterminated tail
+// (if any) is dropped here, unconditionally -- this is the single implementation of the
+// trailing-line rule every segment reader in this subsystem goes through (via `parseSegment`).
+function committedLines(buf) {
+  const lines = _splitLines(buf);
+  lines.pop(); // the remainder after the last `\n`: empty (buffer ended with `\n`) or a torn tail
+  return lines;
+}
+
 function _finding(kind, index, reason) {
   return { kind, index, reason };
 }
 
 // Parse one segment's raw bytes into `{ records, integrity }`. `records` holds accepted v1
-// record objects in file order; `integrity` holds finding objects (each with at least a `.kind`
-// string other code matches on). Pure: no filesystem access, no mutation of `bytes`.
+// record objects in file order; `integrity` holds finding objects (each with a `.kind` that is
+// one of the canonical kinds above). Pure: no filesystem access, no mutation of `bytes`.
 function parseSegment(bytes, expectedActivityId) {
-  const lines = _splitLines(bytes);
+  const lines = committedLines(bytes);
   const out = [];
   const integrity = [];
   let lastSeq = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const isTrailing = i === lines.length - 1;
     if (line.length === 0) {
-      // Either the final empty element from a buffer that DID end with `\n` (normal, silent), or
-      // a genuinely empty interior line (also silent -- nothing to classify).
-      continue;
+      continue; // a genuinely empty interior line -- silent, nothing to classify
     }
 
     let obj;
     try {
       obj = JSON.parse(line.toString('utf8'));
     } catch (e) {
-      if (isTrailing) {
-        // Truncated last write (buffer did not end with `\n`) -- drop silently, no finding.
-        continue;
-      }
-      integrity.push(_finding('corrupt-json', i, `JSON.parse failed: ${e.message}`));
+      integrity.push(_finding(CORRUPT_RECORD, i, `JSON.parse failed: ${e.message}`));
       continue;
     }
 
     if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-      integrity.push(_finding('corrupt-shape', i, 'parsed JSON is not an object'));
+      integrity.push(_finding(CORRUPT_RECORD, i, 'parsed JSON is not an object'));
       continue;
     }
 
     if (obj.schema_version !== records.SCHEMA_VERSION) {
-      integrity.push(_finding('unsupported-schema', i, `schema_version=${JSON.stringify(obj.schema_version)}`));
+      integrity.push(_finding(UNSUPPORTED_SCHEMA, i, `schema_version=${JSON.stringify(obj.schema_version)}`));
       continue;
     }
 
     const rec = records.parseValid(line, expectedActivityId);
     if (rec === null) {
-      integrity.push(_finding('invalid-record', i, 'failed v1 schema/enum validation'));
+      integrity.push(_finding(CORRUPT_RECORD, i, 'failed v1 schema/enum validation'));
       continue;
     }
 
-    if (typeof rec.seq === 'number' && rec.seq <= lastSeq) {
-      integrity.push(_finding('seq-regression', i, `seq ${rec.seq} did not increase past ${lastSeq}`));
+    if (typeof rec.seq === 'number') {
+      if (rec.seq <= lastSeq) {
+        integrity.push(_finding(SEQ_REGRESSION, i, `seq ${rec.seq} did not increase past ${lastSeq}`));
+      }
+      lastSeq = rec.seq;
     }
-    // `lastSeq` tracks the most recently accepted record's own seq (not a running max) -- a
-    // regression is flagged at the exact point it happens, without cascading into false
-    // positives against every later record whose own seq happens to trail an earlier outlier.
-    if (typeof rec.seq === 'number') lastSeq = rec.seq;
 
     out.push(rec); // pushed regardless of the seq check -- seq ordering is a separate integrity
     // signal from schema validity; a record that is otherwise a valid v1 record for this
@@ -115,4 +128,8 @@ function parseSegment(bytes, expectedActivityId) {
   return { records: out, integrity };
 }
 
-module.exports = { parseSegment };
+module.exports = {
+  parseSegment,
+  committedLines,
+  FINDING_KINDS: Object.freeze([CORRUPT_RECORD, UNSUPPORTED_SCHEMA, SEQ_REGRESSION]),
+};

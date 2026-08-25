@@ -561,7 +561,7 @@ test('B1/R2: isProblemBearing is pure and matches the Ruling-33/37 predicate ove
   assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'skipped')])), false);
   assert.strictEqual(read.isProblemBearing(scan([{ type: 'integrity', kind: 'x' }])), true);
   // (d) findings, (e) rejected (incl. bad-name)
-  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [{ kind: 'corrupt-json' }])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [{ kind: 'corrupt-record' }])), true);
   assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [], [{ name: 'python-s3cr3t.jsonl', reason: 'bad-name' }])), true);
   assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [], [{ name: 'python-deadbeef.jsonl', reason: 'symlink' }])), true);
   // (f) >= 2 terminals: exact duplicate OR conflict
@@ -1066,7 +1066,12 @@ test('R2-B2: two identical succeeded terminals are problem-bearing: one grouped 
     const dup = item.problems.filter((p) => p.kind === 'duplicate-terminal');
     assert.deepStrictEqual(dup, [{ kind: 'duplicate-terminal', outcome: 'succeeded', count: 2 }]);
     assert.deepStrictEqual(item.duplicateTerminals, [{ outcome: 'succeeded', count: 2 }]);
-    assert.ok(read.buildExport(home).includes('[duplicate-terminal] succeeded recorded 2 times'));
+    // Codex R3 I: the export carries ONE representation of the duplicate (the grouped Problems
+    // row) -- not the Problems row AND a second `duplicateTerminals` block.
+    const text = read.buildExport(home);
+    assert.ok(text.includes('[duplicate-terminal] succeeded recorded 2 times'));
+    assert.strictEqual((text.match(/duplicate[- ]terminal/g) || []).length, 1);
+    assert.ok(!text.includes('x2'));
   } finally {
     cleanup(home);
   }
@@ -1137,7 +1142,7 @@ test('R2-B2: a corrupt interior line is problem-bearing on the summary and the p
     assert.strictEqual(summary.problemCount, 1);
     const item = detail(home, aid);
     assertParity(item);
-    assert.strictEqual(item.problems[0].kind, 'corrupt-json');
+    assert.strictEqual(item.problems[0].kind, 'corrupt-record');
   } finally {
     cleanup(home);
   }

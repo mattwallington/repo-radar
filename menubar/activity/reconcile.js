@@ -59,19 +59,6 @@ function _ownedSegments(directory) {
   return _scanSegments(directory).segments;
 }
 
-function _splitLines(buf) {
-  const lines = [];
-  let start = 0;
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === 0x0a) {
-      lines.push(buf.subarray(start, i));
-      start = i + 1;
-    }
-  }
-  lines.push(buf.subarray(start)); // trailing (possibly empty) segment, mirrors Python's split
-  return lines;
-}
-
 // One lifecycle VIEW of an activity from a SINGLE scan: whether the view is certain (see
 // `_scanSegments`), which rejected entries made it uncertain, and the three lifecycle facts
 // (has-start / has-terminal / cancel-requested) derived from VALID v1 records for THIS activity
@@ -79,16 +66,19 @@ function _splitLines(buf) {
 // or bad enum never counts. Lifecycle state is DERIVED from parsed segments, never a ledger flag.
 // One scan (not three) so the certainty verdict and the facts it qualifies come from the SAME
 // directory listing -- a segment can't be "certain" for has-start and then vanish for has-terminal.
+//
+// Codex R3 B2 / Ruling 41: segment bytes are parsed via `parse.parseSegment` -- the ONE
+// implementation of the line-split + trailing-line rule (an unterminated final line is ignored
+// unconditionally, even when it happens to be valid JSON; the durability contract is
+// record+`\n`). A private byte-split here previously accepted a newline-less terminal that
+// Python's `_scan` ignored, so the two runtimes disagreed on whether the activity had ended.
 function _lifecycleView(home, aid) {
   const scan = _scanSegments(paths.activityDir(home, aid));
   let hasStart = false;
   let hasTerminal = false;
   let cancelRequested = false;
   for (const seg of scan.segments) {
-    for (const line of _splitLines(seg.data)) {
-      if (line.length === 0) continue;
-      const obj = records.parseValid(line, aid);
-      if (obj === null) continue;
+    for (const obj of parse.parseSegment(seg.data, aid).records) {
       if (obj.type === 'start') hasStart = true;
       else if (obj.type === 'terminal') hasTerminal = true;
       else if (obj.type === 'control' && obj.name === 'cancel_requested') cancelRequested = true;

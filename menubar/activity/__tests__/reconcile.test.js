@@ -319,6 +319,79 @@ test('explicit BUSY probe => stays running (case-insensitive injected value)', (
   }
 });
 
+// Codex R3 B2 / Ruling 41 repro: newline-terminated `start` + a `succeeded` terminal with NO
+// trailing newline. Python ignores the torn tail and (with a free lock) synthesizes
+// `interrupted`; Node previously accepted the tail and then reported a succeeded/interrupted
+// conflict. Now both runtimes ignore it: the activity is start-without-terminal.
+const SUCCEEDED = { schema_version:1, activity_id:AID, type:'terminal', seq:1, ts:'2026-08-14T00:01:00-07:00',
+                    outcome:'succeeded', summary:{}, by:'deadbeef' };
+function seedTorn(home) {
+  secureMkdir(activityDir(home, AID));
+  fs.writeFileSync(segmentPath(home, AID, 'python', 'deadbeef'),
+    `${JSON.stringify(START)}\n${JSON.stringify(SUCCEEDED)}`); // no final `\n`
+}
+
+test('Ruling 41: newline-less valid terminal => reconcile() sees start-without-terminal (BUSY owner: still running, no conflict)', () => {
+  const home = fresh();
+  try {
+    seedTorn(home);
+    const r = reconcile(home, AID, { _probe: () => 'BUSY' });
+    assert.strictEqual(r.outcome, null);
+    assert.strictEqual(r.synthesized, false);
+    assert.deepStrictEqual(r.problems, []); // no conflict, no parse finding: torn tail is silent
+    assert.deepStrictEqual(r.duplicateTerminalCounts, {});
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Ruling 41: newline-less valid terminal + free lock => interrupted synthesized, matching Python, no conflict', () => {
+  const home = fresh();
+  try {
+    seedTorn(home);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'interrupted');
+    assert.ok(r.synthesized);
+    assert.ok(!r.problems.some((p) => p.kind === 'reconcile-terminal-conflict'));
+    // and a SECOND read still sees exactly one terminal (the reconciler's) -- the torn tail stays ignored
+    const again = reconcile(home, AID);
+    assert.strictEqual(again.outcome, 'interrupted');
+    assert.strictEqual(again.synthesized, false);
+    assert.deepStrictEqual(again.duplicateTerminalCounts, { interrupted: 1 });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Ruling 41: the SAME file WITH the trailing newline => terminal seen, succeeded, nothing synthesized', () => {
+  const home = fresh();
+  try {
+    seed(home, [START, SUCCEEDED]);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'succeeded');
+    assert.strictEqual(r.synthesized, false);
+    assert.deepStrictEqual(r.problems, []);
+    assert.ok(!allText(home).includes('"by":"reconciler"'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Ruling 41: synthesizeTerminal ignores a newline-less cancel_requested control (start-only view => interrupted, not cancelled)', () => {
+  const home = fresh();
+  try {
+    secureMkdir(activityDir(home, AID));
+    const cancel = { schema_version:1, activity_id:AID, type:'control', seq:1, ts:'2026-08-14T00:00:30-07:00', name:'cancel_requested' };
+    fs.writeFileSync(segmentPath(home, AID, 'python', 'deadbeef'),
+      `${JSON.stringify(START)}\n${JSON.stringify(cancel)}`); // torn control record
+    assert.strictEqual(reconcileMod.synthesizeTerminal(home, AID), true);
+    assert.match(allText(home), /"outcome":"interrupted"/);
+    assert.doesNotMatch(allText(home), /"outcome":"cancelled"/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('reconcile() does not throw when the internal synthesizeTerminal lease release throws', () => {
   const home = fresh();
   const leaseModule = require('../lease');

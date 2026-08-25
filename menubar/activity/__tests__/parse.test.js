@@ -26,6 +26,56 @@ test('interior corruption is an integrity finding but later lines survive', () =
   const { records: recs, integrity } = parseSegment(Buffer.from(start(0) + 'GARBAGE\n' + term(1)), AID);
   assert.strictEqual(recs.length, 2);          // start + terminal preserved
   assert.strictEqual(integrity.length, 1);        // the interior garbage flagged
+  assert.strictEqual(integrity[0].kind, 'corrupt-record');
+});
+
+// Codex R3 B2 / Ruling 41: the durability contract is record+`\n`. A final line lacking its
+// terminating newline is a torn write and is IGNORED unconditionally -- even when the bytes
+// happen to be a complete, valid JSON record -- with no finding. Python quota.py `_scan` has
+// always applied this rule (`interior = lines[:-1]`); Node previously accepted the parseable tail,
+// so the two runtimes could disagree on whether a terminal existed (Python synthesized
+// `interrupted`, Node then reported a succeeded/interrupted conflict).
+test('Ruling 41: a VALID-JSON terminal with no trailing newline is NOT parsed and is NOT a finding', () => {
+  const text = start(0) + term(1).slice(0, -1); // strip the terminal's `\n`
+  assert.ok(!text.endsWith('\n'));
+  const { records: recs, integrity } = parseSegment(Buffer.from(text), AID);
+  assert.deepStrictEqual(recs.map((r) => r.type), ['start']);
+  assert.deepStrictEqual(integrity, []);
+});
+
+test('Ruling 41: the same bytes WITH the trailing newline parse the terminal', () => {
+  const { records: recs, integrity } = parseSegment(Buffer.from(start(0) + term(1)), AID);
+  assert.deepStrictEqual(recs.map((r) => r.type), ['start', 'terminal']);
+  assert.deepStrictEqual(integrity, []);
+});
+
+test('Ruling 41: a lone newline-less record parses as nothing; a single terminated record parses as one', () => {
+  assert.deepStrictEqual(parseSegment(Buffer.from(start(0).slice(0, -1)), AID), { records: [], integrity: [] });
+  assert.strictEqual(parseSegment(Buffer.from(start(0)), AID).records.length, 1);
+  assert.deepStrictEqual(parseSegment(Buffer.alloc(0), AID), { records: [], integrity: [] });
+});
+
+test('Ruling 41: an unterminated tail that is NOT valid JSON is equally silent (no finding)', () => {
+  const { integrity } = parseSegment(Buffer.from(start(0) + 'GARBAGE'), AID);
+  assert.deepStrictEqual(integrity, []);
+});
+
+test('canonical finding kinds: corrupt-record | unsupported-schema | seq-regression', () => {
+  const bad = JSON.stringify({ schema_version: 1, activity_id: AID, type: 'terminal', seq: 1, ts: TS, outcome: 'bogus', summary: {}, by: 'deadbeef' }) + '\n';
+  const { integrity } = parseSegment(Buffer.from(
+    'not json\n' + '[1,2]\n' + '"str"\n' + bad
+    + JSON.stringify({ schema_version: 2, activity_id: AID, type: 'start', seq: 0, ts: TS }) + '\n'
+    + ev(5) + ev(2)), AID);
+  assert.deepStrictEqual(integrity.map((f) => f.kind), [
+    'corrupt-record', 'corrupt-record', 'corrupt-record', 'corrupt-record', 'unsupported-schema', 'seq-regression',
+  ]);
+  assert.deepStrictEqual([...require('../parse').FINDING_KINDS], ['corrupt-record', 'unsupported-schema', 'seq-regression']);
+});
+
+test('Ruling 42: seq-regression keeps the record and tracks the LAST accepted seq (no cascade)', () => {
+  const { records: recs, integrity } = parseSegment(Buffer.from(ev(5) + ev(2) + ev(3) + ev(3)), AID);
+  assert.deepStrictEqual(recs.map((r) => r.seq), [5, 2, 3, 3]);
+  assert.deepStrictEqual(integrity.map((f) => [f.kind, f.index]), [['seq-regression', 1], ['seq-regression', 3]]);
 });
 
 test('unsupported schema_version does not parse as v1', () => {
