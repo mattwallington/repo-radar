@@ -39,6 +39,12 @@ const PROBLEMS_MAX_ROWS = 500;
 const SUMMARY_MAX_BYTES = 4096;
 const SUMMARY_FIELD_MAX_BYTES = 1024;
 
+// Response-level (root) diagnostics cap (Codex R2 I / Ruling 39): listActivities/buildExport report
+// each activity-shaped root entry that was refused (symlink/non-directory/denied) as a
+// `rejected-activity` problem; past this many, the rest collapse into one visible
+// `{ kind:'truncated', dropped:n }` marker so a hostile root can't inflate the response.
+const ROOT_PROBLEMS_MAX = 50;
+
 // `filter.search` is a literal substring match (never a regex), capped at this many characters.
 const SEARCH_MAX = 256;
 
@@ -54,6 +60,7 @@ module.exports = {
   DETAIL_MAX_ROWS, DETAIL_MAX_BYTES,
   FIELD_MAX_BYTES,
   PROBLEMS_MAX_ROWS,
+  ROOT_PROBLEMS_MAX,
   SUMMARY_MAX_BYTES, SUMMARY_FIELD_MAX_BYTES,
   SEARCH_MAX,
   EXPORT_MAX_BYTES,

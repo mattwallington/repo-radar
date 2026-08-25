@@ -404,30 +404,57 @@ function listOwnedEntries(directory, suffix) {
   return suffix === undefined ? names : names.filter((n) => n.endsWith(suffix));
 }
 
-// Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors
-// `paths.list_owned_subdirs`.
-function listOwnedSubdirs(base) {
+// Immediate real subdir NAMES of an owned base (no symlink follow), PLUS the activity-shaped
+// entries that were refused (Codex R2 I / Ruling 39). `listOwnedSubdirs` used to drop a
+// symlink/non-directory entry silently, so a valid-UUID symlink squatting at the Activity root
+// listed as clean empty history -- the reader could not tell "no activities" apart from "an
+// activity-shaped entry I refused to follow". Returns
+// `{ subdirs: [name], rejected: [{ name, reason }] }` where `rejected` holds ONLY entries whose
+// name is a valid activity id (`ids.validActivityId`) but that are not a real directory:
+// 'symlink' (lstat says symlink -- never followed, whatever it points at), 'not-directory' (a
+// plain file / FIFO / device squatting on an activity name), 'denied' (lstat refused), or
+// 'gone' (removed between readdir and lstat). Entries whose names are NOT activity ids (the
+// `quota` ledger dir, `quota.lock`, stray junk) are not activities and are ignored either way --
+// the reader never surfaces them, and a symlink named `foo` is not an activity being hidden.
+// Mirrors `paths.list_owned_subdirs_detailed`. A missing/invalid/unreadable BASE yields
+// `{ subdirs: [], rejected: [] }` -- read.js probes the root itself, before calling this.
+function listOwnedSubdirsDetailed(base) {
   let dir;
   try {
     dir = _validateOwnedDir(base);
   } catch (e) {
-    return [];
+    return { subdirs: [], rejected: [] };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return [];
+    return { subdirs: [], rejected: [] };
   }
-  const out = [];
+  const subdirs = [];
+  const rejected = [];
   for (const name of names) {
+    let st;
     try {
-      if (fs.lstatSync(path.join(dir, name)).isDirectory()) out.push(name);
+      st = fs.lstatSync(path.join(dir, name));
     } catch (e) {
-      continue; // TOCTOU: entry deleted/swapped mid-scan
+      // TOCTOU: entry deleted/swapped mid-scan, or lstat itself refused. Only an ACTIVITY-shaped
+      // name is worth reporting -- anything else was never going to be listed.
+      if (ids.validActivityId(name)) rejected.push({ name, reason: e.code === 'ENOENT' ? 'gone' : 'denied' });
+      continue;
     }
+    if (st.isDirectory()) { subdirs.push(name); continue; } // lstat: a symlink-to-dir is NOT a dir
+    if (!ids.validActivityId(name)) continue; // junk name -> not an activity, nothing hidden
+    rejected.push({ name, reason: st.isSymbolicLink() ? 'symlink' : 'not-directory' });
   }
-  return out;
+  return { subdirs, rejected };
+}
+
+// Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors
+// `paths.list_owned_subdirs`. Thin `.subdirs`-only wrapper over the detailed variant above --
+// single implementation, existing signature/behavior for quota.js's callers unchanged.
+function listOwnedSubdirs(base) {
+  return listOwnedSubdirsDetailed(base).subdirs;
 }
 
 // Durable atomic create-or-replace of `name` under an owned `directory`: validated dir, temp
@@ -489,5 +516,5 @@ module.exports = {
   activityDir, segmentPath, parseSegmentName, ownerLockPath, quotaDir, ledgerEntryPath,
   secureMkdir, secureOpenAppend, openOwnedRegular,
   readOwnedSegments, readOwnedSegmentsDetailed, statOwnedSegments, readOwnedFile,
-  listOwnedEntries, listOwnedSubdirs, writeOwnedFileAtomic,
+  listOwnedEntries, listOwnedSubdirs, listOwnedSubdirsDetailed, writeOwnedFileAtomic,
 };

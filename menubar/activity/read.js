@@ -52,27 +52,46 @@ class InvalidFilter extends Error {}
 class InvalidActivityId extends InvalidFilter {}
 
 // -------------------------------------------------------------------------------------------
-// Shared PROBLEM-BEARING predicate (Ruling 33). Byte-for-byte the same rule as quota.py's
-// `is_problem_bearing`: over parsed TOP-LEVEL records of one activity, true iff any
-//   (a) `event` with level in {warn, error};
-//   (b) `terminal` with outcome in {failed, blocked, interrupted, succeeded-with-warnings}
-//       (succeeded / cancelled / skipped are routine);
-//   (c) `integrity` record.
-// Pure: records in, bool out; no filesystem, no redaction. Parse/reconcile integrity FINDINGS
-// (which are not records) are folded in by `_buildItem` via `problemCount` -- see `hasProblems`.
+// Shared PROBLEM-BEARING predicate (Ruling 33, redefined over a SCAN by Ruling 37 / Codex R2 B2).
+// Byte-for-byte the same rule as quota.py's `is_problem_bearing`, pinned by the shared v2 fixture
+// (`{ records, findings, rejected }` per case). Over ONE activity's scan, true iff ANY of:
+//   (a) an `event` record with level in {warn, error};
+//   (b) a `terminal` record with outcome in {failed, blocked, interrupted,
+//       succeeded-with-warnings} (succeeded / cancelled / skipped are routine);
+//   (c) an `integrity` record;
+//   (d) any integrity FINDING (parse/reconcile-level: corrupt line, unsupported schema, seq
+//       regression, terminal conflict, no-start, probe/view uncertainty ...);
+//   (e) any REJECTED entry (symlink / non-regular / denied / gone / dir-unreadable, AND a
+//       non-conforming `bad-name` entry -- the reader refused it, so the view is degraded);
+//   (f) >= 2 terminal records (an exact duplicate OR a conflict -- either is a writer anomaly).
+// Pure: scan in, bool out; no filesystem, no redaction. `_buildItem` feeds it the SAME inputs
+// that populate the Problems lens, so `hasProblems` and the lens agree by construction (Codex's
+// R2 repro: two identical `succeeded` terminals used to yield hasProblems:false + an empty lens
+// while `duplicateTerminals` said otherwise). A bare records ARRAY is still accepted (treated as
+// `{ records }`) for the older call shape.
 // -------------------------------------------------------------------------------------------
 const PROBLEM_EVENT_LEVELS = new Set(['warn', 'error']);
 const PROBLEM_OUTCOMES = new Set(['failed', 'blocked', 'interrupted', 'succeeded-with-warnings']);
 
-function isProblemBearing(records) {
-  if (!Array.isArray(records)) return false;
+function isProblemBearing(scan) {
+  if (Array.isArray(scan)) scan = { records: scan };
+  if (!scan || typeof scan !== 'object') return false;
+  const records = Array.isArray(scan.records) ? scan.records : [];
+  const findings = Array.isArray(scan.findings) ? scan.findings : [];
+  const rejected = Array.isArray(scan.rejected) ? scan.rejected : [];
+  if (findings.length > 0) return true; // (d)
+  if (rejected.length > 0) return true; // (e)
+  let terminals = 0;
   for (const r of records) {
     if (!r || typeof r !== 'object') continue;
-    if (r.type === 'event' && PROBLEM_EVENT_LEVELS.has(r.level)) return true;
-    if (r.type === 'terminal' && PROBLEM_OUTCOMES.has(r.outcome)) return true;
-    if (r.type === 'integrity') return true;
+    if (r.type === 'event' && PROBLEM_EVENT_LEVELS.has(r.level)) return true; // (a)
+    if (r.type === 'terminal') {
+      if (PROBLEM_OUTCOMES.has(r.outcome)) return true; // (b)
+      terminals += 1;
+    }
+    if (r.type === 'integrity') return true; // (c)
   }
-  return false;
+  return terminals >= 2; // (f)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -238,6 +257,7 @@ const _PARSE_INTEGRITY_KINDS = new Set([
 const _INCOMPLETE_RECONCILE_KINDS = new Set([
   'reconcile-probe-uncertain', 'reconcile-internal-error', 'reconcile-synthesize-raced',
   'reconcile-settle-failed',
+  'reconcile-view-uncertain', // Ruling 38: a conforming segment was unreadable; no verdict inferred
 ]);
 
 // Redact + bound one flat primitive map (`fields` on an event, `summary` on a terminal). Both
@@ -326,22 +346,62 @@ function _renderFinding(p, redactor, prov) {
 // PROBLEMS_MAX_ROWS rows and `byteBudget` bytes; anything dropped is represented by ONE visible
 // `{ kind:'truncated', dropped:n }` marker row. `total` is the pre-truncation count (the item's
 // `problemCount`).
+//
+// Terminals are GROUPED per outcome (Ruling 37 / spec §6 "exact-dup terminals grouped w/ count"):
+// ONE `{ kind:'terminal', outcome, count, ts, by, summary, ... }` row per failure-like outcome,
+// carrying the FIRST (merged-order) terminal's ts/seq/summary/provenance and a `count` of how
+// many terminals recorded that outcome -- exact duplicates are folded into `count`, never
+// rendered individually. `by` is the first terminal's `by`; when the duplicates disagree on `by`
+// it is the list of distinct values instead (bounded), so a two-writer anomaly stays visible.
+// Independently, ANY outcome recorded >= 2 times (routine outcomes included -- two `succeeded`
+// terminals are still a writer anomaly) adds one structural `{ kind:'duplicate-terminal',
+// outcome, count }` row; conflicting outcomes keep reconcile()'s `reconcile-terminal-conflict`
+// row. Both count toward `problemCount`/`hasProblems`, matching predicate rule (f).
+const _DUP_BY_MAX = 16;
+
+function _groupTerminals(merged, redactor) {
+  const groups = new Map(); // outcome -> { first, count, bys: [distinct scrubbed by, bounded] }
+  for (const r of merged) {
+    if (r.type !== 'terminal') continue;
+    const outcome = String(r.outcome);
+    let g = groups.get(outcome);
+    if (!g) {
+      g = { first: r, count: 0, bys: [] };
+      groups.set(outcome, g);
+    }
+    g.count += 1;
+    const by = _safeStr(r.by, redactor);
+    if (!g.bys.includes(by) && g.bys.length < _DUP_BY_MAX) g.bys.push(by);
+  }
+  const duplicates = [];
+  const rows = new Map(); // first terminal record -> rendered row (emitted at its merged position)
+  for (const [outcome, g] of groups) {
+    if (g.count >= 2) duplicates.push({ kind: 'duplicate-terminal', outcome: _safeStr(outcome, redactor), count: g.count });
+    if (!PROBLEM_OUTCOMES.has(outcome)) continue;
+    rows.set(g.first, {
+      kind: 'terminal',
+      outcome: _safeStr(outcome, redactor),
+      count: g.count,
+      ts: g.first.ts,
+      seq: g.first.seq,
+      by: g.bys.length === 1 ? g.bys[0] : g.bys,
+      summary: _renderFields(g.first.summary, redactor),
+      writerId: g.first.writerId,
+      producer: g.first.producer,
+    });
+  }
+  return { duplicates, rows };
+}
+
 function _buildProblemsLens(structural, merged, redactor, byteBudget) {
-  const candidates = structural.slice();
+  const { duplicates, rows: terminalRows } = _groupTerminals(merged, redactor);
+  const candidates = structural.concat(duplicates);
   for (const r of merged) {
     if (r.type === 'event' && PROBLEM_EVENT_LEVELS.has(r.level)) {
       candidates.push(Object.assign({ kind: 'event' }, _renderEvent(r, redactor)));
-    } else if (r.type === 'terminal' && PROBLEM_OUTCOMES.has(r.outcome)) {
-      candidates.push({
-        kind: 'terminal',
-        outcome: r.outcome,
-        ts: r.ts,
-        seq: r.seq,
-        by: _safeStr(r.by, redactor),
-        summary: _renderFields(r.summary, redactor),
-        writerId: r.writerId,
-        producer: r.producer,
-      });
+    } else if (r.type === 'terminal') {
+      const row = terminalRows.get(r); // only the FIRST terminal of a failure-like outcome has one
+      if (row) candidates.push(row);
     } else if (r.type === 'integrity') {
       candidates.push({
         kind: 'integrity',
@@ -485,11 +545,15 @@ function _buildItem(home, aid, filter, redactor) {
     incomplete = true;
   }
 
+  // Everything the reader REFUSED, for the predicate -- the detailed read's rejections plus every
+  // bad-name entry below (Ruling 37 rule (e)): the same list the lens renders as rejected-segment.
+  const rejectedAll = rejected.map((rj) => ({ name: rj.name, reason: rj.reason }));
   let badNames = 0;
   for (const seg of segments) {
     const prov = _parseSegmentName(home, aid, seg.name);
     if (prov === null) {
       structural.push({ kind: 'rejected-segment', name: _safeStr(seg.name, redactor), reason: 'bad-name' });
+      rejectedAll.push({ name: seg.name, reason: 'bad-name' });
       incomplete = true;
       badNames += 1;
       continue; // never parsed: an unvalidated name is not a segment
@@ -564,6 +628,12 @@ function _buildItem(home, aid, filter, redactor) {
     rawEvents, filter, redactor, Math.max(0, limits.DETAIL_MAX_BYTES - problemsLens.bytes),
   );
 
+  // Ruling 37: the SAME scan the lens was built from -- merged records, every structural finding
+  // (parse integrity, reconcile-level, no-start) and every rejected entry (incl. bad-name) -- is
+  // what the shared predicate sees, so `hasProblems` can never disagree with the lens: each rule
+  // (a)-(f) corresponds to at least one candidate row above, and vice versa.
+  const hasProblems = isProblemBearing({ records: merged, findings: structural, rejected: rejectedAll });
+
   const duplicateTerminals = Object.entries(rec.duplicateTerminalCounts || {})
     .filter(([, count]) => count > 1)
     .map(([dupOutcome, count]) => ({ outcome: _safeStr(dupOutcome, redactor), count }));
@@ -585,9 +655,7 @@ function _buildItem(home, aid, filter, redactor) {
     errorCount,
     warnCount,
     problemCount: problemsLens.total,
-    // Equivalent to `isProblemBearing(merged) || <any integrity finding>`: every record the
-    // predicate counts produces a Problems row, and every finding does too.
-    hasProblems: problemsLens.total > 0,
+    hasProblems,
     incomplete,
     synthesized: Boolean(rec.synthesized),
     events: eventsLens.rows,
@@ -645,16 +713,36 @@ function _sortKey(entry) {
 // Enumerate + assemble every valid activity under `home` as full detail items, unbounded by
 // LIST_MAX/offset/limit -- the shared core listActivities (which then summarizes + pages) and
 // buildExport (which does not) build on. Never throws for a data/IO condition.
+//
+// Codex R2 I / Ruling 39: an activity-shaped ROOT entry that is not a real directory (a
+// valid-UUID symlink, a plain file, an lstat-denied entry) is never followed -- but it must not
+// vanish either. Each becomes a response-level `{ kind:'rejected-activity', id, reason }`
+// diagnostic in `problems` (bounded to ROOT_PROBLEMS_MAX plus one `truncated` marker) and marks
+// the response incomplete, so "clean empty history" is never reported over a root someone has
+// tampered with. `getActivity(id)` on such an entry keeps returning `item:null`/`unreadable`.
 function _collectItems(home, filter, redactor) {
   const base = _activityRoot(home);
   const state = _probeRoot(base);
-  if (state === 'missing') return { items: [], available: true, incomplete: false };
-  if (state === 'unreadable') return { items: [], available: false, incomplete: false };
+  if (state === 'missing') return { items: [], available: true, incomplete: false, problems: [] };
+  if (state === 'unreadable') return { items: [], available: false, incomplete: false, problems: [] };
 
-  const subdirs = paths.listOwnedSubdirs(base);
+  const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(base);
   const aids = subdirs.filter((name) => name !== 'quota' && idsMod.validActivityId(name));
 
-  let incomplete = false;
+  const problems = [];
+  for (const rj of rejected) {
+    if (problems.length >= limits.ROOT_PROBLEMS_MAX) {
+      problems.push(_truncationMarker(rejected.length - limits.ROOT_PROBLEMS_MAX));
+      break;
+    }
+    problems.push({
+      kind: 'rejected-activity',
+      id: _safeStr(rj.name, redactor),
+      reason: _safeStr(rj.reason, redactor),
+    });
+  }
+
+  let incomplete = problems.length > 0;
   const entries = [];
   for (const aid of aids) {
     const built = _safeBuildItem(home, aid, filter, redactor);
@@ -663,7 +751,7 @@ function _collectItems(home, filter, redactor) {
     if (built.item.incomplete) incomplete = true;
   }
   entries.sort((a, b) => _sortKey(b) - _sortKey(a));
-  return { items: entries.map((e) => e.item), available: true, incomplete };
+  return { items: entries.map((e) => e.item), available: true, incomplete, problems };
 }
 
 // -------------------------------------------------------------------------------------------
@@ -672,14 +760,16 @@ function _collectItems(home, filter, redactor) {
 
 // Summary DTOs only (no `events`/`problems`/`duplicateTerminals`), each <= SUMMARY_MAX_BYTES,
 // at most LIST_MAX per call. `filter.level`/`filter.search` are validated here but only affect
-// the Events lens (getActivity/buildExport); they never remove items from the list.
+// the Events lens (getActivity/buildExport); they never remove items from the list. The
+// response-level `problems` array (Ruling 39) holds root diagnostics that belong to no item --
+// `[]` when there are none.
 function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   validateFilter(filter);
   const redactor = new redactMod.Redactor(configuredSecrets);
-  const { items, available, incomplete } = _collectItems(home, filter, redactor);
+  const { items, available, incomplete, problems } = _collectItems(home, filter, redactor);
 
   if (!available) {
-    return { items: [], truncated: false, available: false, incomplete: false };
+    return { items: [], truncated: false, available: false, incomplete: false, problems: [] };
   }
 
   const offset = filter.offset || 0;
@@ -687,7 +777,7 @@ function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   const sliced = items.slice(offset, offset + limit).map((full) => _boundSummary(_summaryOf(full)));
   const truncated = offset + sliced.length < items.length;
 
-  return { items: sliced, truncated, available, incomplete };
+  return { items: sliced, truncated, available, incomplete, problems };
 }
 
 // One full detail item (summary fields + Events lens + Problems lens + duplicateTerminals),
@@ -735,10 +825,16 @@ function _describeProblem(p) {
     }
     case 'terminal': {
       const summary = p.summary && Object.keys(p.summary).length > 0 ? `  summary: ${JSON.stringify(p.summary)}` : '';
-      return `[terminal] [${p.ts}] ${p.outcome} by ${p.by}${summary}`;
+      const by = Array.isArray(p.by) ? p.by.join(', ') : p.by;
+      const count = p.count > 1 ? ` x${p.count}` : '';
+      return `[terminal] [${p.ts}] ${p.outcome}${count} by ${by}${summary}`;
     }
+    case 'duplicate-terminal':
+      return `[duplicate-terminal] ${p.outcome} recorded ${p.count} times`;
     case 'rejected-segment':
       return `[rejected-segment] ${p.reason}: ${p.name || '(directory)'}`;
+    case 'rejected-activity':
+      return `[rejected-activity] ${p.reason}: ${p.id}`;
     case 'truncated':
       return `[truncated] ${p.dropped} further problem(s) not shown`;
     default: {
@@ -756,7 +852,7 @@ function _describeProblem(p) {
 function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   validateFilter(filter);
   const redactor = new redactMod.Redactor(configuredSecrets);
-  const { items, available, incomplete } = _collectItems(home, filter, redactor);
+  const { items, available, incomplete, problems } = _collectItems(home, filter, redactor);
 
   const lines = [];
   lines.push('Repo Radar Activity Export');
@@ -764,6 +860,10 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   lines.push(`available: ${available}`);
   lines.push(`incomplete: ${incomplete}`);
   lines.push(`items: ${items.length}`);
+  if (problems.length > 0) {
+    lines.push('-- System --');
+    for (const p of problems) lines.push(`  ${_describeProblem(p)}`);
+  }
   lines.push('');
 
   if (!available) {

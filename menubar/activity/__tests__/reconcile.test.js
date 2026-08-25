@@ -401,3 +401,134 @@ test('a bad-named segment holding a start is ignored by reconcile(): outcome nul
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// Codex R2 B1 / Ruling 38: reconciliation must never synthesize from a PARTIAL view. A conforming
+// segment the reader REFUSED (chmod 000, or a symlink swapped onto the name) may hold the very
+// terminal whose absence would justify synthesis -- so the view is uncertain, nothing is written,
+// and reconcile() reports `reconcile-view-uncertain` instead of a verdict. Codex's repro: readable
+// start + unreadable `succeeded` terminal + free lock used to yield a SYNTHESIZED `interrupted`
+// terminal, and restoring the perms then exposed two conflicting terminals.
+function seedHidden(home, name, lines) {
+  const p = path.join(activityDir(home, AID), name);
+  fs.writeFileSync(p, lines.map((o) => JSON.stringify(o)).join('\n') + '\n');
+  return p;
+}
+function segmentNames(home) {
+  return fs.readdirSync(activityDir(home, AID)).filter((f) => f.endsWith('.jsonl')).sort();
+}
+
+test('R2: unreadable (0o000) conforming terminal segment => synthesizeTerminal returns false and writes nothing', (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    t.skip('running as root -- permission bits are not enforced');
+    return;
+  }
+  const home = fresh();
+  let hidden;
+  try {
+    seed(home, [START]);
+    hidden = seedHidden(home, 'electron-cafef00d.jsonl', [term(1, 'succeeded')]);
+    fs.chmodSync(hidden, 0o000);
+    // no owner.lock -> lease FREE; the only thing standing between us and a bogus terminal is the gate
+    assert.strictEqual(reconcileMod.synthesizeTerminal(home, AID), false);
+    assert.deepStrictEqual(segmentNames(home), ['electron-cafef00d.jsonl', 'python-deadbeef.jsonl']);
+    // the lease it acquired for the check was released again
+    const l = acquire(ownerLockPath(home, AID));
+    assert.ok(l !== null);
+    l.release();
+  } finally {
+    if (hidden) fs.chmodSync(hidden, 0o600); // restore BEFORE rmSync
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('R2: unreadable conforming terminal segment => reconcile() outcome null, not synthesized, view-uncertain problem; restore => succeeded', (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    t.skip('running as root -- permission bits are not enforced');
+    return;
+  }
+  const home = fresh();
+  let hidden;
+  try {
+    seed(home, [START]);
+    hidden = seedHidden(home, 'electron-cafef00d.jsonl', [term(1, 'succeeded')]);
+    fs.chmodSync(hidden, 0o000);
+
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, null);
+    assert.strictEqual(r.synthesized, false);
+    const p = r.problems.find((x) => x.kind === 'reconcile-view-uncertain');
+    assert.ok(p, 'reconcile-view-uncertain problem present');
+    assert.deepStrictEqual(p.rejected, [{ name: 'electron-cafef00d.jsonl', reason: 'denied' }]);
+    assert.ok(!r.problems.some((x) => x.kind === 'reconcile-synthesize-raced'));
+    assert.deepStrictEqual(segmentNames(home), ['electron-cafef00d.jsonl', 'python-deadbeef.jsonl']);
+
+    fs.chmodSync(hidden, 0o600);
+    const after = reconcile(home, AID);
+    assert.strictEqual(after.outcome, 'succeeded');
+    assert.strictEqual(after.synthesized, false);
+    assert.deepStrictEqual(after.problems, []);
+    assert.deepStrictEqual(after.duplicateTerminalCounts, { succeeded: 1 }); // no manufactured conflict
+  } finally {
+    if (hidden) fs.chmodSync(hidden, 0o600);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('R2: a symlink squatting on a conforming segment name => uncertain view, no synthesis, no write', () => {
+  const home = fresh();
+  try {
+    seed(home, [START]);
+    const victim = path.join(home, 'victim.jsonl');
+    fs.writeFileSync(victim, JSON.stringify(term(1, 'succeeded')) + '\n');
+    fs.symlinkSync(victim, path.join(activityDir(home, AID), 'electron-cafef00d.jsonl'));
+
+    assert.strictEqual(reconcileMod.synthesizeTerminal(home, AID), false);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, null);
+    assert.strictEqual(r.synthesized, false);
+    const p = r.problems.find((x) => x.kind === 'reconcile-view-uncertain');
+    assert.ok(p);
+    assert.deepStrictEqual(p.rejected, [{ name: 'electron-cafef00d.jsonl', reason: 'symlink' }]);
+    assert.deepStrictEqual(segmentNames(home), ['electron-cafef00d.jsonl', 'python-deadbeef.jsonl']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('R2: a NON-conforming rejected entry is not uncertainty: synthesis still proceeds', () => {
+  const home = fresh();
+  try {
+    seed(home, [START]);
+    const victim = path.join(home, 'victim.jsonl');
+    fs.writeFileSync(victim, JSON.stringify(term(1, 'succeeded')) + '\n');
+    fs.symlinkSync(victim, path.join(activityDir(home, AID), 'junk.jsonl')); // rejected, but never a segment
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'interrupted');
+    assert.ok(r.synthesized);
+    assert.ok(!r.problems.some((x) => x.kind === 'reconcile-view-uncertain'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('R2: a READABLE terminal still reports its outcome when another conforming segment is unreadable (no guess involved)', (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    t.skip('running as root -- permission bits are not enforced');
+    return;
+  }
+  const home = fresh();
+  let hidden;
+  try {
+    seed(home, [START, term(1, 'succeeded')]);
+    hidden = seedHidden(home, 'electron-cafef00d.jsonl', [{ schema_version: 1, activity_id: AID, type: 'event',
+      seq: 5, ts: '2026-08-14T00:00:00-07:00', level: 'info', event: 'hidden', fields: {} }]);
+    fs.chmodSync(hidden, 0o000);
+    const r = reconcile(home, AID);
+    assert.strictEqual(r.outcome, 'succeeded'); // a durable, readable terminal is a fact, not an inference
+    assert.strictEqual(r.synthesized, false);
+    assert.deepStrictEqual(segmentNames(home), ['electron-cafef00d.jsonl', 'python-deadbeef.jsonl']);
+  } finally {
+    if (hidden) fs.chmodSync(hidden, 0o600);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

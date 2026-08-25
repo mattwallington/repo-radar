@@ -152,3 +152,54 @@ test('readOwnedSegments (legacy wrapper) keeps returning only the valid segments
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// Codex R2 I / Ruling 39: the root-level counterpart. `listOwnedSubdirs` silently dropped a
+// symlink/non-directory entry, so a valid-UUID symlink at the Activity root listed as clean empty
+// history. `listOwnedSubdirsDetailed` reports activity-shaped refusals; junk names stay ignored.
+const OTHER = '00000000-0000-4000-8000-000000000001';
+
+test('listOwnedSubdirsDetailed: real activity dirs list; a valid-UUID symlink is rejected as symlink', () => {
+  const home = tmpHome();
+  try {
+    paths.secureMkdir(paths.activityDir(home, VALID));
+    const root = path.dirname(paths.quotaDir(home));
+    const target = path.join(home, 'elsewhere');
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, path.join(root, OTHER));
+
+    const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(root);
+    assert.deepStrictEqual(subdirs, [VALID]);
+    assert.deepStrictEqual(rejected, [{ name: OTHER, reason: 'symlink' }]);
+    assert.deepStrictEqual(paths.listOwnedSubdirs(root), [VALID]); // legacy wrapper: unchanged behavior
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('listOwnedSubdirsDetailed: a plain file on an activity id is not-directory; junk names are ignored', () => {
+  const home = tmpHome();
+  try {
+    paths.secureMkdir(paths.activityDir(home, VALID));
+    const root = path.dirname(paths.quotaDir(home));
+    fs.writeFileSync(path.join(root, OTHER), '');
+    fs.writeFileSync(path.join(root, 'quota.lock'), '');
+    fs.symlinkSync(home, path.join(root, 'junk-link'));
+    fs.mkdirSync(paths.quotaDir(home));
+
+    const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(root);
+    assert.deepStrictEqual(subdirs.sort(), [VALID, 'quota']);
+    assert.deepStrictEqual(rejected, [{ name: OTHER, reason: 'not-directory' }]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('listOwnedSubdirsDetailed: a missing base yields empty subdirs and no rejections', () => {
+  const home = tmpHome();
+  try {
+    const root = path.dirname(paths.quotaDir(home)); // never created
+    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [] });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

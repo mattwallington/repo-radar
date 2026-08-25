@@ -223,7 +223,7 @@ test('listActivities: a missing activity root is normal empty history (available
   const home = tmpHome(); // freshly created tmp dir -- Library/Logs/repo-radar/activity never made
   try {
     const result = read.listActivities(home);
-    assert.deepStrictEqual(result, { items: [], truncated: false, available: true, incomplete: false });
+    assert.deepStrictEqual(result, { items: [], truncated: false, available: true, incomplete: false, problems: [] });
   } finally {
     cleanup(home);
   }
@@ -550,16 +550,30 @@ test('B1: an integrity record is problem-bearing and rendered in the Problems le
   }
 });
 
-test('B1: isProblemBearing is pure and matches the Ruling-33 predicate', () => {
+test('B1/R2: isProblemBearing is pure and matches the Ruling-33/37 predicate over a scan', () => {
   const aid = '00000000-0000-4000-8000-000000000000';
   const t = '2026-08-14T00:00:00-07:00';
-  assert.strictEqual(read.isProblemBearing([startRec(aid, 0, t), terminalRec(aid, 1, t, 'succeeded')]), false);
-  assert.strictEqual(read.isProblemBearing([startRec(aid, 0, t), eventRec(aid, 1, t, 'warn', 'x'), terminalRec(aid, 2, t, 'succeeded')]), true);
-  assert.strictEqual(read.isProblemBearing([startRec(aid, 0, t), terminalRec(aid, 1, t, 'interrupted')]), true);
-  assert.strictEqual(read.isProblemBearing([startRec(aid, 0, t), terminalRec(aid, 1, t, 'skipped')]), false);
-  assert.strictEqual(read.isProblemBearing([{ type: 'integrity', kind: 'x' }]), true);
-  assert.strictEqual(read.isProblemBearing([]), false);
+  const scan = (records, findings = [], rejected = []) => ({ records, findings, rejected });
+  // (a)-(c): record-derived
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'succeeded')])), false);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), eventRec(aid, 1, t, 'warn', 'x'), terminalRec(aid, 2, t, 'succeeded')])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'interrupted')])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'skipped')])), false);
+  assert.strictEqual(read.isProblemBearing(scan([{ type: 'integrity', kind: 'x' }])), true);
+  // (d) findings, (e) rejected (incl. bad-name)
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [{ kind: 'corrupt-json' }])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [], [{ name: 'python-s3cr3t.jsonl', reason: 'bad-name' }])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t)], [], [{ name: 'python-deadbeef.jsonl', reason: 'symlink' }])), true);
+  // (f) >= 2 terminals: exact duplicate OR conflict
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'succeeded'), terminalRec(aid, 2, t, 'succeeded')])), true);
+  assert.strictEqual(read.isProblemBearing(scan([startRec(aid, 0, t), terminalRec(aid, 1, t, 'succeeded'), terminalRec(aid, 2, t, 'cancelled')])), true);
+  // degenerate inputs
+  assert.strictEqual(read.isProblemBearing(scan([])), false);
+  assert.strictEqual(read.isProblemBearing({}), false);
   assert.strictEqual(read.isProblemBearing(null), false);
+  // legacy bare-array shape is still accepted as `{ records }`
+  assert.strictEqual(read.isProblemBearing([startRec(aid, 0, t), terminalRec(aid, 1, t, 'failed')]), true);
+  assert.strictEqual(read.isProblemBearing([]), false);
 });
 
 // --- B2: honest lifecycle states -----------------------------------------------------------------
@@ -570,7 +584,7 @@ test('B2: an empty activity directory (reserve-before-start) yields NO item', ()
     const aid = '00000000-0000-4000-8000-000000000030';
     A.secureMkdir(A.activityDir(home, aid));
     const result = read.listActivities(home);
-    assert.deepStrictEqual(result, { items: [], truncated: false, available: true, incomplete: false });
+    assert.deepStrictEqual(result, { items: [], truncated: false, available: true, incomplete: false, problems: [] });
     const one = read.getActivity(home, aid);
     assert.strictEqual(one.item, null);
     assert.strictEqual(one.reason, 'not-started');
@@ -953,6 +967,267 @@ test('I3: a throwing reconcile() is contained as an unknown/incomplete item with
     assert.ok(!text.includes(secret));
   } finally {
     reconcileMod.reconcile = origReconcile;
+    cleanup(home);
+  }
+});
+
+// --- Codex R2 (B1/B2/I): fail-closed reconcile view, grouped terminal problems, root rejections ----
+
+// Every scan-derived signal the predicate counts is also a Problems row, and vice versa -- the
+// invariant Ruling 37 exists to pin. Asserted on every item the R2 tests below build.
+function assertParity(item) {
+  assert.strictEqual(item.hasProblems, item.problemCount > 0, `hasProblems/problemCount disagree on ${item.id}`);
+  assert.strictEqual(item.problemCount > 0, item.problems.length > 0, `problemCount/problems disagree on ${item.id}`);
+}
+
+test('R2-B1: getActivity over a readable start + unreadable (0o000) succeeded terminal never synthesizes; restore => succeeded', (t) => {
+  if (process.getuid && process.getuid() === 0) {
+    t.skip('running as root -- permission bits are not enforced');
+    return;
+  }
+  const home = tmpHome();
+  const aid = '00000000-0000-4000-8000-0000000000a1';
+  seedSegment(home, aid, [startRec(aid, 0, '2026-08-14T00:00:00-07:00')]);
+  seedSegment(home, aid, [terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded')], 'electron', 'cafef00d');
+  const hidden = A.segmentPath(home, aid, 'electron', 'cafef00d');
+  fs.chmodSync(hidden, 0o000);
+  try {
+    // no owner.lock at all -> the lease is FREE; before Ruling 38 this synthesized `interrupted`.
+    const before = fs.readdirSync(A.activityDir(home, aid)).filter((f) => f.endsWith('.jsonl')).sort();
+    const item = detail(home, aid);
+    assert.notStrictEqual(item.outcome, 'interrupted');
+    assert.strictEqual(item.synthesized, false);
+    assert.strictEqual(item.incomplete, true);
+    assert.ok(item.problems.some((p) => p.kind === 'reconcile-view-uncertain'));
+    assert.ok(item.problems.some((p) => p.kind === 'rejected-segment' && p.reason === 'denied'));
+    assertParity(item);
+    const after = fs.readdirSync(A.activityDir(home, aid)).filter((f) => f.endsWith('.jsonl')).sort();
+    assert.deepStrictEqual(after, before, 'no new (reconciler) segment may appear');
+    const listed = read.listActivities(home);
+    assert.strictEqual(listed.incomplete, true);
+    assert.notStrictEqual(listed.items[0].outcome, 'interrupted');
+
+    fs.chmodSync(hidden, 0o600);
+    const restored = detail(home, aid);
+    assert.strictEqual(restored.outcome, 'succeeded');
+    assert.strictEqual(restored.incomplete, false);
+    assert.deepStrictEqual(restored.duplicateTerminals, []); // no manufactured conflict
+    assert.deepStrictEqual(restored.problems, []);
+  } finally {
+    try { fs.chmodSync(hidden, 0o600); } catch (e) { /* already restored */ }
+    cleanup(home);
+  }
+});
+
+test('R2-B1: a conforming terminal segment replaced by a symlink is an uncertain view: no synthesis, incomplete', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-0000000000a2';
+    seedSegment(home, aid, [startRec(aid, 0, '2026-08-14T00:00:00-07:00')]);
+    const victim = path.join(home, 'victim.jsonl');
+    fs.writeFileSync(victim, JSON.stringify(terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded')) + '\n');
+    fs.symlinkSync(victim, A.segmentPath(home, aid, 'electron', 'cafef00d'));
+
+    const item = detail(home, aid);
+    assert.strictEqual(item.outcome, 'running'); // readable start, no readable terminal, verdict withheld
+    assert.strictEqual(item.synthesized, false);
+    assert.strictEqual(item.incomplete, true);
+    assert.ok(item.problems.some((p) => p.kind === 'reconcile-view-uncertain'));
+    assertParity(item);
+    const names = fs.readdirSync(A.activityDir(home, aid)).filter((f) => f.endsWith('.jsonl')).sort();
+    assert.deepStrictEqual(names, ['electron-cafef00d.jsonl', 'python-deadbeef.jsonl']);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-B2: two identical succeeded terminals are problem-bearing: one grouped terminal row (count 2) + duplicate-terminal', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-0000000000b1';
+    seedSegment(home, aid, [
+      startRec(aid, 0, '2026-08-14T00:00:00-07:00'),
+      terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded'),
+      terminalRec(aid, 2, '2026-08-14T00:01:00-07:00', 'succeeded'),
+    ]);
+    const summary = read.listActivities(home).items[0];
+    assert.strictEqual(summary.outcome, 'succeeded');
+    assert.strictEqual(summary.hasProblems, true);
+    assert.ok(summary.problemCount >= 1);
+
+    const item = detail(home, aid);
+    assertParity(item);
+    // `succeeded` is a routine outcome: NO kind:'terminal' row for it, and never one per duplicate.
+    assert.strictEqual(item.problems.filter((p) => p.kind === 'terminal').length, 0);
+    const dup = item.problems.filter((p) => p.kind === 'duplicate-terminal');
+    assert.deepStrictEqual(dup, [{ kind: 'duplicate-terminal', outcome: 'succeeded', count: 2 }]);
+    assert.deepStrictEqual(item.duplicateTerminals, [{ outcome: 'succeeded', count: 2 }]);
+    assert.ok(read.buildExport(home).includes('[duplicate-terminal] succeeded recorded 2 times'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-B2: two identical failed terminals render ONE grouped terminal row with count 2 (not two) + duplicate-terminal', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-0000000000b2';
+    seedSegment(home, aid, [
+      startRec(aid, 0, '2026-08-14T00:00:00-07:00'),
+      terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'failed', { summary: { reason: 'first' } }),
+      terminalRec(aid, 2, '2026-08-14T00:01:01-07:00', 'failed', { summary: { reason: 'second' }, by: 'cafef00d' }),
+    ]);
+    const item = detail(home, aid);
+    assert.strictEqual(item.outcome, 'failed');
+    assertParity(item);
+    const terms = item.problems.filter((p) => p.kind === 'terminal');
+    assert.strictEqual(terms.length, 1);
+    assert.strictEqual(terms[0].outcome, 'failed');
+    assert.strictEqual(terms[0].count, 2);
+    assert.strictEqual(terms[0].ts, '2026-08-14T00:01:00-07:00'); // the FIRST terminal's
+    assert.deepStrictEqual(terms[0].summary, { reason: 'first' });
+    assert.deepStrictEqual(terms[0].by, ['deadbeef', 'cafef00d']); // disagreeing `by` -> list
+    assert.ok(item.problems.some((p) => p.kind === 'duplicate-terminal' && p.outcome === 'failed' && p.count === 2));
+    assert.strictEqual(item.problemCount, 2);
+    const text = read.buildExport(home);
+    assert.ok(text.includes('failed x2 by deadbeef, cafef00d'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-B2: succeeded + failed terminals => conflict problem, interrupted verdict, parity holds', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-0000000000b3';
+    seedSegment(home, aid, [
+      startRec(aid, 0, '2026-08-14T00:00:00-07:00'),
+      terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded'),
+      terminalRec(aid, 2, '2026-08-14T00:01:01-07:00', 'failed'),
+    ]);
+    const item = detail(home, aid);
+    assert.strictEqual(item.outcome, 'interrupted');
+    assert.strictEqual(item.hasProblems, true);
+    assertParity(item);
+    assert.ok(item.problems.some((p) => p.kind === 'reconcile-terminal-conflict'));
+    assert.strictEqual(item.problems.filter((p) => p.kind === 'duplicate-terminal').length, 0); // 1 each: no dup
+    assert.strictEqual(item.problems.filter((p) => p.kind === 'terminal').length, 1); // the failed one
+    assert.deepStrictEqual(item.duplicateTerminals, []);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-B2: a corrupt interior line is problem-bearing on the summary and the predicate agrees with the lens', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-0000000000b4';
+    A.secureMkdir(A.activityDir(home, aid));
+    fs.writeFileSync(A.segmentPath(home, aid, 'python', 'deadbeef'), [
+      JSON.stringify(startRec(aid, 0, '2026-08-14T00:00:00-07:00')),
+      '{not valid json at all',
+      JSON.stringify(terminalRec(aid, 1, '2026-08-14T00:01:00-07:00', 'succeeded')),
+    ].join('\n') + '\n');
+    const summary = read.listActivities(home).items[0];
+    assert.strictEqual(summary.hasProblems, true);
+    assert.strictEqual(summary.problemCount, 1);
+    const item = detail(home, aid);
+    assertParity(item);
+    assert.strictEqual(item.problems[0].kind, 'corrupt-json');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-I: a valid-UUID symlink at the Activity root is a rejected-activity diagnostic, never clean empty history', () => {
+  const home = tmpHome();
+  try {
+    const realAid = '00000000-0000-4000-8000-0000000000c1';
+    const linkAid = '00000000-0000-4000-8000-0000000000c2';
+    // A real activity living OUTSIDE the store, pointed at by a symlink named like an activity.
+    const elsewhere = path.join(home, 'elsewhere', realAid);
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'python-deadbeef.jsonl'), [
+      JSON.stringify(startRec(linkAid, 0, '2026-08-14T00:00:00-07:00')),
+      JSON.stringify(terminalRec(linkAid, 1, '2026-08-14T00:01:00-07:00', 'succeeded')),
+    ].join('\n') + '\n');
+    const root = path.dirname(A.quotaDir(home));
+    A.secureMkdir(root);
+    fs.symlinkSync(elsewhere, path.join(root, linkAid));
+
+    const result = read.listActivities(home);
+    assert.deepStrictEqual(result.items, []); // the symlink is never followed
+    assert.strictEqual(result.available, true);
+    assert.strictEqual(result.incomplete, true);
+    assert.deepStrictEqual(result.problems, [{ kind: 'rejected-activity', id: linkAid, reason: 'symlink' }]);
+
+    const one = read.getActivity(home, linkAid);
+    assert.strictEqual(one.item, null);
+    assert.strictEqual(one.reason, 'unreadable');
+
+    const text = read.buildExport(home);
+    assert.ok(text.includes('incomplete: true'));
+    assert.ok(text.includes(`[rejected-activity] symlink: ${linkAid}`));
+    assert.ok(!text.includes('Activity ' + linkAid));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-I: a plain file squatting on an activity id is rejected as not-directory; real activities still list', () => {
+  const home = tmpHome();
+  try {
+    const good = '00000000-0000-4000-8000-0000000000c3';
+    const squat = '00000000-0000-4000-8000-0000000000c4';
+    seedSegment(home, good, [
+      startRec(good, 0, '2026-08-14T00:00:00-07:00'),
+      terminalRec(good, 1, '2026-08-14T00:01:00-07:00', 'succeeded'),
+    ]);
+    fs.writeFileSync(path.join(path.dirname(A.quotaDir(home)), squat), 'not a dir\n');
+
+    const result = read.listActivities(home);
+    assert.strictEqual(result.items.length, 1);
+    assert.strictEqual(result.items[0].id, good);
+    assert.strictEqual(result.items[0].incomplete, false); // the item itself is fine
+    assert.strictEqual(result.incomplete, true); // the RESPONSE is not
+    assert.deepStrictEqual(result.problems, [{ kind: 'rejected-activity', id: squat, reason: 'not-directory' }]);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-I: a junk-named root entry (not an activity id) is ignored: no diagnostic, incomplete:false', () => {
+  const home = tmpHome();
+  try {
+    const root = path.dirname(A.quotaDir(home));
+    A.secureMkdir(root);
+    fs.symlinkSync(home, path.join(root, 'not-an-activity'));
+    fs.writeFileSync(path.join(root, 'quota.lock'), '');
+    fs.mkdirSync(A.quotaDir(home));
+    const result = read.listActivities(home);
+    assert.deepStrictEqual(result, { items: [], truncated: false, available: true, incomplete: false, problems: [] });
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('R2-I: root diagnostics are bounded at ROOT_PROBLEMS_MAX with a truncated marker', () => {
+  const home = tmpHome();
+  const saved = limits.ROOT_PROBLEMS_MAX;
+  try {
+    limits.ROOT_PROBLEMS_MAX = 2;
+    const root = path.dirname(A.quotaDir(home));
+    A.secureMkdir(root);
+    for (let i = 1; i <= 5; i++) {
+      fs.writeFileSync(path.join(root, `00000000-0000-4000-8000-0000000000d${i}`), '');
+    }
+    const result = read.listActivities(home);
+    assert.strictEqual(result.problems.length, 3);
+    assert.strictEqual(result.problems.filter((p) => p.kind === 'rejected-activity').length, 2);
+    assert.deepStrictEqual(result.problems[2], { kind: 'truncated', dropped: 3 });
+    assert.strictEqual(result.incomplete, true);
+  } finally {
+    limits.ROOT_PROBLEMS_MAX = saved;
     cleanup(home);
   }
 });

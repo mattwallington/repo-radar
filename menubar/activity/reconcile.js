@@ -27,13 +27,36 @@ const RECONCILER = 'reconciler';
 // (correctly) has no naming opinion of its own -- it reads any `*.jsonl` entry that survives the
 // symlink/non-regular safety checks. Left unfiltered here, a non-conforming file sitting in the
 // activity dir (e.g. `python-s3cr3t.jsonl`, or plain `junk.jsonl`) that happens to contain a
-// `start`/`terminal`-shaped record would still drive `_hasStart`/`_hasTerminal`/`_cancelRequested`
-// -- and, via those, `synthesizeTerminal` could WRITE a synthetic terminal (and `reconcile()`
+// `start`/`terminal`-shaped record would still drive `_lifecycleView`'s has-start/has-terminal/
+// cancel-requested facts -- and, via those, `synthesizeTerminal` could WRITE a synthetic terminal (and `reconcile()`
 // derive a displayed outcome) off the back of a file nothing in this codebase ever wrote as a
-// real segment. `_ownedSegments` is the one choke point: every `readOwnedSegments` call in this
-// file goes through it, filtering to entries `paths.parseSegmentName` accepts as conforming.
+// real segment. `_scanSegments` is the one choke point: every segment read in this file goes
+// through it, filtering to entries `paths.parseSegmentName` accepts as conforming.
+//
+// Codex R2 B1 / Ruling 38: the scan is built on the DETAILED read, not the lossy
+// `readOwnedSegments`, because a conforming segment the reader REFUSED (chmod 000, a symlink
+// swapped onto the name, a FIFO, gone mid-scan) is not the same as a segment that is ABSENT.
+// Filtering the lossy list treated it as absent: a readable `start` + an unreadable `succeeded`
+// terminal + a free lock made `synthesizeTerminal` write an `interrupted` terminal, and once the
+// perms were restored the store held two conflicting terminals -- a conflict the reconciler
+// itself manufactured. "Uncertain => preserve, never guess" means the VIEW must be certain before
+// any lifecycle verdict is derived from it. The view is UNCERTAIN iff any rejected entry has a
+// CONFORMING name (it is, or is squatting on, a real segment whose contents we cannot see) or
+// the directory itself could not be listed. A rejected entry whose name does NOT conform
+// (`junk.jsonl`, `python-s3cr3t.jsonl`) is an untrusted non-segment that would never have been
+// parsed anyway -- it is NOT uncertainty and must not block synthesis (read.js reports it as a
+// `bad-name` Problem; the lifecycle is unaffected by it either way).
+function _scanSegments(directory) {
+  const { segments, rejected } = paths.readOwnedSegmentsDetailed(directory);
+  const conforming = segments.filter((seg) => paths.parseSegmentName(seg.name) !== null);
+  const uncertain = rejected.filter(
+    (rj) => rj.reason === 'dir-unreadable' || paths.parseSegmentName(rj.name) !== null,
+  );
+  return { segments: conforming, rejected: uncertain, certain: uncertain.length === 0 };
+}
+
 function _ownedSegments(directory) {
-  return paths.readOwnedSegments(directory).filter((seg) => paths.parseSegmentName(seg.name) !== null);
+  return _scanSegments(directory).segments;
 }
 
 function _splitLines(buf) {
@@ -49,45 +72,43 @@ function _splitLines(buf) {
   return lines;
 }
 
-// Types of VALID v1 records for THIS activity, via the canonical validator -- a nested
-// `fields.type`, unsupported schema, foreign activity_id, or bad enum never counts. Lifecycle
-// state is DERIVED from parsed segments, never a ledger flag.
-function _topTypes(home, aid) {
-  const types = [];
-  for (const seg of _ownedSegments(paths.activityDir(home, aid))) {
+// One lifecycle VIEW of an activity from a SINGLE scan: whether the view is certain (see
+// `_scanSegments`), which rejected entries made it uncertain, and the three lifecycle facts
+// (has-start / has-terminal / cancel-requested) derived from VALID v1 records for THIS activity
+// via the canonical validator -- a nested `fields.type`, unsupported schema, foreign activity_id,
+// or bad enum never counts. Lifecycle state is DERIVED from parsed segments, never a ledger flag.
+// One scan (not three) so the certainty verdict and the facts it qualifies come from the SAME
+// directory listing -- a segment can't be "certain" for has-start and then vanish for has-terminal.
+function _lifecycleView(home, aid) {
+  const scan = _scanSegments(paths.activityDir(home, aid));
+  let hasStart = false;
+  let hasTerminal = false;
+  let cancelRequested = false;
+  for (const seg of scan.segments) {
     for (const line of _splitLines(seg.data)) {
       if (line.length === 0) continue;
       const obj = records.parseValid(line, aid);
-      if (obj !== null) types.push(obj.type);
+      if (obj === null) continue;
+      if (obj.type === 'start') hasStart = true;
+      else if (obj.type === 'terminal') hasTerminal = true;
+      else if (obj.type === 'control' && obj.name === 'cancel_requested') cancelRequested = true;
     }
   }
-  return types;
+  return { certain: scan.certain, rejected: scan.rejected, hasStart, hasTerminal, cancelRequested };
 }
 
 function _hasStart(home, aid) {
-  return _topTypes(home, aid).includes('start');
-}
-
-function _hasTerminal(home, aid) {
-  return _topTypes(home, aid).includes('terminal');
-}
-
-function _cancelRequested(home, aid) {
-  for (const seg of _ownedSegments(paths.activityDir(home, aid))) {
-    for (const line of _splitLines(seg.data)) {
-      if (line.length === 0) continue;
-      const obj = records.parseValid(line, aid);
-      if (obj !== null && obj.type === 'control' && obj.name === 'cancel_requested') return true;
-    }
-  }
-  return false;
+  return _lifecycleView(home, aid).hasStart;
 }
 
 // For a provably-dead (lease-free), started-but-unterminated activity: acquire the lease, write
 // a durable synthetic terminal (by=reconciler), and release. Returns true iff a terminal is now
 // durable as a RESULT of this call. Returns false (preserve) when the lease is BUSY/UNCERTAIN,
-// there's nothing to synthesize (no durable start, or a terminal already exists), or the write
-// fails -- never throws (mirrors Python's `except Exception: return False` boundary).
+// the segment VIEW is uncertain (a conforming segment could not be read -- Ruling 38, see
+// `_scanSegments`), there's nothing to synthesize (no durable start, or a terminal already
+// exists), or the write fails -- never throws (mirrors Python's `except Exception: return False`
+// boundary). The gate is `viewCertain && hasStart && !hasTerminal`, evaluated UNDER the acquired
+// lease from one scan, so nothing observed before the lease was held can drive the write.
 function synthesizeTerminal(home, aid) {
   const lockPath = paths.ownerLockPath(home, aid); // may throw UnsafePath for an invalid aid --
   // deliberately unguarded, mirroring Python (callers are expected to pass a valid aid, exactly
@@ -96,10 +117,15 @@ function synthesizeTerminal(home, aid) {
   // busy/uncertain/unsafe
   if (acquired === null) return false; // owner alive (or uncertain) -> preserve
   try {
-    if (!_hasStart(home, aid) || _hasTerminal(home, aid)) {
+    const view = _lifecycleView(home, aid); // ONE scan, under the lease
+    if (!view.certain) {
+      return false; // Ruling 38: a conforming segment is unreadable -> the terminal we can't see
+      // may already exist. Write NOTHING; the lease is released in `finally` below.
+    }
+    if (!view.hasStart || view.hasTerminal) {
       return false; // nothing to synthesize: never started, or already terminated
     }
-    const outcome = _cancelRequested(home, aid) ? 'cancelled' : 'interrupted';
+    const outcome = view.cancelRequested ? 'cancelled' : 'interrupted';
     const rec = records.buildRecord('terminal', {
       seq: 0, activity_id: aid, outcome, summary: {}, by: RECONCILER,
     });
@@ -182,16 +208,25 @@ function _writerIdFromSegmentName(name) {
 // straight in). Never throws: an unexpected failure degrades to "nothing readable" for the
 // affected segment(s) plus a Problem, rather than crashing the viewer on a half-written/crashed
 // activity.
-function _assemble(home, activityId, problems) {
-  let segs;
+//
+// Ruling 38: alongside the merged records, the caller needs to know whether that view is CERTAIN
+// -- `view.rejected` lists the conforming-but-unreadable entries (or the dir-unreadable marker)
+// that make it uncertain. `view` is mutated in place (like `problems`) rather than changing the
+// return shape. An enumeration failure is itself an uncertain view (nothing was seen).
+function _assemble(home, activityId, problems, view = {}) {
+  let scan;
   try {
-    segs = _ownedSegments(paths.activityDir(home, activityId));
+    scan = _scanSegments(paths.activityDir(home, activityId));
   } catch (e) {
     problems.push({ kind: 'reconcile-internal-error', reason: `segment enumeration failed: ${e.message}` });
+    view.certain = false;
+    view.rejected = [{ name: '', reason: 'dir-unreadable' }];
     return [];
   }
+  view.certain = scan.certain;
+  view.rejected = scan.rejected;
   const perSegment = [];
-  for (const seg of segs) {
+  for (const seg of scan.segments) {
     try {
       const writerId = _writerIdFromSegmentName(seg.name);
       const { records: recs, integrity } = parse.parseSegment(seg.data, activityId);
@@ -242,7 +277,8 @@ function reconcile(home, activityId, { _probe } = {}) {
   const probeFn = _probe || ((lp) => (fs.existsSync(lp) ? lease.probe(lp) : lease.FREE));
 
   const problems = [];
-  const merged = _assemble(home, activityId, problems);
+  const view = {};
+  const merged = _assemble(home, activityId, problems, view);
 
   const terminals = merged.filter((r) => r.type === 'terminal');
   if (terminals.length > 0) {
@@ -264,15 +300,28 @@ function reconcile(home, activityId, { _probe } = {}) {
     return { outcome: 'interrupted', synthesized: false, problems, duplicateTerminalCounts: counts };
   }
 
-  // No terminal recorded anywhere. Nothing to reconcile unless a durable `start` exists.
-  let hasStart;
-  try {
-    hasStart = _hasStart(home, activityId);
-  } catch (e) {
-    problems.push({ kind: 'reconcile-internal-error', reason: `has-start check failed: ${e.message}` });
+  // No terminal among the segments we could READ. Before treating that as "no terminal": is the
+  // view certain (Ruling 38)? A conforming segment that was refused (chmod 000, symlink, FIFO,
+  // gone mid-scan) may hold the very terminal we're about to conclude is missing -- so the
+  // verdict is "unknown", nothing is synthesized, no ledger settle, and the refused entries are
+  // surfaced as a System integrity Problem (read.js scrubs + bounds the reason and marks the item
+  // incomplete). Deliberately AFTER the readable-terminal branch above: a terminal we CAN read is
+  // a durable fact, not a guess -- reporting it stays honest (read.js still flags the refused
+  // entries as `rejected-segment` Problems and marks the item incomplete); uncertainty only ever
+  // withholds a verdict that would have been INFERRED from absence.
+  if (!view.certain) {
+    const rejected = (view.rejected || []).map((rj) => ({ name: rj.name, reason: rj.reason }));
+    const listed = rejected.map((rj) => `${rj.name || '(directory)'} (${rj.reason})`).join(', ');
+    problems.push({
+      kind: 'reconcile-view-uncertain',
+      reason: `${rejected.length} segment entr${rejected.length === 1 ? 'y' : 'ies'} could not be read; lifecycle not inferred: ${listed}`,
+      rejected,
+    });
     return { outcome: null, synthesized: false, problems, duplicateTerminalCounts: {} };
   }
-  if (!hasStart) {
+
+  // Nothing to reconcile unless a durable `start` exists.
+  if (!merged.some((r) => r.type === 'start')) {
     return { outcome: null, synthesized: false, problems, duplicateTerminalCounts: {} };
   }
 
@@ -302,8 +351,10 @@ function reconcile(home, activityId, { _probe } = {}) {
 
   // FREE (including lock-absent, folded in by the default probeFn above): the owner is
   // confirmably gone. Reuse the existing write-side primitive verbatim -- it re-derives
-  // has-start/no-terminal itself under its own lease acquisition, picks cancelled-vs-interrupted,
-  // and performs the durable (fsync-before-release) append. Never reimplemented here.
+  // view-certain/has-start/no-terminal itself under its own lease acquisition (the Ruling 38
+  // gate is re-evaluated there, from a fresh scan taken while the lease is held), picks
+  // cancelled-vs-interrupted, and performs the durable (fsync-before-release) append. Never
+  // reimplemented here.
   const wrote = synthesizeTerminal(home, activityId);
   if (!wrote) {
     // A race: something changed the state between this function's own read and
@@ -337,6 +388,6 @@ function reconcile(home, activityId, { _probe } = {}) {
 // depend on it. Node's quota.js deliberately has NO such function (Ruling B keeps Node's quota
 // surface to admit/grant/settle plus a strictly-read-only `_charge`/`_hasCorrupt` accounting
 // pass -- see quota.js's header comment), but reconcile.js already computes exactly this via
-// `_topTypes` for its own `synthesizeTerminal` gate. Exporting the existing private helper here
+// `_lifecycleView` for its own `synthesizeTerminal` gate. Exporting the existing private helper here
 // (no behavior change) avoids writer.js duplicating the segment-scan logic.
 module.exports = { RECONCILER, synthesizeTerminal, reconcile, _hasStart };
