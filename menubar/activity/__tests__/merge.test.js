@@ -101,3 +101,52 @@ test('does not mutate the input segment arrays or record objects', () => {
   assert.strictEqual(segA.length, 1);
   assert.strictEqual(segB.length, 1);
 });
+
+// --- Codex R1 finding I2: ts is compared as an INSTANT, not lexically, so records from writers
+// with different (or shifting) UTC offsets still merge in true chronological order. ---
+
+test('cross-offset ordering: an earlier instant with a +02:00 offset sorts before a later ' +
+  'instant with a +00:00 offset, even though it sorts LATER lexically', () => {
+  // '...10:00:00+02:00' is 08:00Z; '...09:00:00+00:00' is 09:00Z. Lexically the first string
+  // would sort after the second (because '1' > '0' at the hour digit), but 08:00Z is the earlier
+  // instant, so it must come first.
+  const segA = [{ ts: '2026-08-14T10:00:00+02:00', writerId: 'aaaaaaaa', seq: 0, event: 'A0' }];
+  const segB = [{ ts: '2026-08-14T09:00:00+00:00', writerId: 'bbbbbbbb', seq: 0, event: 'B0' }];
+  const merged = mergeHeads([segA, segB]).map(r => r.event);
+  assert.deepStrictEqual(merged, ['A0', 'B0']);
+});
+
+test('a DST-style offset shift mid-segment keeps append order, and a second writer interleaves ' +
+  'by true instant (not lexically)', () => {
+  const segA = [ // writerId 'aaaaaaaa' -- offset shifts -07:00 -> -08:00, instant moves forward
+    { ts: '2026-08-14T01:00:00-07:00', writerId: 'aaaaaaaa', seq: 0, event: 'A0' }, // 08:00Z
+    { ts: '2026-08-14T01:30:00-08:00', writerId: 'aaaaaaaa', seq: 1, event: 'A1' }, // 09:30Z
+  ];
+  const segB = [
+    { ts: '2026-08-14T08:45:00+00:00', writerId: 'bbbbbbbb', seq: 0, event: 'B0' }, // 08:45Z
+  ];
+  const merged = mergeHeads([segA, segB]).map(r => r.event);
+  // A0 must still precede A1 (append order, unconditional); B0's true instant (08:45Z) falls
+  // between A0 (08:00Z) and A1 (09:30Z) -- a lexical comparison of the raw strings would instead
+  // place B0 after both, since '08:45:00+00:00' sorts lexically after '01:30:00-08:00'.
+  assert.ok(merged.indexOf('A0') < merged.indexOf('A1'));
+  assert.deepStrictEqual(merged, ['A0', 'B0', 'A1']);
+});
+
+test('Z and an equal-instant explicit +00:00 tie, broken deterministically by writerId', () => {
+  const segA = [{ ts: '2026-08-14T10:00:00Z', writerId: 'bbbbbbbb', seq: 0, event: 'A0' }];
+  const segB = [{ ts: '2026-08-14T10:00:00+00:00', writerId: 'aaaaaaaa', seq: 0, event: 'B0' }];
+  const merged = mergeHeads([segA, segB]).map(r => r.event);
+  assert.deepStrictEqual(merged, ['B0', 'A0']); // writerId 'aaaaaaaa' < 'bbbbbbbb'
+});
+
+test('an unparseable ts on one head does not throw and falls back to lexical ts comparison', () => {
+  const segA = [{ ts: 'not-a-real-timestamp', writerId: 'aaaaaaaa', seq: 0, event: 'A0' }];
+  const segB = [{ ts: '2026-08-14T10:00:00Z', writerId: 'bbbbbbbb', seq: 0, event: 'B0' }];
+  let merged;
+  assert.doesNotThrow(() => {
+    merged = mergeHeads([segA, segB]).map(r => r.event);
+  });
+  // lexically '2026-08-14T10:00:00Z' < 'not-a-real-timestamp' (digit < letter), so B0 wins.
+  assert.deepStrictEqual(merged, ['B0', 'A0']);
+});
