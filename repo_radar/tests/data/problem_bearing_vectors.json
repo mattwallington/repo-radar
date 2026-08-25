@@ -1,337 +1,587 @@
 [
   {
     "name": "succeeded, no events",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": false
   },
   {
     "name": "succeeded + warn event",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "event",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "level": "warn",
-        "event": "x",
-        "fields": {}
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 2,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "event",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "level": "warn",
+          "event": "x",
+          "fields": {}
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "succeeded + error event",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "event",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "level": "error",
-        "event": "x",
-        "fields": {}
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 2,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "event",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "level": "error",
+          "event": "x",
+          "fields": {}
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "info-only events",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "event",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "level": "info",
-        "event": "x",
-        "fields": {}
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 2,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "event",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "level": "info",
+          "event": "x",
+          "fields": {}
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": false
   },
   {
     "name": "failed outcome, no events",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "failed",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "failed",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "blocked outcome",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "blocked",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "blocked",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "interrupted outcome",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "interrupted",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "interrupted",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "succeeded-with-warnings outcome",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded-with-warnings",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded-with-warnings",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   },
   {
     "name": "cancelled outcome",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "cancelled",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "cancelled",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": false
   },
   {
     "name": "skipped outcome",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "skipped",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "skipped",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": false
   },
   {
     "name": "integrity record present",
-    "records": [
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "start",
-        "seq": 0,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "sync",
-        "channel": "stable",
-        "trigger": "cli",
-        "created_by": "python"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "integrity",
-        "seq": 1,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "kind": "abandoned-lock"
-      },
-      {
-        "schema_version": 1,
-        "activity_id": "00000000-0000-4000-8000-000000000000",
-        "type": "terminal",
-        "seq": 2,
-        "ts": "2026-08-14T00:00:00-07:00",
-        "outcome": "succeeded",
-        "summary": {},
-        "by": "deadbeef"
-      }
-    ],
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "integrity",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "abandoned-lock"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "succeeded + corrupt-record finding",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [{ "kind": "corrupt-record" }],
+      "rejected": []
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "succeeded + unsupported-schema finding",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [{ "kind": "unsupported-schema" }],
+      "rejected": []
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "succeeded + rejected segment (denied)",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": [{ "name": "python-deadbeef.jsonl", "reason": "denied" }]
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "succeeded + rejected bad-name sibling",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": [{ "name": "junk.jsonl", "reason": "bad-name" }]
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "two identical succeeded terminals (duplicate)",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
+    "problem_bearing": true
+  },
+  {
+    "name": "succeeded + failed terminals (conflict)",
+    "scan": {
+      "records": [
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "start",
+          "seq": 0,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "kind": "sync",
+          "channel": "stable",
+          "trigger": "cli",
+          "created_by": "python"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 1,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "succeeded",
+          "summary": {},
+          "by": "deadbeef"
+        },
+        {
+          "schema_version": 1,
+          "activity_id": "00000000-0000-4000-8000-000000000000",
+          "type": "terminal",
+          "seq": 2,
+          "ts": "2026-08-14T00:00:00-07:00",
+          "outcome": "failed",
+          "summary": {},
+          "by": "cafebabe"
+        }
+      ],
+      "findings": [],
+      "rejected": []
+    },
     "problem_bearing": true
   }
 ]

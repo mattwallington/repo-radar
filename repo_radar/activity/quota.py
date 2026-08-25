@@ -1,4 +1,5 @@
 import fcntl, json, os, stat, time
+from dataclasses import dataclass
 from repo_radar.activity import paths, records, ids
 from repo_radar.activity import lease as lease_mod
 from repo_radar.activity import reconcile as reconcile_mod
@@ -132,30 +133,131 @@ def _unlink_entry(home, activity_id):
 def _segments_data(home, activity_id):
     # descriptor-relative enumerate+read: (name, data, size, mtime) tuples (Round-4 #3).
     # F-E parity fix: filtered to CONFORMING segment names only (`paths.parse_segment_name`) --
-    # this is the single source `_top_types`/`_classify` (and, through them,
-    # `_reconcile_one_locked`/`retain`) read from, so a non-conforming file sitting in the
-    # activity dir (e.g. `python-s3cr3t.jsonl`, or plain `junk.jsonl`) can no longer masquerade
-    # as a real segment and drive lifecycle/classification decisions. Byte-accounting helpers
-    # (`_on_disk`/`_committed`/`_charge`) intentionally do NOT go through this function -- they
-    # use `paths.stat_owned_segments` directly and stay unfiltered on purpose (a bad-named file
-    # still counts toward the quota ceiling).
+    # kept as a thin, independent helper (some tests assert its exact [] output for a
+    # bad-named-only directory); lifecycle/classify decisions now go through `_scan` below
+    # instead. Byte-accounting helpers (`_on_disk`/`_committed`/`_charge`) intentionally do NOT
+    # go through this function -- they use `paths.stat_owned_segments` directly and stay
+    # unfiltered on purpose (a bad-named file still counts toward the quota ceiling).
     return [
         seg for seg in paths.read_owned_segments(paths.activity_dir(home, activity_id))
         if paths.parse_segment_name(seg[0]) is not None
     ]
 
-def _top_types(home, aid):
-    """Types of VALID v1 records for THIS activity (Round-4 #5) — via the canonical validator,
-    so a nested `fields.type`, unsupported schema, foreign activity_id, or bad enum never count."""
-    types = []
-    for _name, data, _size, _mt in _segments_data(home, aid):
-        for line in data.split(b"\n"):
+# Ruling 38 (Codex R2 finding R2-1, BLOCKER): `read_owned_segments`/`_segments_data` silently
+# skip entries they can't open (symlink, non-regular, EACCES, gone) -- a caller that only sees
+# "no terminal" can't tell "there really is no terminal" from "the terminal segment exists but
+# I couldn't read it", and guessing the former when the latter is true is exactly the bug this
+# fixes (Codex repro: readable start + a conforming `succeeded` terminal segment chmod 000 + a
+# free owner lock previously made the reconciler synthesize a SECOND, conflicting `interrupted`
+# terminal). `_scan` is the SINGLE filesystem pass every lifecycle/classify helper below goes
+# through, so they can never disagree about what was actually readable, and it also carries the
+# R2-2 structural-integrity view (interior corruption, unsupported schema, rejected/bad-name
+# segments, terminal multiplicity) that `is_problem_bearing` needs.
+@dataclass
+class Scan:
+    records: list                  # valid parsed top-level v1 records, in segment-then-line order
+    findings: list                 # [{"kind": "corrupt-record" | "unsupported-schema"}, ...]
+    rejected: list                 # [{"name": str, "reason": str}, ...] -- unreadable/unsafe/bad-name
+    view_uncertain: bool           # True => the view may be missing a real record; PRESERVE, never guess
+    mtime: float = 0.0             # newest mtime among the readable conforming segments (0.0 if none)
+
+_UNSUPPORTED_SCHEMA = object()     # sentinel: line is a JSON-parseable dict, but schema_version != 1
+
+def _classify_line(line, aid):
+    """Best-effort per-line classification for `_scan`'s structural `findings` pass -- NOT a
+    security boundary; the actual v1 admission verdict is always `records.parse_valid`, called
+    below regardless. Returns a valid record dict, `_UNSUPPORTED_SCHEMA`, or `None` (any other
+    rejection: malformed JSON, non-dict JSON, wrong activity_id, missing/invalid fields, bad
+    enum, ...) -- `None` becomes a generic `corrupt-record` finding in `_scan`."""
+    try:
+        obj = json.loads(line, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
+    except Exception:
+        obj = None
+    if isinstance(obj, dict) and obj.get("schema_version") != records.SCHEMA_VERSION:
+        return _UNSUPPORTED_SCHEMA
+    return records.parse_valid(line, aid)
+
+def _dir_provably_gone(directory):
+    """True iff `directory` (an activity dir) PROVABLY never existed -- FileNotFoundError, as
+    opposed to existing but being unsafe to open (UnsafePath) or any other OSError, both of which
+    must stay uncertain (preserve). Mirrors `_owner_lock_absent`'s identical distinction for
+    owner.lock, one level up."""
+    try:
+        fd = paths.open_owned_dir(directory)
+    except FileNotFoundError:
+        return True
+    except (paths.UnsafePath, OSError):
+        return False
+    os.close(fd)
+    return False
+
+def _scan(home, aid):
+    """THE single scan (Ruling 38): one filesystem pass over an activity's segment directory,
+    producing a `Scan`. `_top_types`/`_has_start`/`_has_terminal`/`_classify` (and, through them,
+    `_reconcile_one_locked`/`_prune_locked`/`_retain_locked`) all derive from this SAME pass."""
+    directory = paths.activity_dir(home, aid)
+    segments, rejected_raw = paths.read_owned_segments_detailed(directory)
+    rejected = [{"name": name, "reason": reason} for name, reason in rejected_raw]
+
+    if any(r["reason"] == "dir-unreadable" for r in rejected) and _dir_provably_gone(directory):
+        # The activity directory PROVABLY never existed (e.g. a ledger-only reserve-before-start
+        # entry whose owner crashed before secure_mkdir ever ran) -- a DEFINITE "nothing here"
+        # state, not "couldn't tell". Distinct from a directory that EXISTS but is unsafe to
+        # open/list (symlinked / permission-denied / other OSError), which stays genuinely
+        # uncertain below. Mirrors `_owner_lock_absent`'s identical FileNotFoundError-vs-other
+        # split, and keeps `test_corrupt_entry_with_no_owner_lock_clears_via_owner_gone_path`-
+        # style reclamation of a never-started reservation working exactly as before.
+        rejected = []
+
+    conforming = []
+    for seg in segments:
+        if paths.parse_segment_name(seg[0]) is not None:
+            conforming.append(seg)
+        else:
+            # untrusted non-segment (e.g. `junk.jsonl`, `python-s3cr3t.jsonl`): never parsed, but
+            # still surfaced as `rejected` -- R2-2 counts it toward problem-bearing (a stray file
+            # in an activity's dir is itself a structural oddity worth surfacing), it just can't
+            # ever have hidden a real start/terminal, so it does NOT drive `view_uncertain` below.
+            rejected.append({"name": seg[0], "reason": "bad-name"})
+
+    # view_uncertain: the view may be missing a record that actually exists on disk. True iff the
+    # directory itself couldn't be validated/listed, or some rejected entry's NAME would parse as
+    # a conforming segment (i.e. really could carry a start/terminal we simply couldn't read).
+    view_uncertain = any(
+        r["reason"] == "dir-unreadable" or paths.parse_segment_name(r["name"]) is not None
+        for r in rejected
+    )
+
+    records_out = []
+    findings = []
+    mtime = 0.0
+    for name, data, _size, seg_mtime in conforming:
+        mtime = max(mtime, seg_mtime)
+        lines = data.split(b"\n")
+        # the LAST split element is the remainder after the final b"\n"; non-empty means the
+        # segment does not end with a newline -- an in-progress writer's partial last write.
+        # Truncation tolerance, NOT a finding, and never even attempted (mirrors
+        # menubar/activity/parse.js's interior-vs-trailing corruption rule): only INTERIOR lines
+        # (every element except the last) are classified below.
+        interior = lines[:-1]
+        for line in interior:
             if not line:
                 continue
-            obj = records.parse_valid(line, aid)
-            if obj is not None:
-                types.append(obj["type"])
-    return types
+            classified = _classify_line(line, aid)
+            if classified is _UNSUPPORTED_SCHEMA:
+                findings.append({"kind": "unsupported-schema"})
+            elif classified is None:
+                findings.append({"kind": "corrupt-record"})
+            else:
+                records_out.append(classified)
+
+    return Scan(records=records_out, findings=findings, rejected=rejected,
+                view_uncertain=view_uncertain, mtime=mtime)
+
+def _top_types(home, aid):
+    """Types of VALID v1 records for THIS activity (Round-4 #5) — via the single `_scan` pass, so
+    a nested `fields.type`, unsupported schema, foreign activity_id, or bad enum never count."""
+    return [r.get("type") for r in _scan(home, aid).records]
 
 # lifecycle state is DERIVED from parsed segments, never a ledger flag (finding 1)
 def _has_start(home, aid):    return "start" in _top_types(home, aid)
@@ -298,7 +400,11 @@ def _owner_lock_absent(home, aid):
 
 def _reconcile_one_locked(home, aid):
     lock = paths.owner_lock_path(home, aid)
-    if _has_terminal(home, aid):                   # terminal LINE present -> settle if owner gone
+    scan = _scan(home, aid)                         # Ruling 38: ONE scan gates every branch below,
+    if scan.view_uncertain:                          # including the eventual synthesize_terminal call --
+        return                                       # uncertain view => PRESERVE, never guess (R2-1)
+    types = {r.get("type") for r in scan.records}
+    if "terminal" in types:                         # terminal LINE present -> settle if owner gone
         l = lease_mod.acquire(lock)
         if l is not None:
             # finding 1: a terminal LINE on disk is not necessarily DURABLE -- its write() can
@@ -313,16 +419,17 @@ def _reconcile_one_locked(home, aid):
             finally:
                 l.release()
         return
-    if not _has_start(home, aid):                  # reserve-before-start -> lease-gated release
+    if "start" not in types:                        # reserve-before-start -> lease-gated release
         if _owner_lock_absent(home, aid):           # §5/line 78: never-created lock => owner gone
             _unlink_entry(home, aid); return
         l = lease_mod.acquire(lock)                # (nothing recorded; nothing to synthesize)
         if l is not None:
             l.release(); _unlink_entry(home, aid)
         return
-    # has start, no terminal: provably-dead owner -> synthesize interrupted/cancelled + settle.
-    # synthesize_terminal acquires the owner.lock itself (its own free/busy gate); returns False
-    # if BUSY/UNCERTAIN or the write fails, in which case we preserve the charge (safe bias).
+    # has start, no terminal, view NOT uncertain (checked above, before this point is ever
+    # reached): provably-dead owner -> synthesize interrupted/cancelled + settle. synthesize_
+    # terminal acquires the owner.lock itself (its own free/busy gate); returns False if
+    # BUSY/UNCERTAIN or the write fails, in which case we preserve the charge (safe bias).
     if reconcile_mod.synthesize_terminal(home, aid):
         _unlink_entry(home, aid)
 
@@ -341,49 +448,56 @@ def reconcile(home):
         if fd is not None:
             _unlock(fd)
 
-# Ruling 33 (Codex R1 finding B1): the shared PROBLEM-BEARING contract, mirrored 1:1 by the Node
-# reader over the same wire records. An activity is problem-bearing iff ANY of: (a) an `event`
-# record with level in {warn, error}; (b) a `terminal` record with outcome in {failed, blocked,
-# interrupted, succeeded-with-warnings} (`succeeded`/`cancelled`/`skipped` are routine -- cancel
-# is user-initiated); (c) an `integrity` record (top-level type). §7/§9's Problems lens is
-# "warn/error + failure diagnostics", broader than terminal outcome alone -- see
+# Ruling 33/36 (Codex R1 finding B1, R2 finding R2-2): the shared PROBLEM-BEARING contract v2,
+# mirrored 1:1 by the Node reader over the same wire records + scan. An activity is
+# problem-bearing iff ANY of: (a) an `event` record with level in {warn, error}; (b) a `terminal`
+# record with outcome in {failed, blocked, interrupted, succeeded-with-warnings}
+# (`succeeded`/`cancelled`/`skipped` are routine -- cancel is user-initiated); (c) an `integrity`
+# record (top-level type); (d) any structural integrity FINDING (interior corruption / unsupported
+# schema); (e) any REJECTED segment entry (unreadable/unsafe/bad-name); (f) two or more terminal
+# records (duplicate or conflicting). (a)-(c) were the v1 contract, over VALID records alone; v2
+# widens the lens to the whole `Scan` (§7/§9's Problems lens is "warn/error + failure diagnostics
+# + anything structurally wrong", not just terminal outcome or valid records) -- see
 # test_activity_problem_bearing.py / data/problem_bearing_vectors.json for the shared parity
 # fixture the Node side drives against this identical predicate.
 _PROBLEM_EVENT_LEVELS = {"warn", "error"}
 _PROBLEM_OUTCOMES = {"failed", "blocked", "interrupted", "succeeded-with-warnings"}
 
-def is_problem_bearing(parsed_records) -> bool:
-    """Single reusable predicate over parsed top-level records for ONE activity. See the Ruling
-    33 contract above; `_classify` is the sole in-repo caller but this stays a public, dependency-
-    free function (dicts in, bool out) so it's trivially unit-testable against the shared fixture
-    and easy for the Node reader to mirror."""
-    for obj in parsed_records:
+def is_problem_bearing(scan) -> bool:
+    """Single reusable predicate over a `Scan` (or a plain dict with the same `records`/
+    `findings`/`rejected` keys -- e.g. a JSON-loaded vectors-fixture case, so this stays trivially
+    unit-testable and easy for the Node reader to mirror). See the Ruling 33/36 contract above;
+    `_classify` is the sole in-repo caller but this stays a public, dependency-free function."""
+    if isinstance(scan, dict):
+        recs, findings, rejected = scan.get("records", []), scan.get("findings", []), scan.get("rejected", [])
+    else:
+        recs, findings, rejected = scan.records, scan.findings, scan.rejected
+    terminal_count = 0
+    for obj in recs:
         t = obj.get("type")
         if t == "event" and obj.get("level") in _PROBLEM_EVENT_LEVELS:
             return True
-        if t == "terminal" and obj.get("outcome") in _PROBLEM_OUTCOMES:
-            return True
+        if t == "terminal":
+            terminal_count += 1
+            if obj.get("outcome") in _PROBLEM_OUTCOMES:
+                return True
         if t == "integrity":
             return True
-    return False
+    return bool(findings) or bool(rejected) or terminal_count >= 2
 
 def _classify(home, aid):
-    """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — parsed top-level."""
-    segs = _segments_data(home, aid)
-    mtime = max((mt for _n, _d, _sz, mt in segs), default=0.0)
-    types = _top_types(home, aid)
+    """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — via the single
+    `_scan` pass. An uncertain view (couldn't confirm what's actually on disk) is treated as
+    'running': unreconciled/uncertain items must never be guessed into 'problem' or 'routine',
+    and `_prune_locked`/`_retain_locked` already skip 'running' unconditionally (Ruling 38)."""
+    scan = _scan(home, aid)
+    if scan.view_uncertain:
+        return ("running", scan.mtime)
+    types = {r.get("type") for r in scan.records}
     if "terminal" not in types:
-        return ("running", mtime)
-    parsed = []
-    for _n, data, _sz, _mt in segs:
-        for line in data.split(b"\n"):
-            if not line:
-                continue
-            obj = records.parse_valid(line, aid)
-            if obj is not None:
-                parsed.append(obj)
-    problem = is_problem_bearing(parsed)
-    return ("problem" if problem else "routine", mtime)
+        return ("running", scan.mtime)
+    problem = is_problem_bearing(scan)
+    return ("problem" if problem else "routine", scan.mtime)
 
 def _prune_locked(home, need_bytes):
     """Ceiling-override pruner (CALLER HOLDS quota.lock): SETTLED items only (no live ledger

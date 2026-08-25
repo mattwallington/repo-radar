@@ -1,4 +1,4 @@
-import os, stat
+import errno, os, stat
 from pathlib import Path
 from repo_radar.activity import ids
 
@@ -145,17 +145,32 @@ def open_owned_regular(path, flags, mode=0o600):
 def secure_open_append(path, mode=0o600) -> int:
     return open_owned_regular(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
 
-def read_owned_segments(directory, suffix=".jsonl"):
+def read_owned_segments_detailed(directory, suffix=".jsonl"):
     """Enumerate + read files under an owned dir via a validated dir fd, never following a
-    symlinked component or entry (Round-4 #3). Returns [(name, data_bytes, size, mtime)]; []
-    if missing."""
+    symlinked component or entry (Round-4 #3). Returns `(segments, rejected)`:
+      segments -- exactly what `read_owned_segments` returns: [(name, data_bytes, size, mtime)]
+      rejected -- [(name, reason)] for every suffix-matching entry that was refused, `reason` one
+        of: 'symlink' (ELOOP via O_NOFOLLOW), 'not-regular' (FIFO/dir/device), 'denied' (EACCES),
+        'gone' (removed between scandir and open, or a TOCTOU failure mid-scan after open), or
+        'read-failed' (any other open/fstat/read failure). If the DIRECTORY itself can't be
+        validated/listed, `segments` is still `[]` (unchanged contract) but `rejected` is
+        `[('', 'dir-unreadable')]` so a caller can tell "no entries" apart from "couldn't list"
+        (Ruling 38 / Codex R2-1: mirrors menubar/activity/paths.js's readOwnedSegmentsDetailed).
+
+    `read_owned_segments` below is a thin wrapper returning just the `segments` half, preserving
+    its existing signature/behavior for its many callers unchanged."""
     try:
         dfd = open_owned_dir(directory)
     except (UnsafePath, FileNotFoundError):
-        return []
-    out = []
+        return [], [("", "dir-unreadable")]
+    segments = []
+    rejected = []
     try:
-        for entry in os.scandir(dfd):
+        try:
+            entries = list(os.scandir(dfd))
+        except OSError:
+            return [], [("", "dir-unreadable")]
+        for entry in entries:
             if not entry.name.endswith(suffix):
                 continue
             try:
@@ -164,20 +179,34 @@ def read_owned_segments(directory, suffix=".jsonl"):
                 # leave a TOCTOU window where the entry could be swapped between the check and
                 # the open (Codex gate round 1, finding 2; mirrors open_owned_regular).
                 ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
-            except OSError:                                       # symlink (ELOOP) / gone / denied
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    rejected.append((entry.name, "symlink"))
+                elif e.errno == errno.EACCES:
+                    rejected.append((entry.name, "denied"))
+                elif e.errno == errno.ENOENT:
+                    rejected.append((entry.name, "gone"))
+                else:
+                    rejected.append((entry.name, "read-failed"))
                 continue
             try:
                 st = os.fstat(ffd)
                 if not stat.S_ISREG(st.st_mode):                  # FIFO / directory / device
+                    rejected.append((entry.name, "not-regular"))
                     continue
-                out.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
+                segments.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
             except OSError:                                       # TOCTOU: entry deleted/swapped mid-scan
-                continue
+                rejected.append((entry.name, "read-failed"))
             finally:
                 os.close(ffd)
     finally:
         os.close(dfd)
-    return out
+    return segments, rejected
+
+def read_owned_segments(directory, suffix=".jsonl"):
+    """Thin wrapper over `read_owned_segments_detailed` (Ruling 38): see there for the single
+    implementation. Returns [(name, data_bytes, size, mtime)]; [] if missing."""
+    return read_owned_segments_detailed(directory, suffix)[0]
 
 def stat_owned_segments(directory, suffix=".jsonl"):
     """Like read_owned_segments but METADATA ONLY (Codex gate round 1, finding 7): opens each

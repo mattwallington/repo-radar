@@ -31,6 +31,41 @@ def _settled_with_event(home, outcome="succeeded", age_days=0.0, event_level=Non
     old = time.time() - age_days*86400; os.utime(seg, (old, old))
     return aid
 
+def _raw_line(home, aid, line: str):
+    # a raw, non-JSON-record line appended to the SAME deterministic segment file `_rec` writes
+    # to (paths.segment_path is deterministic per producer/writer_id="python"/"deadbeef"), so it
+    # lands as an INTERIOR line once a later record is appended after it -- an integrity finding
+    # (Ruling 36/R2-2), not the silently-dropped trailing-partial-write case.
+    seg = paths.segment_path(home, aid, "python", "deadbeef")
+    fd = paths.secure_open_append(seg); os.write(fd, (line + "\n").encode()); os.close(fd)
+    return seg
+
+def _settled_with_corrupt_interior_line(home, outcome="succeeded", age_days=0.0):
+    # Codex R2 finding R2-2: a settled activity whose segment has ONE corrupt interior line
+    # (between the start and terminal records) must be seen as problem-bearing by `_classify` --
+    # governed by the 90-day rule, not the 14-day routine rule -- even though every top-level
+    # RECORD is otherwise clean.
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(home, aid))
+    l = lease.acquire(paths.owner_lock_path(home, aid)); quota.admit(home, aid, l)
+    _rec(home, aid, type="start", seq=0, kind="sync", channel="stable", trigger="cli", created_by="python")
+    _raw_line(home, aid, "{not valid json")                  # interior corruption
+    seg = _rec(home, aid, type="terminal", seq=9, outcome=outcome, summary={}, by="deadbeef")
+    l.release(); quota.settle(home, aid)
+    old = time.time() - age_days*86400; os.utime(seg, (old, old))
+    return aid
+
+def _settled_with_duplicate_terminals(home, age_days=0.0):
+    # Codex R2 finding R2-2 (f): two terminal records (even IDENTICAL ones) is itself a
+    # structural problem -- duplicate/conflicting terminals must never be classified 'routine'.
+    aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(home, aid))
+    l = lease.acquire(paths.owner_lock_path(home, aid)); quota.admit(home, aid, l)
+    _rec(home, aid, type="start", seq=0, kind="sync", channel="stable", trigger="cli", created_by="python")
+    _rec(home, aid, type="terminal", seq=1, outcome="succeeded", summary={}, by="deadbeef")
+    seg = _rec(home, aid, type="terminal", seq=2, outcome="succeeded", summary={}, by="deadbeef")
+    l.release(); quota.settle(home, aid)
+    old = time.time() - age_days*86400; os.utime(seg, (old, old))
+    return aid
+
 def test_routine_older_than_14d_outside_newest_50_pruned_but_13d_kept(tmp_path, monkeypatch):
     # Spec §7's newest-50 is PROTECTIVE (shields the 50 most-recent items from age-pruning); with
     # only 2 items seeded, both are within a newest-50 window, so the 20d item would never be
@@ -154,3 +189,44 @@ def test_sole_old_problem_is_pruned_by_age_pass_not_shielded(tmp_path, monkeypat
     pruned = quota.retain(tmp_path)
     assert not paths.activity_dir(tmp_path, aid).exists()
     assert aid in pruned
+
+# --- Codex R2 finding R2-2 (BLOCKER): retention must see STRUCTURAL problems, not just valid
+# top-level records -- a `succeeded` activity with corrupt interior content, a rejected/bad-name
+# sibling, or duplicate terminals is problem-bearing even though its parsed records look routine.
+
+def test_corrupt_interior_line_makes_succeeded_activity_problem_bearing_kept_at_20d(tmp_path, monkeypatch):
+    # 20d < the 90-day problem-age threshold -> kept, even though NEWEST_KEEP=0 removes the
+    # newest-50 protection and 20d is already past the 14-day ROUTINE threshold (would be pruned
+    # if the corrupt line weren't seen as a structural problem).
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled_with_corrupt_interior_line(tmp_path, "succeeded", 20)
+    assert quota._classify(tmp_path, aid)[0] == "problem"
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, aid).exists()
+
+def test_corrupt_interior_line_succeeded_activity_pruned_at_100d(tmp_path, monkeypatch):
+    # Same shape, but 100d > the 90-day problem-age threshold -> the structural problem doesn't
+    # shield it forever, just governs it by the RIGHT (90d, not 14d) rule.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled_with_corrupt_interior_line(tmp_path, "succeeded", 100)
+    quota.retain(tmp_path)
+    assert not paths.activity_dir(tmp_path, aid).exists()
+
+def test_bad_name_sibling_file_keeps_succeeded_activity_at_20d(tmp_path, monkeypatch):
+    # A stray non-conforming file sitting next to a clean, settled `succeeded` activity is itself
+    # a structural oddity (R2-2 (e)): the activity must be governed by the 90-day rule, not 14d.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled(tmp_path, "succeeded", 20)
+    (paths.activity_dir(tmp_path, aid) / "junk.jsonl").write_text("not a segment\n")
+    assert quota._classify(tmp_path, aid)[0] == "problem"
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, aid).exists()
+
+def test_duplicate_succeeded_terminals_keeps_activity_at_20d(tmp_path, monkeypatch):
+    # Two terminal records (R2-2 (f)) -- even two IDENTICAL `succeeded` ones -- is a structural
+    # problem (duplicate settlement), governed by the 90-day rule, not the 14-day routine rule.
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid = _settled_with_duplicate_terminals(tmp_path, 20)
+    assert quota._classify(tmp_path, aid)[0] == "problem"
+    quota.retain(tmp_path)
+    assert paths.activity_dir(tmp_path, aid).exists()

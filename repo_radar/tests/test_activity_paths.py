@@ -185,3 +185,64 @@ def test_parse_segment_name_rejects_a_missing_or_wrong_suffix():
 def test_parse_segment_name_rejects_non_string_input_without_raising():
     assert paths.parse_segment_name(None) is None
     assert paths.parse_segment_name(123) is None
+
+# Ruling 38 (Codex R2 finding R2-1, BLOCKER): read_owned_segments_detailed carries a `reason` for
+# every rejected entry so a caller (quota.py's `_scan`) can tell "no terminal segment" apart from
+# "a terminal segment exists but I couldn't read it" -- mirrors
+# menubar/activity/paths.js's readOwnedSegmentsDetailed and its paths-rejected.test.js coverage.
+
+def test_read_owned_segments_detailed_reports_symlink_reason(tmp_path):
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    (d / "python-deadbeef.jsonl").write_bytes(b"x\n")
+    victim = tmp_path / "outside.jsonl"; victim.write_bytes(b"secret\n")
+    os.symlink(victim, d / "python-cafebabe.jsonl")
+    segments, rejected = paths.read_owned_segments_detailed(d)
+    assert [n for n, _d, _sz, _mt in segments] == ["python-deadbeef.jsonl"]
+    assert rejected == [("python-cafebabe.jsonl", "symlink")]
+
+def test_read_owned_segments_detailed_reports_not_regular_reason_for_a_fifo(tmp_path):
+    import signal
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    (d / "python-deadbeef.jsonl").write_bytes(b"x\n")
+    fifo = d / "python-cafebabe.jsonl"
+    os.mkfifo(fifo)
+    def _timeout(*_): raise TimeoutError("read_owned_segments_detailed blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, _timeout); signal.alarm(5)
+    try:
+        segments, rejected = paths.read_owned_segments_detailed(d)
+    finally:
+        signal.alarm(0); signal.signal(signal.SIGALRM, old)
+    assert [n for n, _d, _sz, _mt in segments] == ["python-deadbeef.jsonl"]
+    assert rejected == [("python-cafebabe.jsonl", "not-regular")]
+
+def test_read_owned_segments_detailed_reports_denied_reason_for_a_0o000_file(tmp_path):
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    seg = paths.segment_path(tmp_path, VALID, "python", "deadbeef")
+    seg.write_bytes(b"line1\n")
+    os.chmod(seg, 0o000)
+    try:
+        segments, rejected = paths.read_owned_segments_detailed(d)
+        assert segments == []
+        assert rejected == [("python-deadbeef.jsonl", "denied")]
+    finally:
+        os.chmod(seg, 0o600)          # restore perms BEFORE tmp_path teardown needs to unlink it
+
+def test_read_owned_segments_detailed_reports_dir_unreadable_for_a_never_created_dir(tmp_path):
+    d = paths.activity_dir(tmp_path, VALID)          # never secure_mkdir'd -- doesn't exist
+    segments, rejected = paths.read_owned_segments_detailed(d)
+    assert segments == []
+    assert rejected == [("", "dir-unreadable")]
+
+def test_read_owned_segments_detailed_reports_dir_unreadable_for_a_symlinked_activity_dir(tmp_path):
+    outside = tmp_path / "outside"; outside.mkdir()
+    d = paths.activity_dir(tmp_path, VALID)
+    d.parent.mkdir(parents=True)
+    os.symlink(outside, d)                           # activity dir itself is a symlink
+    segments, rejected = paths.read_owned_segments_detailed(d)
+    assert segments == []
+    assert rejected == [("", "dir-unreadable")]
+
+def test_read_owned_segments_is_a_thin_wrapper_over_detailed(tmp_path):
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    (d / "python-deadbeef.jsonl").write_bytes(b"x\n")
+    assert paths.read_owned_segments(d) == paths.read_owned_segments_detailed(d)[0]
