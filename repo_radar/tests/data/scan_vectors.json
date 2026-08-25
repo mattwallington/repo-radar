@@ -1,0 +1,175 @@
+[
+  {
+    "name": "clean start + terminal, no findings",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "start",
+        "terminal"
+      ],
+      "findings": [],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "interior corrupt line -> corrupt-record; later records still accepted",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{not json\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "start",
+        "terminal"
+      ],
+      "findings": [
+        "corrupt-record"
+      ],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "interior schema_version 2 record -> unsupported-schema, not accepted",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 2, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"event\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"level\": \"info\", \"event\": \"x\", \"fields\": {}}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "start",
+        "terminal"
+      ],
+      "findings": [
+        "unsupported-schema"
+      ],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "trailing VALID-JSON terminal without final newline -> torn, NOT counted, no finding",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}"
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "trailing garbage without final newline -> torn, no finding",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n{\"partial"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "start",
+        "terminal"
+      ],
+      "findings": [],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "seq regression 0,0,1 -> seq-regression; all 3 records still accepted",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"event\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"level\": \"info\", \"event\": \"x\", \"fields\": {}}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 3,
+      "types": [
+        "event",
+        "start",
+        "terminal"
+      ],
+      "findings": [
+        "seq-regression"
+      ],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "two segments each restarting at seq 0 -> NO regression (per-segment tracking)",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"event\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"level\": \"info\", \"event\": \"x\", \"fields\": {}}\n"
+      },
+      {
+        "name": "electron-cafebabe.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"event\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"level\": \"info\", \"event\": \"y\", \"fields\": {}}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 4,
+      "types": [
+        "event",
+        "start",
+        "terminal"
+      ],
+      "findings": [],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "control cancel_requested -> cancel_requested true",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"control\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"name\": \"cancel_requested\"}\n"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "control",
+        "start"
+      ],
+      "findings": [],
+      "cancel_requested": true
+    }
+  },
+  {
+    "name": "empty lines interspersed -> ignored, no findings",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "text": "\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"start\", \"seq\": 0, \"ts\": \"2026-08-14T00:00:00-07:00\", \"kind\": \"sync\", \"channel\": \"stable\", \"trigger\": \"cli\", \"created_by\": \"python\"}\n\n\n{\"schema_version\": 1, \"activity_id\": \"00000000-0000-4000-8000-000000000000\", \"type\": \"terminal\", \"seq\": 1, \"ts\": \"2026-08-14T00:00:00-07:00\", \"outcome\": \"succeeded\", \"summary\": {}, \"by\": \"deadbeef\"}\n\n"
+      }
+    ],
+    "expected": {
+      "record_count": 2,
+      "types": [
+        "start",
+        "terminal"
+      ],
+      "findings": [],
+      "cancel_requested": false
+    }
+  }
+]

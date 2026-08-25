@@ -1,5 +1,6 @@
 import json, os
 from repo_radar.activity import quota, paths, lease, ids
+from repo_radar.activity import scan as scan_mod
 
 # Codex R2 finding R2-1 (BLOCKER): `_reconcile_one_locked` must never synthesize a terminal (or
 # settle the ledger) when its view of an activity's segments is UNCERTAIN -- an unreadable
@@ -118,44 +119,71 @@ def test_scan_view_uncertain_false_for_bad_name_only(tmp_path):
     assert scan.view_uncertain is False
     assert scan.rejected == [{"name": "junk.jsonl", "reason": "bad-name"}]
 
-# --- gate recheck under the lease (Codex R2 B2 recheck) ------------------------------------
+# --- trusted rescan under the lease (Codex R2 B2 recheck, R3 B3) ---------------------------
 # `_reconcile_one_locked`'s own `_scan` call runs BEFORE any lease is acquired -- it only decides
 # whether to CALL `synthesize_terminal` at all. That decision can go stale by the time
 # `synthesize_terminal` actually acquires the owner lease and is about to write: a conforming
-# segment could become unreadable, or a terminal could land, in the gap. `synthesize_terminal`'s
-# `gate` (== quota._synth_gate, a fresh `_scan`) is re-evaluated UNDER that lease to close the
-# window; a gate that comes back negative must block the write entirely.
+# segment could become unreadable, or a terminal could land, in the gap. `synthesize_terminal`
+# therefore UNCONDITIONALLY re-runs the single trusted `scan.scan_activity` under that lease
+# (no separate quota-side gate any more); a rescan that comes back uncertain / terminated must
+# block the write entirely. Both `quota._scan` and `reconcile` go through
+# `scan_mod.scan_activity`, so patching that one function drives every consumer.
 
-def test_reconcile_one_locked_gate_recheck_blocks_stale_synthesis(tmp_path, monkeypatch):
+def _patch_scan_sequence(monkeypatch, first, then):
+    calls = {"n": 0}
+    def fake_scan(home, a):
+        calls["n"] += 1
+        return first if calls["n"] == 1 else then
+    monkeypatch.setattr(scan_mod, "scan_activity", fake_scan)
+    return calls
+
+def test_reconcile_one_locked_under_lease_rescan_blocks_stale_synthesis(tmp_path, monkeypatch):
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid)
     l.release()                                            # owner gone; lock now free
 
-    # First `_scan` call is `_reconcile_one_locked`'s own PRE-lease scan: certain, has a start,
-    # no terminal -- it must decide to call synthesize_terminal. Every call AFTER that (i.e. the
-    # gate's own re-scan, made UNDER the lease synthesize_terminal acquires) reports an uncertain
-    # view, simulating a conforming segment going unreadable in the interim.
+    # First scan is `_reconcile_one_locked`'s own PRE-lease scan: certain, has a start, no
+    # terminal -- it must decide to call synthesize_terminal. The NEXT scan (made UNDER the lease
+    # synthesize_terminal acquires) reports an uncertain view, simulating a conforming segment
+    # going unreadable in the interim.
     certain_has_start = quota.Scan(records=[{"type": "start"}], findings=[], rejected=[],
                                     view_uncertain=False)
     now_uncertain = quota.Scan(records=[], findings=[],
                                 rejected=[{"name": "x", "reason": "denied"}], view_uncertain=True)
-    calls = {"n": 0}
-    def fake_scan(home, a):
-        calls["n"] += 1
-        return certain_has_start if calls["n"] == 1 else now_uncertain
-    monkeypatch.setattr(quota, "_scan", fake_scan)
+    calls = _patch_scan_sequence(monkeypatch, certain_has_start, now_uncertain)
 
     quota._reconcile_one_locked(tmp_path, aid)
 
-    assert calls["n"] == 2                                  # pre-lease scan + the gate's rescan
-    assert paths.ledger_entry_path(tmp_path, aid).exists()  # NOT settled -- gate blocked the write
+    assert calls["n"] == 2                                  # pre-lease scan + the under-lease rescan
+    assert paths.ledger_entry_path(tmp_path, aid).exists()  # NOT settled -- rescan blocked the write
     # nothing was written, and the lease synthesize_terminal acquired was released
     fresh = lease.acquire(paths.owner_lock_path(tmp_path, aid))
     assert fresh is not None
     fresh.release()
 
-def test_reconcile_one_locked_gate_recheck_allows_synthesis_when_view_still_holds(tmp_path):
+def test_reconcile_one_locked_under_lease_rescan_blocks_when_terminal_landed(tmp_path, monkeypatch):
+    # Same shape, but the under-lease rescan now SEES a terminal (one landed in the gap): nothing
+    # must be synthesized (no second, conflicting terminal) and the ledger stays for the normal
+    # terminal-present settle path of a later pass.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    l.release()
+    certain_has_start = quota.Scan(records=[{"type": "start"}], findings=[], rejected=[],
+                                    view_uncertain=False)
+    now_terminated = quota.Scan(records=[{"type": "start"}, {"type": "terminal"}], findings=[],
+                                rejected=[], view_uncertain=False)
+    calls = _patch_scan_sequence(monkeypatch, certain_has_start, now_terminated)
+    before = set(os.listdir(paths.activity_dir(tmp_path, aid)))
+
+    quota._reconcile_one_locked(tmp_path, aid)
+
+    assert calls["n"] == 2
+    assert paths.ledger_entry_path(tmp_path, aid).exists()
+    assert set(os.listdir(paths.activity_dir(tmp_path, aid))) == before   # no synthetic segment
+
+def test_reconcile_one_locked_under_lease_rescan_allows_synthesis_when_view_still_holds(tmp_path):
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid)
@@ -163,27 +191,7 @@ def test_reconcile_one_locked_gate_recheck_allows_synthesis_when_view_still_hold
 
     quota._reconcile_one_locked(tmp_path, aid)
 
-    assert not paths.ledger_entry_path(tmp_path, aid).exists()  # settled: gate reaffirmed, synth wrote
-
-def test_reconcile_one_locked_passes_callable_gate_reflecting_fresh_scan(tmp_path, monkeypatch):
-    # Direct check that `_reconcile_one_locked` wires a `gate` kwarg through to
-    # `synthesize_terminal` at all, and that the gate it builds (`_synth_gate`) evaluates to the
-    # expected bool for a still-certain, has-start/no-terminal view.
-    aid, l = _new_activity(tmp_path)
-    quota.admit(tmp_path, aid, l)
-    _write_start(tmp_path, aid)
-    l.release()
-
-    captured = {}
-    def fake_synthesize_terminal(home, a, gate=None):
-        captured["gate"] = gate
-        return False                                       # decline; don't actually write here
-    monkeypatch.setattr(quota.reconcile_mod, "synthesize_terminal", fake_synthesize_terminal)
-
-    quota._reconcile_one_locked(tmp_path, aid)
-
-    assert callable(captured.get("gate"))
-    assert captured["gate"]() is True                       # certain view, start, no terminal
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()  # settled: rescan reaffirmed, synth wrote
 
 def test_scan_view_uncertain_false_when_activity_dir_never_created(tmp_path):
     # mirrors _owner_lock_absent's FileNotFoundError-vs-other split: a directory that PROVABLY

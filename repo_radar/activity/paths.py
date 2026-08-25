@@ -209,11 +209,18 @@ def read_owned_segments(directory, suffix=".jsonl"):
     return read_owned_segments_detailed(directory, suffix)[0]
 
 def stat_owned_segments(directory, suffix=".jsonl"):
-    """Like read_owned_segments but METADATA ONLY (Codex gate round 1, finding 7): opens each
-    segment safely (O_NOFOLLOW|O_NONBLOCK, fstat-validated S_ISREG) and returns
+    """Like read_owned_segments but METADATA ONLY (Codex gate round 1, finding 7): returns
     [(name, size)] WITHOUT reading file contents, so quota's per-event size accounting never
-    has to reread an entire segment (up to the 64 MiB ceiling) while holding quota.lock and
-    excluding all other producers. Skips unsafe entries exactly like read_owned_segments."""
+    has to reread an entire segment (up to the 64 MiB ceiling) while holding quota.lock.
+
+    Ruling 40 (Codex R3 B1, BLOCKER): sizes are taken WITHOUT opening the entry -- a
+    descriptor-relative lstat (`os.stat(name, dir_fd=dfd, follow_symlinks=False)`) on each
+    suffix-matching entry of the validated dir. The previous open-then-fstat form silently
+    dropped any segment it could not open (e.g. a settled segment chmod 000), so its bytes
+    vanished from `_on_disk`/`_committed`/`_charge` while the payload persisted on disk -- a
+    quota undercount. A permission-denied REGULAR file keeps its provable size here; only
+    symlinks and other non-regular entries (never ours) are skipped, and an entry that vanishes
+    mid-scan is simply omitted."""
     try:
         dfd = open_owned_dir(directory)
     except (UnsafePath, FileNotFoundError):
@@ -224,18 +231,12 @@ def stat_owned_segments(directory, suffix=".jsonl"):
             if not entry.name.endswith(suffix):
                 continue
             try:
-                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+                st = os.stat(entry.name, dir_fd=dfd, follow_symlinks=False)
             except OSError:
-                continue                                          # symlink (ELOOP) / gone / denied
-            try:
-                st = os.fstat(ffd)
-                if not stat.S_ISREG(st.st_mode):
-                    continue                                       # FIFO / directory / device
-                out.append((entry.name, st.st_size))
-            except OSError:                                        # TOCTOU: entry deleted/swapped mid-scan
-                continue
-            finally:
-                os.close(ffd)
+                continue                                          # gone mid-scan
+            if not stat.S_ISREG(st.st_mode):
+                continue                                           # symlink / FIFO / dir / device
+            out.append((entry.name, st.st_size))
     finally:
         os.close(dfd)
     return out
