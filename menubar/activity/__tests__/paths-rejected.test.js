@@ -198,7 +198,7 @@ test('listOwnedSubdirsDetailed: a missing base yields empty subdirs and no rejec
   const home = tmpHome();
   try {
     const root = path.dirname(paths.quotaDir(home)); // never created
-    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [] });
+    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [], uncertain: false }); // Ruling 49: proven absent is not uncertain
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

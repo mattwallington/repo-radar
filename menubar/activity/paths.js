@@ -440,30 +440,43 @@ function listOwnedEntries(directory, suffix) {
 // symlink/non-directory entry silently, so a valid-UUID symlink squatting at the Activity root
 // listed as clean empty history -- the reader could not tell "no activities" apart from "an
 // activity-shaped entry I refused to follow". Returns
-// `{ subdirs: [name], rejected: [{ name, reason }] }` where `rejected` holds ONLY entries whose
-// name is a valid activity id (`ids.validActivityId`) but that are not a real directory:
-// 'symlink' (lstat says symlink -- never followed, whatever it points at), 'not-directory' (a
-// plain file / FIFO / device squatting on an activity name), 'denied' (lstat refused), or
-// 'gone' (removed between readdir and lstat). Entries whose names are NOT activity ids (the
-// `quota` ledger dir, `quota.lock`, stray junk) are not activities and are ignored either way --
-// the reader never surfaces them, and a symlink named `foo` is not an activity being hidden.
-// Mirrors `paths.list_owned_subdirs_detailed`. A missing/invalid/unreadable BASE yields
-// `{ subdirs: [], rejected: [] }` -- read.js probes the root itself, before calling this.
+// `{ subdirs: [name], rejected: [{ name, reason }], uncertain }` where `rejected` holds ONLY
+// entries whose name is a valid activity id (`ids.validActivityId`) but that are not a real
+// directory: 'symlink' (lstat says symlink -- never followed, whatever it points at),
+// 'not-directory' (a plain file / FIFO / device squatting on an activity name), 'stat-failed'
+// (lstat refused for any reason other than ENOENT -- EACCES, EIO, ...), or 'gone' (removed
+// between readdir and lstat). Entries whose names are NOT activity ids (the `quota` ledger dir,
+// `quota.lock`, stray junk) are not activities and are ignored either way -- the reader never
+// surfaces them, and a symlink named `foo` is not an activity being hidden.
+//
+// Codex R5 B1 / Ruling 49: `uncertain` is the ROOT-level counterpart of
+// `statOwnedSegmentsDetailed`'s flag. quota.js used to enumerate through the LOSSY `.subdirs`
+// wrapper, so a UUID-shaped entry whose lstat failed with a non-ENOENT error (Codex injected EIO
+// on one of 16 x 4 MiB settled activities) simply vanished from the accounting: charge 60 MiB,
+// `uncertain:false`, a reservation admitted, restore -> 67,170,304 bytes > ceiling. `uncertain`
+// is true iff the base EXISTS but cannot be validated/listed (UnsafePath / readdir failure other
+// than ENOENT), OR any valid-activity-id entry was rejected for a reason other than 'gone' -- an
+// entry proven absent (ENOENT) hides nothing, every other refusal may. `subdirs`/`rejected`
+// still carry whatever WAS enumerable. A missing base (ENOENT) yields
+// `{ subdirs: [], rejected: [], uncertain: false }` -- read.js probes the root itself, before
+// calling this, and consumes only `rejected` (the flag is additive). Mirrors
+// `paths.list_owned_subdirs_detailed`.
 function listOwnedSubdirsDetailed(base) {
   let dir;
   try {
     dir = _validateOwnedDir(base);
   } catch (e) {
-    return { subdirs: [], rejected: [] };
+    return { subdirs: [], rejected: [], uncertain: e.code !== 'ENOENT' };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return { subdirs: [], rejected: [] };
+    return { subdirs: [], rejected: [], uncertain: e.code !== 'ENOENT' };
   }
   const subdirs = [];
   const rejected = [];
+  let uncertain = false;
   for (const name of names) {
     let st;
     try {
@@ -471,14 +484,22 @@ function listOwnedSubdirsDetailed(base) {
     } catch (e) {
       // TOCTOU: entry deleted/swapped mid-scan, or lstat itself refused. Only an ACTIVITY-shaped
       // name is worth reporting -- anything else was never going to be listed.
-      if (ids.validActivityId(name)) rejected.push({ name, reason: e.code === 'ENOENT' ? 'gone' : 'denied' });
+      if (ids.validActivityId(name)) {
+        if (e.code === 'ENOENT') {
+          rejected.push({ name, reason: 'gone' }); // proven absent: nothing hidden
+        } else {
+          rejected.push({ name, reason: 'stat-failed' }); // refused, not gone: an activity may be hidden
+          uncertain = true;
+        }
+      }
       continue;
     }
     if (st.isDirectory()) { subdirs.push(name); continue; } // lstat: a symlink-to-dir is NOT a dir
     if (!ids.validActivityId(name)) continue; // junk name -> not an activity, nothing hidden
     rejected.push({ name, reason: st.isSymbolicLink() ? 'symlink' : 'not-directory' });
+    uncertain = true; // an activity-shaped entry we refused to measure
   }
-  return { subdirs, rejected };
+  return { subdirs, rejected, uncertain };
 }
 
 // Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors

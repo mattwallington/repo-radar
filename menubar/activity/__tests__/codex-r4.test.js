@@ -278,7 +278,11 @@ test('Ruling 48: seq must be an integer in 0..Number.MAX_SAFE_INTEGER', () => {
   for (const bad of ['9007199254740992', '9007199254740993', '1e400', '-1', '1.5', 'true', '"1"', 'null']) {
     assert.strictEqual(records.parseValid(ev(bad), aid), null, `seq ${bad} must be rejected`);
   }
-  assert.throws(() => records.buildRecord({ type: 'event', activity_id: aid, seq: Number.MAX_SAFE_INTEGER + 1, ts: TS, level: 'info', event: 'x' }), records.InvalidRecord);
+  // Codex R5 S5: the real signature is buildRecord(type, args) -- the previous object-only call
+  // threw for the INVALID TYPE (undefined), not for the unsafe seq. The MAX_SAFE_INTEGER sibling
+  // proves the throw below is really about the seq.
+  assert.doesNotThrow(() => records.buildRecord('event', { activity_id: aid, seq: Number.MAX_SAFE_INTEGER, ts: TS, level: 'info', event: 'x' }));
+  assert.throws(() => records.buildRecord('event', { activity_id: aid, seq: Number.MAX_SAFE_INTEGER + 1, ts: TS, level: 'info', event: 'x' }), records.InvalidRecord);
 
   // the collision Codex found: ...992 and ...993 both parse to the same double -> no spurious
   // seq-regression, because neither is a valid record in the first place

@@ -65,6 +65,7 @@ const { spawnSync } = require('child_process');
 const paths = require('./paths');
 const ids = require('./ids');
 const parse = require('./parse');
+const records = require('./records');
 
 const CEILING = 64 * 1024 * 1024;
 const RESERVE = 60 * 1024;
@@ -237,12 +238,21 @@ function _unlock(fd) {
 // Validates the ledger's FULL invariant (mirrors Python's `_parse_entry` exactly): counters must
 // be EXACT non-boolean integers (strings/floats -> CORRUPT), `reserved` exactly RESERVE,
 // `granted >= 0`, total <= cap.
+//
+// Codex R5 I4 / Ruling 52: the bytes are decoded with the STRICT decoder every other read path
+// uses (`records.decodeUtf8Fatal`, Ruling 47) -- `Buffer.toString('utf8')` is lossy (an invalid
+// byte becomes U+FFFD), so a ledger file carrying a raw 0xff in an ignored field parsed as VALID
+// here while Python's `json.loads` classified it CORRUPT. Any decode error, JSON error or shape
+// failure is CORRUPT. The decoder retains a leading BOM (U+FEFF), which `JSON.parse` rejects --
+// matching Python's "Unexpected UTF-8 BOM" JSONDecodeError. Parity is pinned by
+// `__tests__/ledger-parity.test.js` against the Python-authored `ledger_vectors.json`.
 function _parseEntry(dataBuf) {
   let d;
   try {
-    d = JSON.parse(dataBuf.toString('utf8'));
+    const text = Buffer.isBuffer(dataBuf) ? records.decodeUtf8Fatal(dataBuf) : String(dataBuf);
+    d = JSON.parse(text);
   } catch (e) {
-    return CORRUPT;
+    return CORRUPT; // invalid UTF-8 (TypeError) or invalid JSON (SyntaxError)
   }
   if (typeof d !== 'object' || d === null || Array.isArray(d)) return CORRUPT;
   const r = d.reserved;
@@ -377,23 +387,53 @@ function _hasTerminal(home, aid) {
 // proven absent -- ENOENT -- still contributes 0, as before.) `admit`/`grant` additionally refuse
 // outright while any activity is unmeasurable (see `_accountingUncertain`), since a max-liability
 // guess is a floor for the charge, not a measurement.
-function _charge(home) {
+//
+// Codex R5 B1+I3 / Rulings 49+50: ONE accounting snapshot. `_charge` and `_accountingUncertain`
+// used to rescan the filesystem separately, so a staged transition (an activity unmeasurable
+// during one scan, measurable during the other) let a decision combine the 4 MiB fallback from
+// one scan with `uncertain:false` from the other. And both iterated the LOSSY
+// `paths.listOwnedSubdirs`, which silently dropped a UUID-shaped root entry whose lstat failed
+// with a non-ENOENT error (Codex injected EIO on one of 16 x 4 MiB settled -> charge 60 MiB,
+// `uncertain:false`, admitted, restore -> 67,170,304 bytes > ceiling). `_accountingSnapshot`
+// below is the single implementation: one detailed root enumeration (root uncertainty folds in;
+// every activity-shaped entry refused for a reason other than 'gone' is charged its maximum
+// liability, and a root that exists but cannot be listed at all floors the charge at the
+// ceiling), one ledger pass (corrupt -> max liability), and EXACTLY ONE
+// `statOwnedSegmentsDetailed` per listed activity. `admit`/`grant` consume `charge`, `corrupt`
+// and `uncertain` from the SAME snapshot; `_charge`/`_accountingUncertain` are thin wrappers
+// kept for their callers/tests.
+function _accountingSnapshot(home) {
   const base = path.dirname(paths.quotaDir(home));
+  const root = paths.listOwnedSubdirsDetailed(base);
+  let uncertain = Boolean(root.uncertain);
   const sizes = new Map();
-  for (const name of paths.listOwnedSubdirs(base)) {
+  for (const name of root.subdirs) {
     if (name === 'quota') continue;
     const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
     let size = 0;
     for (const seg of scan.entries) size += seg.size;
-    sizes.set(name, scan.uncertain ? Math.max(size, PER_ACTIVITY_CAP) : size);
+    if (scan.uncertain) { uncertain = true; size = Math.max(size, PER_ACTIVITY_CAP); }
+    sizes.set(name, size);
   }
   let total = 0;
   for (const size of sizes.values()) total += size;
+  let hidden = 0; // activity-shaped root entries refused (not proven gone): max liability each
+  for (const rj of root.rejected) {
+    if (rj.reason === 'gone') continue;
+    hidden += 1;
+    total += PER_ACTIVITY_CAP;
+  }
+  if (root.uncertain && hidden === 0) total = Math.max(total, CEILING); // base itself unlistable
+  let corrupt = false;
   for (const [aid, e] of _ledgerEntries(home)) {
-    if (e === CORRUPT) { total += PER_ACTIVITY_CAP; continue; }
+    if (e === CORRUPT) { corrupt = true; total += PER_ACTIVITY_CAP; continue; }
     total += Math.max(0, e.reserved + e.granted - (sizes.get(aid) || 0));
   }
-  return total;
+  return { charge: total, uncertain, corrupt };
+}
+
+function _charge(home) {
+  return _accountingSnapshot(home).charge;
 }
 
 // spec §7: whether ANY ledger entry is currently untrustworthy. Used to fail-closed refuse new
@@ -402,18 +442,15 @@ function _hasCorrupt(home) {
   return _ledgerEntries(home).some(([, e]) => e === CORRUPT);
 }
 
-// Ruling 45: whether ANY committed activity's bytes are currently unmeasurable (its dir exists
-// but cannot be validated/listed, or an entry's lstat was refused). While this stands `admit` and
-// `grant` refuse best-effort, exactly like `_hasCorrupt` (no throw; bounded warn; sync itself is
-// unaffected) -- an admission decided against a guessed floor could still overrun the ceiling
-// once the bytes become measurable again. A dir proven absent (ENOENT) is NOT uncertain.
+// Ruling 45 / Ruling 49: whether ANY committed activity's bytes are currently unmeasurable (its
+// dir exists but cannot be validated/listed, an entry's lstat was refused, or the Activity root
+// itself hid an activity-shaped entry). While this stands `admit` and `grant` refuse best-effort,
+// exactly like `_hasCorrupt` (no throw; bounded warn; sync itself is unaffected) -- an admission
+// decided against a guessed floor could still overrun the ceiling once the bytes become
+// measurable again. A dir proven absent (ENOENT) is NOT uncertain. Thin wrapper over
+// `_accountingSnapshot` (Ruling 50) -- `admit`/`grant` never call this and `_charge` separately.
 function _accountingUncertain(home) {
-  const base = path.dirname(paths.quotaDir(home));
-  for (const name of paths.listOwnedSubdirs(base)) {
-    if (name === 'quota') continue;
-    if (paths.statOwnedSegmentsDetailed(path.join(base, name)).uncertain) return true;
-  }
-  return false;
+  return _accountingSnapshot(home).uncertain;
 }
 
 // Best-effort delegation to the Python prune entrypoint, via whichever runner is currently
@@ -479,24 +516,20 @@ function admit(home, activityId, lease) {
   let fd = null;
   try {
     fd = _quotaLock(home);
-    let charge = _charge(home);
-    let corrupt = _hasCorrupt(home);
-    let uncertain = _accountingUncertain(home);
-    if (corrupt || uncertain || charge + RESERVE > CEILING) {
-      const headroom = Math.max(RESERVE, charge + RESERVE - CEILING);
+    let snap = _accountingSnapshot(home); // Ruling 50: ONE snapshot per decision
+    if (snap.corrupt || snap.uncertain || snap.charge + RESERVE > CEILING) {
+      const headroom = Math.max(RESERVE, snap.charge + RESERVE - CEILING);
       _unlock(fd);
       fd = null;
       _spawnPythonPrune(home, headroom); // release -> spawn -> (below) re-acquire -> re-evaluate
       fd = _quotaLock(home);
-      charge = _charge(home);
-      corrupt = _hasCorrupt(home);
-      uncertain = _accountingUncertain(home);
+      snap = _accountingSnapshot(home); // FRESH unified snapshot -- never mixed with the first
     }
-    if (uncertain) {
-      _warn('quota: an activity directory is unmeasurable (unlistable); refusing admission (Ruling 45)');
+    if (snap.uncertain) {
+      _warn('quota: an activity directory is unmeasurable (unlistable); refusing admission (Ruling 45/49)');
       return false; // best-effort refuse, same outcome path as a corrupt ledger entry
     }
-    if (corrupt || charge + RESERVE > CEILING) {
+    if (snap.corrupt || snap.charge + RESERVE > CEILING) {
       return false; // best-effort refuse
     }
     _writeEntry(home, activityId, RESERVE, 0); // durable
@@ -514,12 +547,13 @@ function grant(home, activityId, nbytes) {
   let fd = null;
   try {
     fd = _quotaLock(home);
-    if (_hasCorrupt(home)) return false;
-    if (_accountingUncertain(home)) return false; // Ruling 45: unmeasurable bytes -> refuse, like corrupt
+    const snap = _accountingSnapshot(home); // Ruling 50: ONE snapshot per decision
+    if (snap.corrupt) return false;
+    if (snap.uncertain) return false; // Ruling 45/49: unmeasurable bytes -> refuse, like corrupt
     const e = _readEntry(paths.ledgerEntryPath(home, activityId));
     if (e === CORRUPT) return false;
     if (e.granted + nbytes > ORDINARY_CAP) return false; // per-activity cap
-    if (_charge(home) + nbytes > CEILING) return false; // global ceiling
+    if (snap.charge + nbytes > CEILING) return false; // global ceiling
     _writeEntry(home, activityId, e.reserved, e.granted + nbytes); // durable BEFORE append
     return true;
   } catch (e) {
@@ -664,7 +698,7 @@ module.exports = {
   configurePythonRunner,
   _quotaLock, _quotaLockNonblocking, _unlock,
   _parseEntry, _readEntry, _writeEntry,
-  _committed, _onDisk, _ledgerEntries, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
+  _committed, _onDisk, _ledgerEntries, _accountingSnapshot, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
   _spawnPythonPrune, _spawnPythonRetain,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },
