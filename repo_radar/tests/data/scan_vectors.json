@@ -190,5 +190,43 @@
       ],
       "cancel_requested": false
     }
+  },
+  {
+    "name": "utf8-bom-terminal-line",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "bytes_b64": "eyJzY2hlbWFfdmVyc2lvbiI6IDEsICJhY3Rpdml0eV9pZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDAiLCAidHlwZSI6ICJzdGFydCIsICJzZXEiOiAwLCAidHMiOiAiMjAyNi0wOC0xNFQwMDowMDowMC0wNzowMCIsICJraW5kIjogInN5bmMiLCAiY2hhbm5lbCI6ICJzdGFibGUiLCAidHJpZ2dlciI6ICJjbGkiLCAiY3JlYXRlZF9ieSI6ICJweXRob24ifQrvu797InNjaGVtYV92ZXJzaW9uIjogMSwgImFjdGl2aXR5X2lkIjogIjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMCIsICJ0eXBlIjogInRlcm1pbmFsIiwgInNlcSI6IDEsICJ0cyI6ICIyMDI2LTA4LTE0VDAwOjAwOjAwLTA3OjAwIiwgIm91dGNvbWUiOiAic3VjY2VlZGVkIiwgInN1bW1hcnkiOiB7fSwgImJ5IjogImRlYWRiZWVmIn0K"
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [
+        "corrupt-record"
+      ],
+      "cancel_requested": false
+    }
+  },
+  {
+    "name": "utf16le-terminal-line",
+    "segments": [
+      {
+        "name": "python-deadbeef.jsonl",
+        "bytes_b64": "eyJzY2hlbWFfdmVyc2lvbiI6IDEsICJhY3Rpdml0eV9pZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDAiLCAidHlwZSI6ICJzdGFydCIsICJzZXEiOiAwLCAidHMiOiAiMjAyNi0wOC0xNFQwMDowMDowMC0wNzowMCIsICJraW5kIjogInN5bmMiLCAiY2hhbm5lbCI6ICJzdGFibGUiLCAidHJpZ2dlciI6ICJjbGkiLCAiY3JlYXRlZF9ieSI6ICJweXRob24ifQp7ACIAcwBjAGgAZQBtAGEAXwB2AGUAcgBzAGkAbwBuACIAOgAgADEALAAgACIAYQBjAHQAaQB2AGkAdAB5AF8AaQBkACIAOgAgACIAMAAwADAAMAAwADAAMAAwAC0AMAAwADAAMAAtADQAMAAwADAALQA4ADAAMAAwAC0AMAAwADAAMAAwADAAMAAwADAAMAAwADAAIgAsACAAIgB0AHkAcABlACIAOgAgACIAdABlAHIAbQBpAG4AYQBsACIALAAgACIAcwBlAHEAIgA6ACAAMQAsACAAIgB0AHMAIgA6ACAAIgAyADAAMgA2AC0AMAA4AC0AMQA0AFQAMAAwADoAMAAwADoAMAAwAC0AMAA3ADoAMAAwACIALAAgACIAbwB1AHQAYwBvAG0AZQAiADoAIAAiAHMAdQBjAGMAZQBlAGQAZQBkACIALAAgACIAcwB1AG0AbQBhAHIAeQAiADoAIAB7AH0ALAAgACIAYgB5ACIAOgAgACIAZABlAGEAZABiAGUAZQBmACIAfQAK"
+      }
+    ],
+    "expected": {
+      "record_count": 1,
+      "types": [
+        "start"
+      ],
+      "findings": [
+        "corrupt-record"
+      ],
+      "cancel_requested": false
+    }
   }
 ]

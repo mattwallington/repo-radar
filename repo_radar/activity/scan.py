@@ -52,14 +52,26 @@ def _classify_line(line, aid):
     """Best-effort per-line classification for the structural `findings` pass -- NOT a security
     boundary; the actual v1 admission verdict is always `records.parse_valid`, called below
     regardless. Returns a valid record dict, `_UNSUPPORTED`, or `None` (any other rejection:
-    malformed JSON, non-dict JSON, wrong activity_id, missing/invalid fields, bad enum, ...)."""
+    malformed JSON, non-dict JSON, wrong activity_id, missing/invalid fields, bad enum, ...).
+
+    Ruling 51 (Codex R5-2, BLOCKER): `line` is decoded STRICT UTF-8 (never `utf-8-sig`) BEFORE any
+    JSON probe, including the unsupported-schema detection below -- `json.loads(bytes)` otherwise
+    auto-detects UTF-16/32 and silently accepts/strips a BOM, so a UTF-16LE- or BOM-prefixed line
+    could parse as a well-formed `{"schema_version": 1, ...}` object here and get misclassified as
+    a valid record (or, for a non-1 schema_version, `unsupported-schema`) instead of the
+    `corrupt-record` both this line and Node's reader must agree on. A decode failure is corrupt,
+    full stop, never routed through the schema-version probe."""
     try:
-        obj = json.loads(line, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
+        text = line.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return None
+    try:
+        obj = json.loads(text, parse_constant=lambda _c: (_ for _ in ()).throw(ValueError("non-finite")))
     except Exception:
         obj = None
     if isinstance(obj, dict) and obj.get("schema_version") != records.SCHEMA_VERSION:
         return _UNSUPPORTED
-    return records.parse_valid(line, aid)
+    return records.parse_valid(text, aid)
 
 def parse_segment_bytes(data, aid):
     """Pure per-segment parser (the Python mirror of parse.js `parseSegment`): raw segment bytes

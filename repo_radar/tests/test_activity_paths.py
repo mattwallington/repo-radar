@@ -1,8 +1,11 @@
-import os, stat
+import errno, os, stat
 import pytest
 from repo_radar.activity import paths
 
 VALID = "00000000-0000-4000-8000-000000000000"
+AID_A = "00000000-0000-4000-8000-0000000000aa"
+AID_B = "00000000-0000-4000-8000-0000000000bb"
+AID_C = "00000000-0000-4000-8000-0000000000cc"
 
 def test_activity_dir_rejects_bad_id(tmp_path):
     with pytest.raises(paths.UnsafePath):
@@ -246,3 +249,101 @@ def test_read_owned_segments_is_a_thin_wrapper_over_detailed(tmp_path):
     d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
     (d / "python-deadbeef.jsonl").write_bytes(b"x\n")
     assert paths.read_owned_segments(d) == paths.read_owned_segments_detailed(d)[0]
+
+# --- Ruling 49 (Codex R5-1, BLOCKER): list_owned_subdirs_detailed classifies, never silently
+# drops, a valid-activity-id entry that isn't a plain lstat-able directory --------------------
+
+def test_list_owned_subdirs_detailed_classifies_symlink_and_not_directory(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))                   # base + quota/ exist
+    real = paths.activity_dir(tmp_path, AID_A); paths.secure_mkdir(real)
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, base / AID_B)                                # AID_B: symlink
+    (base / AID_C).write_bytes(b"not a directory")                   # AID_C: regular file
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    assert set(subdirs) == {"quota", AID_A}
+    assert dict(rejected) == {AID_B: "symlink", AID_C: "not-directory"}
+    assert uncertain is True
+
+def test_list_owned_subdirs_detailed_gone_entry_is_rejected_but_not_uncertain(tmp_path, monkeypatch):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, AID_A))
+    real_lstat = paths.os.lstat
+    def hooked(name, dir_fd=None):
+        if name == AID_A:
+            raise OSError(errno.ENOENT, "raced away")
+        return real_lstat(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "lstat", hooked)
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    assert AID_A not in subdirs
+    assert (AID_A, "gone") in rejected
+    assert uncertain is False                     # ENOENT is proven-gone, never uncertain
+
+def test_list_owned_subdirs_detailed_stat_failure_is_uncertain_not_gone(tmp_path, monkeypatch):
+    # Codex R5-1's exact defect: an lstat failure OTHER than ENOENT (e.g. EIO) previously vanished
+    # the entry from the enumeration entirely -- quota's accounting never even reached
+    # `stat_owned_segments_detailed` for it, undercounting the charge instead of refusing.
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, AID_A))
+    real_lstat = paths.os.lstat
+    def hooked(name, dir_fd=None):
+        if name == AID_A:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "lstat", hooked)
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    assert AID_A not in subdirs
+    assert (AID_A, "stat-failed") in rejected
+    assert uncertain is True
+
+def test_list_owned_subdirs_detailed_denied_entry_is_uncertain(tmp_path, monkeypatch):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, AID_A))
+    real_lstat = paths.os.lstat
+    def hooked(name, dir_fd=None):
+        if name == AID_A:
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_lstat(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "lstat", hooked)
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    assert AID_A not in subdirs
+    assert (AID_A, "denied") in rejected
+    assert uncertain is True
+
+def test_list_owned_subdirs_detailed_base_missing_is_not_uncertain(tmp_path):
+    base = paths.quota_dir(tmp_path).parent            # the "activity" dir path, never created
+    base.parent.mkdir(parents=True)                     # the shared "repo-radar" prefix DOES exist
+    assert paths.list_owned_subdirs_detailed(base) == ([], [], False)
+
+def test_list_owned_subdirs_detailed_symlinked_base_is_uncertain(tmp_path):
+    import shutil
+    d = paths.activity_dir(tmp_path, VALID); paths.secure_mkdir(d)
+    outside = tmp_path / "outside"; outside.mkdir()
+    activity_root = paths.quota_dir(tmp_path).parent
+    shutil.rmtree(activity_root)
+    os.symlink(outside, activity_root)                  # base itself is a symlink
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(activity_root)
+    assert subdirs == [] and rejected == [] and uncertain is True
+
+def test_list_owned_subdirs_is_a_thin_wrapper_over_detailed(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, VALID))
+    assert paths.list_owned_subdirs(base) == paths.list_owned_subdirs_detailed(base)[0]
+
+def test_list_owned_subdirs_detailed_ignores_non_uuid_names_in_rejected(tmp_path):
+    # a stray non-UUID file/symlink at the root (e.g. `.DS_Store`, junk) is simply invisible to
+    # `subdirs`/`rejected` -- it never hid a real activity's bytes, so it must not manufacture
+    # `uncertain=True` or show up in `rejected`.
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    (base / "junk").write_bytes(b"not an activity")
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, base / "also-junk")
+    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    assert set(subdirs) == {"quota"}
+    assert rejected == []
+    assert uncertain is False

@@ -123,7 +123,22 @@ def parse_valid(raw, expected_activity_id):
     is a SUPPORTED v1 record FOR the expected activity with valid base metadata, required fields,
     AND type-specific enums. Anything else → None. A stray/nested/foreign/malformed `terminal`
     (wrong outcome, wrong activity_id, unsupported schema, missing field) therefore never counts,
-    so it cannot settle, finalize, or make an activity prunable."""
+    so it cannot settle, finalize, or make an activity prunable.
+
+    Ruling 51 (Codex R5-2, BLOCKER): `json.loads(bytes)` auto-detects UTF-16/32 and silently
+    accepts (and strips) a leading UTF-8 BOM, per the JSON RFC's encoding-detection recommendation
+    -- so a UTF-16LE- or BOM-prefixed terminal line was accepted by Python while Node's reader
+    (fatal on non-UTF-8, and never BOM-aware) rejected the SAME bytes as `corrupt-record`. `raw`
+    is decoded STRICT UTF-8 first when it's bytes (NOT `utf-8-sig`, which would strip a BOM and
+    keep accepting it) -- a `UnicodeDecodeError` (any non-UTF-8 byte sequence, including UTF-16/32)
+    is rejected outright. A `str` input already decoded elsewhere is used as-is: `json.loads` on a
+    string with a literal leading U+FEFF (what strict UTF-8 decoding of a BOM-prefixed line leaves
+    behind) already raises on its own, matching Node's BOM rejection without any extra check here."""
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return None
     try:
         # parse_constant rejects NaN/Infinity/-Infinity, which Python's json would otherwise
         # accept but Node's JSON.parse rejects — keeping the two parsers in agreement (Round-6 #2)

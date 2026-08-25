@@ -147,6 +147,20 @@ def test_build_rejects_non_dict_fields():
     with pytest.raises(R.InvalidRecord):
         R.build("event", seq=0, activity_id=AID, level="info", event="x", fields=5)
 
+def test_parse_valid_rejects_utf8_bom_prefixed_bytes():   # Ruling 51 (Codex R5-2, BLOCKER)
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"terminal","seq":9,'
+           '"ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded","summary":{},'
+           '"by":"deadbeef"}') % AID
+    assert R.parse_valid(raw.encode("utf-8"), AID) is not None          # plain UTF-8: unchanged
+    bom_prefixed = b"\xef\xbb\xbf" + raw.encode("utf-8")
+    assert R.parse_valid(bom_prefixed, AID) is None                     # BOM-prefixed: rejected
+
+def test_parse_valid_rejects_utf16le_encoded_bytes():      # Ruling 51 (Codex R5-2, BLOCKER)
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"terminal","seq":9,'
+           '"ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded","summary":{},'
+           '"by":"deadbeef"}') % AID
+    assert R.parse_valid(raw.encode("utf-16-le"), AID) is None
+
 def test_build_rejects_nested_field_values():
     """Nested dicts/lists in fields should raise InvalidRecord (not stringify)."""
     with pytest.raises(R.InvalidRecord):

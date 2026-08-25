@@ -1,4 +1,5 @@
 import fcntl, json, os, stat, time
+from dataclasses import dataclass
 from repo_radar.activity import paths, records, ids
 from repo_radar.activity import scan as scan_mod
 from repo_radar.activity import lease as lease_mod
@@ -45,9 +46,17 @@ def _unlock(fd):
 
 def _parse_entry(data):
     """Validate the ledger's FULL invariant (Round-3/6 #6/#5): counters must be EXACT non-boolean
-    ints (strings/floats → CORRUPT), `reserved` exactly RESERVE, `granted >= 0`, total ≤ cap."""
+    ints (strings/floats → CORRUPT), `reserved` exactly RESERVE, `granted >= 0`, total ≤ cap.
+
+    Ruling 52 (Codex R5-4, IMPORTANT): `data` is decoded STRICT UTF-8 first, exactly like
+    `records.parse_valid` (Ruling 51) -- `json.loads(bytes)` auto-detects UTF-16/32 and silently
+    accepts (and strips) a UTF-8 BOM, so a UTF-16LE- or BOM-prefixed ledger file was accepted by
+    Python here while Node's reader (lossy the other way) disagreed. A `UnicodeDecodeError` falls
+    through to the same broad `except Exception: CORRUPT` as any other malformed entry -- the
+    existing fail-closed sentinel, unchanged."""
     try:
-        d = json.loads(data)
+        text = data.decode("utf-8", "strict") if isinstance(data, (bytes, bytearray)) else data
+        d = json.loads(text)
         r, g = d["reserved"], d["granted"]
         if isinstance(r, bool) or isinstance(g, bool) or not isinstance(r, int) or not isinstance(g, int):
             return "CORRUPT"
@@ -180,22 +189,51 @@ def _on_disk(home, aid):
     """Thin wrapper over `_on_disk_detailed` (Ruling 45): unchanged shape/behavior."""
     return _on_disk_detailed(home, aid)[0]
 
-def _committed_detailed(home):
-    """(bytes, uncertain_aids) companion to `_committed` (Ruling 45): `bytes` is the REAL
-    measured total across every activity directory (settled or live) -- no max-liability
-    substitution. `uncertain_aids` is the set of activity-id directory names that couldn't be
-    fully validated/listed/stat'd this pass."""
+def _sized_subdirs(home):
+    """ONE root-enumeration + per-activity stat pass (Ruling 49/50), shared by
+    `_accounting_snapshot` and `_committed_detailed` so neither maintains its own independent copy
+    of "list subdirs, skip quota/, stat each one, fold in whatever's uncertain". Root enumeration
+    goes through `paths.list_owned_subdirs_detailed` (Ruling 49) so a hidden/unmeasurable
+    activity-id entry at the ROOT level (EIO, EACCES, a symlink or file squatting on the name)
+    folds into `uncertain_names` here too, not just a per-activity directory's own stat failure --
+    a root-rejected entry never even reaches `sizes` (it was never a listable, stat-able directory
+    this pass), so `_accounting_snapshot` below must treat it exactly like a directory whose OWN
+    `stat_owned_segments_detailed` came back uncertain: `name in uncertain_names` with NO entry in
+    `sizes` (measured baseline 0) still gets the max-liability charge, never silently 0.
+
+    Returns `(sizes, uncertain, uncertain_names)`:
+      sizes -- {name: REAL measured bytes}, for names whose directory WAS actually listed/stat'd
+        this pass -- no max-liability substitution (that's `_accounting_snapshot`'s job).
+      uncertain -- True iff the root enumeration itself was uncertain (couldn't validate/list the
+        base), OR any name in `uncertain_names` below is non-empty.
+      uncertain_names -- every activity-id whose bytes couldn't be fully measured this pass: a
+        per-activity directory whose `stat_owned_segments_detailed` came back uncertain, UNION a
+        root-level entry rejected for any reason other than 'gone' (ENOENT -- proven absent, never
+        uncertain). Kept for `_committed_detailed`'s established (bytes, uncertain_aids) shape."""
     base = paths.quota_dir(home).parent
-    total = 0
-    uncertain_aids = set()
-    for name in paths.list_owned_subdirs(base):    # dir-fd-safe subdir names (Round-4 #3)
+    subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
+    sizes = {}
+    uncertain_names = set()
+    for name in subdirs:
         if name == "quota":
             continue
-        entries, uncertain = paths.stat_owned_segments_detailed(base / name)
-        total += sum(sz for _n, sz in entries)
-        if uncertain:
-            uncertain_aids.add(name)
-    return total, uncertain_aids
+        entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
+        sizes[name] = sum(sz for _n, sz in entries)
+        if dir_uncertain:
+            uncertain_names.add(name)
+    for name, reason in rejected:
+        if reason != "gone":                # ENOENT alone is proven absent -- 0 bytes, not uncertain
+            uncertain_names.add(name)
+    return sizes, root_uncertain or bool(uncertain_names), uncertain_names
+
+def _committed_detailed(home):
+    """(bytes, uncertain_aids) companion to `_committed` (Ruling 45/49): `bytes` is the REAL
+    measured total across every activity directory (settled or live) -- no max-liability
+    substitution. `uncertain_aids` is the set of activity-id directory names that couldn't be
+    fully validated/listed/stat'd this pass. Thin wrapper over the shared `_sized_subdirs` single-
+    pass primitive (Ruling 50) that `_accounting_snapshot` also uses."""
+    sizes, _uncertain, uncertain_names = _sized_subdirs(home)
+    return sum(sizes.values()), uncertain_names
 
 def _committed(home):
     """Thin wrapper over `_committed_detailed` (Ruling 45): unchanged shape/behavior."""
@@ -217,47 +255,57 @@ def _ledger_entries(home):
             out.append((aid, _read_entry(paths.ledger_entry_path(home, aid))))
     return out
 
-def _charge(home):
-    """Codex R2 fix (fix-review round 2 BLOCKER): SINGLE fstat scan per activity, reused for
-    BOTH the committed sum and the per-entry outstanding term. The prior version called
-    _committed(home) (one scan of every activity's segments) and then, separately, this
-    function's own _on_disk(home, aid) (a SECOND scan of just aid's segments) — two scans of the
-    SAME activity at two DIFFERENT times. A concurrent writer's append (writers release
-    quota.lock before appending, per the module's lifecycle) landing between those two scans was
-    excluded from `committed` (scanned before the append) AND subtracted out of `outstanding` via
-    the stale-vs-fresh mismatch in _on_disk (scanned after) — a double-miss undercount (measured
-    repro: charged 61940 vs true 62120). Scanning each activity exactly once and reusing that one
-    value for both terms makes an append either fully counted (both terms see the post-append
-    size) or fully deferred to the NEXT _charge() call (both terms see the pre-append size) — it
-    can never be split across the two. Per-activity result is always max(size, reserved+granted),
-    the same conservative liability as before non-interleaved — never an undercount. Still
-    fstat-only (finding 7/I7): never reads segment CONTENT here.
+@dataclass
+class Snapshot:
+    """The unified accounting read (Ruling 50 / Codex R5-3, IMPORTANT): `charge` and `uncertain`
+    as computed from the SAME single filesystem+ledger pass. See `_accounting_snapshot` below."""
+    charge: int
+    uncertain: bool
 
-    Ruling 45 (Codex R4 B1, BLOCKER): a directory that EXISTS but can't be measured this pass
-    (`paths.stat_owned_segments_detailed`'s `uncertain`) used to contribute its bare (possibly 0,
-    possibly partial) measured bytes here -- exactly the Ruling-40 undercount one level up (Codex
-    repro: 16 x 4 MiB settled, chmod 000 one dir -> charge drops to 60 MiB -> a reservation is
-    wrongly admitted -> restore -> 67,170,304 bytes on disk, over the ceiling). Such a directory
-    is now charged its MAXIMUM liability, max(measured, PER_ACTIVITY_CAP) -- the same
-    max-liability rule a torn/corrupt ledger entry already gets below, and max(...) (not a flat
-    replace) so any bytes that WERE provable before the failure are never discarded even if they
-    somehow exceed the cap. A directory PROVEN absent (FileNotFoundError) still contributes 0, as
-    before. `admit`/`grant` additionally refuse outright while ANY activity is unmeasurable (see
-    `_accounting_uncertain`), since a max-liability guess is a floor for the charge, not a
-    trustworthy measurement to admit new liability against."""
-    base = paths.quota_dir(home).parent
-    sizes = {}
-    for name in paths.list_owned_subdirs(base):
-        if name == "quota":
-            continue
-        entries, uncertain = paths.stat_owned_segments_detailed(base / name)
-        size = sum(sz for _n, sz in entries)
-        sizes[name] = max(size, PER_ACTIVITY_CAP) if uncertain else size
-    total = sum(sizes.values())
+def _accounting_snapshot(home):
+    """Codex R2 fix (fix-review round 2 BLOCKER) + Ruling 45 (Codex R4 B1) + Ruling 50 (Codex R5-3,
+    IMPORTANT), now unified into ONE pass. Pre-R5-3, `_charge` and `_accounting_uncertain` were
+    each their OWN independent full scan (root enumeration + one `stat_owned_segments_detailed`
+    per activity); `admit`/`grant` called them back-to-back. A directory's measurability could
+    change BETWEEN those two independent scans, combining a max-liability fallback charge from
+    ONE scan with an `uncertain=False` verdict from the OTHER, later scan of the same moment --
+    admitting on a charge/uncertainty pair that never coexisted in reality. This function is now
+    the SINGLE source both `_charge` and `_accounting_uncertain` (thin wrappers below) read from,
+    and `admit`/`grant` call it exactly once per decision (never `_charge`+`_accounting_uncertain`
+    separately), so the two numbers are always a matched pair from one instant.
+
+    Root enumeration is `paths.list_owned_subdirs_detailed` (Ruling 49): its own `uncertain` folds
+    into this snapshot's `uncertain` up front (a hidden/unmeasurable activity-id entry at the ROOT
+    level must refuse exactly like an unmeasurable per-activity directory does). Each activity
+    directory is `stat_owned_segments_detailed`'d EXACTLY ONCE via the shared `_sized_subdirs`
+    primitive -- kept as its own patchable seam for existing hook-based tests (mid-scan-append
+    undercount, etc.) that monkeypatch `paths.stat_owned_segments_detailed` directly. An uncertain
+    activity contributes its MAXIMUM liability, max(measured, PER_ACTIVITY_CAP) -- the same
+    max-liability rule a torn/corrupt ledger entry gets below, and max(...) (not a flat replace) so
+    any bytes that WERE provable before the failure are never discarded even if they somehow
+    exceed the cap. A ROOT-rejected entry (Ruling 49: never even reached `sizes`, e.g. an EIO'd
+    lstat) gets the SAME treatment with a measured baseline of 0 -- i.e. flatly PER_ACTIVITY_CAP --
+    so it can never silently vanish from the charge the way it did pre-fix (Codex repro: charge
+    drops to 60 MiB with `uncertain=False`, a reservation wrongly admitted). Ledger entries are
+    read once via `_ledger_entries`; a CORRUPT entry still contributes its own PER_ACTIVITY_CAP max
+    liability exactly once, unchanged from before. `admit`/`grant` additionally refuse outright
+    while `snap.uncertain` (a max-liability guess is a floor for the charge, not a trustworthy
+    measurement to admit new liability against)."""
+    sizes, uncertain, uncertain_names = _sized_subdirs(home)
+    charged_sizes = {
+        name: (max(sizes.get(name, 0), PER_ACTIVITY_CAP) if name in uncertain_names else sizes[name])
+        for name in set(sizes) | uncertain_names
+    }
+    total = sum(charged_sizes.values())
     for aid, e in _ledger_entries(home):
         total += PER_ACTIVITY_CAP if e == "CORRUPT" \
-            else max(0, e["reserved"] + e["granted"] - sizes.get(aid, 0))
-    return total
+            else max(0, e["reserved"] + e["granted"] - charged_sizes.get(aid, 0))
+    return Snapshot(charge=total, uncertain=uncertain)
+
+def _charge(home):
+    """Thin wrapper over `_accounting_snapshot` (Ruling 50): unchanged shape/behavior, kept for
+    tests/introspection that only need the charge total."""
+    return _accounting_snapshot(home).charge
 
 def _has_corrupt(home):
     # spec §7: whether ANY ledger entry is currently untrustworthy. Used to fail-closed refuse
@@ -265,20 +313,10 @@ def _has_corrupt(home):
     return any(e == "CORRUPT" for _aid, e in _ledger_entries(home))
 
 def _accounting_uncertain(home):
-    """Ruling 45 (Codex R4 B1): whether ANY activity directory's byte accounting is currently
-    untrustworthy -- its directory exists but couldn't be validated/opened/listed, or a contained
-    entry's lstat couldn't be resolved to gone-vs-present this pass. Mirrors `_has_corrupt`'s
-    role: `admit`/`grant` refuse best-effort (no exception, warn once, sync itself proceeds) while
-    it stands -- `_charge`'s max-liability substitution above only bounds the OVERCOUNT floor; it
-    can't prove the ceiling math is safe to admit new liability against. A directory PROVEN
-    absent (FileNotFoundError) is never uncertain."""
-    base = paths.quota_dir(home).parent
-    for name in paths.list_owned_subdirs(base):
-        if name == "quota":
-            continue
-        if paths.stat_owned_segments_detailed(base / name)[1]:
-            return True
-    return False
+    """Thin wrapper over `_accounting_snapshot` (Ruling 45/50): unchanged shape/behavior, kept for
+    tests/introspection that only need the uncertainty flag. See `_accounting_snapshot` for what
+    folds into it -- root-enumeration uncertainty (Ruling 49) and every per-activity directory's."""
+    return _accounting_snapshot(home).uncertain
 
 def admit(home, activity_id, lease):
     fd = None
@@ -287,11 +325,15 @@ def admit(home, activity_id, lease):
         _reconcile_all_locked(home)                            # reconcile BEFORE charge
         if _has_corrupt(home):
             return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
-        if _accounting_uncertain(home):
+        # Ruling 50: ONE unified snapshot -- charge and uncertain are a matched pair from the
+        # SAME pass, never `_charge(home)` and `_accounting_uncertain(home)` as two separate scans.
+        snap = _accounting_snapshot(home)
+        if snap.uncertain:
             return False        # Ruling 45: refuse new admissions while any activity dir is unmeasurable
-        if _charge(home) + RESERVE > CEILING:
-            _prune_locked(home, (_charge(home) + RESERVE) - CEILING)   # prune FIRST
-            if _charge(home) + RESERVE > CEILING:
+        if snap.charge + RESERVE > CEILING:
+            _prune_locked(home, (snap.charge + RESERVE) - CEILING)   # prune FIRST
+            snap = _accounting_snapshot(home)           # FRESH unified snapshot before re-deciding
+            if snap.uncertain or snap.charge + RESERVE > CEILING:
                 return False                                   # best-effort refuse
         _write_entry(home, activity_id, RESERVE, 0)            # durable, descriptor-relative
         return True
@@ -307,14 +349,16 @@ def grant(home, activity_id, nbytes):
         fd = _quota_lock(home)
         if _has_corrupt(home):
             return False        # spec §7: refuse grants while any corrupt entry stands
-        if _accounting_uncertain(home):
+        # Ruling 50: ONE unified snapshot -- see admit() above for why this must not be two calls.
+        snap = _accounting_snapshot(home)
+        if snap.uncertain:
             return False        # Ruling 45: refuse grants while any activity dir is unmeasurable
         p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
         if e == "CORRUPT":
             return False
         if e["granted"] + nbytes > ORDINARY_CAP:      # per-activity cap
             return False
-        if _charge(home) + nbytes > CEILING:           # global ceiling
+        if snap.charge + nbytes > CEILING:              # global ceiling, from the SAME snapshot
             return False
         _write_entry(home, activity_id, e["reserved"], e["granted"] + nbytes)   # durable BEFORE append
         return True

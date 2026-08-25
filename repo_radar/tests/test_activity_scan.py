@@ -150,6 +150,23 @@ def test_scan_parse_segment_bytes_classifies_invalid_utf8_line_as_corrupt_record
     assert [r["type"] for r in records_out] == ["start"]
     assert findings == [{"kind": scan_mod.CORRUPT_RECORD}]
 
+def test_scan_parse_segment_bytes_classifies_bom_and_utf16_lines_as_corrupt_never_unsupported():
+    # Ruling 51 (Codex R5-2, BLOCKER): `json.loads(bytes)` auto-detects UTF-16/32 and silently
+    # accepts/strips a leading UTF-8 BOM -- so a BOM-prefixed or UTF-16LE-encoded line used to
+    # parse as a well-formed `{"schema_version": 1, ...}` object here (Python accepted it while
+    # Node's reader rejected the SAME bytes). `_classify_line` must decode STRICT UTF-8 BEFORE any
+    # JSON probe, including the unsupported-schema check, so these are always `corrupt-record` --
+    # never misrouted through `unsupported-schema` by a probe that happened to still parse.
+    aid = ids.mint_activity_id()
+    terminal = _line(aid, "terminal", 1, outcome="succeeded", summary={}, by="deadbeef")
+    bom_terminal = b"\xef\xbb\xbf" + terminal.encode("utf-8")
+    utf16_terminal = terminal.encode("utf-16-le")
+    for bad_bytes in (bom_terminal, utf16_terminal):
+        data = _start_line(aid).encode() + b"\n" + bad_bytes + b"\n"
+        records_out, findings = scan_mod.parse_segment_bytes(data, aid)
+        assert [r["type"] for r in records_out] == ["start"]
+        assert findings == [{"kind": scan_mod.CORRUPT_RECORD}]
+
 def test_scan_cancel_requested_only_from_accepted_records(tmp_path):
     aid = ids.mint_activity_id(); _mk(tmp_path, aid)
     _append_raw(tmp_path, aid, "deadbeef", _start_line(aid) + "\n")

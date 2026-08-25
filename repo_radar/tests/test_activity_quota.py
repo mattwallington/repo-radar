@@ -1,7 +1,10 @@
-import json, os
+import base64, errno, json, os, pathlib
 import pytest
 from repo_radar.activity import quota, paths, lease, ids, writer
 from repo_radar.activity import reconcile as reconcile_mod
+
+LEDGER_VECTORS = json.loads(
+    (pathlib.Path(__file__).parent / "data" / "ledger_vectors.json").read_text())
 
 def _mk(tmp_path, aid):
     d = paths.activity_dir(tmp_path, aid); paths.secure_mkdir(d)
@@ -514,3 +517,179 @@ def test_charge_does_not_undercount_terminal_append_landing_mid_scan(tmp_path, m
         f"_charge undercounted a mid-scan terminal append: charged {charge} < true committed {true_committed}"
     assert charge >= quota.RESERVE + 2000, \
         f"_charge undercounted vs the entry's own reservation ceiling: charged {charge} < {quota.RESERVE + 2000}"
+
+# --- R5-1 / Ruling 49 (Codex, BLOCKER): a root-level lstat failure must never vanish an activity
+# from the ceiling -------------------------------------------------------------------------------
+
+def test_root_enumeration_stat_failure_does_not_vanish_from_the_ceiling(tmp_path, monkeypatch):
+    """`paths.list_owned_subdirs` (pre-fix) silently dropped a UUID-shaped root entry whose own
+    `lstat` failed with a non-ENOENT error -- so quota's `_committed_detailed`/`_charge` never
+    even REACHED `stat_owned_segments_detailed` for it: its bytes vanished from the charge
+    entirely, rather than merely being mis-measured. Codex's exact repro: 16 settled x 4 MiB =
+    64 MiB; inject EIO on ONE activity's root-lstat -> charge drops to 60 MiB -> a 60 KiB
+    reservation is wrongly admitted -> restore -> 67,170,304 bytes, over the hard ceiling. This is
+    the root-enumeration counterpart of
+    test_unreadable_activity_directory_does_not_vanish_from_the_ceiling (test_activity_scan.py),
+    which drives the same repro shape at the per-directory-stat layer (Ruling 45) rather than
+    here, at the root-lstat layer (Ruling 49) that feeds it."""
+    monkeypatch.setattr(quota, "RESERVE", 60)
+    monkeypatch.setattr(quota, "PER_ACTIVITY_CAP", 4096)
+    monkeypatch.setattr(quota, "ORDINARY_CAP", 4096 - 60)
+    monkeypatch.setattr(quota, "CEILING", 10 ** 9)          # generous ceiling for this one admit
+
+    live_aid, live_lease = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live_aid, live_lease) is True
+
+    settled_aids = []
+    for _ in range(16):
+        aid = ids.mint_activity_id()
+        paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+        paths.segment_path(tmp_path, aid, "python", "deadbeef").write_bytes(b"x" * 4096)
+        settled_aids.append(aid)
+    broken_aid = settled_aids[0]
+
+    real_charge = 16 * 4096 + quota.RESERVE
+    monkeypatch.setattr(quota, "CEILING", real_charge)      # ceiling now EXACTLY full: zero headroom
+    assert quota._charge(tmp_path) == real_charge
+    assert quota._accounting_uncertain(tmp_path) is False
+
+    real_lstat = paths.os.lstat
+    def hooked(name, dir_fd=None):
+        if name == broken_aid:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_lstat(name, dir_fd=dir_fd)
+    monkeypatch.setattr(paths.os, "lstat", hooked)
+    try:
+        assert quota._accounting_uncertain(tmp_path) is True
+        charge_after = quota._charge(tmp_path)
+        assert charge_after >= quota.CEILING, (
+            f"_charge dropped below the ceiling once a root entry's lstat started failing: "
+            f"{charge_after} < {quota.CEILING}"
+        )
+        fresh_aid, fresh_lease = _new_activity(tmp_path)
+        assert quota.admit(tmp_path, fresh_aid, fresh_lease) is False   # would wrongly succeed pre-fix
+        assert quota.grant(tmp_path, live_aid, 1) is False               # unrelated grant refused too
+    finally:
+        monkeypatch.setattr(paths.os, "lstat", real_lstat)   # restore before any more scans
+
+    assert quota._accounting_uncertain(tmp_path) is False
+    restored_charge = quota._charge(tmp_path)
+    assert restored_charge == real_charge                # recomputed to the exact real total
+    assert restored_charge <= quota.CEILING
+
+    # accounting is trustworthy again -- with a LITTLE headroom, a fresh admission now succeeds
+    monkeypatch.setattr(quota, "CEILING", real_charge + quota.RESERVE)
+    fresh_aid2, fresh_lease2 = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh_aid2, fresh_lease2) is True
+
+# --- R5-3 / Ruling 50 (Codex, IMPORTANT): admit()/grant() must decide from ONE unified snapshot,
+# never `_charge`+`_accounting_uncertain` as two separate scans ---------------------------------
+
+def test_admit_refuses_from_a_single_snapshot_not_two_separate_scans(tmp_path, monkeypatch):
+    """Pre-fix, `admit()` called `_accounting_uncertain(home)` and (if that returned False)
+    `_charge(home)` as two INDEPENDENT filesystem passes over the same activity directories. A
+    directory's measurability could change BETWEEN those two passes, so the `uncertain` verdict
+    and the `charge` total could come from two DIFFERENT moments in time -- a max-liability
+    fallback baked into `charge` by the second pass with nothing telling the caller the accounting
+    had actually gone uncertain by then. This stages exactly that: the hook answers
+    `uncertain=True` the FIRST time this activity's directory is measured, `False` any later time.
+    The decisive assertion isn't just the refusal (a correct implementation refuses either way
+    here) but that it happens from EXACTLY ONE stat call -- proving `admit` never goes on to take
+    a SECOND, later reading of the same directory that could disagree with the first."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release(); quota.settle(tmp_path, aid)          # one settled activity, real bytes on disk
+
+    real = paths.stat_owned_segments_detailed
+    aid_dir = paths.activity_dir(tmp_path, aid)
+    calls = {"n": 0}
+    def hooked(directory, suffix=".jsonl"):
+        entries, _uncertain = real(directory, suffix)
+        if str(directory) == str(aid_dir):
+            calls["n"] += 1
+            return entries, calls["n"] == 1          # True on call #1, False on any later call
+        return entries, _uncertain
+    monkeypatch.setattr(paths, "stat_owned_segments_detailed", hooked)
+
+    fresh, fl = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh, fl) is False   # refused: the single snapshot saw uncertain
+    assert calls["n"] == 1, (
+        f"admit must decide from exactly ONE stat pass per activity (a single unified snapshot), "
+        f"saw {calls['n']} -- a second, later call could observe a DIFFERENT answer than the one "
+        f"the refusal was actually based on"
+    )
+
+def test_admit_charge_and_uncertain_are_a_matched_pair_from_one_reading(tmp_path, monkeypatch):
+    """Complement to the test above, reversed order (False then True): pre-fix, `_accounting_
+    uncertain`'s own (first) scan would see the still-False answer and let admission proceed past
+    it, while `_charge`'s SEPARATE (second) scan -- landing after the simulated transition -- would
+    already see True and silently substitute a PER_ACTIVITY_CAP max-liability guess into the
+    charge, with nothing downstream ever learning the accounting had gone uncertain. Fixed code
+    takes only ONE reading per activity per decision, so `charge` and `uncertain` are always a
+    matched pair -- proven here by the same call-count assertion, independent of hook ordering."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release(); quota.settle(tmp_path, aid)
+
+    real = paths.stat_owned_segments_detailed
+    aid_dir = paths.activity_dir(tmp_path, aid)
+    calls = {"n": 0}
+    def hooked(directory, suffix=".jsonl"):
+        entries, _uncertain = real(directory, suffix)
+        if str(directory) == str(aid_dir):
+            calls["n"] += 1
+            return entries, calls["n"] > 1           # False on call #1, True on any later call
+        return entries, _uncertain
+    monkeypatch.setattr(paths, "stat_owned_segments_detailed", hooked)
+
+    fresh, fl = _new_activity(tmp_path)
+    admitted = quota.admit(tmp_path, fresh, fl)        # outcome must reflect ONLY the single reading
+    assert calls["n"] == 1, (
+        f"admit must never take a SECOND, later reading of the same activity's directory within "
+        f"one decision -- saw {calls['n']} calls"
+    )
+    assert admitted is True, \
+        "the single reading said uncertain=False with tiny real bytes -- admission should proceed"
+
+# --- R5-4 / Ruling 52 (Codex, IMPORTANT): ledger decoding parity with Node -----------------------
+# `data/ledger_vectors.json` is a shared cross-language fixture (a concurrent Node agent drives the
+# same file against its own ledger reader); this file only owns the PYTHON half of the contract.
+
+def test_ledger_vectors_fixture_schema():
+    assert LEDGER_VECTORS, "fixture must not be empty"
+    for case in LEDGER_VECTORS:
+        assert set(case) == {"name", "bytes_b64", "expected"}, case["name"]
+        assert case["expected"] == "corrupt" or set(case["expected"]) == {"reserved", "granted"}, case["name"]
+
+@pytest.mark.parametrize("case", LEDGER_VECTORS, ids=[c["name"] for c in LEDGER_VECTORS])
+def test_ledger_vectors_parse_entry(case):
+    data = base64.b64decode(case["bytes_b64"])
+    result = quota._parse_entry(data)
+    if case["expected"] == "corrupt":
+        assert result == "CORRUPT", case["name"]
+    else:
+        assert result == case["expected"], case["name"]
+
+@pytest.mark.parametrize("case", LEDGER_VECTORS, ids=[c["name"] for c in LEDGER_VECTORS])
+def test_ledger_vectors_read_entry_via_tmp_file(tmp_path, case):
+    # companion drive through `_read_entry` (a real file on disk, descriptor-relative read) rather
+    # than `_parse_entry` directly, proving the decode fix holds through the full read path too.
+    aid = ids.mint_activity_id()
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    p = paths.ledger_entry_path(tmp_path, aid)
+    p.write_bytes(base64.b64decode(case["bytes_b64"]))
+    result = quota._read_entry(p)
+    if case["expected"] == "corrupt":
+        assert result == "CORRUPT", case["name"]
+    else:
+        assert result == case["expected"], case["name"]
+
+def test_ledger_vectors_valid_entry_uses_the_real_reserve_constant():
+    # sanity: the fixture's one "valid" case must actually match the module's live RESERVE value,
+    # not a hardcoded number that could silently drift out of sync with a future RESERVE change.
+    valid_cases = [c for c in LEDGER_VECTORS if c["expected"] != "corrupt"]
+    assert valid_cases, "fixture must contain at least one accepted case"
+    for c in valid_cases:
+        assert c["expected"]["reserved"] == quota.RESERVE, c["name"]

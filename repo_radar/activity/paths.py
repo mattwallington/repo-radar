@@ -333,23 +333,78 @@ def list_owned_entries(directory, suffix=None):
     finally:
         os.close(dfd)
 
-def list_owned_subdirs(base):
-    """Immediate real subdir NAMES of an owned base via a validated dir fd (no symlink follow)."""
+def list_owned_subdirs_detailed(base):
+    """Immediate real subdir NAMES of an owned base via a validated dir fd (no symlink follow),
+    now with a `rejected`/`uncertain` companion (Ruling 49 / Codex R5-1, BLOCKER): a UUID-shaped
+    entry whose `lstat` fails with a non-ENOENT error (EIO, EACCES, ...) -- or that lstat's fine
+    but ISN'T a plain directory (a symlink, or a file/FIFO squatting on the name) -- used to be
+    silently dropped out of the enumeration entirely. Quota's byte accounting only ever reaches
+    `stat_owned_segments_detailed` for names THIS function returns, so a hidden activity directory
+    vanished from the charge completely rather than merely being mis-measured (Codex repro:
+    injected EIO on one of 16 x 4 MiB settled dirs -> charge drops to 60 MiB, `uncertain=False`,
+    a reservation is wrongly admitted, restore -> 67,170,304 bytes on disk, over the ceiling).
+
+    Returns `(subdirs, rejected, uncertain)`:
+      subdirs -- exactly what `list_owned_subdirs` returns: real directory names (no symlinks).
+      rejected -- [(name, reason)] for every VALID-ACTIVITY-ID-shaped entry that ISN'T a plain,
+        lstat-able directory: 'symlink' (lstat resolves to a symlink), 'not-directory' (a regular
+        file/FIFO/etc. squatting on the name), 'denied' (EACCES), 'gone' (ENOENT -- raced away
+        mid-scan, proven gone), or 'stat-failed' (any other lstat OSError, e.g. EIO). A
+        non-UUID-shaped name (e.g. `quota`, stray junk) is never classified here -- callers
+        already filter those out by name, and they can't hide a real activity's bytes.
+      uncertain -- True iff the base itself couldn't be validated/opened/listed (an unsafe or
+        missing-but-not-provably-absent base), OR any valid-activity-id entry was rejected for a
+        reason OTHER than 'gone' (a proven-ENOENT race is not uncertain; anything else leaves
+        that activity's existence/type unproven and must not be treated as "nothing there").
+
+    `list_owned_subdirs` below is the unchanged `[0]` wrapper, preserving its existing signature/
+    behavior for callers that don't need to distinguish "gone" from "uncertain". Every quota
+    enumeration that feeds byte accounting (`_committed_detailed`, `_accounting_snapshot`) uses
+    this detailed form directly so root-level uncertainty folds into the same snapshot as
+    per-activity uncertainty (Ruling 50)."""
     try:
         dfd = open_owned_dir(base)
-    except (UnsafePath, FileNotFoundError):
-        return []
-    out = []
+    except FileNotFoundError:
+        return [], [], False              # base provably never existed -- nothing here to hide
+    except (UnsafePath, OSError):
+        return [], [], True               # base exists but is unsafe/inaccessible -- uncertain
+    subdirs = []
+    rejected = []
+    uncertain = False
     try:
-        for e in os.scandir(dfd):
+        try:
+            entries = list(os.scandir(dfd))
+        except OSError:
+            return [], [], True           # base opened fine but couldn't be listed -- uncertain
+        for e in entries:
             try:
-                if stat.S_ISDIR(os.lstat(e.name, dir_fd=dfd).st_mode):
-                    out.append(e.name)
-            except OSError:                                       # TOCTOU: entry deleted/swapped mid-scan
+                st = os.lstat(e.name, dir_fd=dfd)
+            except OSError as err:
+                if not ids.valid_activity_id(e.name):
+                    continue               # non-UUID name: never hid a real activity's bytes
+                if err.errno == errno.ENOENT:
+                    rejected.append((e.name, "gone"))          # raced away -- proven gone
+                elif err.errno == errno.EACCES:
+                    rejected.append((e.name, "denied")); uncertain = True
+                else:
+                    rejected.append((e.name, "stat-failed")); uncertain = True
                 continue
+            if stat.S_ISDIR(st.st_mode):
+                subdirs.append(e.name)
+            elif ids.valid_activity_id(e.name):
+                if stat.S_ISLNK(st.st_mode):
+                    rejected.append((e.name, "symlink"))
+                else:
+                    rejected.append((e.name, "not-directory"))
+                uncertain = True
     finally:
         os.close(dfd)
-    return out
+    return subdirs, rejected, uncertain
+
+def list_owned_subdirs(base):
+    """Thin `subdirs`-only wrapper over `list_owned_subdirs_detailed` (Ruling 49): unchanged
+    behavior for existing callers that don't need to distinguish "gone" from "uncertain"."""
+    return list_owned_subdirs_detailed(base)[0]
 
 def unlink_owned_tree(activity_dir):
     """Delete every entry in an owned activity dir, then rmdir it — all relative to validated dir
