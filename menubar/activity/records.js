@@ -340,6 +340,148 @@ function _decodeUtf8Fatal(buf) {
   return _FATAL_UTF8.decode(buf);
 }
 
+// G5-Node2: cross-runtime literal-integer enforcement. Python's `int` vs `float` types make
+// `1.0` unambiguously a float, rejected wherever `isinstance(x, int)` is required -- but Node's
+// `JSON.parse` has no int/float distinction (`1.0`, `1e0`, and `1` all become the identical
+// `Number` 1), so without extra work Node silently ACCEPTS a non-integer JSON literal where
+// Python REJECTS it (caught by `ledger-parity.test.js`'s `float-granted` vector: Python's
+// `_parse_entry` -> CORRUPT, Node's old `JSON.parse`-only path -> accepted). Ruling: fail-closed
+// parity -- Node must reject a non-integer literal wherever Python types the field as `int`.
+//
+// Primary path: Node >=21 (verified on this machine's v22.22.2) passes a third `context` argument
+// to the JSON.parse reviver carrying `context.source`, the EXACT source text matched for that
+// value -- `1.0` reports source `"1.0"`, `1e3` reports `"1e3"`, plain `1` reports `"1"`. A value
+// is a strict integer iff its source matches `INT_LITERAL_RE` below (no fraction, no exponent;
+// `-0` DOES match -- Python's `json.loads` also parses a bare `-0` to `int` 0, so keeping Node's
+// `-0` acceptance symmetric is correct, not an oversight).
+//
+// Only a TOP-LEVEL occurrence of an `integerKeys` name is checked -- `fields`/`summary` may
+// legitimately carry a same-named nested key with a real float value (e.g. `fields.seq`), and
+// flagging that would be an over-rejection the Python side never makes. The reviver walks
+// bottom-up, so a pending violation is only confirmed once the FINAL call (key `""`, whose value
+// is the fully-revived root object) lets us compare each candidate's holder against the root by
+// reference -- only holder === root means it was a genuine top-level property, not a nested one.
+//
+// Electron fallback: Electron's Chromium/V8 needs to be >= Chrome 114 (V8 >= 11.4) for
+// `context.source` to exist; this repo's menubar/package.json pins `"electron": "^32.0.0"`
+// (Chromium ~128, comfortably above the threshold), so the reviver path is what actually runs
+// packaged. The fallback below exists for correctness on an older runtime anyway: it re-tokenizes
+// the already-JSON.parse-valid text with a small string/escape-aware state machine, tracks
+// object/array nesting depth, and -- exactly like the reviver's holder check -- only inspects a
+// number token that is the immediate value of an `integerKeys` name found at depth 1 (a direct
+// property of the top-level object). `_reviverSourceProbe` is a mutable module-level function
+// (not an inline const) specifically so a test can stub it to force this path even on a runtime
+// that does support `context.source`, keeping the fallback covered without needing actual old V8.
+const INT_LITERAL_RE = /^-?(0|[1-9]\d*)$/;
+
+let _reviverSourceProbe = function () {
+  let source;
+  try {
+    JSON.parse('{"a":1}', function (k, v, ctx) {
+      if (k === 'a' && ctx && typeof ctx.source === 'string') source = ctx.source;
+      return v;
+    });
+  } catch (e) { /* treated as unsupported below */ }
+  return source === '1';
+};
+
+// Test-only seam (see comment above): overrides the probe used by parseJsonStrictIntegers so a
+// unit test can force the fallback-scan code path deterministically. Not used by any production
+// call site.
+function _setReviverSourceProbeForTests(fn) {
+  const prev = _reviverSourceProbe;
+  _reviverSourceProbe = fn;
+  return prev;
+}
+
+function _strictIntegerReviver(integerKeys) {
+  const keySet = new Set(integerKeys);
+  const pending = []; // {holder, key, source}
+  return function (k, v, ctx) {
+    if (typeof v === 'number' && keySet.has(k)) {
+      const src = ctx && typeof ctx.source === 'string' ? ctx.source : undefined;
+      pending.push({ holder: this, key: k, source: src });
+    }
+    if (k === '') {
+      // Final reviver call: `this` is the synthetic `{ "": rootValue }` wrapper, and `v` here
+      // IS the fully-revived root value -- use `v` as the root reference so only a pending
+      // entry whose holder is literally the root object counts as "top-level".
+      for (const p of pending) {
+        if (p.holder !== v) continue;
+        if (p.source === undefined || !INT_LITERAL_RE.test(p.source)) {
+          throw new InvalidRecord(`non-integer literal for ${JSON.stringify(p.key)}`);
+        }
+      }
+    }
+    return v;
+  };
+}
+
+// Fallback tokenizer: the same permissive JSON token grammar `JSON.parse` has already validated
+// the text against (this function only ever runs on text that just parsed successfully), so a
+// failed/incomplete tokenization here is unreachable in practice -- returning null in that case
+// just skips the extra literal check rather than crashing.
+const _JSON_TOKEN_RE = /"(?:[^"\\]|\\.)*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|[{}[\]:,]|[ \t\r\n]+/y;
+
+function _tokenizeJsonForFallback(text) {
+  const tokens = [];
+  let i = 0;
+  while (i < text.length) {
+    _JSON_TOKEN_RE.lastIndex = i;
+    const m = _JSON_TOKEN_RE.exec(text);
+    if (!m || m.index !== i || m[0].length === 0) return null;
+    if (!/^[ \t\r\n]+$/.test(m[0])) tokens.push(m[0]);
+    i += m[0].length;
+  }
+  return tokens;
+}
+
+// Returns the first offending key name, or null if every top-level (object-nesting-depth-1)
+// occurrence of an `integerKeys` name has a pure-integer literal source.
+function _findTopLevelIntegerViolation(text, integerKeys) {
+  const tokens = _tokenizeJsonForFallback(text);
+  if (tokens === null) return null;
+  const keySet = new Set(integerKeys);
+  let depth = 0;
+  let expectingValueForKey = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === '{' || tok === '[') { depth++; expectingValueForKey = null; continue; }
+    if (tok === '}' || tok === ']') { depth--; expectingValueForKey = null; continue; }
+    if (tok === ':') continue;
+    if (tok === ',') { expectingValueForKey = null; continue; }
+    if (depth === 1 && expectingValueForKey !== null) {
+      const key = expectingValueForKey;
+      expectingValueForKey = null;
+      if (keySet.has(key) && /^-?[0-9]/.test(tok) && !INT_LITERAL_RE.test(tok)) return key;
+      continue;
+    }
+    if (depth === 1 && tok[0] === '"' && tokens[i + 1] === ':') {
+      expectingValueForKey = JSON.parse(tok);
+      continue;
+    }
+  }
+  return null;
+}
+
+// Exported strict-integer JSON parser: identical to `JSON.parse(text)` except any TOP-LEVEL
+// property named in `integerKeys` whose value is a JSON number literal carrying a fraction or
+// exponent (e.g. `1.0`, `1e3`) throws `InvalidRecord` instead of silently returning the collapsed
+// integer `Number`. Used by both `parseValid` (keys `seq`/`schema_version`) and
+// `quota._parseEntry` (keys `reserved`/`granted`) so a non-integer literal is CORRUPT / invalid
+// on Node exactly where Python's `isinstance(x, int)` already rejects it.
+function parseJsonStrictIntegers(text, integerKeys) {
+  if (_reviverSourceProbe()) {
+    return JSON.parse(text, _strictIntegerReviver(integerKeys));
+  }
+  const obj = JSON.parse(text); // malformed JSON -- SyntaxError propagates to the caller, as before
+  const badKey = _findTopLevelIntegerViolation(text, integerKeys);
+  if (badKey !== null) {
+    throw new InvalidRecord(`non-integer literal for ${JSON.stringify(badKey)}`);
+  }
+  return obj;
+}
+
 // Task 2.2b addition: the READ-side counterpart to buildRecord/encodeRecord, needed by
 // reconcile.js's lifecycle checks (_hasStart/_hasTerminal/_cancelRequested parse EXISTING
 // segments rather than building new records). Mirrors `records.parse_valid` -- THE canonical
@@ -361,13 +503,17 @@ function _decodeUtf8Fatal(buf) {
 // Python's `json.loads(bytes)` rejected it (a terminal `succeeded` on Node, `corrupt-record` ->
 // `interrupted` on Python: a cross-language conflict). Invalid UTF-8 is an invalid record. The
 // decoder keeps a leading BOM (`ignoreBOM: true`) so `JSON.parse` rejects it, as Python does.
+//
+// G5-Node2: `seq`/`schema_version` are parsed via `parseJsonStrictIntegers` (not a bare
+// `JSON.parse`) so a non-integer literal (`1.0`, `1e0`) is rejected here, at parse time, instead
+// of silently collapsing to the equal-valued integer the way plain `JSON.parse` would.
 function parseValid(raw, expectedActivityId) {
   let obj;
   try {
     const text = Buffer.isBuffer(raw) ? _decodeUtf8Fatal(raw) : raw;
-    obj = JSON.parse(text);
+    obj = parseJsonStrictIntegers(text, ['seq', 'schema_version']);
   } catch (e) {
-    return null; // invalid UTF-8 (TypeError) or invalid JSON (SyntaxError)
+    return null; // invalid UTF-8 (TypeError), invalid JSON (SyntaxError), or InvalidRecord literal
   }
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
   if (obj.schema_version !== SCHEMA_VERSION || obj.activity_id !== expectedActivityId) return null;
@@ -385,4 +531,5 @@ module.exports = {
   MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
   RecordTooLarge, InvalidRecord,
   buildRecord, encodeRecord, encodedLen, parseValid, decodeUtf8Fatal: _decodeUtf8Fatal,
+  parseJsonStrictIntegers, _setReviverSourceProbeForTests,
 };

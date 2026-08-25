@@ -246,13 +246,18 @@ function _unlock(fd) {
 // failure is CORRUPT. The decoder retains a leading BOM (U+FEFF), which `JSON.parse` rejects --
 // matching Python's "Unexpected UTF-8 BOM" JSONDecodeError. Parity is pinned by
 // `__tests__/ledger-parity.test.js` against the Python-authored `ledger_vectors.json`.
+//
+// G5-Node2: parsed via `records.parseJsonStrictIntegers` (keys `reserved`/`granted`), not a bare
+// `JSON.parse` -- a non-integer literal (`1.0`, `1e3`) throws `InvalidRecord`, caught below and
+// classified CORRUPT, matching Python's `isinstance(v, int)` rejection of the equivalent `float`
+// (fixture case `float-granted` in `ledger_vectors.json`).
 function _parseEntry(dataBuf) {
   let d;
   try {
     const text = Buffer.isBuffer(dataBuf) ? records.decodeUtf8Fatal(dataBuf) : String(dataBuf);
-    d = JSON.parse(text);
+    d = records.parseJsonStrictIntegers(text, ['reserved', 'granted']);
   } catch (e) {
-    return CORRUPT; // invalid UTF-8 (TypeError) or invalid JSON (SyntaxError)
+    return CORRUPT; // invalid UTF-8 (TypeError), invalid JSON (SyntaxError), or non-integer literal
   }
   if (typeof d !== 'object' || d === null || Array.isArray(d)) return CORRUPT;
   const r = d.reserved;

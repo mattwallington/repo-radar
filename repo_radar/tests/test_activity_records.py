@@ -89,8 +89,18 @@ def test_shared_validation_vectors():      # Round-5 #3: same accept/reject case
     import json, pathlib
     V = pathlib.Path(__file__).parent / "data" / "record_validation_vectors.json"
     for case in json.loads(V.read_text()):
-        accepted = R.parse_valid(json.dumps(case["raw"]), case["raw"]["activity_id"]) is not None
-        assert accepted == case["accept"], case.get("why", case["raw"])
+        # G5-Node2: a case whose whole point is a JSON literal's exact spelling (e.g. `seq: 1.0`
+        # vs `1`) can't be represented via `raw` -- re-serializing a *parsed* object loses that
+        # distinction on the Node side (JS has no int/float split, so JSON.stringify(1.0) === "1"
+        # is indistinguishable from a real integer). `raw_text` carries the literal JSON line text
+        # verbatim instead, so both languages' parsers see the exact same source bytes.
+        if "raw_text" in case:
+            raw_text = case["raw_text"]
+            activity_id = json.loads(raw_text)["activity_id"]
+            accepted = R.parse_valid(raw_text, activity_id) is not None
+        else:
+            accepted = R.parse_valid(json.dumps(case["raw"]), case["raw"]["activity_id"]) is not None
+        assert accepted == case["accept"], case.get("why", case.get("raw", case.get("raw_text")))
 
 def test_parse_valid_rejects_non_finite_numbers():   # Round-6 #2 (Node JSON.parse parity)
     raw = ('{"schema_version":1,"activity_id":"%s","type":"event","seq":0,'

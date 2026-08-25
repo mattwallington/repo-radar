@@ -108,7 +108,13 @@ test('cross-language validator parity: record_validation_vectors.json', () => {
   const vectors = require(vectorsPath);
   assert.ok(vectors.length >= 11, `expected at least the 11 original vectors, got ${vectors.length}`);
   for (const v of vectors) {
-    const accepted = records.parseValid(JSON.stringify(v.raw), '00000000-0000-4000-8000-000000000000') !== null;
+    // G5-Node2: a case testing an exact JSON literal spelling (e.g. `seq: 1.0`) uses `raw_text`
+    // (the literal JSON line text) instead of `raw` (a parsed object) -- `JSON.stringify(v.raw)`
+    // can't reproduce a non-integer literal here: `require()`-ing the vectors file already
+    // parsed `1.0` into the plain JS number 1 (JS has no int/float split), so re-stringifying it
+    // would silently emit `"seq":1`, losing the exact case this vector exists to cover.
+    const text = v.raw_text !== undefined ? v.raw_text : JSON.stringify(v.raw);
+    const accepted = records.parseValid(text, '00000000-0000-4000-8000-000000000000') !== null;
     assert.strictEqual(accepted, v.accept, v.why);
   }
 });

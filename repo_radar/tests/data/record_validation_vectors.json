@@ -220,5 +220,15 @@
       "event": "x",
       "fields": {}
     }
+  },
+  {
+    "accept": false,
+    "why": "seq is a non-integer JSON literal (1.0) -- 'raw' (a parsed object) can't represent this: both languages' JSON parsers reconstruct a value from it, and JS's JSON.parse/JSON.stringify round-trip collapses 1.0 to the indistinguishable literal 1, silently losing the case this vector exists to cover. 'raw_text' carries the literal JSON line text verbatim instead so the exact source spelling reaches parse_valid/parseValid unchanged (G5-Node2 cross-runtime literal-integer parity)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1.0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "seq is a non-integer JSON literal via exponent notation (1e0) -- see the 1.0 case above for why 'raw_text' (not 'raw') is used",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1e0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
   }
 ]
