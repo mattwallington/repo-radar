@@ -598,6 +598,13 @@ function _buildItem(home, aid, filter, redactor) {
     incomplete = true;
   } else if (rec.outcome !== null && rec.outcome !== undefined) {
     outcome = String(rec.outcome);
+  } else if ((rec.problems || []).some((p) => p && p.kind === 'reconcile-view-uncertain')) {
+    // View-uncertain (Ruling 38) vs. probe-uncertain (spec §5): a VIEW uncertainty means a
+    // conforming segment or the directory itself could not be read, so whether a terminal exists
+    // is UNPROVEN -- 'running' would assert "no terminal", which we cannot establish here. A
+    // PROBE uncertainty (the `else` branch below, start present, no terminal readable, only
+    // owner liveness unconfirmed) stays 'running' per spec §5.
+    outcome = 'unknown';
   } else {
     outcome = 'running';
   }

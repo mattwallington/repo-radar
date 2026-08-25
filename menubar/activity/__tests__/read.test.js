@@ -995,7 +995,9 @@ test('R2-B1: getActivity over a readable start + unreadable (0o000) succeeded te
     // no owner.lock at all -> the lease is FREE; before Ruling 38 this synthesized `interrupted`.
     const before = fs.readdirSync(A.activityDir(home, aid)).filter((f) => f.endsWith('.jsonl')).sort();
     const item = detail(home, aid);
-    assert.notStrictEqual(item.outcome, 'interrupted');
+    // view-uncertain: the terminal's existence is unproven, so the verdict is 'unknown' (not
+    // 'running', which would assert "no terminal" -- an assertion we can't back up here).
+    assert.strictEqual(item.outcome, 'unknown');
     assert.strictEqual(item.synthesized, false);
     assert.strictEqual(item.incomplete, true);
     assert.ok(item.problems.some((p) => p.kind === 'reconcile-view-uncertain'));
@@ -1005,7 +1007,7 @@ test('R2-B1: getActivity over a readable start + unreadable (0o000) succeeded te
     assert.deepStrictEqual(after, before, 'no new (reconciler) segment may appear');
     const listed = read.listActivities(home);
     assert.strictEqual(listed.incomplete, true);
-    assert.notStrictEqual(listed.items[0].outcome, 'interrupted');
+    assert.strictEqual(listed.items[0].outcome, 'unknown');
 
     fs.chmodSync(hidden, 0o600);
     const restored = detail(home, aid);
@@ -1029,7 +1031,9 @@ test('R2-B1: a conforming terminal segment replaced by a symlink is an uncertain
     fs.symlinkSync(victim, A.segmentPath(home, aid, 'electron', 'cafef00d'));
 
     const item = detail(home, aid);
-    assert.strictEqual(item.outcome, 'running'); // readable start, no readable terminal, verdict withheld
+    // readable start, no readable terminal, verdict withheld: view-uncertain -> 'unknown', not
+    // 'running' -- whether a terminal exists behind the symlink is unproven, not absent.
+    assert.strictEqual(item.outcome, 'unknown');
     assert.strictEqual(item.synthesized, false);
     assert.strictEqual(item.incomplete, true);
     assert.ok(item.problems.some((p) => p.kind === 'reconcile-view-uncertain'));
