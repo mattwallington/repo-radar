@@ -120,42 +120,52 @@ function seedFullLedger(home) {
 // R7-1 / Ruling 60
 // ---------------------------------------------------------------------------------------------
 
-test('Ruling 60: _quotaLock binds the quota dir dev+ino; _lockedQuotaDirIntact is false once it is renamed, recreated, or replaced by a symlink', () => {
+// Codex R8 B1 / Ruling 64: the lock context shape changed from `{ fd, dir, dev, ino }` to
+// `{ fd, dir, ident: {dev,ino}, rootIdent: {dev,ino} }` (identity of `quota/` AND the activity
+// root, both bound), and `_lockedQuotaDirIntact` was replaced by `_verifyCanonical` (checks
+// both). This test's assumptions legitimately changed with it; see codex-r8.test.js for the new
+// pre-wait-window regression coverage.
+test('Ruling 60/64: _quotaLock binds quota-dir + activity-root dev+ino; _verifyCanonical is false once quota/ is renamed, recreated, or replaced by a symlink', () => {
   const home = tmpHome();
   try {
     const qdir = A.quotaDir(home);
+    const rootDir = path.dirname(qdir);
     const ctx = quota._quotaLock(home);
     try {
       const st = fs.lstatSync(qdir);
+      const rst = fs.lstatSync(rootDir);
       assert.strictEqual(ctx.dir, qdir);
-      assert.strictEqual(ctx.dev, st.dev);
-      assert.strictEqual(ctx.ino, st.ino);
+      assert.strictEqual(ctx.ident.dev, st.dev);
+      assert.strictEqual(ctx.ident.ino, st.ino);
+      assert.strictEqual(ctx.rootIdent.dev, rst.dev);
+      assert.strictEqual(ctx.rootIdent.ino, rst.ino);
       assert.strictEqual(typeof ctx.fd, 'number');
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx), true);
+      assert.strictEqual(quota._verifyCanonical(ctx), true);
 
       fs.renameSync(qdir, `${qdir}.moved`);
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx), false, 'ENOENT after lock is a rename, not "no ledgers"');
+      assert.strictEqual(quota._verifyCanonical(ctx), false, 'ENOENT after lock is a rename, not "no ledgers"');
       assert.throws(() => quota._quotaDirIdentity(qdir), (e) => e instanceof A.UnsafePath && e.code === 'ENOENT');
 
       fs.mkdirSync(qdir, 0o700); // a NEW directory at the same path: different inode
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx), false, 'recreated dir has a different identity');
+      assert.strictEqual(quota._verifyCanonical(ctx), false, 'recreated dir has a different identity');
       fs.rmdirSync(qdir);
 
       fs.symlinkSync(`${qdir}.moved`, qdir); // a symlink to the original: never followed
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx), false);
+      assert.strictEqual(quota._verifyCanonical(ctx), false);
       assert.throws(() => quota._quotaDirIdentity(qdir), A.UnsafePath);
       fs.unlinkSync(qdir);
 
       fs.renameSync(`${qdir}.moved`, qdir); // the ORIGINAL back in place: same inode again
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx), true);
-      assert.strictEqual(quota._lockedQuotaDirIntact(null), false);
-      assert.strictEqual(quota._lockedQuotaDirIntact(ctx.fd), false, 'a bare fd carries no identity');
+      assert.strictEqual(quota._verifyCanonical(ctx), true);
+      assert.strictEqual(quota._verifyCanonical(null), false);
+      assert.strictEqual(quota._verifyCanonical(ctx.fd), false, 'a bare fd carries no identity');
     } finally {
       quota._unlock(ctx);
     }
     // nonblocking variant binds identity too
     const nb = quota._quotaLockNonblocking(home);
-    assert.ok(nb && typeof nb.fd === 'number' && nb.dir === qdir && typeof nb.ino === 'number');
+    assert.ok(nb && typeof nb.fd === 'number' && nb.dir === qdir
+      && typeof nb.ident.ino === 'number' && typeof nb.rootIdent.ino === 'number');
     quota._unlock(nb);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

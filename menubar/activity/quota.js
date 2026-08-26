@@ -205,28 +205,40 @@ function _lockfNonblocking(fd) {
 // reservation is written. Unlocked readers (`_accountingSnapshot(home)` with no context) keep
 // ENOENT = "no ledgers yet". A directory that is `lstat`-able as a real directory but NOT the
 // one locked is exactly the swap this guards against.
-function _quotaDirIdentity(qdir) {
+// `label` is purely cosmetic (the error message) -- Codex R8 B1 / Ruling 64 reuses this same
+// generic real-non-symlink-directory check for the activity ROOT too, not just `quota/` itself.
+function _quotaDirIdentity(qdir, label = 'quota dir') {
   let st;
   try {
     st = fs.lstatSync(qdir);
   } catch (e) {
-    const err = new paths.UnsafePath(`quota dir identity: ${e.message}`);
+    const err = new paths.UnsafePath(`${label} identity: ${e.message}`);
     if (e.code === 'ENOENT') err.code = 'ENOENT';
     throw err;
   }
   if (st.isSymbolicLink() || !st.isDirectory()) {
-    throw new paths.UnsafePath(`quota dir identity: ${qdir} is not a real directory`);
+    throw new paths.UnsafePath(`${label} identity: ${qdir} is not a real directory`);
   }
   return { dev: st.dev, ino: st.ino };
 }
 
-// True iff the quota dir the lock context recorded is STILL the directory at that path (same
-// device + inode, a real non-symlink directory). Never throws.
-function _lockedQuotaDirIntact(ctx) {
-  if (!ctx || typeof ctx !== 'object') return false;
+// Codex R8 B1 / Ruling 64: the ONE canonical-identity re-verification helper -- checks BOTH
+// bound identities a lock context now carries (`ident` for `quota/`, `rootIdent` for the
+// activity root -- see `_bindLockContext`), never just the ledger dir the way the Round-7
+// `_lockedQuotaDirIntact` this replaces did. A swap of the activity ROOT alone (leaving `quota/`
+// itself untouched) is exactly as dangerous as a `quota/` swap: `_gatherAccounting`'s activity-dir
+// enumeration walks the ROOT, not `quota/`, so a root swap could hide every measured activity's
+// bytes from a locked decision while `quota/`'s own identity stayed intact. True iff BOTH
+// directories are still real, non-symlink directories at their original dev+inode. Never throws --
+// any lstat failure (ENOENT/EACCES/ELOOP) or an identity mismatch is UNCERTAIN, i.e. `false`.
+function _verifyCanonical(ctx) {
+  if (!ctx || typeof ctx !== 'object' || !ctx.ident || !ctx.rootIdent) return false;
   try {
     const id = _quotaDirIdentity(ctx.dir);
-    return id.dev === ctx.dev && id.ino === ctx.ino;
+    if (id.dev !== ctx.ident.dev || id.ino !== ctx.ident.ino) return false;
+    const rootId = _quotaDirIdentity(path.dirname(ctx.dir), 'activity root');
+    if (rootId.dev !== ctx.rootIdent.dev || rootId.ino !== ctx.rootIdent.ino) return false;
+    return true;
   } catch (e) {
     return false; // ENOENT (renamed away), symlink/non-dir (swapped), or lstat refused
   }
@@ -234,35 +246,76 @@ function _lockedQuotaDirIntact(ctx) {
 
 // Opens (creating if needed) + locks quota.lock; validates it's a regular file (fail closed on
 // a swapped component, mirroring Python's S_ISREG check) via paths.openOwnedRegular, which
-// already does this. Returns the LOCK CONTEXT `{ fd, dir, dev, ino }` -- the held fd plus the
-// identity of the `quota/` directory captured AT LOCK TIME (Ruling 60, above); every locked
-// accounting/write path threads this context through so it can re-verify identity. Throws
-// (UnsafePath / OSError-equivalent) on failure -- callers (admit/grant/settle) catch broadly and
-// fail closed to false/no-op.
+// already does this. Returns the LOCK CONTEXT `{ fd, dir, ident: {dev,ino}, rootIdent: {dev,ino} }`
+// -- the held fd plus the identity of BOTH `quota/` and the activity root, captured AT LOCK TIME
+// (Ruling 60/64, below); every locked accounting/write path threads this context through so it
+// can re-verify identity via `_verifyCanonical`. Throws (UnsafePath / OSError-equivalent) on
+// failure -- callers (admit/grant/settle) catch broadly and fail closed to false/no-op.
+//
+// Codex R8 B1 / Ruling 64 (BLOCKER): the Round-7 version captured identity ONLY AFTER
+// `_lockfBlocking` returned -- i.e. only after the WAIT for a contended lock had already
+// completed. Codex's real-process repro: hold `quota.lock` in another process; while THIS
+// process blocks waiting for it, swap the entire `quota/` directory for a fresh empty one; once
+// the wait ends and the lock is acquired, `_bindLockContext` lstats whatever is NOW at that path
+// -- the swapped-in empty directory -- and binds ITS identity, fresh, so it reads as "intact" for
+// the rest of the decision. Every one of 16 x 4 MiB real liabilities in the moved-aside directory
+// vanished from the snapshot (measured: canonical charge 61,440 vs the authorized liability
+// 67,170,304). The wait itself was therefore an UNBOUNDED unguarded window -- arbitrarily long,
+// entirely under another holder's control.
+//
+// Fixed by capturing identity of BOTH `quota/` AND the activity root BEFORE opening/waiting on
+// the lock at all (`preIdent`/`preRootIdent` below), then AGAIN once the lock is actually held
+// (`_bindLockContext`), and comparing the two: any ENOENT/symlink/non-dir/mismatch on either
+// directory, at either end, fails the ACQUISITION itself (release, close, throw) -- exactly like
+// a lockf status failure -- so a swap landing anywhere in the wait window is caught before the
+// lock context is ever handed to a caller, not discovered later against a compromised baseline.
 function _quotaLock(home) {
   const qdir = paths.quotaDir(home);
+  const rootDir = path.dirname(qdir);
   paths.secureMkdir(qdir); // ensures activity/ + quota/ exist
+
+  // Pre-wait identity: nothing is held yet, so a failure here (e.g. `quota/` already a symlink)
+  // just propagates -- there is nothing to release.
+  const preIdent = _quotaDirIdentity(qdir);
+  const preRootIdent = _quotaDirIdentity(rootDir, 'activity root');
+
   const lockPath = _quotaLockPath(home);
   const fd = paths.openOwnedRegular(lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
-  const status = _lockfBlocking(fd);
+  // Self-reference (`module.exports`, not a bare call): the ONE test seam this mirrors -- a
+  // regression test can stub `quota._lockfBlocking` to swap `quota/` out from under the wait,
+  // proving the pre/post comparison below actually catches it (Codex R8 regression tests).
+  const status = module.exports._lockfBlocking(fd);
   if (status !== 0) {
     fs.closeSync(fd);
     throw new Error(`quota.lock: lockf did not report success (status=${status})`);
   }
-  return _bindLockContext(fd, qdir);
+  return _bindLockContext(fd, qdir, rootDir, preIdent, preRootIdent);
 }
 
-// Captures the quota dir's identity UNDER the just-acquired lock. A dir that is already gone /
-// swapped by the time the lock is held is a failed acquisition (the lock protects nothing).
-function _bindLockContext(fd, qdir) {
-  let id;
+// Captures `quota/`'s and the activity root's identity again, now that the lock is actually
+// held, and compares each against the PRE-wait identity `_quotaLock`/`_quotaLockNonblocking`
+// captured before opening/waiting on the lock (Ruling 64). Either directory gone, replaced by a
+// symlink, or swapped for a DIFFERENT real directory at any point during the wait -> the lock
+// protects nothing meaningful -> FAIL the acquisition (release the just-acquired lock, close the
+// fd, throw) exactly like a lockf status failure. On success, returns the lock context with BOTH
+// bound identities threaded through so every locked accounting/write/delegation path can
+// re-verify via `_verifyCanonical`.
+function _bindLockContext(fd, qdir, rootDir, preIdent, preRootIdent) {
+  let postIdent;
+  let postRootIdent;
   try {
-    id = _quotaDirIdentity(qdir);
+    postIdent = _quotaDirIdentity(qdir);
+    postRootIdent = _quotaDirIdentity(rootDir, 'activity root');
   } catch (e) {
     fs.closeSync(fd);
     throw e;
   }
-  return { fd, dir: qdir, dev: id.dev, ino: id.ino };
+  if (postIdent.dev !== preIdent.dev || postIdent.ino !== preIdent.ino
+      || postRootIdent.dev !== preRootIdent.dev || postRootIdent.ino !== preRootIdent.ino) {
+    fs.closeSync(fd);
+    throw new paths.UnsafePath('quota dir or activity root changed identity across the lock wait; refusing acquisition (Ruling 64)');
+  }
+  return { fd, dir: qdir, ident: postIdent, rootIdent: postRootIdent };
 }
 
 // Codex R4 (BLOCKER, "Fix-G"): the NON-BLOCKING sibling of `_quotaLock`, used ONLY by
@@ -283,7 +336,15 @@ function _bindLockContext(fd, qdir) {
 // treats any thrown error the same as "could not confirm live" (skip, never raise).
 function _quotaLockNonblocking(home) {
   const qdir = paths.quotaDir(home);
+  const rootDir = path.dirname(qdir);
   paths.secureMkdir(qdir); // ensures activity/ + quota/ exist
+
+  // Ruling 64: same pre-wait capture as the blocking variant, even though this variant never
+  // actually waits -- a genuine setup failure here (bad `home`, unsafe path) still throws exactly
+  // like `_quotaLock`, per this function's existing contract (see the header comment above).
+  const preIdent = _quotaDirIdentity(qdir);
+  const preRootIdent = _quotaDirIdentity(rootDir, 'activity root');
+
   const lockPath = _quotaLockPath(home);
   const fd = paths.openOwnedRegular(lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
   const status = _lockfNonblocking(fd);
@@ -291,7 +352,7 @@ function _quotaLockNonblocking(home) {
     fs.closeSync(fd);
     return null; // BUSY (75) or any other non-success -- skip immediately, never wait
   }
-  return _bindLockContext(fd, qdir); // same Ruling-60 identity capture as the blocking variant
+  return _bindLockContext(fd, qdir, rootDir, preIdent, preRootIdent); // Ruling 64: same post-acquisition re-verify as the blocking variant
 }
 
 // Bare close -- stock Node has no flock(2) binding, so (like lease.js) there is no separate
@@ -299,8 +360,25 @@ function _quotaLockNonblocking(home) {
 // opens a FRESH fd per call and nothing else in this module retains a second reference, so this
 // is a true full release, not the shared-OFD caveat lease.js documents for a live child.
 // Accepts the lock context `_quotaLock` returns (or a bare fd, for symmetry with older callers).
+//
+// Codex R8 I3 / Ruling 66: this function itself must NEVER throw -- `admit`/`grant` used to call
+// it unguarded (only `appendReserveIfLive` already wrapped it), so a release/close failure at
+// exactly the wrong moment (e.g. after a reservation was already durably written) could replace
+// an already-decided, already-persisted `true` result with an escaping exception instead. There
+// is only ONE underlying release primitive on this platform -- closing the fd IS the lock release
+// (see the paragraph above, and lease.js's `release()` comment: no separate flock(2) LOCK_UN
+// exists to call first) -- so "attempt the release, then the close, each contained" collapses to
+// one attempt here; every caller nonetheless ALSO wraps its own call to this function (see
+// admit/grant/settle below) as a second, independent backstop, matching Fix-G's existing
+// belt-and-suspenders pattern for this exact call.
 function _unlock(ctx) {
-  fs.closeSync(typeof ctx === 'number' ? ctx : ctx.fd);
+  const fd = typeof ctx === 'number' ? ctx : (ctx && typeof ctx.fd === 'number' ? ctx.fd : null);
+  if (fd === null) return; // nothing to release
+  try {
+    fs.closeSync(fd);
+  } catch (e) {
+    // best-effort: a stuck/failed release/close must never escape past this function (Ruling 66).
+  }
 }
 
 // Validates the ledger's FULL invariant (mirrors Python's `_parse_entry` exactly): counters must
@@ -365,15 +443,15 @@ function _writeEntry(home, activityId, reserved, granted, lockCtx) {
   const blob = Buffer.from(JSON.stringify({ reserved, granted }), 'utf8');
   const qdir = paths.quotaDir(home);
   if (lockCtx !== undefined && lockCtx !== null) {
-    if (lockCtx.dir !== qdir || !_lockedQuotaDirIntact(lockCtx)) {
-      throw new paths.UnsafePath('quota dir changed identity under the lock; refusing ledger write (Ruling 60)');
+    if (lockCtx.dir !== qdir || !_verifyCanonical(lockCtx)) {
+      throw new paths.UnsafePath('quota dir or activity root changed identity under the lock; refusing ledger write (Ruling 60/64)');
     }
   } else {
     paths.secureMkdir(qdir);
   }
   paths.writeOwnedFileAtomic(qdir, `${activityId}.json`, blob, 0o600);
-  if (lockCtx !== undefined && lockCtx !== null && !_lockedQuotaDirIntact(lockCtx)) {
-    throw new paths.UnsafePath('quota dir changed identity during ledger write; refusing (Ruling 60)');
+  if (lockCtx !== undefined && lockCtx !== null && !_verifyCanonical(lockCtx)) {
+    throw new paths.UnsafePath('quota dir or activity root changed identity during ledger write; refusing (Ruling 60/64)');
   }
 }
 
@@ -418,11 +496,11 @@ function _onDisk(home, aid) {
 function _ledgerEntriesDetailed(home, lockCtx) {
   const qdir = paths.quotaDir(home);
   const locked = lockCtx !== undefined && lockCtx !== null;
-  if (locked && (lockCtx.dir !== qdir || !_lockedQuotaDirIntact(lockCtx))) {
+  if (locked && (lockCtx.dir !== qdir || !_verifyCanonical(lockCtx))) {
     return { entries: [], uncertain: true };
   }
   const listing = paths.listOwnedEntriesDetailed(qdir, '.json');
-  if (locked && !_lockedQuotaDirIntact(lockCtx)) {
+  if (locked && !_verifyCanonical(lockCtx)) {
     return { entries: [], uncertain: true };
   }
   const entries = [];
@@ -763,25 +841,41 @@ function admit(home, activityId, lease) {
   let ctx = null;
   try {
     ctx = _quotaLock(home);
-    let snap = _accountingSnapshot(home, ctx); // Ruling 50: ONE snapshot per decision
+    // Self-reference (`module.exports`, not a bare call): a test seam so a regression test can
+    // observe the EXACT return value of a genuine snapshot, then mutate `quota/`/root identity
+    // before this call's caller (below) gets to act on it -- proving the Ruling-64 check right
+    // below actually protects the delegation window, not just the enumeration window Ruling 60
+    // already covered.
+    let snap = module.exports._accountingSnapshot(home, ctx); // Ruling 50: ONE snapshot per decision
     if (_refuseNonDecidable(snap, 'admission')) return false; // Ruling 61: no prune delegation
     if (snap.charge + RESERVE > CEILING) {
+      // Codex R8 B1 / Ruling 64: re-verify identity ONE MORE TIME, immediately before releasing
+      // the lock to delegate -- `snap` above proved the decision was certain/non-corrupt/over-
+      // ceiling AT THE MOMENT it was gathered, but nothing yet has re-checked identity since. A
+      // swap landing in the (tiny but real) gap between that snapshot returning and this branch
+      // running would otherwise hand Python's prune loop a headroom figure computed against a
+      // directory this process no longer actually has locked -- refuse instead, exactly like an
+      // uncertain/corrupt snapshot.
+      if (!_verifyCanonical(ctx)) {
+        _warn('quota: accounting identity changed under the lock; refusing admission without pruning (Ruling 64)');
+        return false;
+      }
       // certain, non-corrupt, merely over the ceiling: a MEASURED shortfall -> delegate prune
       const headroom = snap.charge + RESERVE - CEILING;
-      _unlock(ctx);
+      try { _unlock(ctx); } catch (e) { /* Ruling 66: best-effort cleanup must never replace this decision */ }
       ctx = null;
       _spawnPythonPrune(home, headroom); // release -> spawn -> (below) re-acquire -> re-evaluate
       ctx = _quotaLock(home);
-      snap = _accountingSnapshot(home, ctx); // FRESH unified snapshot -- never mixed with the first
+      snap = module.exports._accountingSnapshot(home, ctx); // FRESH unified snapshot -- never mixed with the first
       if (_refuseNonDecidable(snap, 'admission')) return false;
       if (snap.charge + RESERVE > CEILING) return false; // best-effort refuse
     }
-    _writeEntry(home, activityId, RESERVE, 0, ctx); // durable; identity-verified (Ruling 60)
+    _writeEntry(home, activityId, RESERVE, 0, ctx); // durable; identity-verified (Ruling 60/64)
     return true;
   } catch (e) {
     return false; // durability/safety failure -> refuse
   } finally {
-    if (ctx !== null) _unlock(ctx);
+    if (ctx !== null) { try { _unlock(ctx); } catch (e) { /* Ruling 66 */ } }
   }
 }
 
@@ -798,12 +892,12 @@ function grant(home, activityId, nbytes) {
     if (e === CORRUPT) return false;
     if (e.granted + nbytes > ORDINARY_CAP) return false; // per-activity cap
     if (snap.charge + nbytes > CEILING) return false; // global ceiling
-    _writeEntry(home, activityId, e.reserved, e.granted + nbytes, ctx); // durable BEFORE append
+    _writeEntry(home, activityId, e.reserved, e.granted + nbytes, ctx); // durable BEFORE append; identity-verified (Ruling 60/64)
     return true;
   } catch (e) {
     return false; // durability/safety failure -> refuse the append
   } finally {
-    if (ctx !== null) _unlock(ctx);
+    if (ctx !== null) { try { _unlock(ctx); } catch (e) { /* Ruling 66 */ } }
   }
 }
 
@@ -887,10 +981,17 @@ function appendReserveIfLive(home, aid, appendFn, opts) {
   try {
     fd = nonblocking ? _quotaLockNonblocking(home) : _quotaLock(home);
     if (fd === null) return false; // nonblocking only: lock BUSY (or spawn anomaly) -> skip, never wait
-    if (!_lockedQuotaDirIntact(fd)) return false; // Ruling 60: ledger dir swapped under the lock -> not provably live
+    if (!_verifyCanonical(fd)) return false; // Ruling 60/64: quota dir or root swapped under the lock -> not provably live, BEFORE the read
     const e = _readEntry(paths.ledgerEntryPath(home, aid));
     if (e === CORRUPT) return false; // settled (missing) or genuinely corrupt -> no-op
     appendFn(); // ledger still live -- its reservation covers this reserve-consuming append
+    // Ruling 64: re-verify AFTER the write too -- a swap landing during the append can only ever
+    // make the appended record land somewhere unaccounted-for (an overcount at worst, since the
+    // record itself carries no reservation of its own); reporting refusal here matches
+    // `_writeEntry`'s own post-write check and costs nothing extra (the append already happened
+    // and cannot be undone, but the CALLER only ever treats this return value as best-effort
+    // observability -- see this function's own header comment).
+    if (!_verifyCanonical(fd)) return false;
     return true;
   } catch (e) {
     return false; // never-raises (best-effort cancel)
@@ -939,11 +1040,20 @@ function settle(home, activityId) {
   void activityId; // prune reaps by headroom, not by a specific activity id (mirrors admit's own delegation)
   try {
     let snap;
+    let canonical;
     const ctx = _quotaLock(home);
     try {
       snap = _accountingSnapshot(home, ctx);
+      // Codex R8 B1 / Ruling 64: re-verify identity while STILL under the lock, before it is
+      // released below -- mirrors `admit`'s own pre-delegation check (this is settle's own
+      // "before any prune delegation" moment; see `_verifyCanonical`'s header comment).
+      canonical = _verifyCanonical(ctx);
     } finally {
-      _unlock(ctx);
+      try { _unlock(ctx); } catch (e) { /* Ruling 66 */ }
+    }
+    if (!canonical) {
+      _warn('quota: accounting identity changed under the lock; refusing settle reap without pruning (Ruling 64)');
+      return;
     }
     if (_refuseNonDecidable(snap, 'settle reap')) return;
     _spawnPythonPrune(home, 0);
@@ -956,11 +1066,15 @@ module.exports = {
   CEILING, RESERVE, PER_ACTIVITY_CAP, ORDINARY_CAP, CORRUPT,
   admit, grant, settle, appendReserveIfLive,
   configurePythonRunner,
-  _quotaLock, _quotaLockNonblocking, _unlock, _quotaDirIdentity, _lockedQuotaDirIntact,
+  _quotaLock, _quotaLockNonblocking, _unlock, _quotaDirIdentity, _verifyCanonical,
   _parseEntry, _readEntry, _writeEntry,
   _committed, _onDisk, _ledgerEntries, _ledgerEntriesDetailed,
   _gatherAccounting, _computeSnapshot, _accountingSnapshot, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,
   _spawnPythonPrune, _spawnPythonRetain,
+  // Codex R8 B1 / Ruling 64 test seam: `_quotaLock` calls this through `module.exports` (not a
+  // bare reference) specifically so a regression test can stub it to swap `quota/` during the
+  // lock WAIT, proving the pre/post identity comparison actually catches a mid-wait swap.
+  _lockfBlocking,
   get PYTHON_BIN() { return PYTHON_BIN; },
   set PYTHON_BIN(v) { PYTHON_BIN = v; },
 };
