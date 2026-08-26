@@ -1,16 +1,25 @@
 'use strict';
 // Task 2.2b: proves Ruling B's delegation mechanism actually works, end to end, against a REAL
-// Python subprocess (not a mock) -- an `admit` that first fails because a corrupt ledger entry
-// stands (spec §7 refuse-while-corrupt) spawns the real `python -m repo_radar.activity.prune`,
-// which reconciles + evidence-clears it (Python's B2 state machine, unchanged), and the
-// re-evaluated Node `admit` then succeeds where it first failed.
+// Python subprocess (not a mock) -- an `admit` that first fails because the accounting is
+// CERTAIN, NON-CORRUPT and merely over the 64 MiB ceiling spawns the real
+// `python -m repo_radar.activity.prune <headroom>`, which reconciles + prunes settled activities
+// (Python's `_prune_locked`, unchanged), and the re-evaluated Node `admit` then succeeds where it
+// first failed.
+//
+// Codex R7 B2 / Ruling 61 (this file's fixture changed): the original fixture here was a CORRUPT
+// ledger entry that admit's delegation got Python to evidence-clear. Under Ruling 61 an
+// uncertain OR corrupt snapshot refuses admission OUTRIGHT with NO prune delegation (a
+// floor/sentinel charge handed to the prune loop deleted every prunable activity), so a corrupt
+// entry is no longer something Node's admission path clears. The delegation mechanism itself is
+// unchanged and is now proven on the only trigger that remains: a measured, certain shortfall.
+// (The "corrupt -> NOT delegated" half lives in codex-r7.test.js.)
 //
 // The "false-before" half is proven by pointing quota.js's PYTHON_BIN test seam at a
 // nonexistent binary FIRST (so the exact same real `admit()` codepath attempts delegation via a
 // real spawnSync call, finds no interpreter, and -- per the brief's "spawnSync, never throws"
-// contract -- fails closed rather than crashing) and observing admit still return false with the
-// corrupt entry untouched. Restoring PYTHON_BIN to the real interpreter and calling `admit`
-// again is the "true-after" half, via a REAL python3 child process. Both calls exercise
+// contract -- fails closed rather than crashing) and observing admit still return false with
+// every settled activity untouched. Restoring PYTHON_BIN to the real interpreter and calling
+// `admit` again is the "true-after" half, via a REAL python3 child process. Both calls exercise
 // admit()'s single, real, internal release->spawn->reacquire->reevaluate sequence (see
 // ../quota.js) -- nothing about the sequence itself is mocked, only which binary is available to
 // spawn.
@@ -61,59 +70,64 @@ function realPython3Path() {
 }
 
 const REPO_ROOT = path.join(__dirname, '..', '..', '..');
+const TS = '2026-08-14T00:00:00-07:00';
 
-// A corrupt ledger entry (no owner.lock ever created -> Python's prune reconcile evidence-clears
-// it via the "owner provably gone" path) plus a fresh, admittable activity -- the same fixture
-// admit false-before/true-after above uses, factored out for the B3 tests below.
-function corruptPlusFreshActivity(home) {
-  A.secureMkdir(A.quotaDir(home));
-  const staleAid = A.mintActivityId();
-  const staleEntry = A.ledgerEntryPath(home, staleAid);
-  fs.writeFileSync(staleEntry, '{not valid json', { mode: 0o600 });
+// A SETTLED, PRUNABLE activity of `nbytes`: a conforming segment carrying a durable start +
+// terminal (so Python's `_classify` sees a reconciled, routine run -- never 'running'), grown to
+// `nbytes` with a SPARSE tail (an unterminated final line, ignored by both parsers; costs no real
+// disk). No ledger entry, no owner.lock.
+function seedPrunable(home, nbytes) {
+  const aid = A.mintActivityId();
+  A.secureMkdir(A.activityDir(home, aid));
+  const seg = A.segmentPath(home, aid, 'python', 'deadbeef');
+  const lines = [
+    { schema_version: 1, activity_id: aid, type: 'start', seq: 0, ts: TS, kind: 'sync', channel: 'stable', trigger: 'cli', created_by: 'python' },
+    { schema_version: 1, activity_id: aid, type: 'terminal', seq: 1, ts: TS, outcome: 'succeeded', summary: {}, by: 'deadbeef' },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n';
+  fs.writeFileSync(seg, lines, { mode: 0o600 });
+  fs.truncateSync(seg, nbytes);
+  return aid;
+}
+
+// The CERTAIN, NON-CORRUPT, OVER-CEILING fixture (Ruling 61's only delegation trigger): 16 x
+// 4 MiB settled activities == exactly CEILING, so `charge + RESERVE > CEILING` and a fresh
+// admission needs the prune to free room. Plus the fresh, admittable activity.
+function fullPlusFreshActivity(home) {
+  const settled = [];
+  for (let i = 0; i < 16; i++) settled.push(seedPrunable(home, quota.PER_ACTIVITY_CAP));
   const aid = A.mintActivityId();
   A.secureMkdir(A.activityDir(home, aid));
   const l = A.acquire(A.ownerLockPath(home, aid));
-  return { staleEntry, aid, l };
+  return { settled, aid, l };
 }
 
-test('admit false-before / true-after: a corrupt-blocking refusal delegates to the real python prune entrypoint', { skip: !hasPython3() && 'python3 not found on PATH' }, () => {
+const settledDirsRemaining = (home, settled) => settled.filter((s) => fs.existsSync(A.activityDir(home, s))).length;
+
+test('admit false-before / true-after: a certain over-ceiling refusal delegates to the real python prune entrypoint', { skip: !hasPython3() && 'python3 not found on PATH' }, () => {
   const home = tmpHome();
   const originalPythonBin = quota.PYTHON_BIN;
 
   try {
-    // A corrupt ledger entry with NO activity dir at all -> owner.lock was never created ->
-    // Python's prune reconcile pass evidence-clears it via the "owner provably gone" path
-    // (spec line 78 / §7 Gap 2b) -- the exact same fixture as
-    // test_corrupt_entry_with_no_owner_lock_clears_via_owner_gone_path in
-    // repo_radar/tests/test_activity_quota.py.
-    A.secureMkdir(A.quotaDir(home));
-    const staleAid = A.mintActivityId();
-    const staleEntry = A.ledgerEntryPath(home, staleAid);
-    fs.writeFileSync(staleEntry, '{not valid json', { mode: 0o600 });
-    assert.strictEqual(quota._hasCorrupt(home), true);
-
-    const [aid, l] = (() => {
-      const id = A.mintActivityId();
-      A.secureMkdir(A.activityDir(home, id));
-      return [id, A.acquire(A.ownerLockPath(home, id))];
-    })();
+    const { settled, aid, l } = fullPlusFreshActivity(home);
     assert.ok(l !== null);
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: quota.CEILING, uncertain: false, corrupt: false }, 'sanity: certain, non-corrupt, exactly full');
 
     // -- false-before: delegation attempted (real spawnSync call) but no interpreter available.
     quota.PYTHON_BIN = '/nonexistent/python3-does-not-exist-for-this-test';
-    assert.strictEqual(quota.admit(home, aid, l), false, 'must refuse: corrupt entry still stands, delegation unavailable');
-    assert.ok(fs.existsSync(staleEntry), 'stale corrupt entry must be untouched -- Node never unlinks it itself');
-    assert.strictEqual(quota._hasCorrupt(home), true);
+    assert.strictEqual(quota.admit(home, aid, l), false, 'must refuse: still full, delegation unavailable');
+    assert.strictEqual(settledDirsRemaining(home, settled), 16, 'nothing pruned -- Node never deletes anything itself');
+    assert.ok(!fs.existsSync(A.ledgerEntryPath(home, aid)), 'no reservation written');
 
     // -- true-after: same real admit() call, now with a real python3 available to delegate to.
     quota.PYTHON_BIN = originalPythonBin;
-    assert.strictEqual(quota.admit(home, aid, l), true, 'must succeed: real python prune cleared the corrupt entry');
-    assert.ok(!fs.existsSync(staleEntry), 'python prune -- not Node -- physically removed the corrupt entry');
-    assert.strictEqual(quota._hasCorrupt(home), false);
+    assert.strictEqual(quota.admit(home, aid, l), true, 'must succeed: real python prune freed the headroom');
+    assert.ok(settledDirsRemaining(home, settled) < 16, 'python prune -- not Node -- physically removed settled activities');
     assert.deepStrictEqual(
       JSON.parse(fs.readFileSync(A.ledgerEntryPath(home, aid), 'utf8')),
       { reserved: quota.RESERVE, granted: 0 },
     );
+    const after_ = quota._accountingSnapshot(home);
+    assert.ok(after_.charge <= quota.CEILING && !after_.uncertain && !after_.corrupt);
   } finally {
     quota.PYTHON_BIN = originalPythonBin;
   }
@@ -123,14 +137,7 @@ test('a spawn failure (missing python3) never throws out of admit -- it fails cl
   const home = tmpHome();
   const originalPythonBin = quota.PYTHON_BIN;
   try {
-    A.secureMkdir(A.quotaDir(home));
-    const staleAid = A.mintActivityId();
-    fs.writeFileSync(A.ledgerEntryPath(home, staleAid), '{not valid json', { mode: 0o600 });
-
-    const aid = A.mintActivityId();
-    A.secureMkdir(A.activityDir(home, aid));
-    const l = A.acquire(A.ownerLockPath(home, aid));
-
+    const { aid, l } = fullPlusFreshActivity(home);
     quota.PYTHON_BIN = '/nonexistent/python3-does-not-exist-for-this-test';
     assert.doesNotThrow(() => {
       const result = quota.admit(home, aid, l);
@@ -146,11 +153,11 @@ test('a spawn failure (missing python3) never throws out of admit -- it fails cl
 // not the hardcoded dev-only PYTHON_BIN/REPO_ROOT fallback.
 // -------------------------------------------------------------------------------------------
 
-test('B3(a): admit\'s corrupt-clearing delegation uses the CONFIGURED runner, not the bare PYTHON_BIN fallback', { skip: !hasPython3() && 'python3 not found on PATH' }, () => {
+test('B3(a): admit\'s over-ceiling prune delegation uses the CONFIGURED runner, not the bare PYTHON_BIN fallback', { skip: !hasPython3() && 'python3 not found on PATH' }, () => {
   const home = tmpHome();
   const originalPythonBin = quota.PYTHON_BIN;
   try {
-    const { staleEntry, aid, l } = corruptPlusFreshActivity(home);
+    const { settled, aid, l } = fullPlusFreshActivity(home);
 
     // Poison the OLD fallback -- if _spawnPythonPrune ever fell back to PYTHON_BIN instead of
     // the configured runner, delegation would fail and admit would stay refused.
@@ -164,7 +171,7 @@ test('B3(a): admit\'s corrupt-clearing delegation uses the CONFIGURED runner, no
     });
 
     assert.strictEqual(quota.admit(home, aid, l), true, 'must succeed via the CONFIGURED runner, proving PYTHON_BIN was not used');
-    assert.ok(!fs.existsSync(staleEntry), 'the configured runner\'s python prune -- not the PYTHON_BIN fallback -- cleared the corrupt entry');
+    assert.ok(settledDirsRemaining(home, settled) < 16, 'the configured runner\'s python prune -- not the PYTHON_BIN fallback -- freed the room');
   } finally {
     quota.PYTHON_BIN = originalPythonBin;
     quota.configurePythonRunner(null);
@@ -191,9 +198,9 @@ test('B3(a): a packaged-style layout (venv/bin/python + repo_radar under one roo
       env: { PYTHONPATH: fakeRoot },
     });
 
-    const { staleEntry, aid, l } = corruptPlusFreshActivity(home);
+    const { settled, aid, l } = fullPlusFreshActivity(home);
     assert.strictEqual(quota.admit(home, aid, l), true, 'the packaged-style venv/bin/python + repo_radar layout must resolve and successfully delegate');
-    assert.ok(!fs.existsSync(staleEntry));
+    assert.ok(settledDirsRemaining(home, settled) < 16);
   } finally {
     quota.PYTHON_BIN = originalPythonBin;
     quota.configurePythonRunner(null);
@@ -202,7 +209,7 @@ test('B3(a): a packaged-style layout (venv/bin/python + repo_radar under one roo
 
 // -------------------------------------------------------------------------------------------
 // Codex B3(b): a failed delegated spawn must be surfaced (bounded warn/log), never throw, and
-// admit must stay fail-closed while the corrupt entry stands.
+// admit must stay fail-closed while the shortfall stands.
 // -------------------------------------------------------------------------------------------
 
 test('B3(b): a missing configured interpreter is surfaced via a warn line, never throws, and admit stays fail-closed', () => {
@@ -211,13 +218,13 @@ test('B3(b): a missing configured interpreter is surfaced via a warn line, never
   const realConsoleError = console.error;
   console.error = (msg) => warnings.push(String(msg));
   try {
-    const { staleEntry, aid, l } = corruptPlusFreshActivity(home);
+    const { settled, aid, l } = fullPlusFreshActivity(home);
     quota.configurePythonRunner({ python: '/nonexistent/python3-does-not-exist-for-this-test', cwd: os.tmpdir(), env: {} });
 
     let result;
     assert.doesNotThrow(() => { result = quota.admit(home, aid, l); });
-    assert.strictEqual(result, false, 'fail-closed: corrupt entry still stands, delegation unavailable');
-    assert.ok(fs.existsSync(staleEntry), 'corrupt entry untouched -- Node never unlinks it itself');
+    assert.strictEqual(result, false, 'fail-closed: still full, delegation unavailable');
+    assert.strictEqual(settledDirsRemaining(home, settled), 16, 'settled activities untouched -- Node never deletes anything itself');
     assert.ok(
       warnings.some((m) => /activity/i.test(m) && /prune/i.test(m)),
       `expected a surfaced prune-failure warning, got: ${JSON.stringify(warnings)}`,
@@ -237,13 +244,13 @@ test('B3(b): a non-zero prune exit (not just a missing binary) is also surfaced 
   const realConsoleError = console.error;
   console.error = (msg) => warnings.push(String(msg));
   try {
-    const { staleEntry, aid, l } = corruptPlusFreshActivity(home);
+    const { settled, aid, l } = fullPlusFreshActivity(home);
     quota.configurePythonRunner({ python: fakeScript, cwd: os.tmpdir(), env: {} });
 
     let result;
     assert.doesNotThrow(() => { result = quota.admit(home, aid, l); });
     assert.strictEqual(result, false);
-    assert.ok(fs.existsSync(staleEntry));
+    assert.strictEqual(settledDirsRemaining(home, settled), 16);
     assert.ok(
       warnings.some((m) => /boom on stderr from the fake interpreter/.test(m)),
       `expected the bounded stderr excerpt surfaced, got: ${JSON.stringify(warnings)}`,

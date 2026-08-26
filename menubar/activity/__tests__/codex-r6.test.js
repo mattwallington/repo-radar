@@ -210,44 +210,66 @@ test('Ruling 56: an unlistable Activity root is EXACTLY CEILING and uncertain (w
   }
 });
 
-test('Ruling 56: _computeSnapshot is pure -- the normalized rule, term by term, with an explicit constants override', () => {
+// Codex R7 I3 / Ruling 62 REPLACES the Round-6 arithmetic this test originally pinned: measured
+// bytes are never discarded. Activities carry `{ onDisk: int, uncertain: bool }` (v2). Terms:
+//   certain:   on_disk + (max(0, r+g - on_disk) if live entry)
+//   uncertain: max(measured_partial, CAP)                (no ledger liability)
+//   corrupt:   measured + CAP                            (was: exactly CAP)
+//   unlistable ledger dir: max(sum measured, CEILING);  unlistable root: max(sum liabilities + corrupt caps, CEILING)
+test('Ruling 56 -> Ruling 62: _computeSnapshot is pure -- the measurement-preserving rule, term by term, with an explicit constants override', () => {
   const C = { CEILING: 1000, PER_ACTIVITY_CAP: 100, RESERVE: 10 };
   const base = { rootListable: true, ledgerListable: true, activities: [], rejectedRootIds: [], ledger: [] };
   const snap = (over) => quota._computeSnapshot({ ...base, ...over }, C);
 
   assert.deepStrictEqual(snap({}), { charge: 0, uncertain: false, corrupt: false });
   // on_disk only
-  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 40 }] }), { charge: 40, uncertain: false, corrupt: false });
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 40, uncertain: false }] }), { charge: 40, uncertain: false, corrupt: false });
   // live entry above on_disk: on_disk + (reserved+granted - on_disk) == reserved+granted
-  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 5 }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 5, uncertain: false }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
     { charge: 30, uncertain: false, corrupt: false });
   // live entry below on_disk: on_disk wins, no negative liability
-  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 50 }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 50, uncertain: false }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
     { charge: 50, uncertain: false, corrupt: false });
   // live entry with no directory at all: on_disk 0
   assert.deepStrictEqual(snap({ ledger: [{ aid: 'z', reserved: 10, granted: 0 }] }), { charge: 10, uncertain: false, corrupt: false });
-  // UNCERTAIN via null on_disk: exactly CAP, its live liability is NOT added
-  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: null }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
+  // UNCERTAIN with a partial measurement BELOW the cap: max(partial, CAP) == CAP, liability NOT added
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 30, uncertain: true }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
     { charge: 100, uncertain: true, corrupt: false });
+  // UNCERTAIN with a partial measurement ABOVE the cap: the MEASURED bytes win (Ruling 62 -- never discarded)
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 150, uncertain: true }], ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
+    { charge: 150, uncertain: true, corrupt: false });
+  // UNCERTAIN with nothing measured (0): exactly CAP
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 0, uncertain: true }] }), { charge: 100, uncertain: true, corrupt: false });
   // UNCERTAIN via rejected root id (not in activities): exactly CAP, liability not added
   assert.deepStrictEqual(snap({ rejectedRootIds: ['r'], ledger: [{ aid: 'r', reserved: 10, granted: 20 }] }),
     { charge: 100, uncertain: true, corrupt: false });
-  // corrupt entry: exactly CAP total, even with bytes on disk; corrupt flag set
-  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 40 }], ledger: [{ aid: 'a', corrupt: true }] }),
-    { charge: 100, uncertain: false, corrupt: true });
-  // corrupt entry whose aid has no directory: still exactly CAP
+  // corrupt entry WITH measured bytes: measured + CAP (was: exactly CAP); corrupt flag set
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 40, uncertain: false }], ledger: [{ aid: 'a', corrupt: true }] }),
+    { charge: 140, uncertain: false, corrupt: true });
+  // corrupt entry whose aid has no directory: exactly CAP
   assert.deepStrictEqual(snap({ ledger: [{ aid: 'q', corrupt: true }] }), { charge: 100, uncertain: false, corrupt: true });
-  // mixed: measurable 40 + uncertain CAP + corrupt CAP + live-only 10
+  // corrupt AND uncertain aid: corrupt rule applies (measured + CAP), uncertain flag still set
+  assert.deepStrictEqual(snap({ activities: [{ aid: 'a', onDisk: 40, uncertain: true }], ledger: [{ aid: 'a', corrupt: true }] }),
+    { charge: 140, uncertain: true, corrupt: true });
+  // mixed: measurable 40 + uncertain max(7, CAP) + corrupt (0 + CAP) + live-only 10
   assert.deepStrictEqual(snap({
-    activities: [{ aid: 'a', onDisk: 40 }, { aid: 'b', onDisk: null }],
+    activities: [{ aid: 'a', onDisk: 40, uncertain: false }, { aid: 'b', onDisk: 7, uncertain: true }],
     ledger: [{ aid: 'c', corrupt: true }, { aid: 'd', reserved: 10, granted: 0 }, { aid: 'b', reserved: 10, granted: 5 }],
   }), { charge: 40 + 100 + 100 + 10, uncertain: true, corrupt: true });
-  // unlistable root / ledger dir: exactly CEILING, uncertain, corrupt still reported
-  assert.deepStrictEqual(snap({ rootListable: false, activities: [{ aid: 'a', onDisk: 40 }] }), { charge: 1000, uncertain: true, corrupt: false });
-  assert.deepStrictEqual(snap({ ledgerListable: false, activities: [{ aid: 'a', onDisk: 40 }], ledger: [{ aid: 'a', corrupt: true }] }),
+  // unlistable ROOT: max(sum live liabilities + corrupt caps, CEILING), uncertain, corrupt reported
+  assert.deepStrictEqual(snap({ rootListable: false, ledger: [{ aid: 'a', reserved: 10, granted: 20 }] }),
+    { charge: 1000, uncertain: true, corrupt: false });
+  assert.deepStrictEqual(snap({ rootListable: false, ledger: [{ aid: 'a', reserved: 10, granted: 990 }, { aid: 'b', corrupt: true }] }),
+    { charge: 1100, uncertain: true, corrupt: true });
+  // unlistable LEDGER dir: max(sum measured (as certain, no liabilities), CEILING), uncertain
+  assert.deepStrictEqual(snap({ ledgerListable: false, activities: [{ aid: 'a', onDisk: 40, uncertain: false }], ledger: [{ aid: 'a', corrupt: true }] }),
     { charge: 1000, uncertain: true, corrupt: true });
+  assert.deepStrictEqual(snap({ ledgerListable: false, activities: [{ aid: 'a', onDisk: 900, uncertain: false }, { aid: 'b', onDisk: 300, uncertain: true }] }),
+    { charge: 1200, uncertain: true, corrupt: false });
+  // both unlistable: root rule (liabilities), still floored at CEILING
+  assert.deepStrictEqual(snap({ rootListable: false, ledgerListable: false }), { charge: 1000, uncertain: true, corrupt: false });
   // no constants override -> module constants
-  assert.deepStrictEqual(quota._computeSnapshot({ ...base, activities: [{ aid: 'a', onDisk: null }] }),
+  assert.deepStrictEqual(quota._computeSnapshot({ ...base, activities: [{ aid: 'a', onDisk: 0, uncertain: true }] }),
     { charge: quota.PER_ACTIVITY_CAP, uncertain: true, corrupt: false });
   assert.deepStrictEqual(quota._computeSnapshot({ ...base, rootListable: false }),
     { charge: quota.CEILING, uncertain: true, corrupt: false });

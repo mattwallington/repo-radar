@@ -394,7 +394,12 @@ function _setReviverSourceProbeForTests(fn) {
   return prev;
 }
 
-function _strictIntegerReviver(integerKeys) {
+// Codex R7 I4 / Ruling 63: the reviver COLLECTS per-key literal validity into `violations` (a
+// Set the caller owns) instead of throwing -- so `parseValid` can decide per record type which
+// keys' literals matter (`seq`/`schema_version` for every type; `pid` ONLY for `ownership`,
+// where an additive `"pid":1.0` on an `event` is an unknown field readers must ignore, spec §2).
+// `parseJsonStrictIntegers` keeps its throwing contract on top of this.
+function _strictIntegerReviver(integerKeys, violations) {
   const keySet = new Set(integerKeys);
   const pending = []; // {holder, key, source}
   return function (k, v, ctx) {
@@ -408,9 +413,7 @@ function _strictIntegerReviver(integerKeys) {
       // entry whose holder is literally the root object counts as "top-level".
       for (const p of pending) {
         if (p.holder !== v) continue;
-        if (p.source === undefined || !INT_LITERAL_RE.test(p.source)) {
-          throw new InvalidRecord(`non-integer literal for ${JSON.stringify(p.key)}`);
-        }
+        if (p.source === undefined || !INT_LITERAL_RE.test(p.source)) violations.add(p.key);
       }
     }
     return v;
@@ -436,17 +439,20 @@ function _tokenizeJsonForFallback(text) {
   return tokens;
 }
 
-// Returns an offending key name, or null if every `integerKeys` name's LAST top-level
-// (object-nesting-depth-1) occurrence has a pure-integer literal source.
+// Returns the Set of offending key names (empty if every `integerKeys` name's LAST top-level
+// (object-nesting-depth-1) occurrence has a pure-integer literal source) -- the same per-key
+// collection the reviver path produces (Ruling 63), so `parseValid` can scope enforcement by
+// record type on either path.
 //
 // Codex R6 S6 / Ruling 59: duplicate keys. `JSON.parse` (and Python's `json.loads`) keep the
 // LAST occurrence of a duplicated key, and the reviver path sees only that final value/source --
 // so `{"seq":1.0,"seq":1}` is accepted there (seq is the integer 1) while this fallback used to
 // reject on the FIRST occurrence. It now records the last value token seen per key at depth 1 and
 // decides on that, agreeing with the reviver path and Python.
-function _findTopLevelIntegerViolation(text, integerKeys) {
+function _findTopLevelIntegerViolations(text, integerKeys) {
+  const violations = new Set();
   const tokens = _tokenizeJsonForFallback(text);
-  if (tokens === null) return null;
+  if (tokens === null) return violations;
   const keySet = new Set(integerKeys);
   const lastToken = new Map(); // key -> the value token of its LAST top-level occurrence
   let depth = 0;
@@ -469,27 +475,38 @@ function _findTopLevelIntegerViolation(text, integerKeys) {
     }
   }
   for (const [key, tok] of lastToken) {
-    if (/^-?[0-9]/.test(tok) && !INT_LITERAL_RE.test(tok)) return key;
+    if (/^-?[0-9]/.test(tok) && !INT_LITERAL_RE.test(tok)) violations.add(key);
   }
-  return null;
+  return violations;
+}
+
+// Ruling 63: the COLLECTING form -- `JSON.parse(text)` plus the Set of TOP-LEVEL `integerKeys`
+// names whose LAST occurrence is a JSON number literal carrying a fraction or exponent (`1.0`,
+// `1e3`). Never throws for a literal violation (malformed JSON still propagates as SyntaxError).
+// Both the reviver path and the fallback tokenizer path produce the identical Set.
+function parseJsonCollectIntegerViolations(text, integerKeys) {
+  const violations = new Set();
+  if (_reviverSourceProbe()) {
+    const value = JSON.parse(text, _strictIntegerReviver(integerKeys, violations));
+    return { value, violations };
+  }
+  const value = JSON.parse(text); // malformed JSON -- SyntaxError propagates to the caller, as before
+  return { value, violations: _findTopLevelIntegerViolations(text, integerKeys) };
 }
 
 // Exported strict-integer JSON parser: identical to `JSON.parse(text)` except any TOP-LEVEL
 // property named in `integerKeys` whose value is a JSON number literal carrying a fraction or
 // exponent (e.g. `1.0`, `1e3`) throws `InvalidRecord` instead of silently returning the collapsed
-// integer `Number`. Used by both `parseValid` (keys `seq`/`schema_version`) and
-// `quota._parseEntry` (keys `reserved`/`granted`) so a non-integer literal is CORRUPT / invalid
-// on Node exactly where Python's `isinstance(x, int)` already rejects it.
+// integer `Number`. Used by `parse.js` (key `schema_version`) and `quota._parseEntry` (keys
+// `reserved`/`granted`) so a non-integer literal is CORRUPT / invalid on Node exactly where
+// Python's `isinstance(x, int)` already rejects it. `parseValid` uses the collecting form above
+// so it can scope `pid` to `ownership` records only (Ruling 63).
 function parseJsonStrictIntegers(text, integerKeys) {
-  if (_reviverSourceProbe()) {
-    return JSON.parse(text, _strictIntegerReviver(integerKeys));
+  const { value, violations } = parseJsonCollectIntegerViolations(text, integerKeys);
+  for (const key of integerKeys) { // report in the caller's key order, deterministically
+    if (violations.has(key)) throw new InvalidRecord(`non-integer literal for ${JSON.stringify(key)}`);
   }
-  const obj = JSON.parse(text); // malformed JSON -- SyntaxError propagates to the caller, as before
-  const badKey = _findTopLevelIntegerViolation(text, integerKeys);
-  if (badKey !== null) {
-    throw new InvalidRecord(`non-integer literal for ${JSON.stringify(badKey)}`);
-  }
-  return obj;
+  return value;
 }
 
 // Task 2.2b addition: the READ-side counterpart to buildRecord/encodeRecord, needed by
@@ -524,17 +541,31 @@ function parseJsonStrictIntegers(text, integerKeys) {
 // `ownership{pid:1.0}` record was valid on Node only, and `trigger-glue._hasAckSignal` counted a
 // handoff ack Python would never have seen. The check is TOP-LEVEL ONLY, like the others (a
 // `fields.pid` float is a legitimate flat-primitive value).
+//
+// Codex R7 I4 / Ruling 63: `pid`'s literal is enforced ONLY when `type === 'ownership'`. Applying
+// it to every type rejected a v1 `event` carrying an unknown ADDITIVE `"pid":1.0` that Python
+// accepted (spec §2: readers ignore additive fields -- Python's `_validate` never looks at `pid`
+// outside `ownership`, so the float is simply an ignored extra there). The literal validity of
+// all three keys is COLLECTED by `parseJsonCollectIntegerViolations`; `seq` and `schema_version`
+// are enforced for every type, `pid` per type, below. Shared vector: the `event` + additive
+// `pid: 1.0` `raw_text` case in `record_validation_vectors.json` (accept).
 const STRICT_INTEGER_KEYS = Object.freeze(['seq', 'schema_version', 'pid']);
+const ALWAYS_STRICT_KEYS = Object.freeze(['seq', 'schema_version']);
 
 function parseValid(raw, expectedActivityId) {
   let obj;
+  let violations;
   try {
     const text = Buffer.isBuffer(raw) ? _decodeUtf8Fatal(raw) : raw;
-    obj = parseJsonStrictIntegers(text, STRICT_INTEGER_KEYS);
+    ({ value: obj, violations } = parseJsonCollectIntegerViolations(text, STRICT_INTEGER_KEYS));
   } catch (e) {
-    return null; // invalid UTF-8 (TypeError), invalid JSON (SyntaxError), or InvalidRecord literal
+    return null; // invalid UTF-8 (TypeError) or invalid JSON (SyntaxError)
   }
   if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+  for (const key of ALWAYS_STRICT_KEYS) {
+    if (violations.has(key)) return null; // non-integer literal for a field every type carries
+  }
+  if (obj.type === 'ownership' && violations.has('pid')) return null; // Ruling 63: ownership only
   if (obj.schema_version !== SCHEMA_VERSION || obj.activity_id !== expectedActivityId) return null;
   try {
     _validate(obj); // FULL v1 shape validation, same function buildRecord uses
@@ -550,5 +581,5 @@ module.exports = {
   MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
   RecordTooLarge, InvalidRecord,
   buildRecord, encodeRecord, encodedLen, parseValid, decodeUtf8Fatal: _decodeUtf8Fatal,
-  parseJsonStrictIntegers, _setReviverSourceProbeForTests,
+  parseJsonStrictIntegers, parseJsonCollectIntegerViolations, _setReviverSourceProbeForTests,
 };

@@ -15,6 +15,13 @@
 //     prunes, all under ITS OWN `quota.lock`. `admit` releases the Node quota.lock BEFORE
 //     spawning that child (never holds the lock while the Python child needs it -- deadlock
 //     otherwise) and re-acquires after the child exits, then re-evaluates from disk.
+//     Codex R7 B2 / Ruling 61: that delegation happens ONLY from a CERTAIN, NON-CORRUPT snapshot
+//     that is merely over the ceiling (a measured shortfall). An uncertain or corrupt snapshot
+//     refuses outright with NO prune delegation -- a floor/sentinel charge handed to the prune
+//     loop deleted every prunable activity. Node's admission path therefore no longer triggers
+//     corrupt-entry clearing at all; Python's own passes do.
+//     Codex R7 B1 / Ruling 60: every locked decision is bound to the `quota/` directory's
+//     dev+inode identity captured at lock time (Node has no dir fd) -- see `_quotaDirIdentity`.
 //
 // `admit`'s own pre-delegation charge/corrupt computation is therefore Node's ENTIRE "reconcile
 // pass": strictly READ-ONLY (never synthesizes a terminal, never removes an entry). Only the
@@ -183,12 +190,58 @@ function _lockfNonblocking(fd) {
   return r.status;
 }
 
+// Codex R7 B1 / Ruling 60: the ledger directory's IDENTITY, bound to the lock hold. `_quotaLock`
+// creates/validates `quota/` BEFORE acquiring quota.lock, and `paths.listOwnedEntriesDetailed`
+// treats ENOENT as PROVEN "no ledgers yet" -- correct for an unlocked reader, but inside a locked
+// decision an ENOENT means the directory was renamed/swapped AFTER the lock was taken (Codex
+// repro: 16 x 4 MiB liabilities, rename `quota/` between lock and enumeration -> the snapshot saw
+// no ledgers -> `admit` wrote a reservation -> 67,170,304 bytes > ceiling). Python closes this
+// with a dir fd (descriptor-relative enumeration cannot be redirected); stock Node has no
+// `openat`, so identity is preserved by INODE instead: at lock time the quota dir is `lstat`ed
+// and `{ dev, ino }` recorded in the lock context; every locked accounting pass re-lstats the
+// dir immediately before AND after enumeration, and `_writeEntry` re-verifies immediately
+// before (and after) its temp+rename. ENOENT, a symlink, a non-directory, or a `{dev,ino}`
+// mismatch -> the ledger is UNCERTAIN (never certain-empty) -> `admit`/`grant` refuse and no
+// reservation is written. Unlocked readers (`_accountingSnapshot(home)` with no context) keep
+// ENOENT = "no ledgers yet". A directory that is `lstat`-able as a real directory but NOT the
+// one locked is exactly the swap this guards against.
+function _quotaDirIdentity(qdir) {
+  let st;
+  try {
+    st = fs.lstatSync(qdir);
+  } catch (e) {
+    const err = new paths.UnsafePath(`quota dir identity: ${e.message}`);
+    if (e.code === 'ENOENT') err.code = 'ENOENT';
+    throw err;
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new paths.UnsafePath(`quota dir identity: ${qdir} is not a real directory`);
+  }
+  return { dev: st.dev, ino: st.ino };
+}
+
+// True iff the quota dir the lock context recorded is STILL the directory at that path (same
+// device + inode, a real non-symlink directory). Never throws.
+function _lockedQuotaDirIntact(ctx) {
+  if (!ctx || typeof ctx !== 'object') return false;
+  try {
+    const id = _quotaDirIdentity(ctx.dir);
+    return id.dev === ctx.dev && id.ino === ctx.ino;
+  } catch (e) {
+    return false; // ENOENT (renamed away), symlink/non-dir (swapped), or lstat refused
+  }
+}
+
 // Opens (creating if needed) + locks quota.lock; validates it's a regular file (fail closed on
 // a swapped component, mirroring Python's S_ISREG check) via paths.openOwnedRegular, which
-// already does this. Returns the held fd. Throws (UnsafePath / OSError-equivalent) on failure --
-// callers (admit/grant/settle) catch broadly and fail closed to false/no-op.
+// already does this. Returns the LOCK CONTEXT `{ fd, dir, dev, ino }` -- the held fd plus the
+// identity of the `quota/` directory captured AT LOCK TIME (Ruling 60, above); every locked
+// accounting/write path threads this context through so it can re-verify identity. Throws
+// (UnsafePath / OSError-equivalent) on failure -- callers (admit/grant/settle) catch broadly and
+// fail closed to false/no-op.
 function _quotaLock(home) {
-  paths.secureMkdir(paths.quotaDir(home)); // ensures activity/ + quota/ exist
+  const qdir = paths.quotaDir(home);
+  paths.secureMkdir(qdir); // ensures activity/ + quota/ exist
   const lockPath = _quotaLockPath(home);
   const fd = paths.openOwnedRegular(lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
   const status = _lockfBlocking(fd);
@@ -196,7 +249,20 @@ function _quotaLock(home) {
     fs.closeSync(fd);
     throw new Error(`quota.lock: lockf did not report success (status=${status})`);
   }
-  return fd;
+  return _bindLockContext(fd, qdir);
+}
+
+// Captures the quota dir's identity UNDER the just-acquired lock. A dir that is already gone /
+// swapped by the time the lock is held is a failed acquisition (the lock protects nothing).
+function _bindLockContext(fd, qdir) {
+  let id;
+  try {
+    id = _quotaDirIdentity(qdir);
+  } catch (e) {
+    fs.closeSync(fd);
+    throw e;
+  }
+  return { fd, dir: qdir, dev: id.dev, ino: id.ino };
 }
 
 // Codex R4 (BLOCKER, "Fix-G"): the NON-BLOCKING sibling of `_quotaLock`, used ONLY by
@@ -216,7 +282,8 @@ function _quotaLock(home) {
 // and the caller (`appendReserveIfLive`) already wraps the whole acquisition in a try/catch that
 // treats any thrown error the same as "could not confirm live" (skip, never raise).
 function _quotaLockNonblocking(home) {
-  paths.secureMkdir(paths.quotaDir(home)); // ensures activity/ + quota/ exist
+  const qdir = paths.quotaDir(home);
+  paths.secureMkdir(qdir); // ensures activity/ + quota/ exist
   const lockPath = _quotaLockPath(home);
   const fd = paths.openOwnedRegular(lockPath, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
   const status = _lockfNonblocking(fd);
@@ -224,15 +291,16 @@ function _quotaLockNonblocking(home) {
     fs.closeSync(fd);
     return null; // BUSY (75) or any other non-success -- skip immediately, never wait
   }
-  return fd;
+  return _bindLockContext(fd, qdir); // same Ruling-60 identity capture as the blocking variant
 }
 
 // Bare close -- stock Node has no flock(2) binding, so (like lease.js) there is no separate
 // "unlock" verb; closing Node's sole retained fd on the OFD drops the flock. `_quotaLock` always
 // opens a FRESH fd per call and nothing else in this module retains a second reference, so this
 // is a true full release, not the shared-OFD caveat lease.js documents for a live child.
-function _unlock(fd) {
-  fs.closeSync(fd);
+// Accepts the lock context `_quotaLock` returns (or a bare fd, for symmetry with older callers).
+function _unlock(ctx) {
+  fs.closeSync(typeof ctx === 'number' ? ctx : ctx.fd);
 }
 
 // Validates the ledger's FULL invariant (mirrors Python's `_parse_entry` exactly): counters must
@@ -281,14 +349,32 @@ function _readEntry(entryPath) {
 // validated `quota/` dir). This is the ONLY write path quota.js has -- no unlink, ever (Ruling
 // B). Validates `activityId` FIRST (path-traversal guard, mirrors Python's fix-round-1 Critical
 // fix) before any filename is built.
-function _writeEntry(home, activityId, reserved, granted) {
+//
+// Codex R7 B1 / Ruling 60: when called under a lock context (`admit`/`grant` always are), the
+// quota dir's identity is re-verified IMMEDIATELY before the temp+rename (a renamed/swapped
+// `quota/` -> throw, no write) and again after it (a swap that landed mid-write leaves a stray
+// entry in the wrong directory -- an overcount at worst, never an undercount -- and the decision
+// is still refused so no append is authorized against it). The temp+rename itself targets the
+// verified validated path; Node has no `renameat`, so this pre/post identity pair is the
+// closest stock Node gets to Python's dir-fd-relative write. Without a context (no caller today)
+// the write is unguarded, as before.
+function _writeEntry(home, activityId, reserved, granted, lockCtx) {
   if (!ids.validActivityId(activityId)) {
     throw new paths.UnsafePath(`invalid activity_id for ledger path: ${JSON.stringify(activityId)}`);
   }
   const blob = Buffer.from(JSON.stringify({ reserved, granted }), 'utf8');
   const qdir = paths.quotaDir(home);
-  paths.secureMkdir(qdir);
+  if (lockCtx !== undefined && lockCtx !== null) {
+    if (lockCtx.dir !== qdir || !_lockedQuotaDirIntact(lockCtx)) {
+      throw new paths.UnsafePath('quota dir changed identity under the lock; refusing ledger write (Ruling 60)');
+    }
+  } else {
+    paths.secureMkdir(qdir);
+  }
   paths.writeOwnedFileAtomic(qdir, `${activityId}.json`, blob, 0o600);
+  if (lockCtx !== undefined && lockCtx !== null && !_lockedQuotaDirIntact(lockCtx)) {
+    throw new paths.UnsafePath('quota dir changed identity during ledger write; refusing (Ruling 60)');
+  }
 }
 
 // fstat-only sizing (mirrors the I7 fix): sum of every activity's segment sizes EXCEPT quota/.
@@ -320,9 +406,25 @@ function _onDisk(home, aid) {
 // squatting on `quota/`). The lossy `listOwnedEntries` collapsed that to `[]` -- "no ledgers" --
 // so every outstanding reservation vanished from the charge during a transient failure and a new
 // reservation was admitted (Codex repro: 67,170,304 bytes after restore). A MISSING quota dir
-// (ENOENT) is still proven "no ledgers yet". `_ledgerEntries` is the `.entries`-only wrapper.
-function _ledgerEntriesDetailed(home) {
-  const listing = paths.listOwnedEntriesDetailed(paths.quotaDir(home), '.json');
+// (ENOENT) is still proven "no ledgers yet" -- for an UNLOCKED reader. `_ledgerEntries` is the
+// `.entries`-only wrapper.
+//
+// Codex R7 B1 / Ruling 60: under a lock context (`lockCtx` from `_quotaLock`) the ledger dir's
+// identity is re-verified immediately BEFORE enumeration and again AFTER it: the dir the lock
+// was bound to must still be the real directory at that path (same dev+ino). ENOENT / symlink /
+// non-dir / mismatch at either check -> `{ entries: [], uncertain: true }` -- a post-lock ENOENT
+// is a rename/swap, never "no ledgers yet". The post-check covers the residual window between
+// the pre-check and `readdir` (Node has no dir fd to enumerate through).
+function _ledgerEntriesDetailed(home, lockCtx) {
+  const qdir = paths.quotaDir(home);
+  const locked = lockCtx !== undefined && lockCtx !== null;
+  if (locked && (lockCtx.dir !== qdir || !_lockedQuotaDirIntact(lockCtx))) {
+    return { entries: [], uncertain: true };
+  }
+  const listing = paths.listOwnedEntriesDetailed(qdir, '.json');
+  if (locked && !_lockedQuotaDirIntact(lockCtx)) {
+    return { entries: [], uncertain: true };
+  }
   const entries = [];
   for (const name of listing.entries) {
     const aid = name.slice(0, -5); // strip ".json"
@@ -433,12 +535,25 @@ function _hasTerminal(home, aid) {
 //     while Python reported 0. Now an unlistable root OR ledger dir is EXACTLY CEILING (and
 //     uncertain) on both sides.
 //
-// Gathered inputs (the shape `accounting_vectors.json` describes, camelCased):
+// Codex R7 I3 / Ruling 62 (REPLACES the Round-6 arithmetic above; Python implements the identical
+// rule): measured bytes are NEVER discarded. `_gatherAccounting` used to null an activity's
+// measurement the moment its scan came back uncertain, so a directory whose entries HAD been
+// sized (a later entry's lstat refused, say) lost every byte it had proven and was replaced by
+// the flat PER_ACTIVITY_CAP guess -- an undercount whenever the proven bytes exceeded the cap.
+// Every activity now carries `{ onDisk: number, uncertain: boolean }` -- `onDisk` is the partial
+// sum of the entries that DID stat (0 if none), `uncertain` says the sum may be incomplete
+// (`paths.statOwnedSegmentsDetailed` returns the entries it did stat even when `uncertain`).
+//
+// Gathered inputs (the v2 shape `accounting_vectors.json` describes, camelCased):
 //   { rootListable, ledgerListable,
-//     activities: [{ aid, onDisk: int | null }],   // listed activity dirs; null = unmeasurable
-//     rejectedRootIds: [aid],                        // valid-activity-id root entries refused (not 'gone')
+//     activities: [{ aid, onDisk: int, uncertain: bool }],  // listed activity dirs; partial bytes
+//     rejectedRootIds: [aid],                                // valid-activity-id root entries refused (not 'gone')
 //     ledger: [{ aid, reserved, granted } | { aid, corrupt: true }] }
-function _gatherAccounting(home) {
+//
+// `lockCtx` (Ruling 60): the lock context from `_quotaLock`, threaded through to
+// `_ledgerEntriesDetailed` so a locked decision re-verifies the ledger dir's identity around its
+// enumeration. Omitted for unlocked readers.
+function _gatherAccounting(home, lockCtx) {
   const base = path.dirname(paths.quotaDir(home));
   const root = paths.listOwnedSubdirsDetailed(base);
   const activities = [];
@@ -446,8 +561,8 @@ function _gatherAccounting(home) {
     if (name === 'quota') continue;
     const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
     let size = 0;
-    for (const seg of scan.entries) size += seg.size;
-    activities.push({ aid: name, onDisk: scan.uncertain ? null : size });
+    for (const seg of scan.entries) size += seg.size; // partial measurement is KEPT when uncertain
+    activities.push({ aid: name, onDisk: size, uncertain: Boolean(scan.uncertain) });
   }
   const rejectedRootIds = [];
   for (const rj of root.rejected) {
@@ -456,9 +571,9 @@ function _gatherAccounting(home) {
   // `listOwnedSubdirsDetailed.uncertain` covers BOTH "the base could not be validated/listed"
   // (early return: `subdirs` and `rejected` both empty) AND "an activity-shaped entry was refused"
   // (the base WAS listed; the entry is in `rejected`). Only the former is "root unlistable" here --
-  // the latter is per-activity uncertainty (`rejectedRootIds`), charged PER_ACTIVITY_CAP each.
+  // the latter is per-activity uncertainty (`rejectedRootIds`), charged max(0, CAP) each.
   const rootListable = !(root.uncertain && rejectedRootIds.length === 0);
-  const led = _ledgerEntriesDetailed(home);
+  const led = _ledgerEntriesDetailed(home, lockCtx);
   const ledger = [];
   for (const [aid, e] of led.entries) {
     ledger.push(e === CORRUPT ? { aid, corrupt: true } : { aid, reserved: e.reserved, granted: e.granted });
@@ -469,16 +584,22 @@ function _gatherAccounting(home) {
   };
 }
 
-// PURE (Ruling 56 -- the ONE charge rule, identical in Python's `quota._compute_snapshot`):
-//   charge = SUM_aid term(aid) + SUM_{corrupt ledger entries} PER_ACTIVITY_CAP
-//   term(aid) = PER_ACTIVITY_CAP                        if aid is UNCERTAIN (rejected at the root
-//                                                       for a non-gone reason, or its stat was
-//                                                       unmeasurable) -- NO ledger liability added
-//             = on_disk + max(0, reserved+granted - on_disk)   if aid has a live non-corrupt entry
-//             = on_disk                                  otherwise
-//   a corrupt entry's aid contributes exactly PER_ACTIVITY_CAP in total (no on_disk term);
-//   unlistable root OR unlistable ledger dir -> charge = CEILING, uncertain = true;
-//   uncertain = !rootListable || !ledgerListable || any activity uncertain;
+// PURE (Ruling 62 -- the ONE charge rule, identical in Python's `quota._compute_snapshot`; fixture
+// parity in `accounting-parity.test.js`). With `measured(aid)` = the activity's (possibly
+// partial) on-disk bytes (0 if it was never listed):
+//   CORRUPT-ledger aid:   measured + PER_ACTIVITY_CAP           (checked first: a corrupt entry's
+//                                                                aid is charged this way even if
+//                                                                its scan was also uncertain)
+//   UNCERTAIN aid:        max(measured, PER_ACTIVITY_CAP)       (rejected at the root for a
+//                                                                non-gone reason, or its scan was
+//                                                                uncertain) -- NO ledger liability
+//   certain aid:          measured + (max(0, reserved+granted - measured) if live non-corrupt
+//                                                                entry else 0)
+//   unlistable ledger dir: max(SUM measured over every activity (as certain, no liabilities),
+//                              CEILING), uncertain
+//   unlistable root:       max(SUM (reserved+granted) over live entries + SUM corrupt caps,
+//                              CEILING), uncertain
+//   uncertain = !rootListable || !ledgerListable || any activity uncertain || any rejected root id;
 //   corrupt   = any corrupt ledger entry.
 // `constants` (CEILING / PER_ACTIVITY_CAP) defaults to module state; the vector driver overrides.
 function _computeSnapshot(inputs, constants) {
@@ -486,38 +607,48 @@ function _computeSnapshot(inputs, constants) {
   const cap = constants && constants.PER_ACTIVITY_CAP !== undefined ? constants.PER_ACTIVITY_CAP : PER_ACTIVITY_CAP;
 
   const corrupt = inputs.ledger.some((e) => e.corrupt === true);
+  const measured = new Map(); // aid -> partial or full on-disk bytes
   const uncertainIds = new Set(inputs.rejectedRootIds);
   for (const a of inputs.activities) {
-    if (a.onDisk === null || a.onDisk === undefined) uncertainIds.add(a.aid);
+    const bytes = Number.isFinite(a.onDisk) ? a.onDisk : 0;
+    measured.set(a.aid, (measured.get(a.aid) || 0) + bytes);
+    if (a.uncertain === true || a.onDisk === null || a.onDisk === undefined) uncertainIds.add(a.aid);
   }
   const uncertain = !inputs.rootListable || !inputs.ledgerListable || uncertainIds.size > 0;
-  if (!inputs.rootListable || !inputs.ledgerListable) return { charge: ceiling, uncertain, corrupt };
 
-  const onDisk = new Map();
-  for (const a of inputs.activities) {
-    if (!uncertainIds.has(a.aid)) onDisk.set(a.aid, a.onDisk);
-  }
   const live = new Map(); // aid -> reserved+granted (non-corrupt entries only)
   const corruptIds = new Set();
   for (const e of inputs.ledger) {
     if (e.corrupt === true) corruptIds.add(e.aid);
     else live.set(e.aid, e.reserved + e.granted);
   }
-  const aids = new Set([...uncertainIds, ...onDisk.keys(), ...live.keys()]);
+
+  if (!inputs.rootListable) {
+    let liabilities = 0;
+    for (const v of live.values()) liabilities += v;
+    liabilities += corruptIds.size * cap;
+    return { charge: Math.max(liabilities, ceiling), uncertain, corrupt };
+  }
+  if (!inputs.ledgerListable) {
+    let bytes = 0;
+    for (const v of measured.values()) bytes += v;
+    return { charge: Math.max(bytes, ceiling), uncertain, corrupt };
+  }
+
+  const aids = new Set([...uncertainIds, ...measured.keys(), ...live.keys(), ...corruptIds]);
   let charge = 0;
   for (const aid of aids) {
-    if (corruptIds.has(aid)) continue; // charged once below, as PER_ACTIVITY_CAP total
-    if (uncertainIds.has(aid)) { charge += cap; continue; }
-    const disk = onDisk.get(aid) || 0;
+    const disk = measured.get(aid) || 0;
+    if (corruptIds.has(aid)) { charge += disk + cap; continue; }
+    if (uncertainIds.has(aid)) { charge += Math.max(disk, cap); continue; }
     charge += disk;
     if (live.has(aid)) charge += Math.max(0, live.get(aid) - disk);
   }
-  charge += corruptIds.size * cap;
   return { charge, uncertain, corrupt };
 }
 
-function _accountingSnapshot(home) {
-  return _computeSnapshot(_gatherAccounting(home));
+function _accountingSnapshot(home, lockCtx) {
+  return _computeSnapshot(_gatherAccounting(home, lockCtx));
 }
 
 function _charge(home) {
@@ -599,55 +730,80 @@ function _spawnPythonRetain(home) {
 // `lease` mirrors Python's admit(home, activity_id, lease) signature for call-site symmetry
 // (writer.js will call this with the lease it just acquired, exactly as writer.py does) but,
 // like the current Python, does not itself inspect it -- kept for API compatibility.
+//
+// Codex R7 B2 / Ruling 61: NO destructive pruning under uncertainty. `admit` used to delegate
+// `_spawnPythonPrune` whenever the snapshot was `uncertain` OR `corrupt` OR over the ceiling --
+// but an uncertain snapshot's charge is a FLOOR (a ceiling sentinel / max-liability guess), not
+// a measurement, and Python's prune loop, handed that constant, kept deleting prunable
+// activities until nothing was left (the headroom it was chasing could never be reached). Prune
+// is now delegated ONLY when the snapshot is certain AND non-corrupt AND merely over the ceiling
+// (a real, measured shortfall). `uncertain || corrupt` -> refuse admission outright: fail closed
+// with a bounded warn, NO delegation. A corrupt entry is therefore no longer cleared by Node's
+// admission path at all -- Python's own admission/retention passes (which run their B2
+// reconcile under their own lock and their own certainty check) remain the only clearers.
+//
+// Ruling 60: the whole decision runs against the lock context `_quotaLock` returned -- the
+// snapshot re-verifies the ledger dir's identity around enumeration, and `_writeEntry`
+// re-verifies immediately before/after the reservation write. A swap at any of those points ->
+// uncertain / throw -> refused, no reservation written.
+function _refuseNonDecidable(snap, what) {
+  if (snap.uncertain) {
+    _warn(`quota: accounting is uncertain (an activity or the ledger dir is unmeasurable); refusing ${what} without pruning (Ruling 61)`);
+    return true;
+  }
+  if (snap.corrupt) {
+    _warn(`quota: a corrupt ledger entry stands; refusing ${what} without pruning (Ruling 61)`);
+    return true;
+  }
+  return false;
+}
+
 function admit(home, activityId, lease) {
   void lease;
-  let fd = null;
+  let ctx = null;
   try {
-    fd = _quotaLock(home);
-    let snap = _accountingSnapshot(home); // Ruling 50: ONE snapshot per decision
-    if (snap.corrupt || snap.uncertain || snap.charge + RESERVE > CEILING) {
-      const headroom = Math.max(RESERVE, snap.charge + RESERVE - CEILING);
-      _unlock(fd);
-      fd = null;
+    ctx = _quotaLock(home);
+    let snap = _accountingSnapshot(home, ctx); // Ruling 50: ONE snapshot per decision
+    if (_refuseNonDecidable(snap, 'admission')) return false; // Ruling 61: no prune delegation
+    if (snap.charge + RESERVE > CEILING) {
+      // certain, non-corrupt, merely over the ceiling: a MEASURED shortfall -> delegate prune
+      const headroom = snap.charge + RESERVE - CEILING;
+      _unlock(ctx);
+      ctx = null;
       _spawnPythonPrune(home, headroom); // release -> spawn -> (below) re-acquire -> re-evaluate
-      fd = _quotaLock(home);
-      snap = _accountingSnapshot(home); // FRESH unified snapshot -- never mixed with the first
+      ctx = _quotaLock(home);
+      snap = _accountingSnapshot(home, ctx); // FRESH unified snapshot -- never mixed with the first
+      if (_refuseNonDecidable(snap, 'admission')) return false;
+      if (snap.charge + RESERVE > CEILING) return false; // best-effort refuse
     }
-    if (snap.uncertain) {
-      _warn('quota: an activity directory is unmeasurable (unlistable); refusing admission (Ruling 45/49)');
-      return false; // best-effort refuse, same outcome path as a corrupt ledger entry
-    }
-    if (snap.corrupt || snap.charge + RESERVE > CEILING) {
-      return false; // best-effort refuse
-    }
-    _writeEntry(home, activityId, RESERVE, 0); // durable
+    _writeEntry(home, activityId, RESERVE, 0, ctx); // durable; identity-verified (Ruling 60)
     return true;
   } catch (e) {
     return false; // durability/safety failure -> refuse
   } finally {
-    if (fd !== null) _unlock(fd);
+    if (ctx !== null) _unlock(ctx);
   }
 }
 
 // No reconcile/spawn here by design (brief: "keep it cheap; refusal is the required behavior,
 // cleanup is admit's job"). Refuse-while-corrupt (spec §7) still applies unconditionally.
 function grant(home, activityId, nbytes) {
-  let fd = null;
+  let ctx = null;
   try {
-    fd = _quotaLock(home);
-    const snap = _accountingSnapshot(home); // Ruling 50: ONE snapshot per decision
+    ctx = _quotaLock(home);
+    const snap = _accountingSnapshot(home, ctx); // Ruling 50: ONE snapshot per decision
     if (snap.corrupt) return false;
-    if (snap.uncertain) return false; // Ruling 45/49: unmeasurable bytes -> refuse, like corrupt
+    if (snap.uncertain) return false; // Ruling 45/49/60: unmeasurable bytes or swapped ledger dir -> refuse
     const e = _readEntry(paths.ledgerEntryPath(home, activityId));
     if (e === CORRUPT) return false;
     if (e.granted + nbytes > ORDINARY_CAP) return false; // per-activity cap
     if (snap.charge + nbytes > CEILING) return false; // global ceiling
-    _writeEntry(home, activityId, e.reserved, e.granted + nbytes); // durable BEFORE append
+    _writeEntry(home, activityId, e.reserved, e.granted + nbytes, ctx); // durable BEFORE append
     return true;
   } catch (e) {
     return false; // durability/safety failure -> refuse the append
   } finally {
-    if (fd !== null) _unlock(fd);
+    if (ctx !== null) _unlock(ctx);
   }
 }
 
@@ -731,6 +887,7 @@ function appendReserveIfLive(home, aid, appendFn, opts) {
   try {
     fd = nonblocking ? _quotaLockNonblocking(home) : _quotaLock(home);
     if (fd === null) return false; // nonblocking only: lock BUSY (or spawn anomaly) -> skip, never wait
+    if (!_lockedQuotaDirIntact(fd)) return false; // Ruling 60: ledger dir swapped under the lock -> not provably live
     const e = _readEntry(paths.ledgerEntryPath(home, aid));
     if (e === CORRUPT) return false; // settled (missing) or genuinely corrupt -> no-op
     appendFn(); // ledger still live -- its reservation covers this reserve-consuming append
@@ -771,9 +928,24 @@ function appendReserveIfLive(home, aid, appendFn, opts) {
 // reconcile only clears a terminal-bearing entry once its owner is confirmably gone). Status-
 // checked (B3b) and never-raises: `_spawnPythonPrune` itself doesn't throw, but this is wrapped
 // defensively anyway, matching writer.js's own belt-and-suspenders wrapping of this call.
+//
+// Codex R7 B2 / Ruling 61: the same "no destructive pruning under uncertainty" guard `admit`
+// applies. The reap is a prune entrypoint (its loop prunes whenever the charge it computes
+// exceeds the ceiling), so it is delegated ONLY from a certain, non-corrupt snapshot -- taken
+// under quota.lock (Ruling 60 identity-bound), released BEFORE the spawn exactly like `admit`.
+// An uncertain or corrupt snapshot -> bounded warn, no delegation; the settled entry then simply
+// charges conservatively until a later certain pass (Node's or Python's) reaps it.
 function settle(home, activityId) {
   void activityId; // prune reaps by headroom, not by a specific activity id (mirrors admit's own delegation)
   try {
+    let snap;
+    const ctx = _quotaLock(home);
+    try {
+      snap = _accountingSnapshot(home, ctx);
+    } finally {
+      _unlock(ctx);
+    }
+    if (_refuseNonDecidable(snap, 'settle reap')) return;
     _spawnPythonPrune(home, 0);
   } catch (e) {
     _warn(`settle reap failed: ${e.message}`);
@@ -784,7 +956,7 @@ module.exports = {
   CEILING, RESERVE, PER_ACTIVITY_CAP, ORDINARY_CAP, CORRUPT,
   admit, grant, settle, appendReserveIfLive,
   configurePythonRunner,
-  _quotaLock, _quotaLockNonblocking, _unlock,
+  _quotaLock, _quotaLockNonblocking, _unlock, _quotaDirIdentity, _lockedQuotaDirIntact,
   _parseEntry, _readEntry, _writeEntry,
   _committed, _onDisk, _ledgerEntries, _ledgerEntriesDetailed,
   _gatherAccounting, _computeSnapshot, _accountingSnapshot, _charge, _hasCorrupt, _accountingUncertain, _hasTerminal,

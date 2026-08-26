@@ -261,22 +261,25 @@ test('Ruling 50: a staged uncertain->measurable->uncertain transition across act
     // Every snapshot sees SOME activity as unmeasurable, but each individual activity flips
     // between calls. A decision that mixed scans could see "all measurable" -- the unified
     // snapshot cannot.
+    //
+    // Codex R7 B2 / Ruling 61: an UNCERTAIN first snapshot now refuses OUTRIGHT -- no prune
+    // delegation, no second snapshot -- so each decision is exactly ONE scan per activity (it
+    // used to be two: snapshot -> delegate -> fresh snapshot).
     withStagedStat({ [d1]: [true, false], [d2]: [false, true] }, (calls) => {
       withNoPython(() => {
-        assert.strictEqual(quota.admit(home, live, lease), false, 'must NOT admit: every snapshot was uncertain');
+        assert.strictEqual(quota.admit(home, live, lease), false, 'must NOT admit: the one snapshot was uncertain');
       });
-      // admit takes one snapshot, delegates prune (unavailable here), then takes ONE fresh one
-      assert.strictEqual(calls.get(d1), 2, 'two decisions -> two scans of s1 (not four)');
-      assert.strictEqual(calls.get(d2), 2, 'two decisions -> two scans of s2 (not four)');
-      assert.strictEqual(calls.get(dLive), 2);
+      assert.strictEqual(calls.get(d1), 1, 'one decision -> one scan of s1 (Ruling 61: no post-prune re-snapshot under uncertainty)');
+      assert.strictEqual(calls.get(d2), 1, 'one decision -> one scan of s2');
+      assert.strictEqual(calls.get(dLive), 1);
     });
     assert.ok(!fs.existsSync(A.ledgerEntryPath(home, live)), 'no reservation was written');
 
     // Permanently unmeasurable: refused, still exactly one scan per activity per decision.
     withStagedStat({ [d1]: [true] }, (calls) => {
       withNoPython(() => assert.strictEqual(quota.admit(home, live, lease), false));
-      assert.strictEqual(calls.get(d1), 2);
-      assert.strictEqual(calls.get(d2), 2);
+      assert.strictEqual(calls.get(d1), 1);
+      assert.strictEqual(calls.get(d2), 1);
     });
 
     // Snapshot consistency: a fallback charge is never reported with uncertain:false.
@@ -292,18 +295,24 @@ test('Ruling 50: a staged uncertain->measurable->uncertain transition across act
   }
 });
 
-test('Ruling 50: admit that succeeds after the fresh post-prune snapshot admitted on a MEASURABLE snapshot, never a mixed one', () => {
+test('Ruling 50 + Ruling 61: an uncertain snapshot refuses in ONE scan (no delegation, no re-snapshot); the NEXT decision, fully measurable, admits on its own single snapshot', () => {
   const home = tmpHome();
   try {
     const s1 = seedSettled(home, 4096);
     const d1 = A.activityDir(home, s1);
     const [live, lease] = newLiveActivity(home);
-    // uncertain on the first snapshot only -> refused, prune delegated, fresh snapshot measurable
+    // Pre-R7 this test expected: uncertain first snapshot -> prune delegated -> fresh measurable
+    // snapshot -> ADMITTED (two scans). Ruling 61: uncertainty never delegates and never
+    // re-snapshots; the decision is refused on its one scan. Only a fresh decision may admit.
     withStagedStat({ [d1]: [true, false] }, (calls) => {
       let ok;
       withNoPython(() => { ok = quota.admit(home, live, lease); });
-      assert.strictEqual(calls.get(d1), 2, 'two snapshots, one scan each');
-      assert.strictEqual(ok, true, 'admitted on the second (fully measurable) snapshot');
+      assert.strictEqual(calls.get(d1), 1, 'one snapshot, one scan -- refused without a post-prune re-snapshot');
+      assert.strictEqual(ok, false, 'refused: the one snapshot was uncertain');
+      assert.ok(!fs.existsSync(A.ledgerEntryPath(home, live)), 'no reservation was written');
+      withNoPython(() => { ok = quota.admit(home, live, lease); });
+      assert.strictEqual(calls.get(d1), 2, 'the next decision is its own single scan');
+      assert.strictEqual(ok, true, 'admitted on a fully measurable snapshot');
     });
     assert.deepStrictEqual(quota._readEntry(A.ledgerEntryPath(home, live)), { reserved: quota.RESERVE, granted: 0 });
     lease.release();
