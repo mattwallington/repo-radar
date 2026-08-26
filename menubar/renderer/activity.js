@@ -50,9 +50,18 @@ const TEXT = {
   loadError: 'Activity history couldn’t be loaded.',
   loading: 'Loading…',
   empty: 'No activity recorded yet.',
-  unavailable: 'Activity history is unavailable right now.',
-  truncated: 'Older activity is not shown.',
-  incomplete: 'Some activity could not be read or verified — this view may be incomplete.',
+  emptyHint: 'The next sync will record its first activity here.',
+  unavailable: 'Activity history is unavailable.',
+  unavailableHint: 'The history store exists but could not be read.',
+  truncatedHead: 'Showing the newest',
+  truncatedTail: 'older activity is not shown.',
+  incomplete: 'History is incomplete — some records could not be read.',
+  // The action bar. Every one of these is FIXED: the export path is the only variable that ever
+  // reaches the status line, and it comes from main's save dialog (still scrubbed on the way in).
+  exported: 'Exported to',
+  exportCancelled: 'Export cancelled — nothing was written.',
+  exportError: 'The export couldn’t be completed.',
+  revealError: 'That activity couldn’t be shown in Finder.',
   noEvents: 'This activity recorded no events.',
   noMatches: 'No events match the current filter.',
   eventsTruncated: 'Further events were not included for this activity.',
@@ -160,6 +169,10 @@ function renderChip(doc, dto) {
   const item = dto && typeof dto === 'object' ? dto : {};
   const chip = el(doc, 'div', 'chip');
   chip.setAttribute('data-activity-id', UUID_V4_RE.test(item.id) ? item.id : '');
+  // Reachable without a mouse: a focus stop that announces what it is. The keys that activate it
+  // are handled by the same delegated listener as the click, so this stays a pure renderer.
+  chip.setAttribute('tabindex', '0');
+  chip.setAttribute('role', 'button');
 
   const head = el(doc, 'div', 'chip-head');
   head.appendChild(el(doc, 'span', 'chip-time', formatTime(item.startedAt)));
@@ -254,26 +267,65 @@ function renderProblemRow(doc, problem) {
   return row;
 }
 
-// The newest-first chip list, plus the three store states the reader reports. Task 4.5 replaces
-// these `.state` rows with the first-class three-state UI and adds Refresh/Export/Reveal; the
-// class names below (`state-unavailable` / `state-incomplete` / `state-truncated`) are the hooks
-// it takes over.
+function truncatedText(shown) {
+  return `${TEXT.truncatedHead} ${shown} — ${TEXT.truncatedTail}`;
+}
+
+// Task 4.5 (Round-3 #9 / Round-4 #7): the reader reports THREE different things about the store,
+// and this is where they stop being one grey "nothing here" line.
+//
+//   { available:true,  items:[] }                 the store is MISSING. Ordinary empty history:
+//                                                 nothing has synced yet, and the hint says so.
+//   { available:false }                           the store EXISTS and could not be read. This
+//                                                 must never read as "no activity" -- the user's
+//                                                 history may be sitting right there, and telling
+//                                                 them it is empty is telling them it is gone.
+//   { available:true, incomplete:true, items:[…] } what could be read, PLUS an admission that the
+//                                                 view is partial, PLUS the store-level problems
+//                                                 that say why.
+//
+// `result.problems` (Ruling 39) are root diagnostics that belong to no item -- an activity-shaped
+// root entry the reader refused to follow (a valid-UUID symlink, a plain file, an lstat-denied
+// entry), bounded, plus a `truncated` marker for the remainder. Nothing else in the UI can show
+// them: they have no activity to hang off, so without these rows the banner says "incomplete" and
+// never why. Pure, and exported so the three states can be asserted directly.
+function renderStoreState(doc, result) {
+  const res = result && typeof result === 'object' ? result : {};
+  const items = Array.isArray(res.items) ? res.items : [];
+  const wrap = el(doc, 'div', 'store-state');
+
+  if (res.available === false) {
+    const panel = el(doc, 'div', 'state state-unavailable', TEXT.unavailable);
+    panel.appendChild(el(doc, 'div', 'state-hint', TEXT.unavailableHint));
+    wrap.appendChild(panel);
+    return wrap; // nothing further is claimed about a store we could not read
+  }
+
+  if (res.incomplete) wrap.appendChild(el(doc, 'div', 'state state-incomplete', TEXT.incomplete));
+  const problems = Array.isArray(res.problems) ? res.problems : [];
+  for (const p of problems) wrap.appendChild(renderProblemRow(doc, p));
+
+  if (items.length === 0) {
+    const panel = el(doc, 'div', 'state state-empty', TEXT.empty);
+    panel.appendChild(el(doc, 'div', 'state-hint', TEXT.emptyHint));
+    wrap.appendChild(panel);
+  }
+  return wrap;
+}
+
+// The newest-first chip list, under whichever store state applies.
 function renderList(doc, result) {
   const res = result && typeof result === 'object' ? result : {};
   const items = Array.isArray(res.items) ? res.items : [];
   const list = el(doc, 'div', 'chip-list');
+  list.appendChild(renderStoreState(doc, res));
 
-  if (res.available === false) {
-    list.appendChild(el(doc, 'div', 'state state-unavailable', TEXT.unavailable));
-    return list;
-  }
-  if (res.incomplete) list.appendChild(el(doc, 'div', 'state state-incomplete', TEXT.incomplete));
-  if (items.length === 0) {
-    list.appendChild(el(doc, 'div', 'state state-empty', TEXT.empty));
-    return list;
-  }
+  // An unreadable store renders NO chips, whatever `items` happens to hold: drawing history over
+  // a store the reader could not read would be a completeness claim it explicitly refused to make.
+  if (res.available === false) return list;
   for (const item of items) list.appendChild(renderChip(doc, item));
-  if (res.truncated) list.appendChild(el(doc, 'div', 'state state-truncated', TEXT.truncated));
+  // Says how many are on screen rather than implying that is all there is.
+  if (res.truncated) list.appendChild(el(doc, 'div', 'state state-truncated', truncatedText(items.length)));
   return list;
 }
 
@@ -426,11 +478,17 @@ function boot(win, doc, api) {
   // `systemBodyEl` is the only container the diagnostics ever paint into.
   const systemEl = doc.getElementById('system');
   const systemBodyEl = doc.getElementById('system-body');
+  // Task 4.5: the action bar and its single status line.
+  const refreshEl = doc.getElementById('btn-refresh');
+  const exportEl = doc.getElementById('btn-export');
+  const revealEl = doc.getElementById('btn-reveal');
+  const statusEl = doc.getElementById('action-status');
 
   const view = { lens: 'events', filter: {}, selectedId: null, detail: null };
   let pendingFocus = focusIdFromHash(win.location.hash);
   let listReady = false;
   let systemLoaded = false;
+  let exporting = false;
 
   function put(container, node) {
     container.textContent = '';
@@ -448,11 +506,20 @@ function boot(win, doc, api) {
     put(container, box);
   }
 
+  // The action bar's one output. Fixed strings only, save for the export path main hands back --
+  // which still goes through `el`, i.e. through sanitizeText, like every other string on the page.
+  function setStatus(text) {
+    statusEl.textContent = '';
+    if (text) statusEl.appendChild(el(doc, 'span', 'action-status-text', text));
+  }
+
   function markSelected() {
     const chips = listEl.querySelectorAll('.chip');
     for (const chip of chips) {
       chip.classList.toggle('selected', chip.getAttribute('data-activity-id') === view.selectedId);
     }
+    // Reveal acts on the SELECTED activity, so it is only offered when there is one.
+    revealEl.disabled = !view.selectedId;
   }
 
   function paintDetail() {
@@ -486,10 +553,12 @@ function boot(win, doc, api) {
   async function loadList() {
     put(listEl, el(doc, 'div', 'state state-loading', TEXT.loading));
     try {
-      // No filter: `activity:list` ignores level/search for item selection anyway, and an empty
-      // object is the only value guaranteed to pass the main side's validator untouched. Task 4.5
-      // owns the Refresh/Export controls that will pass `normalizeFilter(...)` here.
-      const result = await api.list({});
+      // `normalizeFilter` is the ONLY place a filter is built, so the object crossing the bridge
+      // here is the same shape -- and, for a given view, the same value -- the Export button
+      // sends. The main side rejects an out-of-bounds filter rather than clamping it, and this is
+      // what guarantees it never sees one. (`activity:list` ignores level/search when selecting
+      // items; they matter to `activity:export`, whose Events section is filtered by them.)
+      const result = await api.list(normalizeFilter(view.filter));
       put(listEl, renderList(doc, result));
       listReady = true;
       if (pendingFocus) {
@@ -538,14 +607,31 @@ function boot(win, doc, api) {
   });
 
   // Delegated: the chips themselves are produced by a pure renderer that attaches no listeners.
-  listEl.addEventListener('click', (event) => {
-    let node = event.target;
+  // The id is re-validated on the way out even though `renderChip` only ever writes a UUIDv4 --
+  // it is about to become the argument of a bridge call.
+  function chipIdFrom(target) {
+    let node = target;
     while (node && node !== listEl && !(node.classList && node.classList.contains('chip'))) {
       node = node.parentNode;
     }
-    if (!node || node === listEl) return;
-    const id = focusIdFromHash(node.getAttribute('data-activity-id'));
+    if (!node || node === listEl) return null;
+    return focusIdFromHash(node.getAttribute('data-activity-id'));
+  }
+
+  listEl.addEventListener('click', (event) => {
+    const id = chipIdFrom(event.target);
     if (id && id !== view.selectedId) select(id);
+  });
+
+  // Keyboard activation for the focusable chips, delegated exactly like the click. Enter and
+  // Space are what "activate" means for a role=button; Space is prevented so it selects the chip
+  // instead of scrolling the list pane out from under it.
+  listEl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const id = chipIdFrom(event.target);
+    if (!id) return;
+    event.preventDefault();
+    if (id !== view.selectedId) select(id);
   });
 
   // Ruling P4-8, second half: main deep-links into an ALREADY OPEN window by re-issuing
@@ -570,6 +656,60 @@ function boot(win, doc, api) {
   tabs.events.addEventListener('click', () => setLens('events'));
   tabs.problems.addEventListener('click', () => setLens('problems'));
 
+  // -----------------------------------------------------------------------------------------
+  // Task 4.5: the action bar.
+  // -----------------------------------------------------------------------------------------
+
+  // Re-issues the load. The System section is refreshed alongside it ONLY when it is already
+  // expanded -- Ruling P4-1: an ordinary refresh must never touch the shared log files.
+  function refreshAll() {
+    setStatus('');
+    const listed = loadList();
+    if (systemEl.open) loadSystem();
+    return listed;
+  }
+
+  // The whole export happens in main: it validates this filter, builds the redacted text, runs
+  // the save dialog and writes the file 0600, then answers the chosen path (or null if the user
+  // cancelled). This side supplies exactly one thing -- a filter object built by `normalizeFilter`
+  // from the level/search controls, never their raw text -- and displays one fixed line.
+  // Re-entrancy is refused so a double-click cannot stack two save dialogs.
+  async function doExport() {
+    if (exporting) return;
+    exporting = true;
+    exportEl.disabled = true;
+    setStatus('');
+    try {
+      const saved = await api.export(normalizeFilter(view.filter));
+      setStatus(saved ? `${TEXT.exported} ${saved}` : TEXT.exportCancelled);
+    } catch (e) {
+      // Ruling P4-7: the rejection is opaque -- its code and message are not trustworthy across
+      // the bridge and are never inspected, let alone shown. The button itself is the retry.
+      setStatus(TEXT.exportError);
+    } finally {
+      exporting = false;
+      exportEl.disabled = false;
+    }
+  }
+
+  // Per selected item: main turns the id into the activity's own directory under the owned
+  // activity root. No path is ever built here.
+  async function doReveal() {
+    const id = view.selectedId;
+    if (!id) return;
+    setStatus('');
+    try {
+      await api.reveal(id);
+    } catch (e) {
+      setStatus(TEXT.revealError);
+    }
+  }
+
+  refreshEl.addEventListener('click', refreshAll);
+  exportEl.addEventListener('click', doExport);
+  revealEl.addEventListener('click', doReveal);
+  revealEl.disabled = true; // nothing is selected yet, and a failed first load leaves it that way
+
   setLens('events'); // paints the empty detail pane ("select an activity") on its way through
   // Returned so a caller (the unit tests) can await the first load; the browser path ignores it.
   return loadList();
@@ -583,7 +723,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined' && window.a
 if (typeof module !== 'undefined') {
   module.exports = {
     sanitizeText, formatTime, formatDuration,
-    renderChip, renderEventRow, renderProblemRow, renderList,
+    renderChip, renderEventRow, renderProblemRow, renderStoreState, renderList,
     renderEvents, renderProblems, renderDetail, describeProblem,
     normalizeFilter, matchesEventFilter, focusIdFromHash,
     boot,

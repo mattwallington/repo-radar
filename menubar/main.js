@@ -601,15 +601,32 @@ function updateTrayMenu() {
       label: '📊 View Progress',
       click: () => showLogWindow()
     });
+    // Task 4.5: Activity History, available in BOTH branches. "📊 View Progress" is the live tail
+    // of the run in flight; this is the durable record of every past attempt, and it is the only
+    // unconditional way into the window -- "⚠️ View Errors" below appears only when the cache
+    // holds a problem item, so a user with a clean history would otherwise have no entry point.
+    // No focus id: the window opens on the list, not deep-linked at anything.
+    menuItems.push({
+      label: '🗒 Activity',
+      click: () => showActivityWindow()
+    });
   } else {
     // Sync not running - show Sync Now
     menuItems.push({
       label: '▶ Sync Now',
       click: () => triggerSync()
     });
-    
-    // Activity History (Task 4.4 / Rulings P4-6, P4-14): the affordance exists only when the
-    // cache holds an actual item to open, and it deep-links straight to that item.
+
+    // The same unconditional entry as the syncing branch above -- see the note there for why it
+    // appears in both and why it carries no focus id.
+    menuItems.push({
+      label: '🗒 Activity',
+      click: () => showActivityWindow()
+    });
+
+    // View Errors (Task 4.4 / Rulings P4-6, P4-14): the same window as the entry above, but
+    // GATED -- it exists only when the cache holds an actual item to open, and it deep-links
+    // straight to that item.
     // `status.hasErrors` no longer gates it -- that flag was set by pre-attempt failures which
     // produce no `errorList`, so it could offer "View Errors" for a window that had nothing to
     // render. It still drives the tray icon above, unchanged. This is a plain READ: the reader is

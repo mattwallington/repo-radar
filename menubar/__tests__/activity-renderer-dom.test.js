@@ -342,8 +342,10 @@ test('renderer/activity.js is sandbox-safe: no require, no Node globals', () => 
 // the shim above is extended with the handful of live-DOM affordances boot uses -- getElementById,
 // classList, querySelectorAll('.chip'), parentNode -- and driven with a fake `activityApi`.
 // -------------------------------------------------------------------------------------------
-function fire(node, type, target) {
-  for (const [t, fn] of node.listeners) if (t === type) fn({ target: target || node });
+// `extra` carries the event properties a specific handler reads -- Task 4.5's delegated keyboard
+// activation needs `key` and a real `preventDefault` (Space would otherwise scroll the pane).
+function fire(node, type, target, extra) {
+  for (const [t, fn] of node.listeners) if (t === type) fn(Object.assign({ target: target || node }, extra));
 }
 
 function livePage() {
@@ -367,7 +369,9 @@ function livePage() {
     return node;
   };
   for (const id of ['list', 'detail', 'event-level', 'event-search', 'event-filters', 'tab-events',
-    'tab-problems', 'system', 'system-body']) {
+    'tab-problems', 'system', 'system-body',
+    // Task 4.5: the action bar (Refresh / Export / Reveal) and its status line.
+    'btn-refresh', 'btn-export', 'btn-reveal', 'action-status']) {
     byId[id] = doc.createElement('div');
     byId[id].value = '';
   }
@@ -391,13 +395,20 @@ function fakeWindow(hash) {
   return win;
 }
 
+// What the main-side save dialog hands back. It is a real filesystem path, so the renderer shows
+// it as text through the same scrubber everything else goes through -- it is not renderer input,
+// but it is not renderer-authored either.
+const EXPORT_PATH = '/Users/someone/Desktop/repo-radar-activity-2026-08-26.txt';
+
 function fakeApi(over) {
   const calls = [];
   const api = {
     list: async (filter) => { calls.push(['list', filter]); return { items: [], truncated: false, available: true, incomplete: false, problems: [] }; },
     get: async (id) => { calls.push(['get', id]); return { item: null, available: true, reason: 'missing' }; },
-    export: async () => { throw new Error('not used by Task 4.2'); },
-    reveal: async () => { throw new Error('not used by Task 4.2'); },
+    // Task 4.5: both are recorded like the other two. `export` answers a path (the main side
+    // resolves it from the OS save dialog); `reveal` answers `true` once dispatched.
+    export: async (filter) => { calls.push(['export', filter]); return EXPORT_PATH; },
+    reveal: async (activityId) => { calls.push(['reveal', activityId]); return true; },
   };
   return { api: Object.assign(api, over), calls };
 }
@@ -965,4 +976,347 @@ test('a response with no `system` payload paints the section without throwing', 
   fire(t.byId.system, 'toggle');
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(t.byId['system-body'].textContent.length > 0);
+});
+
+// -------------------------------------------------------------------------------------------
+// Task 4.5: the three store states (Round-3 #9 / Round-4 #7).
+//
+// `read.listActivities` reports three DIFFERENT things and the UI must not blur them into one
+// "nothing here" line:
+//   * `{available:true, items:[]}`  -- a MISSING store. Normal empty history: nothing has synced
+//     yet. Reassuring, and it says how history starts.
+//   * `{available:false}`           -- the store EXISTS but could not be read. An alarming state
+//     that must never read as "no activity": the user's history may be sitting right there.
+//   * `{available:true, incomplete:true, items:[...]}` -- what could be read, plus an explicit
+//     admission that the view is partial, plus the store-level `problems[]` rows that say why.
+// -------------------------------------------------------------------------------------------
+function storeStateText(result) {
+  return R.renderStoreState(makeDoc(), result).textContent;
+}
+
+function statesIn(node) {
+  return walk(node).filter((el) => el.className.split(' ').includes('state'));
+}
+
+test('renderStoreState gives the three reader states three DIFFERENT fixed texts', () => {
+  const emptyText = storeStateText(listResult({}));
+  const unavailableText = storeStateText(listResult({ available: false }));
+  const incompleteText = storeStateText(listResult({ items: [CHIP_DTO], incomplete: true }));
+
+  assert.match(emptyText, /no activity recorded yet/i);
+  assert.match(emptyText, /sync/i, 'the empty state says how history starts');
+
+  assert.match(unavailableText, /activity history is unavailable/i);
+  assert.match(unavailableText, /could not be read/i, 'and says the store exists but is unreadable');
+
+  assert.match(incompleteText, /history is incomplete/i);
+
+  const texts = [emptyText, unavailableText, incompleteText];
+  for (let i = 0; i < texts.length; i++) {
+    for (let j = i + 1; j < texts.length; j++) {
+      assert.notStrictEqual(texts[i], texts[j], 'each state must be distinguishable by its text alone');
+    }
+  }
+});
+
+test('an unreadable store never reads as empty history, and vice versa', () => {
+  const unavailableText = storeStateText(listResult({ available: false }));
+  assert.ok(!/no activity recorded yet/i.test(unavailableText),
+    'an unreadable store must never claim there is no activity');
+  const emptyText = storeStateText(listResult({}));
+  assert.ok(!/unavailable/i.test(emptyText), 'and empty history must never claim to be unavailable');
+});
+
+test('renderStoreState marks each state with its own class, and only that one', () => {
+  const classesOf = (result) => statesIn(R.renderStoreState(makeDoc(), result))
+    .map((el) => el.className).join(' ');
+  assert.match(classesOf(listResult({})), /state-empty/);
+  assert.ok(!/state-unavailable|state-incomplete/.test(classesOf(listResult({}))));
+  assert.match(classesOf(listResult({ available: false })), /state-unavailable/);
+  assert.ok(!/state-empty/.test(classesOf(listResult({ available: false }))),
+    'the unavailable state does not also claim emptiness');
+  assert.match(classesOf(listResult({ items: [CHIP_DTO], incomplete: true })), /state-incomplete/);
+});
+
+test('an incomplete store shows the banner ALONGSIDE the items it could read', () => {
+  const list = R.renderList(makeDoc(), listResult({ items: [CHIP_DTO], incomplete: true }));
+  assert.strictEqual(walk(list).filter((el) => el.className.split(' ').includes('chip')).length, 1,
+    'the readable items are still shown');
+  assert.match(list.textContent, /history is incomplete/i);
+});
+
+test('an UNAVAILABLE store renders zero chips even if items were (wrongly) non-empty', () => {
+  const list = R.renderList(makeDoc(), listResult({ available: false, items: [CHIP_DTO, CHIP_DTO] }));
+  assert.strictEqual(walk(list).filter((el) => el.className.split(' ').includes('chip')).length, 0,
+    'nothing may be presented as history over a store we could not read');
+  assert.match(list.textContent, /unavailable/i);
+});
+
+test('the truncated footer states how many are shown rather than implying that is all', () => {
+  const items = [CHIP_DTO, CHIP_DTO, CHIP_DTO];
+  const list = R.renderList(makeDoc(), listResult({ items, truncated: true }));
+  const footer = statesIn(list).find((el) => el.className.includes('state-truncated'));
+  assert.ok(footer, 'a truncated response gets a footer line');
+  assert.match(footer.textContent, /3/, 'it names how many are on screen');
+  assert.match(footer.textContent, /older/i, 'and says the rest are older, not absent');
+  assert.strictEqual(statesIn(R.renderList(makeDoc(), listResult({ items }))).length, 0,
+    'an untruncated, complete, non-empty list gets no state line at all');
+});
+
+// -------------------------------------------------------------------------------------------
+// Store-level problems (Task 4.2 deferred minor, now required). `_collectItems` reports an
+// activity-shaped root entry it refused to follow -- a valid-UUID symlink, a plain file, an
+// lstat-denied entry -- as `{kind:'rejected-activity', id, reason}` on the RESPONSE, belonging to
+// no item. Before this task nothing rendered them: the store said "incomplete" and never why, and
+// `describeProblem`'s `rejected-activity` branch was unreachable from the app.
+// -------------------------------------------------------------------------------------------
+const REJECTED = Object.freeze({ kind: 'rejected-activity', id: '11111111-2222-4333-8444-555555555555', reason: 'symlink' });
+
+function problemRowsIn(node) {
+  return walk(node).filter((el) => el.className.split(' ').includes('problem'));
+}
+
+test('store-level problems are rendered as rows, under the incomplete banner', () => {
+  const list = R.renderList(makeDoc(), listResult({
+    items: [CHIP_DTO], incomplete: true, problems: [REJECTED, { kind: 'truncated', dropped: 4 }],
+  }));
+  const rows = problemRowsIn(list);
+  assert.strictEqual(rows.length, 2, 'one row per store-level problem');
+  assert.ok(rows[0].textContent.includes('rejected-activity'), 'the kind is named');
+  assert.ok(rows[0].textContent.includes('symlink'), 'and its reason -- reachable at last');
+  assert.ok(rows[0].textContent.includes(REJECTED.id), 'and which root entry it was');
+  assert.ok(rows[1].textContent.includes('4'), 'the bounded-out remainder is stated too');
+
+  const banner = statesIn(list).find((el) => el.className.includes('state-incomplete'));
+  assert.ok(banner, 'the banner is still there');
+  assert.ok(walk(list).indexOf(banner) < walk(list).indexOf(rows[0]), 'the rows sit under it');
+});
+
+test('a store-level problem is inert text, like every other producer-derived string', () => {
+  const list = R.renderList(makeDoc(), listResult({
+    incomplete: true, problems: [{ kind: 'rejected-activity', id: ANSI_XSS, reason: ANSI_NOISE }],
+  }));
+  assertInert(list, XSS);
+});
+
+test('a clean store renders no problem rows', () => {
+  assert.strictEqual(problemRowsIn(R.renderList(makeDoc(), listResult({ items: [CHIP_DTO] }))).length, 0);
+  for (const bad of [null, undefined, 'nope', {}]) {
+    const list = R.renderList(makeDoc(), listResult({ items: [CHIP_DTO], incomplete: true, problems: bad }));
+    assert.strictEqual(problemRowsIn(list).length, 0, `problems:${JSON.stringify(bad)} must not throw`);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Chips reachable from the keyboard (Task 4.2 note). Not a full a11y pass: a focus stop, a role,
+// and the two keys that mean "activate" -- delegated exactly like the click, so the pure renderer
+// still attaches no listeners.
+// -------------------------------------------------------------------------------------------
+test('a chip is a focus stop that announces itself as a button', () => {
+  const chip = R.renderChip(makeDoc(), CHIP_DTO);
+  assert.strictEqual(chip.getAttribute('tabindex'), '0');
+  assert.strictEqual(chip.getAttribute('role'), 'button');
+  assert.deepStrictEqual(chip.listeners, [], 'still no listeners on the pure renderer');
+});
+
+test('Enter and Space select the focused chip; other keys do not', async () => {
+  for (const [key, expected] of [['Enter', 2], [' ', 2], ['a', 1], ['Tab', 1]]) {
+    const t = bootedList('');
+    await t.booted;
+    const chip = t.byId.list.querySelectorAll('.chip')[0];
+    let prevented = 0;
+    fire(t.byId.list, 'keydown', chip, { key, preventDefault: () => { prevented += 1; } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.strictEqual(t.calls.length, expected, `key ${JSON.stringify(key)}`);
+    if (expected === 2) {
+      assert.deepStrictEqual(t.calls[1], ['get', LIVE_ITEM.id]);
+      assert.strictEqual(prevented, 1, 'Space must not also scroll the pane');
+    }
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Task 4.5: the action bar. Refresh re-issues the load; Export goes to main with the SAME
+// validated filter object the list used (never the raw input text -- main REJECTS an
+// out-of-bounds filter, and renderer text must never reach a filesystem write); Reveal is
+// per-selected-item and disabled until there is one.
+// -------------------------------------------------------------------------------------------
+function statusOf(t) {
+  return t.byId['action-status'].textContent;
+}
+
+test('Refresh re-issues the list load', async () => {
+  const t = bootedList('');
+  await t.booted;
+  assert.strictEqual(t.calls.length, 1);
+
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls[1], ['list', {}]);
+  assert.strictEqual(t.byId.list.querySelectorAll('.chip').length, 2, 'and repaints the list');
+});
+
+test('Refresh also refreshes the System section, but only while it is expanded', async () => {
+  const t = bootedSystem();
+  await t.booted;
+
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls, [['list', {}], ['list', {}]],
+    'a collapsed System section is never read -- that is the whole point of P4-1');
+
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls.slice(3), [['list', {}], ['list', { system: true }]],
+    'an expanded section is refreshed alongside the list');
+});
+
+test('Export sends exactly the normalized filter -- never the raw search input', async () => {
+  const t = bootedList('');
+  await t.booted;
+  t.byId['event-level'].value = 'error';
+  t.byId['event-search'].value = '  Boom  ';
+  fire(t.byId['event-search'], 'input');
+
+  fire(t.byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const sent = t.calls[1];
+  assert.deepStrictEqual(sent, ['export', { level: 'error', search: 'Boom' }]);
+  assert.notStrictEqual(sent[1].search, '  Boom  ', 'the raw input never crosses the bridge');
+});
+
+test('Export drops what the main-side validator would reject, rather than sending it', async () => {
+  const t = bootedList('');
+  await t.booted;
+  t.byId['event-level'].value = 'trace';           // not a level main accepts
+  t.byId['event-search'].value = 'x'.repeat(1000); // over SEARCH_MAX
+  fire(t.byId['event-level'], 'change');
+
+  fire(t.byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepStrictEqual(t.calls[1], ['export', { search: 'x'.repeat(256) }]);
+});
+
+test('a completed Export states the path main chose', async () => {
+  const t = bootedList('');
+  await t.booted;
+  fire(t.byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(statusOf(t), /exported to/i);
+  assert.ok(statusOf(t).includes(EXPORT_PATH), 'the saved path is shown');
+});
+
+test('a cancelled Export says so and claims nothing was written', async () => {
+  const { doc, byId } = livePage();
+  const { api } = fakeApi({
+    list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
+    export: async () => null,
+  });
+  await R.boot(fakeWindow(''), doc, api);
+  fire(byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(byId['action-status'].textContent, /cancelled/i);
+  assert.ok(!/exported to/i.test(byId['action-status'].textContent));
+});
+
+test('a rejected Export shows one fixed line, never the error (P4-7)', async () => {
+  const { doc, byId } = livePage();
+  const { api } = fakeApi({
+    list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
+    export: async () => {
+      const e = new Error('EACCES: permission denied, open /Users/someone/Desktop/x.txt');
+      e.code = 'internal';
+      throw e;
+    },
+  });
+  await R.boot(fakeWindow(''), doc, api);
+  fire(byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const text = byId['action-status'].textContent;
+  assert.ok(text.length > 0, 'a failure is never silent');
+  assert.ok(!text.includes('EACCES'), 'the underlying error text never reaches the page');
+  assert.ok(!text.includes('/Users/'), 'nor any path from it');
+  assert.ok(!text.includes('internal'), 'nor the code -- which is never branched on');
+  assert.strictEqual(byId.list.querySelectorAll('.chip').length, 1, 'and the list is untouched');
+});
+
+test('a second Export click while one is in flight opens no second save dialog', async () => {
+  const { doc, byId } = livePage();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const { api, calls } = fakeApi({
+    list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
+    export: async (filter) => { calls.push(['export', filter]); await gate; return EXPORT_PATH; },
+  });
+  await R.boot(fakeWindow(''), doc, api);
+
+  fire(byId['btn-export'], 'click');
+  fire(byId['btn-export'], 'click');
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(calls.filter((c) => c[0] === 'export').length, 1);
+});
+
+test('Reveal is disabled until an activity is selected, and reveals only that one', async () => {
+  const t = bootedList('');
+  await t.booted;
+  assert.strictEqual(t.byId['btn-reveal'].disabled, true, 'nothing is selected yet');
+
+  fire(t.byId['btn-reveal'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(t.calls.length, 1, 'and a click on it does nothing');
+
+  const chip = t.byId.list.querySelectorAll('.chip')[0];
+  fire(t.byId.list, 'click', chip);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(t.byId['btn-reveal'].disabled, false, 'a selection enables it');
+
+  fire(t.byId['btn-reveal'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls[2], ['reveal', LIVE_ITEM.id], 'the id comes from the selection');
+});
+
+test('a rejected Reveal shows one fixed line, never the error (P4-7)', async () => {
+  const { doc, byId } = livePage();
+  const { api } = fakeApi({
+    list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
+    get: async () => LIVE_DETAIL,
+    reveal: async () => { throw new Error('EACCES /Users/someone/.repo-radar/activity'); },
+  });
+  await R.boot(fakeWindow('#' + LIVE_ITEM.id), doc, api);
+  fire(byId['btn-reveal'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const text = byId['action-status'].textContent;
+  assert.ok(text.length > 0);
+  assert.ok(!text.includes('EACCES') && !text.includes('/Users/'));
+});
+
+test('the status line is cleared when the next action starts', async () => {
+  const t = bootedList('');
+  await t.booted;
+  fire(t.byId['btn-export'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(statusOf(t).length > 0);
+
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(statusOf(t), '', 'a stale "Exported to ..." must not outlive the view it described');
+});
+
+test('the action bar is wired to the page controls the HTML actually provides', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'activity.html'), 'utf8');
+  for (const id of ['btn-refresh', 'btn-export', 'btn-reveal', 'action-status']) {
+    assert.ok(html.includes(`id="${id}"`), `activity.html must provide #${id}`);
+  }
 });

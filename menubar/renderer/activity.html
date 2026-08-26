@@ -30,7 +30,20 @@
       justify-content: space-between;
     }
     .topbar h1 { font-size: 15px; font-weight: 600; color: #cccccc; }
-    .toolbar { display: flex; gap: 8px; }
+    .toolbar { display: flex; align-items: center; gap: 8px; }
+    .action {
+      background: transparent;
+      border: 1px solid #3e3e42;
+      border-radius: 4px;
+      color: #cccccc;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    .action:hover:not(:disabled) { background: #2a2d2e; }
+    .action:disabled { color: #6e6e6e; cursor: default; }
+    .action:focus-visible { outline: 1px solid #0e639c; }
+    .action-status { color: #9d9d9d; font-size: 12px; max-width: 420px; overflow-wrap: anywhere; }
 
     .panes { flex: 1; display: flex; min-height: 0; }
     .pane { overflow-y: auto; min-height: 0; }
@@ -47,6 +60,9 @@
     }
     .chip:hover { background: #2a2d2e; }
     .chip.selected { background: #094771; border-color: #0e639c; }
+    /* Task 4.5: chips are focus stops (tabindex/role on the pure renderer), so the focus ring has
+       to be visible -- otherwise keyboard users can activate a chip they cannot see. */
+    .chip:focus-visible { outline: 1px solid #0e639c; outline-offset: 1px; }
     .chip-head { display: flex; align-items: center; gap: 8px; }
     .chip-meta { display: flex; align-items: center; gap: 8px; margin-top: 3px; color: #9d9d9d; font-size: 12px; }
     .chip-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; color: #cccccc; }
@@ -141,15 +157,27 @@
     .problem-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; color: #6e6e6e; flex: none; }
     .problem-text { overflow-wrap: anywhere; }
 
-    /* ---- states (Task 4.5 replaces these with the first-class three-state UI) ---- */
+    /* ---- states: the three the reader reports, told apart on sight (Round-3 #9 / Round-4 #7).
+       state-empty is ordinary and grey; state-incomplete and state-truncated are amber warnings
+       about what is NOT on screen; state-unavailable is a red panel, because "the store is there
+       and we could not read it" is not the same news as "nothing has synced yet". ---- */
     .state {
       padding: 10px;
       color: #9d9d9d;
       font-size: 12px;
       line-height: 1.5;
     }
+    .state-hint { color: #6e6e6e; font-size: 12px; line-height: 1.5; margin-top: 3px; }
     .state-incomplete, .state-truncated { color: #e2c08d; }
-    .state-unavailable, .state-error { color: #f48771; }
+    .state-error { color: #f48771; }
+    .state-empty { border: 1px dashed #3e3e42; border-radius: 5px; }
+    .state-unavailable {
+      color: #f48771;
+      border: 1px solid #5a1d1d;
+      border-radius: 5px;
+      background: #2a1d1d;
+    }
+    .state-unavailable .state-hint { color: #e0a08d; }
     /* ---- Task 4.3: the System section (shared, uncorrelated diagnostics) ---- */
     .pane-list { display: flex; flex-direction: column; }
     #list { flex: 1 0 auto; }
@@ -208,9 +236,19 @@
 <body>
   <div class="topbar">
     <h1>Activity</h1>
-    <!-- Task 4.5 hook: the Refresh / Export / Reveal controls mount here and call
-         activityApi.list / activityApi.export / activityApi.reveal. -->
-    <div id="toolbar" class="toolbar"></div>
+    <!-- Task 4.5: the action bar. Refresh re-issues the list load (and the System section when it
+         is expanded); Export hands main the CURRENT validated filter and main does the rest --
+         it builds the redacted text, runs the save dialog and writes the file 0600, so no
+         renderer text ever reaches the file or its path; Reveal opens the selected activity's own
+         directory in Finder. The status line is the one place any of the three reports an
+         outcome; it starts empty and is cleared whenever the next action begins. Reveal starts
+         disabled because nothing is selected yet. -->
+    <div id="toolbar" class="toolbar">
+      <span id="action-status" class="action-status"></span>
+      <button id="btn-refresh" class="action" type="button">Refresh</button>
+      <button id="btn-export" class="action" type="button">Export…</button>
+      <button id="btn-reveal" class="action" type="button" disabled>Reveal</button>
+    </div>
   </div>
   <div class="panes">
     <div class="pane pane-list">
