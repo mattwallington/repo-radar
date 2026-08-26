@@ -388,10 +388,26 @@ def _segments_data(home, activity_id):
 # alias) so a monkeypatch of `scan_mod.scan_activity` reaches every consumer uniformly.
 Scan = scan_mod.Scan
 
-def _scan(home, aid):
+def _scan(home, aid, ctx=None):
     """THE single scan (Ruling 38): see `scan.scan_activity`. `_top_types`/`_has_start`/
     `_has_terminal`/`_classify` (and, through them, `_reconcile_one_locked`/`_prune_locked`/
-    `_retain_locked`) all derive from this SAME pass."""
+    `_retain_locked`) all derive from this SAME pass.
+
+    Ruling 68 (G9-Py, Codex Round 9 BLOCKER; landed as Python-side defense-in-depth per the
+    spec's 2026-08-26 §7 threat-model scope ruling -- Node has no fd-relative directory reads, so
+    this half of the ABA class stays closed only here): `ctx` (a `LockCtx` from an ACTIVE
+    `_quota_lock`), when given, routes this scan through the fd-bound `scan.scan_activity_dir_fd
+    (ctx.afd, aid)` instead of the path-based `scan.scan_activity(home, aid)` -- so a locked
+    classification decision (`_classify` via `_prune_locked`/`_retain_locked`, and `_reconcile_
+    one_locked`'s own pre-lease scan) reads the SAME retained activity directory the lock's own
+    root enumeration and deletion (Ruling 67) already resolve `aid` against, never re-resolving
+    `<aid>/` by PATH mid-decision -- the ABA gap a path-based re-scan left open (a same-ID
+    activity swapped in for the duration of classification, then swapped back before the caller's
+    own deletion decision, could otherwise make a path-based re-scan see a DIFFERENT directory
+    than the one actually enumerated/deleted). `None` (the default) -- unlocked/introspection
+    callers -- keeps the existing path-based scan, unchanged."""
+    if ctx is not None:
+        return scan_mod.scan_activity_dir_fd(ctx.afd, aid)
     return scan_mod.scan_activity(home, aid)
 
 def _top_types(home, aid):
@@ -911,7 +927,7 @@ def _reconcile_one_locked(home, aid, ctx):
     instead of the path-based `_unlink_entry(home, aid)`, closing the residual Ruling 60 left
     open (a swapped `quota/` re-resolved by path as "certain empty" while holding the lock)."""
     lock = paths.owner_lock_path(home, aid)
-    scan = _scan(home, aid)                         # Ruling 38: ONE scan gates every branch below,
+    scan = _scan(home, aid, ctx)                     # Ruling 38/68: ONE scan gates every branch below,
     if scan.view_uncertain:                          # including the eventual synthesize_terminal call --
         return                                       # uncertain view => PRESERVE, never guess (R2-1)
     types = {r.get("type") for r in scan.records}
@@ -1008,12 +1024,26 @@ def is_problem_bearing(scan) -> bool:
             return True
     return bool(findings) or bool(rejected) or terminal_count >= 2
 
-def _classify(home, aid):
+def _classify(home, aid, ctx=None):
     """('running'|'problem'|'routine', newest_mtime) for a SETTLED activity — via the single
     `_scan` pass. An uncertain view (couldn't confirm what's actually on disk) is treated as
     'running': unreconciled/uncertain items must never be guessed into 'problem' or 'routine',
-    and `_prune_locked`/`_retain_locked` already skip 'running' unconditionally (Ruling 38)."""
-    scan = _scan(home, aid)
+    and `_prune_locked`/`_retain_locked` already skip 'running' unconditionally (Ruling 38).
+
+    Ruling 68 (G9-Py, Codex Round 9 BLOCKER; Python-side defense-in-depth per the spec's
+    2026-08-26 §7 threat-model scope ruling): `ctx`, when given -- from an ACTIVE `_quota_lock` --
+    is threaded into `_scan` so this classification reads the SAME fd-retained activity directory
+    `_prune_locked`/`_retain_locked` already enumerated (and will delete), never re-resolving
+    `<aid>/` by PATH mid-decision. Pre-fix, `_classify` always called `_scan(home, aid)`
+    (path-based) even from inside a locked prune/retain pass: a temporary same-ID activity
+    directory containing a `succeeded` terminal, swapped in for just this call and swapped back
+    (to the original start-only, still-running activity) before the caller's own deletion
+    decision, made `_classify` report the SWAPPED-IN terminal (kind='routine') while the actual
+    deletion a moment later hit the RESTORED original -- `quota.prune` deleting a running,
+    unreconciled item (Codex Round 9 repro). `_prune_locked`/`_retain_locked` now pass their own
+    `ctx` here; unlocked callers (tests, introspection) keep passing no `ctx` and get the
+    path-based scan, exactly as before."""
+    scan = _scan(home, aid, ctx)
     if scan.view_uncertain:
         return ("running", scan.mtime)
     types = {r.get("type") for r in scan.records}
@@ -1055,7 +1085,14 @@ def _prune_locked(home, need_bytes, ctx):
     would still (for a root swap specifically) see the real, original tree, per this codebase's
     fail-closed convention (Ruling 61/64/65) an identity anomaly refuses outright rather than
     "getting lucky" and continuing; refuse ENTIRELY (return 0, nothing pruned) rather than build a
-    candidate list this pass cannot vouch for."""
+    candidate list this pass cannot vouch for.
+
+    Ruling 68 (G9-Py, Codex Round 9 BLOCKER; Python-side defense-in-depth per the spec's
+    2026-08-26 §7 threat-model scope ruling): each candidate's `_classify(home, aid, ctx)` call
+    (below) is now ALSO bound to `ctx.afd`, closing the one piece of this function's own I/O that
+    Ruling 67 left path-based -- `_classify` used to re-resolve `<aid>/` from scratch via `paths.
+    activity_dir(home, aid)`, a walk entirely independent of the enumeration/deletion above. See
+    `_classify` and `_scan`'s own docstrings for the ABA this closes."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return 0                                   # live set unproven -- never delete under uncertainty
@@ -1066,7 +1103,7 @@ def _prune_locked(home, need_bytes, ctx):
     for aid in paths.list_owned_subdirs_dir_fd(ctx.afd):
         if aid == "quota" or aid in live:
             continue
-        kind, mtime = _classify(home, aid)
+        kind, mtime = _classify(home, aid, ctx)
         if kind == "running":
             continue                               # never prune running/unreconciled
         items.append((aid, kind, mtime))
@@ -1117,7 +1154,12 @@ def _retain_locked(home, ctx):
     `_verify_canonical(ctx)` gate as `_prune_locked` before building the candidate list at all --
     see that function's own comment for why an identity anomaly refuses outright here too, even
     though a root-swap specifically would still (for THIS pass) resolve `ctx.afd`-relative reads
-    against the real, original tree."""
+    against the real, original tree.
+
+    Ruling 68 (G9-Py, Codex Round 9 BLOCKER; Python-side defense-in-depth per the spec's
+    2026-08-26 §7 threat-model scope ruling): each candidate's `_classify(home, aid, ctx)` call
+    (below) is now ALSO bound to `ctx.afd`, same rationale/fix as `_prune_locked`'s own -- see
+    `_classify`/`_scan`'s own docstrings."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return []                                    # live set unproven -- never delete under uncertainty
@@ -1130,7 +1172,7 @@ def _retain_locked(home, ctx):
     for aid in before:
         if aid == "quota" or aid in live:
             continue
-        kind, mtime = _classify(home, aid)
+        kind, mtime = _classify(home, aid, ctx)
         if kind == "running":
             continue                                         # never prune running/unreconciled
         candidates.append((aid, kind, mtime))

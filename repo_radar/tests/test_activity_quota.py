@@ -1399,6 +1399,106 @@ def test_unlock_survives_injected_lock_un_failure_admit_still_returns_true(tmp_p
         "reserved": quota.RESERVE, "granted": 0,
     }
 
+# --- Ruling 68 (G9-Py, Codex Round 9 BLOCKER): `_prune_locked`/`_retain_locked` enumerate
+# candidates and delete via `ctx.afd` (Ruling 67), but `_classify` used to re-resolve each
+# candidate's directory by PATH (`scan.scan_activity(home, aid)` -- a fresh walk from the shared
+# `Library/Logs/repo-radar` prefix, entirely independent of `ctx.afd`'s already-open,
+# lock-acquisition-time binding). The tests below inject a REAL swap of the ACTIVITY ROOT --
+# rename `activity/` -> `activity.moved/`, a fresh `activity/` created with a SAME-ID `aid`
+# subdirectory holding a `succeeded` terminal -- exactly around the classification read, then
+# restore the original before the test's own assertions (mirroring "restore the original before
+# `_verify_canonical`" from the finding: `_prune_locked`'s own root-identity check, unrelated to
+# this fix, sees a validly-restored root by the time it runs and lets deletion proceed normally,
+# so these tests isolate CLASSIFICATION's own correctness rather than an unrelated refusal).
+# Landed as Python-side defense-in-depth per the spec's 2026-08-26 §7 threat-model scope ruling
+# (Node cannot mirror this fix -- no fd-relative directory reads in Node's `fs`).
+
+def test_prune_locked_classify_survives_activity_root_swap_during_fd_bound_scan(tmp_path, monkeypatch):
+    """With the Ruling 68 fix, `_classify`'s scan is `ctx.afd`-bound: `ctx.afd` was opened+
+    validated at lock acquisition, long BEFORE this test's swap, so it stays bound to the TRUE
+    original `activity/` tree regardless of what gets renamed at the canonical PATH afterward --
+    the same already-proven immunity every other `ctx.afd`-relative read in this module has
+    (Ruling 67). Classification therefore reads the REAL, start-only (still-running) activity, not
+    the fake succeeded-terminal one sitting at the swapped-in path -- `quota.prune` must delete
+    NOTHING."""
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid)              # start only, no terminal -> genuinely RUNNING
+    # never admitted -> no ledger entry -> a bare directory prune candidate
+
+    root_dir = paths.quota_dir(tmp_path).parent            # activity/
+    moved_dir = tmp_path / "activity.moved"
+    real_read = paths.read_owned_segments_dir_fd_detailed
+    state = {"done": False}
+
+    def hooked(dfd, name, suffix=".jsonl"):
+        if not state["done"] and name == aid:
+            state["done"] = True
+            os.rename(root_dir, moved_dir)                          # (1) rename the real activity dir aside
+            paths.secure_mkdir(paths.activity_dir(tmp_path, aid))     # (2) fresh same-ID dir...
+            _write_terminal(tmp_path, aid, outcome="succeeded")       #     ...with a succeeded terminal
+            try:
+                return real_read(dfd, name, suffix)                  # (3) let the read proceed
+            finally:
+                shutil.rmtree(root_dir)                               # (4) drop the fake...
+                os.rename(moved_dir, root_dir)                        #     ...restore the original
+        return real_read(dfd, name, suffix)
+    monkeypatch.setattr(paths, "read_owned_segments_dir_fd_detailed", hooked)
+
+    try:
+        freed = quota.prune(tmp_path, need_bytes=1)
+    finally:
+        monkeypatch.undo()
+
+    assert state["done"], "the fd-bound classification read must actually have been reached"
+    assert freed == 0
+    assert paths.activity_dir(tmp_path, aid).exists()
+    assert quota._top_types(tmp_path, aid) == ["start"]     # the TRUE original -- never a terminal
+    l.release()
+
+def test_prune_locked_classify_via_path_form_deletes_running_item_on_activity_root_swap(tmp_path, monkeypatch):
+    """Counterfactual (Codex Round 9 repro, confirms the pre-fix vulnerability): with `_classify`
+    rerouted back through the PATH form (`quota._scan` forced to ignore `ctx`, exactly matching
+    the pre-Ruling-68 implementation), the SAME swap technique -- but landing around the
+    path-based read (`paths.read_owned_segments_detailed`, an independent fresh walk NOT bound to
+    `ctx.afd`) -- fools classification into reading the fake succeeded-terminal directory. By the
+    time the swap is undone and `_prune_locked` reaches its deletion decision, the REAL, restored,
+    start-only (still-running) activity is what's actually at that path, and `quota.prune` deletes
+    it -- reproducing "never prune running/unreconciled" being violated. This test is expected to
+    keep passing as a canary: if `_classify`/`_scan` is ever silently reverted to the path form,
+    this documents exactly why that regresses."""
+    monkeypatch.setattr(quota, "_scan", lambda home, aid, ctx=None: quota.scan_mod.scan_activity(home, aid))
+
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid)
+    root_dir = paths.quota_dir(tmp_path).parent
+    moved_dir = tmp_path / "activity.moved"
+    real_read = paths.read_owned_segments_detailed
+    state = {"done": False}
+
+    def hooked(directory, suffix=".jsonl"):
+        if not state["done"] and pathlib.Path(directory) == paths.activity_dir(tmp_path, aid):
+            state["done"] = True
+            os.rename(root_dir, moved_dir)
+            paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+            _write_terminal(tmp_path, aid, outcome="succeeded")
+            try:
+                return real_read(directory, suffix)      # resolves the FAKE -- a fresh, independent walk
+            finally:
+                shutil.rmtree(root_dir)
+                os.rename(moved_dir, root_dir)            # restored BEFORE _prune_locked's deletion decision
+        return real_read(directory, suffix)
+    monkeypatch.setattr(paths, "read_owned_segments_detailed", hooked)
+
+    try:
+        freed = quota.prune(tmp_path, need_bytes=1)
+    finally:
+        monkeypatch.undo()
+
+    assert state["done"], "the path-based classification read must actually have been reached"
+    assert freed > 0
+    assert not paths.activity_dir(tmp_path, aid).exists()    # BUG (pre-fix): the running item was deleted
+    l.release()
+
 def test_verify_canonical_returns_false_when_quota_replaced_by_regular_file(tmp_path):
     """Non-blocking residual (Codex Round 9 reviewer note, G9-Py): `_verify_canonical` is
     documented as NEVER raising, but pre-fix only caught `OSError`. Replacing `quota/` with a

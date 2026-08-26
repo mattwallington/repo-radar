@@ -121,6 +121,22 @@ def _dir_provably_gone(directory):
     os.close(fd)
     return False
 
+def _dir_provably_gone_dir_fd(dfd, name):
+    """fd-bound counterpart to `_dir_provably_gone` (Ruling 68, G9-Py): True iff `name` (an
+    activity subdirectory) PROVABLY never existed relative to `dfd` -- `FileNotFoundError`, as
+    opposed to existing but unsafe to open (ELOOP/ENOTDIR/etc.) or any other `OSError`, both of
+    which must stay uncertain (preserve). Mirrors `_dir_provably_gone`'s identical distinction,
+    just resolved via an already-validated directory fd (a locked `quota.LockCtx.afd`) instead of
+    a fresh path walk."""
+    try:
+        sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    os.close(sub)
+    return False
+
 def scan_activity(home, aid):
     """THE single scan: one filesystem pass over an activity's segment directory -> `Scan`."""
     directory = paths.activity_dir(home, aid)
@@ -146,6 +162,49 @@ def scan_activity(home, aid):
 
     # view_uncertain: the directory itself couldn't be validated/listed, or some rejected entry's
     # NAME would parse as a conforming segment (i.e. really could carry a start/terminal).
+    view_uncertain = any(
+        r["reason"] == "dir-unreadable" or paths.parse_segment_name(r["name"]) is not None
+        for r in rejected
+    )
+
+    records_out, findings, mtime = [], [], 0.0
+    for name, data, _size, seg_mtime in conforming:
+        mtime = max(mtime, seg_mtime)
+        recs, finds = parse_segment_bytes(data, aid)
+        records_out.extend(recs)
+        findings.extend(finds)
+
+    cancel = any(r.get("type") == "control" and r.get("name") == "cancel_requested"
+                 for r in records_out)
+    return Scan(records=records_out, findings=findings, rejected=rejected,
+                view_uncertain=view_uncertain, mtime=mtime, cancel_requested=cancel)
+
+def scan_activity_dir_fd(dfd, aid):
+    """Ruling 68 (G9-Py, Codex Round 9 BLOCKER): fd-bound counterpart to `scan_activity` for a
+    LOCKED classification decision. Reads `aid`'s segments via `paths.read_owned_segments_dir_fd_
+    detailed(dfd, aid)` -- opening the activity subdirectory relative to an ALREADY-VALIDATED root
+    directory fd `dfd` (a locked `quota.LockCtx.afd`) -- instead of `scan_activity`'s path-based
+    `paths.read_owned_segments_detailed(paths.activity_dir(home, aid))`. No path re-resolution of
+    the activity subdirectory once `dfd` is given: `quota._classify`, when called under `quota.
+    lock` with a live `ctx`, uses this so classification reads the SAME retained directory
+    `_prune_locked`/`_retain_locked`'s own `ctx.afd`-bound enumeration and deletion already work
+    with -- never a directory a same-ID pathname swap re-resolved to mid-decision. Otherwise
+    IDENTICAL segment enumeration/finding/seq-regression/cancel-requested rules to `scan_activity`
+    -- see the module docstring; only the read primitive and the provably-gone check
+    (`_dir_provably_gone_dir_fd` instead of `_dir_provably_gone`) differ."""
+    segments, rejected_raw = paths.read_owned_segments_dir_fd_detailed(dfd, aid)
+    rejected = [{"name": name, "reason": reason} for name, reason in rejected_raw]
+
+    if any(r["reason"] == "dir-unreadable" for r in rejected) and _dir_provably_gone_dir_fd(dfd, aid):
+        rejected = []
+
+    conforming = []
+    for seg in segments:
+        if paths.parse_segment_name(seg[0]) is not None:
+            conforming.append(seg)
+        else:
+            rejected.append({"name": seg[0], "reason": "bad-name"})
+
     view_uncertain = any(
         r["reason"] == "dir-unreadable" or paths.parse_segment_name(r["name"]) is not None
         for r in rejected

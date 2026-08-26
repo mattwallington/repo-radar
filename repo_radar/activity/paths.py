@@ -324,6 +324,77 @@ def stat_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
         os.close(sub)
     return out, uncertain
 
+def read_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
+    """Ruling 68 (G9-Py, Codex Round 9 BLOCKER): fd-bound counterpart to `read_owned_segments_
+    detailed` for a LOCKED per-activity CLASSIFICATION read. Opens the activity subdirectory
+    `name` relative to an ALREADY-VALIDATED root directory fd `dfd` (a locked `quota.LockCtx.afd`)
+    with `O_NOFOLLOW|O_DIRECTORY` -- so a symlink squatting on `name` is rejected, not resolved
+    through -- then runs the SAME enumerate+read segment logic as `read_owned_segments_detailed`
+    on that opened subdirectory fd. `scan.scan_activity_dir_fd` (in turn `quota._classify`, when
+    called with a live `ctx`) uses this so a LOCKED classification decision never re-resolves the
+    activity subdirectory by PATH -- closing the ABA gap a path-based re-scan left open: enumerate
+    (`_prune_locked`/`_retain_locked`) and delete (`unlink_owned_tree_dir_fd`) were already bound
+    to `ctx.afd` (Ruling 67), but `_classify` still called `paths.activity_dir(home, aid)` and
+    walked it FRESH from the shared `Library/Logs/repo-radar` prefix every time -- a resolution
+    completely independent of `ctx.afd`'s already-open, lock-acquisition-time binding. A same-ID
+    activity swapped in for the duration of that independent walk (then swapped back before the
+    deletion decision) could make classification see content that was never the SAME directory
+    the lock's own enumeration/deletion ever actually touched (Codex repro: a temporary succeeded-
+    terminal activity fooled classify into 'routine' while the real, restored, start-only activity
+    -- still running -- was the one actually deleted). Node cannot mirror this (no fd-relative
+    directory reads in Node's `fs`); on the Python side this is defense-in-depth per the spec's
+    §7 threat-model scope ruling (2026-08-26, Phase-3 gate Round 9) -- keeps Python's own
+    never-prune-running guarantee fully descriptor-bound even though the underlying same-UID ABA
+    class is outside the documented threat model.
+
+    Returns `(segments, rejected)` -- same shape/semantics as `read_owned_segments_detailed`:
+      segments -- [(name, data_bytes, size, mtime)].
+      rejected -- [(name, reason)] per suffix-matching entry ('symlink'/'not-regular'/'denied'/
+        'gone'/'read-failed'), OR `[('', 'dir-unreadable')]` if the SUBDIRECTORY itself couldn't be
+        opened/listed relative to `dfd` (mirrors the path-based form folding both 'never existed'
+        and 'unsafe to open' into the same dir-unreadable signal; `scan.scan_activity_dir_fd`'s own
+        provably-gone companion check distinguishes the two independently, exactly like `scan.
+        scan_activity`'s `_dir_provably_gone` does for the path-based form)."""
+    try:
+        sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+    except OSError:
+        return [], [("", "dir-unreadable")]
+    segments = []
+    rejected = []
+    try:
+        try:
+            entries = list(os.scandir(sfd))
+        except OSError:
+            return [], [("", "dir-unreadable")]
+        for entry in entries:
+            if not entry.name.endswith(suffix):
+                continue
+            try:
+                ffd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=sfd)
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    rejected.append((entry.name, "symlink"))
+                elif e.errno == errno.EACCES:
+                    rejected.append((entry.name, "denied"))
+                elif e.errno == errno.ENOENT:
+                    rejected.append((entry.name, "gone"))
+                else:
+                    rejected.append((entry.name, "read-failed"))
+                continue
+            try:
+                st = os.fstat(ffd)
+                if not stat.S_ISREG(st.st_mode):
+                    rejected.append((entry.name, "not-regular"))
+                    continue
+                segments.append((entry.name, _read_fd(ffd), st.st_size, st.st_mtime))
+            except OSError:
+                rejected.append((entry.name, "read-failed"))
+            finally:
+                os.close(ffd)
+    finally:
+        os.close(sfd)
+    return segments, rejected
+
 def fsync_owned_segments(directory, suffix=".jsonl"):
     """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT
     reading content (Codex gate round 1, finding 1): before reconcile settles an activity whose

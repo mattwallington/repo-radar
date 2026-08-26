@@ -140,11 +140,23 @@ def test_scan_view_uncertain_false_for_bad_name_only(tmp_path):
 # `scan_mod.scan_activity`, so patching that one function drives every consumer.
 
 def _patch_scan_sequence(monkeypatch, first, then):
+    # Ruling 68 (G9-Py): `_reconcile_one_locked`'s own PRE-lease scan is now `ctx`-bound (it runs
+    # under quota.lock with a live `ctx` -- see quota._scan) and goes through `scan_mod.
+    # scan_activity_dir_fd`, not `scan_mod.scan_activity`. The UNDER-lease rescan `synthesize_
+    # terminal` performs is unrelated to quota.lock (it runs under the per-activity owner lease
+    # instead, and `reconcile.synthesize_terminal` has no `ctx` to bind to) and stays on the
+    # path-based `scan_mod.scan_activity`, unchanged. Both are patched here, sharing ONE counter,
+    # so "first"/"then" still line up with "pre-lease scan" / "under-lease rescan" regardless of
+    # which underlying function each now goes through.
     calls = {"n": 0}
     def fake_scan(home, a):
         calls["n"] += 1
         return first if calls["n"] == 1 else then
+    def fake_scan_dir_fd(dfd, a):
+        calls["n"] += 1
+        return first if calls["n"] == 1 else then
     monkeypatch.setattr(scan_mod, "scan_activity", fake_scan)
+    monkeypatch.setattr(scan_mod, "scan_activity_dir_fd", fake_scan_dir_fd)
     return calls
 
 def test_reconcile_one_locked_under_lease_rescan_blocks_stale_synthesis(tmp_path, monkeypatch):
