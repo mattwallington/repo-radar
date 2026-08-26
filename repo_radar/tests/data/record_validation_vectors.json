@@ -240,5 +240,10 @@
     "accept": false,
     "why": "ownership pid is the non-integer JSON literal 1.0 -- Python's isinstance(1.0, int) is already False so this is rejected by type either way, but (like the seq/schema_version 1.0 cases above) 'raw' can't carry the exact literal spelling since round-tripping a parsed object loses the int/float distinction on the Node side; 'raw_text' carries the literal JSON line text verbatim so both languages' parsers see the identical source bytes (Codex R6-3 fixture half)",
     "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"ownership\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"owner_token\":\"deadbeef\",\"role\":\"initial\",\"producer\":\"python\",\"pid\":1.0,\"boot_id\":\"a1b2c3d4e5f60718\",\"proc_birth\":\"2026-08-14T00:00:00-07:00\"}"
+  },
+  {
+    "accept": true,
+    "why": "additive pid on a non-ownership record (event) is accepted -- Python's _validate only type-checks 'pid' for type:'ownership'; on any other record type an unknown additive field (even the non-integer literal 1.0, which WOULD be rejected on an ownership record) is simply ignored. 'raw_text' carries the literal 1.0 spelling verbatim, matching the 'raw_text' convention the 1.0-literal cases above already use, so the Node cross-runtime driver sees the identical source bytes (Ruling 63 / Codex R7-4: the Node reader scopes its strict-literal pid check to ownership only, same as Python)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{},\"pid\":1.0}"
   }
 ]

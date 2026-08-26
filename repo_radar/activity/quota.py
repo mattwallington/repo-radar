@@ -23,26 +23,49 @@ def _open_quota_dir(home):
     paths.secure_mkdir(paths.quota_dir(home))              # ensure activity/ + quota/ exist
     return paths.open_owned_dir(paths.quota_dir(home))     # validated quota/ dir fd (Round-5 #1)
 
-def _quota_lock(home):
-    paths.secure_mkdir(paths.quota_dir(home))
-    afd = paths.open_owned_dir(paths.quota_dir(home).parent)   # validated activity/ dir fd
-    try:                                                        # quota.lock opened RELATIVE to it
-        fd = os.open("quota.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=afd)
-    finally:
-        os.close(afd)
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):                           # reject FIFO/device (Round-5 #5)
-        os.close(fd); raise paths.UnsafePath("quota.lock is not a regular file")
-    try:
-        if stat.S_IMODE(st.st_mode) != 0o600:
-            os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)      # blocking; brief critical section
-    except BaseException:
-        os.close(fd); raise                 # no fd leak on fchmod/flock failure (fix round 1, Minor 3)
-    return fd
+@dataclass
+class LockCtx:
+    """Ruling 60 (Codex R7-1, BLOCKER): the object `_quota_lock` returns -- a validated
+    `quota.lock` fd PLUS the `quota/` directory fd `_quota_lock` validated/opened BEFORE taking
+    `flock`, kept alive for the WHOLE lifetime of the lock. `admit`/`grant` read/write the ledger
+    through `qfd` (via `_ledger_entries_detailed_fd`/`_read_entry_fd`/`_write_entry_fd`) instead of
+    re-resolving `quota/` by path for their own decision snapshot -- so a rename/swap of `quota/`
+    AFTER the lock was acquired can never be misread by that decision as "no ledgers yet" the way
+    a fresh path-based `ENOENT` would be (Codex repro: 16 x 4 MiB ledger liabilities, rename
+    `quota/` between lock and enumeration -> `admit` wrongly admitted a reservation -> 67,170,304
+    bytes on disk, over the ceiling). `_unlock` closes both fds. Other locked call sites
+    (`_reconcile_all_locked`, `_prune_locked`, `_retain_locked`, `settle`'s `_unlink_entry`) are
+    NOT required to thread `qfd` through -- they're exercised directly (without a real lock) by
+    existing tests, and their own path-based ENOENT=empty reading is an accepted, unchanged
+    reading for those "unlocked reader" call shapes."""
+    lock_fd: int
+    qfd: int
 
-def _unlock(fd):
-    fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+def _quota_lock(home):
+    qfd = _open_quota_dir(home)          # validated quota/ dir fd, opened+kept BEFORE flock (Ruling 60)
+    try:
+        afd = paths.open_owned_dir(paths.quota_dir(home).parent)   # validated activity/ dir fd
+        try:                                                        # quota.lock opened RELATIVE to it
+            fd = os.open("quota.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=afd)
+        finally:
+            os.close(afd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):                           # reject FIFO/device (Round-5 #5)
+            os.close(fd); raise paths.UnsafePath("quota.lock is not a regular file")
+        try:
+            if stat.S_IMODE(st.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)      # blocking; brief critical section
+        except BaseException:
+            os.close(fd); raise             # no fd leak on fchmod/flock failure (fix round 1, Minor 3)
+        return LockCtx(lock_fd=fd, qfd=qfd)
+    except BaseException:
+        os.close(qfd); raise                # no qfd leak either, on ANY failure above (Ruling 60)
+
+def _unlock(ctx):
+    fcntl.flock(ctx.lock_fd, fcntl.LOCK_UN)
+    os.close(ctx.lock_fd)
+    os.close(ctx.qfd)
 
 def _parse_entry(data):
     """Validate the ledger's FULL invariant (Round-3/6 #6/#5): counters must be EXACT non-boolean
@@ -72,10 +95,28 @@ def _read_entry(path):
     except (paths.UnsafePath, FileNotFoundError, OSError):
         return "CORRUPT"
 
-def _write_entry(home, activity_id, reserved, granted):
-    """Durable, DESCRIPTOR-RELATIVE ledger write (Round-5 #1): temp file + full-write loop +
-    fsync, atomic rename and dir fsync all relative to the validated quota dir fd, with temp
-    cleanup on any failure. Raises on durability failure."""
+def _read_entry_fd(qfd, activity_id):
+    """Descriptor-relative counterpart to `_read_entry` (Ruling 60 / Codex R7-1, BLOCKER): reads
+    `<activity_id>.json` relative to an ALREADY-VALIDATED `quota/` dir fd (a `LockCtx.qfd`) instead
+    of re-resolving `quota/` by path. `admit`/`grant` use this for their own locked decision.
+    Same fail-closed contract as `_read_entry`: a missing/invalid/malformed entry -> "CORRUPT"
+    (an invalid `activity_id` also can't be turned into a safe filename -> "CORRUPT", mirroring
+    what a caller like `grant` already does with `_read_entry`'s result)."""
+    if not ids.valid_activity_id(activity_id):
+        return "CORRUPT"
+    try:
+        return _parse_entry(paths.read_owned_dir_fd_regular(qfd, f"{activity_id}.json"))
+    except (paths.UnsafePath, FileNotFoundError, OSError):
+        return "CORRUPT"
+
+def _write_entry_fd(qfd, activity_id, reserved, granted):
+    """Descriptor-relative CORE of the durable ledger write (Ruling 60 / Codex R7-1, BLOCKER):
+    temp file + full-write loop + fsync, atomic rename + dir fsync, temp cleanup on any failure --
+    all relative to an ALREADY-VALIDATED `quota/` dir fd (a `LockCtx.qfd`), never re-resolving
+    `quota/` by path. `admit`/`grant` call this directly with `ctx.qfd` while holding the lock, so
+    the write stays bound to the SAME directory identity the lock validated. Raises on durability
+    failure (via `paths.write_owned_dir_fd_regular_atomic`); `_write_entry` below is the
+    path-based wrapper other (unlocked) call sites use."""
     if not ids.valid_activity_id(activity_id):
         # fix round 1, Critical: activity_id becomes a filename below; dir_fd is IGNORED for an
         # absolute name and `../` escapes the quota dir, so this MUST be validated before any
@@ -83,35 +124,19 @@ def _write_entry(home, activity_id, reserved, granted):
         raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     blob = json.dumps({"reserved": reserved, "granted": granted}).encode()
     name = f"{activity_id}.json"; tmp = f".{activity_id}.{os.getpid()}.tmp"
+    paths.write_owned_dir_fd_regular_atomic(qfd, name, tmp, blob)
+
+def _write_entry(home, activity_id, reserved, granted):
+    """Path-based wrapper over `_write_entry_fd` (Ruling 60): opens+validates the `quota/` dir
+    fresh for this ONE write (used by unlocked/introspection call sites, e.g. tests that call this
+    directly without holding `quota.lock`). Locked callers (`admit`/`grant`) call
+    `_write_entry_fd(ctx.qfd, ...)` directly instead, so their write stays bound to the SAME
+    validated directory identity `_quota_lock` captured, never re-resolved by path."""
+    if not ids.valid_activity_id(activity_id):
+        raise paths.UnsafePath(f"invalid activity_id for ledger path: {activity_id!r}")
     qfd = _open_quota_dir(home)
     try:
-        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=qfd)
-        try:
-            view = memoryview(blob)
-            while view:
-                n = os.write(tfd, view)
-                if n <= 0:
-                    raise OSError("zero-byte write")         # no infinite loop (Round-6 #5)
-                view = view[n:]
-            os.fsync(tfd)
-        except BaseException:
-            os.close(tfd)
-            try:
-                os.unlink(tmp, dir_fd=qfd)                    # temp cleanup on write/fsync failure
-            except OSError:
-                pass
-            raise
-        else:
-            os.close(tfd)
-        try:
-            os.replace(tmp, name, src_dir_fd=qfd, dst_dir_fd=qfd)   # atomic rename, descriptor-relative
-        except BaseException:
-            try:
-                os.unlink(tmp, dir_fd=qfd)                    # cleanup on rename failure too (Round-6 #5)
-            except OSError:
-                pass
-            raise
-        os.fsync(qfd)                                        # durable rename (dir entry)
+        _write_entry_fd(qfd, activity_id, reserved, granted)
     finally:
         os.close(qfd)
 
@@ -260,6 +285,23 @@ def _ledger_entries_detailed(home):
             out.append((aid, _read_entry(paths.ledger_entry_path(home, aid))))
     return out, uncertain
 
+def _ledger_entries_detailed_fd(qfd):
+    """Descriptor-relative counterpart to `_ledger_entries_detailed` (Ruling 60 / Codex R7-1,
+    BLOCKER): enumerates + reads the ledger relative to an ALREADY-VALIDATED `quota/` dir fd (a
+    `LockCtx.qfd`), never re-resolving `quota/` by path -- so a rename/swap of the directory AFTER
+    the lock was acquired can never be misread as "no ledgers yet" (see
+    `paths.list_owned_dir_fd_detailed`'s module note). Same `(entries, uncertain)` shape as
+    `_ledger_entries_detailed`, but `uncertain` here has no 'gone' case at all: ANY scandir failure
+    on this fd is uncertain, never empty. `_gather_accounting` uses this when called with a `qfd`
+    (i.e. from `admit`/`grant`'s own locked decision snapshot)."""
+    names, uncertain = paths.list_owned_dir_fd_detailed(qfd, suffix=".json")
+    out = []
+    for name in names:
+        aid = name[:-5]
+        if ids.valid_activity_id(aid):
+            out.append((aid, _read_entry_fd(qfd, aid)))
+    return out, uncertain
+
 def _ledger_entries(home):
     # (aid, entry-or-CORRUPT) pairs for every valid-UUID-named ledger entry in the quota dir. A
     # name that isn't a valid UUIDv4 is skipped fail-closed (never fed back into a path —
@@ -289,11 +331,17 @@ class Snapshot:
 @dataclass
 class ActivityInput:
     """One root-listed activity directory's byte measurement, as gathered by `_gather_accounting`
-    (Ruling 56 / Codex R6-4, IMPORTANT). `on_disk` is the REAL measured byte total, or `None` if
-    that directory's OWN `stat_owned_segments_detailed` pass came back uncertain (exists, but
-    couldn't be fully measured -- EACCES/ELOOP/ENOTDIR/a failed lstat on some entry within it)."""
+    (Ruling 62 / Codex R7-3, IMPORTANT -- REPLACES the Round-6 `on_disk: int | None` shape).
+    `on_disk_measured` is ALWAYS the real, summed byte total of whatever entries `stat_owned_
+    segments_detailed` actually managed to stat this pass -- 0 if none, but NEVER `None` and NEVER
+    discarded, even when that directory's own stat pass came back uncertain (partial measurement
+    is still real, measured, on-disk liability and must count). `uncertain` is True iff that
+    directory's OWN `stat_owned_segments_detailed` pass came back uncertain (exists, but couldn't
+    be FULLY measured -- EACCES/ELOOP/ENOTDIR/a failed lstat on some entry within it); `_compute_
+    snapshot` decides what to do with a partial measurement, this dataclass just carries it."""
     aid: str
-    on_disk: int | None
+    on_disk_measured: int
+    uncertain: bool
 
 @dataclass
 class LedgerInput:
@@ -337,7 +385,7 @@ class AccountingInputs:
     rejected_root_ids: list
     ledger: list
 
-def _gather_accounting(home):
+def _gather_accounting(home, qfd=None):
     """ALL filesystem + ledger reads for one accounting decision, in a single pass (Ruling 56 /
     Codex R6-4, IMPORTANT) -- `_compute_snapshot` below is pure and does none of its own I/O.
 
@@ -353,7 +401,15 @@ def _gather_accounting(home):
 
     Each real activity directory is `stat_owned_segments_detailed`'d exactly once -- the same
     hook seam existing tests (e.g. test_admit_refuses_from_a_single_snapshot_not_two_separate_
-    scans) monkeypatch directly. Ledger entries come from `_ledger_entries_detailed` (Ruling 54)."""
+    scans) monkeypatch directly; its (possibly partial) measured bytes are ALWAYS kept in
+    `ActivityInput.on_disk_measured` (Ruling 62 / Codex R7-3 -- never discarded to `None`).
+
+    `qfd` (Ruling 60 / Codex R7-1, BLOCKER): when given -- a `LockCtx.qfd` from an ACTIVE
+    `_quota_lock` -- ledger entries come from the descriptor-relative `_ledger_entries_detailed_fd`
+    instead of the path-based `_ledger_entries_detailed(home)`, so `admit`/`grant`'s own locked
+    decision never re-resolves `quota/` by path (where a rename/swap AFTER the lock was acquired
+    could otherwise surface as a misleading `ENOENT` = "no ledgers yet"). `None` (the default) --
+    unlocked/introspection callers -- keeps the existing path-based reading."""
     base = paths.quota_dir(home).parent
     subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
     root_listable = not (root_uncertain and not rejected)
@@ -363,11 +419,14 @@ def _gather_accounting(home):
         if name == "quota":
             continue
         entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
-        on_disk = None if dir_uncertain else sum(sz for _n, sz in entries)
-        activities.append(ActivityInput(aid=name, on_disk=on_disk))
+        on_disk_measured = sum(sz for _n, sz in entries)      # partial-or-full, NEVER discarded
+        activities.append(ActivityInput(aid=name, on_disk_measured=on_disk_measured, uncertain=dir_uncertain))
     rejected_root_ids = [name for name, reason in rejected if reason != "gone"]
 
-    ledger_entries, ledger_uncertain = _ledger_entries_detailed(home)
+    if qfd is not None:
+        ledger_entries, ledger_uncertain = _ledger_entries_detailed_fd(qfd)
+    else:
+        ledger_entries, ledger_uncertain = _ledger_entries_detailed(home)
     ledger = [
         LedgerInput(aid=aid, corrupt=True) if e == "CORRUPT"
         else LedgerInput(aid=aid, reserved=e["reserved"], granted=e["granted"])
@@ -388,67 +447,90 @@ def _compute_snapshot(inputs):
     exactly like every other constant this module already treats this way (see `NEWEST_KEEP`
     etc.), so a test's `monkeypatch.setattr(quota, "CEILING", ...)` is honored here too.
 
-    The shared cross-language rule (mirrored 1:1 by the Node agent; pinned by
-    `repo_radar/tests/data/accounting_vectors.json`):
-      charge = sum(term(aid) for aid over every non-corrupt aid) + PER_ACTIVITY_CAP * (# corrupt
-        ledger entries).
-      term(aid) is exactly PER_ACTIVITY_CAP (no separate on_disk/liability term added on top) if
-        aid is UNCERTAIN: a rejected valid-activity-id root entry (a non-'gone' rejection), OR a
-        root-listed activity directory whose own byte measurement came back uncertain
-        (`on_disk is None`). Its live-ledger liability, if any, is NOT added on top -- by
-        construction a valid (non-corrupt) ledger entry always has `reserved + granted <=
-        PER_ACTIVITY_CAP` (see `_parse_entry`), so max(0, reserved+granted-PER_ACTIVITY_CAP) is
-        always 0 anyway.
-      Otherwise term(aid) = on_disk(aid) + (max(0, reserved+granted-on_disk(aid)) if aid has a
-        live non-corrupt ledger entry, else 0). An aid with no directory at all (e.g.
-        reserve-before-start, before `secure_mkdir` ever ran) has on_disk(aid) == 0 by
-        construction -- it's simply absent from `inputs.activities`.
-      A corrupt ledger entry's aid contributes exactly PER_ACTIVITY_CAP total, no separate
-        on_disk term even if that same aid also has a real, measured activity directory --
-        excluded from the `term(aid)` domain entirely, counted only via the flat sum above.
-      uncertain = (not root_listable) or (not ledger_listable) or any term(aid) above took the
-        uncertain branch.
+    Ruling 62 (Codex R7-3, IMPORTANT -- REPLACES the Round-6 rule): committed bytes are
+    AUTHORITATIVE from the scan and must never be discarded, even under uncertainty or ledger
+    corruption. The shared cross-language rule (mirrored 1:1 by the Node agent; pinned by
+    `repo_radar/tests/data/accounting_vectors.json` schema v2):
+
+      Unlistable activity ROOT (`root_listable=False` -- `inputs.activities`/`rejected_root_ids`
+        are always empty in this case, see `_gather_accounting`): no bytes are measurable at all,
+        so the charge is purely the ledger's own outstanding liability -- `max(sum(reserved+
+        granted for every LIVE ledger entry) + PER_ACTIVITY_CAP * (# corrupt ledger entries),
+        CEILING)`, uncertain=True.
+      Unlistable LEDGER dir (`ledger_listable=False`, root listable -- `inputs.ledger` is always
+        empty in this case): no ledger liability is knowable, so the charge is purely what WAS
+        measured -- `max(sum(on_disk_measured for every root-listed activity), CEILING)`,
+        uncertain=True. (`on_disk_measured` is already the real, partial-or-full measured total --
+        never discarded, per `ActivityInput`.)
+      Otherwise (both listable), per aid over the union of root-listed activities, rejected root
+        ids, and ledger entries:
+        - CORRUPT-ledger aid: `measured_on_disk + PER_ACTIVITY_CAP` (`measured_on_disk` is that
+          aid's `on_disk_measured` if it's also a root-listed activity, else 0) -- committed bytes
+          are KEPT even for a corrupt ledger entry, on top of the outstanding-liability cap. Takes
+          priority over the uncertain-activity branch below (corrupt-ledger status is decisive).
+        - UNCERTAIN aid (a rejected valid-activity-id root entry, OR a root-listed activity whose
+          own `stat_owned_segments_detailed` pass came back uncertain): `max(measured_partial,
+          PER_ACTIVITY_CAP)` -- `measured_partial` is whatever WAS actually stat'd this pass (0 if
+          the aid was rejected outright / nothing stat'd), never a flat cap that discards a larger
+          partial measurement. No extra ledger liability is added on top.
+        - CERTAIN aid (measured, not corrupt-ledger, not uncertain): `on_disk_measured + (max(0,
+          reserved+granted-on_disk_measured) if a live non-corrupt ledger entry exists, else 0)`
+          -- unchanged from Round-6.
+      uncertain = (not root_listable) or (not ledger_listable) or any term(aid) took the
+        UNCERTAIN-aid branch (a corrupt-ledger aid, on its own, does NOT set uncertain).
       corrupt = any corrupt entry in `inputs.ledger` -- computed UNCONDITIONALLY, even when root/
-        ledger enumeration itself failed (a corrupt entry that WAS actually read this pass is
-        still corrupt, independent of whether some OTHER part of the pass was unmeasurable).
-      An unlistable root OR an unlistable ledger flattens the WHOLE charge to CEILING (not just
-        its own portion) -- "how much is reserved right now" becomes entirely unknowable, so
-        nothing less than the hard ceiling is a safe number to admit/grant new liability against."""
+        ledger enumeration itself failed."""
     corrupt = any(entry.corrupt for entry in inputs.ledger)
-    if not inputs.root_listable or not inputs.ledger_listable:
-        return Snapshot(charge=CEILING, uncertain=True, corrupt=corrupt)
 
-    on_disk_by_aid = {a.aid: a.on_disk for a in inputs.activities}
-    rejected_root = set(inputs.rejected_root_ids)
-    corrupt_aids = {e.aid for e in inputs.ledger if e.corrupt}
     live_ledger = {e.aid: e for e in inputs.ledger if not e.corrupt}
+    corrupt_ledger = {e.aid: e for e in inputs.ledger if e.corrupt}
 
-    aids = (set(on_disk_by_aid) | rejected_root | set(live_ledger)) - corrupt_aids
+    if not inputs.root_listable:
+        total = sum(e.reserved + e.granted for e in live_ledger.values())
+        total += PER_ACTIVITY_CAP * len(corrupt_ledger)
+        return Snapshot(charge=max(total, CEILING), uncertain=True, corrupt=corrupt)
+
+    if not inputs.ledger_listable:
+        total = sum(a.on_disk_measured for a in inputs.activities)
+        return Snapshot(charge=max(total, CEILING), uncertain=True, corrupt=corrupt)
+
+    by_aid = {a.aid: a for a in inputs.activities}
+    rejected_root = set(inputs.rejected_root_ids)
+
+    aids = set(by_aid) | rejected_root | set(live_ledger) | set(corrupt_ledger)
     uncertain = False
     total = 0
     for aid in aids:
-        if aid in rejected_root or (aid in on_disk_by_aid and on_disk_by_aid[aid] is None):
-            uncertain = True
-            total += PER_ACTIVITY_CAP
+        measured = by_aid[aid].on_disk_measured if aid in by_aid else 0
+        if aid in corrupt_ledger:
+            total += measured + PER_ACTIVITY_CAP
             continue
-        disk = on_disk_by_aid.get(aid, 0)
+        activity_uncertain = aid in rejected_root or (aid in by_aid and by_aid[aid].uncertain)
+        if activity_uncertain:
+            uncertain = True
+            total += max(measured, PER_ACTIVITY_CAP)
+            continue
         liability = 0
         if aid in live_ledger:
             e = live_ledger[aid]
-            liability = max(0, e.reserved + e.granted - disk)
-        total += disk + liability
-    total += PER_ACTIVITY_CAP * len(corrupt_aids)
+            liability = max(0, e.reserved + e.granted - measured)
+        total += measured + liability
     return Snapshot(charge=total, uncertain=uncertain, corrupt=corrupt)
 
-def _accounting_snapshot(home):
+def _accounting_snapshot(home, qfd=None):
     """The single source `_charge`/`_accounting_uncertain`/`admit`/`grant` all read from, so
     `charge`, `uncertain` and `corrupt` are always a matched triple from one instant -- never
     `_charge`+`_accounting_uncertain` as two separate scans (Ruling 50 / Codex R5-3), and never a
     separate `_has_corrupt()` pre-check ahead of this snapshot's own pass (Ruling 55 / Codex R6-2,
     BLOCKER: that let a staged clean->corrupt ledger read admit with a corrupt entry inside the
     actual decision snapshot). Now a thin composition of `_gather_accounting` (all I/O, one pass)
-    and `_compute_snapshot` (pure) -- Ruling 56 / Codex R6-4, IMPORTANT."""
-    return _compute_snapshot(_gather_accounting(home))
+    and `_compute_snapshot` (pure) -- Ruling 56 / Codex R6-4, IMPORTANT.
+
+    `qfd` (Ruling 60 / Codex R7-1, BLOCKER): forwarded to `_gather_accounting` -- pass a
+    `LockCtx.qfd` when this snapshot IS the decision inside an active `_quota_lock` (as `admit`/
+    `grant` do), so the ledger read stays descriptor-relative to the SAME validated `quota/`
+    identity the lock captured, never re-resolved by path."""
+    return _compute_snapshot(_gather_accounting(home, qfd=qfd))
 
 def _charge(home):
     """Thin wrapper over `_accounting_snapshot` (Ruling 50): unchanged shape/behavior, kept for
@@ -470,69 +552,73 @@ def _accounting_uncertain(home):
     return _accounting_snapshot(home).uncertain
 
 def admit(home, activity_id, lease):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)                                 # may raise UnsafePath (swapped component)
+        ctx = _quota_lock(home)                                # may raise UnsafePath (swapped component)
         _reconcile_all_locked(home)                            # reconcile BEFORE charge
         # Ruling 50/55: ONE unified snapshot -- charge, uncertain AND corrupt are a matched triple
         # from the SAME pass, never `_charge(home)`+`_accounting_uncertain(home)` as two separate
         # scans, and never a separate `_has_corrupt(home)` pre-check ahead of this snapshot's own
         # pass (that let a staged clean->corrupt ledger read admit with a corrupt entry inside the
-        # actual decision snapshot -- Codex R6-2, BLOCKER).
-        snap = _accounting_snapshot(home)
+        # actual decision snapshot -- Codex R6-2, BLOCKER). Ruling 60 / Codex R7-1, BLOCKER: bound
+        # to `ctx.qfd` -- the SAME `quota/` dir fd `_quota_lock` validated -- so this decision never
+        # re-resolves `quota/` by path (a rename/swap after the lock was taken would otherwise
+        # surface as a misleading path-based ENOENT = "no ledgers yet").
+        snap = _accounting_snapshot(home, qfd=ctx.qfd)
         if snap.corrupt:
             return False        # spec §7: refuse new admissions while any corrupt entry stands (fail-closed)
         if snap.uncertain:
             return False        # Ruling 45: refuse new admissions while any activity dir is unmeasurable
         if snap.charge + RESERVE > CEILING:
             _prune_locked(home, (snap.charge + RESERVE) - CEILING)   # prune FIRST
-            snap = _accounting_snapshot(home)           # FRESH unified snapshot before re-deciding
+            snap = _accounting_snapshot(home, qfd=ctx.qfd)   # FRESH unified snapshot before re-deciding
             if snap.corrupt or snap.uncertain or snap.charge + RESERVE > CEILING:
                 return False                                   # best-effort refuse
-        _write_entry(home, activity_id, RESERVE, 0)            # durable, descriptor-relative
+        _write_entry_fd(ctx.qfd, activity_id, RESERVE, 0)      # durable, bound to the SAME fd (Ruling 60)
         return True
     except (OSError, paths.UnsafePath):
         return False                                           # durability/safety failure -> refuse
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)
 
 def grant(home, activity_id, nbytes):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)
+        ctx = _quota_lock(home)
         # Ruling 50/55: ONE unified snapshot -- see admit() above for why this must not be a
-        # separate `_has_corrupt()` call plus its own `_accounting_snapshot()` pass.
-        snap = _accounting_snapshot(home)
+        # separate `_has_corrupt()` call plus its own `_accounting_snapshot()` pass. Ruling 60 /
+        # Codex R7-1: bound to `ctx.qfd`, same rationale as admit() above.
+        snap = _accounting_snapshot(home, qfd=ctx.qfd)
         if snap.corrupt:
             return False        # spec §7: refuse grants while any corrupt entry stands
         if snap.uncertain:
             return False        # Ruling 45: refuse grants while any activity dir is unmeasurable
-        p = paths.ledger_entry_path(home, activity_id); e = _read_entry(p)
+        e = _read_entry_fd(ctx.qfd, activity_id)
         if e == "CORRUPT":
             return False
         if e["granted"] + nbytes > ORDINARY_CAP:      # per-activity cap
             return False
         if snap.charge + nbytes > CEILING:              # global ceiling, from the SAME snapshot
             return False
-        _write_entry(home, activity_id, e["reserved"], e["granted"] + nbytes)   # durable BEFORE append
+        _write_entry_fd(ctx.qfd, activity_id, e["reserved"], e["granted"] + nbytes)   # durable BEFORE append
         return True
     except (OSError, paths.UnsafePath):
         return False                                   # durability/safety failure -> refuse the append
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)
 
 def settle(home, activity_id):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)
+        ctx = _quota_lock(home)
         _unlink_entry(home, activity_id)           # bytes now counted purely by the scan
     except (OSError, paths.UnsafePath):
         return None                                 # best-effort release; never raises (fix round 1, Minor 2)
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)
 
 def _owner_lock_absent(home, aid):
     """spec §5/line 78: an owner.lock that was NEVER CREATED => owner provably gone. Returns True
@@ -599,15 +685,15 @@ def _reconcile_all_locked(home):
         _reconcile_one_locked(home, aid)
 
 def reconcile(home):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)
+        ctx = _quota_lock(home)
         _reconcile_all_locked(home)
     except (OSError, paths.UnsafePath):
         return None                                 # fail closed on lock failure (fix round 1, Minor 2)
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)
 
 # Ruling 33/36 (Codex R1 finding B1, R2 finding R2-2): the shared PROBLEM-BEARING contract v2,
 # mirrored 1:1 by the Node reader over the same wire records + scan. An activity is
@@ -663,9 +749,21 @@ def _classify(home, aid):
 def _prune_locked(home, need_bytes):
     """Ceiling-override pruner (CALLER HOLDS quota.lock): SETTLED items only (no live ledger
     entry), never running/unreconciled, always keep the newest problem. Enumeration + deletion
-    are descriptor-relative (Round-4 #3) so pruning can never escape the Activity tree."""
+    are descriptor-relative (Round-4 #3) so pruning can never escape the Activity tree.
+
+    Ruling 61 (Codex R7-2, BLOCKER): the live set comes from `_ledger_entries_detailed`, not the
+    lossy `_ledger_entries`; if the ledger dir itself is unlistable this pass, the live set is
+    UNPROVEN -- prune NOTHING (return 0) rather than treat every settled activity as a candidate
+    against a wrongly-empty live set. Pre-fix, `prune_to_ceiling`'s outer loop kept calling this
+    against a constant charge sentinel (an unlistable ledger flattens the charge to CEILING) and
+    this function's own live set silently went empty, so it deleted every settled candidate on
+    each iteration (Codex repro: three settled routine activities + unlistable ledger -> all three
+    deleted, charge still pinned at the ceiling)."""
     base = paths.quota_dir(home).parent
-    live = {aid for aid, _e in _ledger_entries(home)}
+    entries, ledger_uncertain = _ledger_entries_detailed(home)
+    if ledger_uncertain:
+        return 0                                   # live set unproven -- never delete under uncertainty
+    live = {aid for aid, _e in entries}
     items = []
     for aid in paths.list_owned_subdirs(base):
         if aid == "quota" or aid in live:
@@ -685,22 +783,30 @@ def _prune_locked(home, need_bytes):
     return freed
 
 def prune(home, need_bytes):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)                      # public entry is lock-safe (finding 1)
+        ctx = _quota_lock(home)                      # public entry is lock-safe (finding 1)
         return _prune_locked(home, need_bytes)
     except (OSError, paths.UnsafePath):
         return 0                                     # fail closed on lock failure (fix round 1, Minor 2)
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)
 
 def _retain_locked(home):
     """CALLER HOLDS quota.lock. Applies the spec §7 age/newest-50 retention matrix, then the
     ceiling-override (which MAY prune within the protected newest-50 window, per spec -- the
-    ceiling always wins). Returns the list of pruned activity ids."""
+    ceiling always wins). Returns the list of pruned activity ids.
+
+    Ruling 61 (Codex R7-2, BLOCKER): same live-set guard as `_prune_locked` -- the live set comes
+    from `_ledger_entries_detailed`; if the ledger dir is unlistable this pass, refuse ENTIRELY
+    (return `[]`, delete nothing) rather than run the age/newest-50 matrix against a wrongly-empty
+    live set that would treat every live reservation as prunable."""
     base = paths.quota_dir(home).parent
-    live = {aid for aid, _e in _ledger_entries(home)}
+    entries, ledger_uncertain = _ledger_entries_detailed(home)
+    if ledger_uncertain:
+        return []                                    # live set unproven -- never delete under uncertainty
+    live = {aid for aid, _e in entries}
     before = set(paths.list_owned_subdirs(base))            # pre-deletion snapshot (Round-6 #6)
 
     candidates = []
@@ -744,13 +850,13 @@ def _retain_locked(home):
     return sorted(before - set(paths.list_owned_subdirs(base)))
 
 def retain(home):
-    fd = None
+    ctx = None
     try:
-        fd = _quota_lock(home)
+        ctx = _quota_lock(home)
         _reconcile_all_locked(home)                          # settle newly-dead owners first
         return _retain_locked(home)
     except (OSError, paths.UnsafePath):
         return []                                             # fail closed on lock failure
     finally:
-        if fd is not None:
-            _unlock(fd)
+        if ctx is not None:
+            _unlock(ctx)

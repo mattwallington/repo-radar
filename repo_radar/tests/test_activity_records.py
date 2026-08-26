@@ -176,6 +176,18 @@ def test_ownership_rejects_non_integer_pid_literal_1_0():   # Codex R6-3 fixture
            '"proc_birth":"2026-08-14T00:00:00-07:00"}') % AID
     assert R.parse_valid(raw, AID) is None
 
+def test_event_accepts_additive_non_integer_pid_literal():   # Ruling 63 (Codex R7-4) fixture half
+    # direct confirmation (the generic vectors driver above already covers this via the
+    # 'raw_text' case added to record_validation_vectors.json): `_validate` only type-checks
+    # `pid` for type:"ownership" -- on an "event" record, `pid` (even the non-integer literal 1.0
+    # that WOULD be rejected on an ownership record, per the test above) is just an unknown
+    # additive field and is ignored entirely. The Node reader scopes its own strict-literal `pid`
+    # check to ownership only, matching this.
+    raw = ('{"schema_version":1,"activity_id":"%s","type":"event","seq":0,'
+           '"ts":"2026-08-14T00:00:00-07:00","level":"info","event":"x","fields":{},'
+           '"pid":1.0}') % AID
+    assert R.parse_valid(raw, AID) is not None
+
 def test_parse_valid_rejects_utf16le_encoded_bytes():      # Ruling 51 (Codex R5-2, BLOCKER)
     raw = ('{"schema_version":1,"activity_id":"%s","type":"terminal","seq":9,'
            '"ts":"2026-08-14T00:00:00-07:00","outcome":"succeeded","summary":{},'

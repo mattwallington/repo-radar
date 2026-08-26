@@ -114,3 +114,51 @@ def test_cli_defaults_requested_when_argv_absent(tmp_path):
                        env={**os.environ, "HOME": str(tmp_path)}, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert int(r.stdout.strip()) >= 0
+
+# --- Codex R7-2 (BLOCKER) / Ruling 61: pruning under ledger uncertainty must delete NOTHING -----
+#
+# Pre-fix, `prune_to_ceiling` looped `while quota._charge(home) + requested > quota.CEILING` --
+# but under ledger uncertainty `_charge` is a CONSTANT sentinel (an unlistable ledger flattens the
+# charge to CEILING), so the loop never terminates via headroom and instead keeps calling
+# `_prune_locked` until it runs out of candidates, destructively deleting EVERY prunable activity
+# even though the "0 live entries" ledger view is entirely unproven.
+
+def test_prune_to_ceiling_deletes_nothing_when_ledger_listing_is_uncertain(tmp_path, monkeypatch):
+    # Codex's exact repro shape: three settled, routine (prunable-looking) activities, plus a
+    # forced ledger-listing failure. Pre-fix this deleted all three (charge pinned at the
+    # ceiling sentinel kept the loop going); fixed, prune_to_ceiling must refuse outright.
+    aids = []
+    for _ in range(3):
+        aid, l = _new_activity(tmp_path)
+        quota.admit(tmp_path, aid, l)
+        _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+        quota.settle(tmp_path, aid)
+        aids.append(aid)
+
+    monkeypatch.setattr(quota, "CEILING", 1)   # any nonzero charge would look "over ceiling"
+
+    real = paths.list_owned_entries_detailed
+    def hooked(directory, suffix=None):
+        if str(directory) == str(paths.quota_dir(tmp_path)):
+            return [], True                     # simulated unlistable ledger dir
+        return real(directory, suffix)
+    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+
+    freed = prune.prune_to_ceiling(tmp_path, requested=quota.RESERVE)
+
+    assert freed == 0
+    for aid in aids:
+        assert paths.activity_dir(tmp_path, aid).exists()   # nothing deleted under uncertainty
+
+def test_prune_to_ceiling_still_prunes_normally_once_ledger_is_certain_again(tmp_path, monkeypatch):
+    # Companion: with the SAME setup but no ledger-listing failure, the certain over-ceiling case
+    # still prunes exactly as before -- the fix doesn't change the normal path.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    quota.settle(tmp_path, aid)
+    monkeypatch.setattr(quota, "CEILING", quota.RESERVE + 200)
+
+    freed = prune.prune_to_ceiling(tmp_path, requested=quota.RESERVE)
+    assert freed > 0
+    assert not paths.activity_dir(tmp_path, aid).exists()

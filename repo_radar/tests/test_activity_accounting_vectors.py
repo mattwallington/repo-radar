@@ -1,4 +1,5 @@
-"""Ruling 56 (Codex R6-4, IMPORTANT): the shared, normalized byte-accounting rule -- pinned by
+"""Ruling 56 (Codex R6-4, IMPORTANT) / Ruling 62 (Codex R7-3, IMPORTANT -- schema v2, REPLACES the
+Round-6 arithmetic): the shared, normalized byte-accounting rule -- pinned by
 `repo_radar/tests/data/accounting_vectors.json`, which a concurrent Node suite drives against its
 own identical implementation of the same function. This file drives it against Python's
 `quota._compute_snapshot`, a PURE function (no filesystem/ledger I/O -- see `quota._gather_
@@ -17,7 +18,10 @@ VECTORS = json.loads(
 
 
 def _inputs_from_json(d):
-    activities = [quota.ActivityInput(aid=a["aid"], on_disk=a["on_disk"]) for a in d["activities"]]
+    activities = [
+        quota.ActivityInput(aid=a["aid"], on_disk_measured=a["on_disk"], uncertain=a["uncertain"])
+        for a in d["activities"]
+    ]
     ledger = []
     for entry in d["ledger"]:
         if entry.get("corrupt"):
@@ -45,7 +49,7 @@ def test_accounting_vectors_fixture_schema():
         assert set(case["constants"]) == {"CEILING", "PER_ACTIVITY_CAP", "RESERVE"}, case["name"]
         assert set(case["expected"]) == {"charge", "uncertain", "corrupt"}, case["name"]
         for a in case["inputs"]["activities"]:
-            assert set(a) == {"aid", "on_disk"}, case["name"]
+            assert set(a) == {"aid", "on_disk", "uncertain"}, case["name"]
         for e in case["inputs"]["ledger"]:
             assert set(e) == {"aid", "corrupt"} or set(e) == {"aid", "reserved", "granted"}, case["name"]
         # the real constants (Ruling 56: "use the REAL constants so the vectors read naturally")
@@ -82,23 +86,26 @@ def test_compute_snapshot_is_pure_no_filesystem_access(monkeypatch, tmp_path):
 
     inputs = quota.AccountingInputs(
         root_listable=True, ledger_listable=True,
-        activities=[quota.ActivityInput(aid="a", on_disk=42)],
+        activities=[quota.ActivityInput(aid="a", on_disk_measured=42, uncertain=False)],
         rejected_root_ids=[], ledger=[],
     )
     snap = quota._compute_snapshot(inputs)
     assert snap == quota.Snapshot(charge=42, uncertain=False, corrupt=False)
 
 
-def test_corrupt_ledger_entry_suppresses_its_own_on_disk_term():
-    # Not one of the required fixture cases, but the exact overlap `_compute_snapshot`'s rule
-    # calls out explicitly: an aid with BOTH a real, measured activity directory AND a corrupt
-    # ledger entry must contribute ONLY the flat PER_ACTIVITY_CAP -- never on_disk + cap.
+def test_corrupt_ledger_entry_adds_its_measured_on_disk_bytes_plus_the_cap():
+    # Ruling 62 (Codex R7-3, IMPORTANT -- REPLACES the Round-6 rule this test used to pin): an
+    # aid with BOTH a real, measured activity directory AND a corrupt ledger entry must now
+    # contribute measured_on_disk + PER_ACTIVITY_CAP -- committed bytes are authoritative and must
+    # never be discarded, even when that aid's ledger entry is corrupt (this assumption CHANGED
+    # under R7-3; the Round-6 rule excluded a corrupt aid's on_disk term entirely).
     inputs = quota.AccountingInputs(
         root_listable=True, ledger_listable=True,
-        activities=[quota.ActivityInput(aid="x", on_disk=999999)],
+        activities=[quota.ActivityInput(aid="x", on_disk_measured=999999, uncertain=False)],
         rejected_root_ids=[],
         ledger=[quota.LedgerInput(aid="x", corrupt=True)],
     )
     snap = quota._compute_snapshot(inputs)
-    assert snap.charge == quota.PER_ACTIVITY_CAP
+    assert snap.charge == 999999 + quota.PER_ACTIVITY_CAP
     assert snap.corrupt is True
+    assert snap.uncertain is False

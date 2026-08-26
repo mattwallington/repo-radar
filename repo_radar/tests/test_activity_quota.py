@@ -1,4 +1,4 @@
-import base64, errno, json, os, pathlib
+import base64, errno, json, os, pathlib, time
 import pytest
 from repo_radar.activity import quota, paths, lease, ids, writer
 from repo_radar.activity import reconcile as reconcile_mod
@@ -729,6 +729,13 @@ def test_ledger_dir_listing_failure_refuses_admit_and_grant(tmp_path, monkeypatc
         return real(directory, suffix)
     monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
 
+    # Ruling 60 (Codex R7-1, BLOCKER): admit()/grant()'s own DECISION snapshot now reads the
+    # ledger descriptor-relative to `ctx.qfd` (`_ledger_entries_detailed_fd` ->
+    # `paths.list_owned_dir_fd_detailed`), never the path-based function hooked above -- so the
+    # fd-bound listing must ALSO be forced uncertain here for the decision itself to see it (the
+    # path-based hook above still covers `_reconcile_all_locked`'s own, separate, path-based pass).
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", lambda dfd, suffix=None: ([], True))
+
     fresh, fl = _new_activity(tmp_path)
     assert quota.admit(tmp_path, fresh, fl) is False    # refused: ledger dir unmeasurable
     assert quota.grant(tmp_path, live, 1) is False       # unrelated grant refused too
@@ -751,37 +758,50 @@ def test_ledger_dir_enoent_charges_from_segments_only_not_uncertain(tmp_path):
 
 def test_admit_uses_one_ledger_entries_pass_per_decision_snapshot(tmp_path, monkeypatch):
     """Pre-fix, `admit()` called `_has_corrupt()` SEPARATELY, before `_accounting_snapshot()` --
-    two INDEPENDENT `_ledger_entries` passes for one decision. A ledger read that flips between
-    those two passes let a corrupt entry slip into the actual decision snapshot while the earlier
+    two INDEPENDENT ledger passes for one decision. A ledger read that flips between those two
+    passes let a corrupt entry slip into the actual decision snapshot while the earlier
     `_has_corrupt()` pre-check still saw clean data and passed, silently admitting alongside a
     corrupt entry. `held`'s owner.lock stays HELD (no start ever written) so `_reconcile_all_
     locked`'s own pass over the ledger (an unrelated, expected EARLIER pass -- it settles dead
     owners, not the decision itself) can't clear the entry out from under this test: reconcile
-    tries to acquire the lock, finds it busy, and leaves the entry in place. `calls["n"] == 2`
-    proves the DECISION itself took exactly one further pass -- not a third, separate corrupt-
-    only check in addition to it."""
+    tries to acquire the lock, finds it busy, and leaves the entry in place.
+
+    Ruling 60 (Codex R7-1, BLOCKER) split what used to be ONE shared function into two
+    structurally distinct ones: `_reconcile_all_locked` still reads the ledger path-based
+    (`_ledger_entries` -> `_ledger_entries_detailed`), while the DECISION snapshot now reads it
+    fd-bound (`_ledger_entries_detailed_fd(ctx.qfd)`), bypassing the path entirely. Hooking each
+    separately and asserting each is called exactly once proves the same property the original
+    `calls["n"] == 2` assertion did (no separate, extra corrupt-only check anywhere) under the new
+    structure -- and additionally proves the decision truly went through the fd-bound path."""
     held, hl = _new_activity(tmp_path)                      # owner.lock HELD (never released below)
     paths.ledger_entry_path(tmp_path, held).write_text(
         json.dumps({"reserved": quota.RESERVE, "granted": 0}))   # a real, CLEAN ledger entry
 
-    real = quota._ledger_entries_detailed
-    calls = {"n": 0}
-    def staged(home):
-        calls["n"] += 1
-        entries, uncertain = real(home)
-        if calls["n"] == 1:
-            return entries, uncertain                       # call #1 (reconcile's iteration): clean
-        # call #2 onward (the actual decision snapshot): force `held`'s entry CORRUPT
-        return [(a, "CORRUPT" if a == held else e) for a, e in entries], uncertain
-    monkeypatch.setattr(quota, "_ledger_entries_detailed", staged)
+    real_path = quota._ledger_entries_detailed
+    path_calls = {"n": 0}
+    def staged_path(home):
+        path_calls["n"] += 1
+        return real_path(home)
+    monkeypatch.setattr(quota, "_ledger_entries_detailed", staged_path)
+
+    real_fd = quota._ledger_entries_detailed_fd
+    fd_calls = {"n": 0}
+    def staged_fd(qfd):
+        fd_calls["n"] += 1
+        entries, uncertain = real_fd(qfd)
+        return [(a, "CORRUPT" if a == held else e) for a, e in entries], uncertain   # force CORRUPT
+    monkeypatch.setattr(quota, "_ledger_entries_detailed_fd", staged_fd)
 
     try:
         fresh, fl = _new_activity(tmp_path)
         assert quota.admit(tmp_path, fresh, fl) is False    # refused: the decision snapshot saw corrupt
-        assert calls["n"] == 2, (
-            f"expected exactly 2 ledger-entries passes (1 reconcile iteration + 1 decision "
-            f"snapshot), saw {calls['n']} -- an extra pass means a separate corrupt-only check "
-            f"still exists"
+        assert path_calls["n"] == 1, (
+            f"expected exactly 1 path-based ledger pass (reconcile's own iteration), saw "
+            f"{path_calls['n']}"
+        )
+        assert fd_calls["n"] == 1, (
+            f"expected exactly 1 fd-bound ledger pass (the decision snapshot itself), saw "
+            f"{fd_calls['n']} -- an extra pass means a separate corrupt-only check still exists"
         )
     finally:
         hl.release()
@@ -790,10 +810,132 @@ def test_grant_refuses_when_its_own_decision_snapshot_finds_corrupt(tmp_path, mo
     aid, l = _new_activity(tmp_path)
     assert quota.admit(tmp_path, aid, l) is True
 
-    real = quota._ledger_entries_detailed
-    def staged(home):
-        entries, uncertain = real(home)
+    # Ruling 60 (Codex R7-1, BLOCKER): grant()'s decision snapshot reads the ledger fd-bound
+    # (`_ledger_entries_detailed_fd`), not the path-based `_ledger_entries_detailed`.
+    real = quota._ledger_entries_detailed_fd
+    def staged(qfd):
+        entries, uncertain = real(qfd)
         return [(a, "CORRUPT" if a == aid else e) for a, e in entries], uncertain
-    monkeypatch.setattr(quota, "_ledger_entries_detailed", staged)
+    monkeypatch.setattr(quota, "_ledger_entries_detailed_fd", staged)
 
     assert quota.grant(tmp_path, aid, 1) is False
+
+# --- Codex R7-1 (BLOCKER) / Ruling 60: a post-lock swap of `quota/` must never be misread by
+# admit's/grant's own decision as "no ledgers yet" -- the decision stays bound to the SAME
+# `quota/` directory identity `_quota_lock` validated (via `LockCtx.qfd`), never re-resolved by
+# path -----------------------------------------------------------------------------------------
+
+def test_admit_decision_refuses_and_writes_nothing_when_quota_dir_fd_listing_fails(tmp_path, monkeypatch):
+    """`_quota_lock` validates/opens `quota/` (and creates it via `secure_mkdir`) BEFORE taking
+    `flock` -- so pre-fix, if the directory were renamed/swapped AFTER the lock was acquired, a
+    fresh PATH-based re-read (`list_owned_entries_detailed(quota_dir)`) could hit ENOENT and
+    misread that as "no ledgers yet" (entries=[], uncertain=False), even though real, live ledger
+    liabilities exist -- admit would then wrongly admit a reservation over the ceiling (Codex
+    repro: 16 x 4 MiB ledger liabilities, rename `quota/` between lock and enumeration -> admit
+    wrote a reservation -> 67,170,304 bytes on disk, over the 64 MiB ceiling).
+
+    `_reconcile_all_locked` is stubbed out here (an unrelated, separately-tested pass -- these 16
+    stale-looking entries have no owner.lock/lease to protect them from it) to isolate admit's own
+    DECISION snapshot. The fd-bound listing that decision now reads through (`ctx.qfd` ->
+    `_ledger_entries_detailed_fd` -> `paths.list_owned_dir_fd_detailed`) is forced to come back
+    unable to enumerate, simulating the swap. admit must refuse, write NO reservation anywhere
+    (neither the fresh activity's own entry nor any of the 16 pre-existing ones), and a snapshot
+    taken through that SAME fd while the failure stands must be uncertain."""
+    monkeypatch.setattr(quota, "_reconcile_all_locked", lambda home: None)
+
+    aids = []
+    for _ in range(16):
+        aid = ids.mint_activity_id(); _mk(tmp_path, aid)
+        paths.ledger_entry_path(tmp_path, aid).write_text(
+            json.dumps({"reserved": quota.RESERVE, "granted": quota.PER_ACTIVITY_CAP - quota.RESERVE}))
+        aids.append(aid)
+    before = {aid: paths.ledger_entry_path(tmp_path, aid).read_bytes() for aid in aids}
+
+    calls = {"n": 0}
+    def hooked(dfd, suffix=None):
+        calls["n"] += 1
+        return [], True                 # simulate: the fd-bound listing can no longer enumerate
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", hooked)
+
+    # lower-level companion check, taken WHILE the failure stands: a decision snapshot bound to
+    # the SAME validated `quota/` fd must be uncertain, never quietly "empty"
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        snap = quota._accounting_snapshot(tmp_path, qfd=ctx.qfd)
+    finally:
+        quota._unlock(ctx)
+    assert snap.uncertain is True
+
+    fresh, fl = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, fresh, fl) is False
+    assert calls["n"] >= 1, "the decision must actually have gone through the fd-bound listing"
+
+    assert not paths.ledger_entry_path(tmp_path, fresh).exists()   # no NEW reservation anywhere
+    for aid in aids:
+        assert paths.ledger_entry_path(tmp_path, aid).read_bytes() == before[aid]   # nothing else touched
+
+    monkeypatch.undo()   # restore both the reconcile stub and the fd-listing hook
+    # a fresh, unhooked snapshot afterwards confirms the real ledger is intact and certain again --
+    # the normal path is unchanged by this fix
+    real_snap = quota._compute_snapshot(quota._gather_accounting(tmp_path))
+    assert real_snap.uncertain is False
+    assert real_snap.corrupt is False
+    assert real_snap.charge == 16 * quota.PER_ACTIVITY_CAP
+
+def test_admit_normal_path_unchanged_when_quota_dir_is_not_swapped(tmp_path):
+    # Sanity companion to the test above: with no swap/failure at all, admit still succeeds
+    # normally through the new fd-bound decision path -- the fix must not change ordinary behavior.
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+    assert json.loads(paths.ledger_entry_path(tmp_path, aid).read_text()) == {
+        "reserved": quota.RESERVE, "granted": 0,
+    }
+
+# --- Codex R7-2 (BLOCKER) / Ruling 61: pruning under ledger uncertainty must delete NOTHING,
+# not sweep every settled candidate against a wrongly-empty live set -----------------------------
+
+def test_prune_locked_refuses_and_deletes_nothing_when_ledger_listing_is_uncertain(tmp_path, monkeypatch):
+    """Pre-fix, `_prune_locked`'s live set came from the lossy `_ledger_entries`, which collapses
+    an unlistable ledger dir to `[]` -- so every settled activity looked prunable even though the
+    true live set (whether anything is actually still reserved) was entirely unproven. A settled,
+    routine (prunable-looking) activity must survive when the ledger dir can't be listed."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    quota.settle(tmp_path, aid)          # settled, routine -> would normally be prunable
+
+    real = paths.list_owned_entries_detailed
+    def hooked(directory, suffix=None):
+        if str(directory) == str(paths.quota_dir(tmp_path)):
+            return [], True
+        return real(directory, suffix)
+    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+
+    freed = quota._prune_locked(tmp_path, need_bytes=10**9)
+    assert freed == 0
+    assert paths.activity_dir(tmp_path, aid).exists()   # nothing deleted under uncertainty
+
+def test_retain_locked_refuses_and_deletes_nothing_when_ledger_listing_is_uncertain(tmp_path, monkeypatch):
+    # Same guard, via `retain()`'s own live-set read: a routine item that's normally well outside
+    # the newest-50/age protections (and so would be pruned) must survive when the ledger listing
+    # itself is uncertain.
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid)
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    _write_terminal(tmp_path, aid)
+    l.release(); quota.settle(tmp_path, aid)
+    old = time.time() - 999 * 86400
+    os.utime(seg, (old, old))                      # backdate well past the 14d routine threshold
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)   # outside the protected window; would normally prune
+
+    real = paths.list_owned_entries_detailed
+    def hooked(directory, suffix=None):
+        if str(directory) == str(paths.quota_dir(tmp_path)):
+            return [], True
+        return real(directory, suffix)
+    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+
+    pruned = quota.retain(tmp_path)
+    assert pruned == []
+    assert paths.activity_dir(tmp_path, aid).exists()   # nothing deleted under uncertainty

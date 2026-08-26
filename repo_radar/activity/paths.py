@@ -316,6 +316,80 @@ def read_owned_file(path):
     finally:
         os.close(fd)
 
+# --- Ruling 60 (Codex R7-1, BLOCKER): fd-bound counterparts for a LOCKED ledger decision -------
+#
+# `quota._quota_lock` validates/opens `quota/` BEFORE taking `flock`, then (as of Ruling 60) keeps
+# that fd alive for the lock's whole lifetime (see `quota.LockCtx`). Everything below operates
+# descriptor-relative to an ALREADY-VALIDATED directory fd and never re-resolves the directory by
+# path -- so a rename/swap of `quota/` AFTER the lock was acquired can never be misread as "the
+# ledger is empty" the way a fresh path-based `ENOENT` would be. There is no "gone" case here: the
+# directory's existence was already proven when the fd was opened, so ANY failure from here on
+# means "could not be listed/read/written right now", never "never existed" -- these primitives
+# report that fail-closed (`uncertain=True` / a raised exception), they never silently fold into
+# empty.
+
+def list_owned_dir_fd_detailed(dfd, suffix=None):
+    """(entries, uncertain) via `os.scandir` on an ALREADY-VALIDATED directory fd -- the fd-bound
+    counterpart to `list_owned_entries_detailed` (Ruling 60). `entries` -- unfiltered names
+    (suffix-filtered if given), exactly like `list_owned_entries`. `uncertain` -- True on ANY
+    `OSError` from `scandir` on this fd; there is no "gone" case (see module note above)."""
+    try:
+        entries = list(os.scandir(dfd))
+    except OSError:
+        return [], True
+    return [e.name for e in entries if suffix is None or e.name.endswith(suffix)], False
+
+def read_owned_dir_fd_regular(dfd, name):
+    """Read a REGULAR file by `name` relative to an ALREADY-VALIDATED directory fd (Ruling 60) --
+    the fd-bound counterpart to `read_owned_file`, used for a locked ledger-entry read. `O_NOFOLLOW`
+    rejects a symlinked entry; `O_NONBLOCK` means opening a FIFO can't block. Raises `OSError`/
+    `UnsafePath` on any failure (missing, symlink, non-regular, read failure) -- the caller
+    (`quota._read_entry_fd`) treats any exception as CORRUPT, matching `_read_entry`'s existing
+    fail-closed contract."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UnsafePath(f"not a regular file: {name}")
+        return _read_fd(fd)
+    finally:
+        os.close(fd)
+
+def write_owned_dir_fd_regular_atomic(dfd, name, tmp_name, blob, mode=0o600):
+    """Durable atomic write relative to an ALREADY-VALIDATED directory fd (Ruling 60) -- the
+    fd-bound counterpart to `quota._write_entry`'s temp-file + fsync + atomic-rename durability
+    contract (full-write loop, fsync, atomic rename with both sides on `dfd`, directory fsync,
+    temp cleanup on any failure), so a locked ledger write never re-resolves `quota/` by path
+    either. Raises on durability failure; caller (`quota._write_entry_fd`) lets that propagate to
+    the caller's own `except (OSError, paths.UnsafePath)` fail-closed handling."""
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dfd)
+    try:
+        view = memoryview(blob)
+        while view:
+            n = os.write(fd, view)
+            if n <= 0:
+                raise OSError("zero-byte write")           # no infinite loop (mirrors Round-6 #5)
+            view = view[n:]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    else:
+        os.close(fd)
+    try:
+        os.replace(tmp_name, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dfd)                                          # durable rename (dir entry)
+
 def list_owned_entries_detailed(directory, suffix=None):
     """(entries, uncertain) companion to `list_owned_entries` (Ruling 54 / Codex R6-1, BLOCKER):
     the plain `list_owned_entries` collapsed EVERY listing failure -- a directory that provably
