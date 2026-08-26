@@ -274,6 +274,56 @@ def stat_owned_segments(directory, suffix=".jsonl"):
     behavior for existing callers that don't need to distinguish "gone" from "uncertain"."""
     return stat_owned_segments_detailed(directory, suffix)[0]
 
+def stat_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
+    """Ruling 67 (Round-8 follow-up, "G8b"): fd-bound counterpart to `stat_owned_segments_detailed`
+    for a LOCKED per-activity byte measurement. Opens the activity subdirectory `name` relative to
+    an ALREADY-VALIDATED root directory fd `dfd` (a locked `quota.LockCtx.afd`) with
+    `O_NOFOLLOW|O_DIRECTORY` -- so a symlink squatting on `name` is rejected, not resolved through
+    -- then runs the SAME metadata-only per-entry `lstat` logic as `stat_owned_segments_detailed`
+    on that opened subdir fd. A locked accounting pass therefore never re-resolves EITHER the
+    activity ROOT or the activity subdirectory by path (closing the gap `_gather_accounting` left:
+    binding `quota/`'s identity to the lock, per Ruling 64, did nothing to stop the ROOT
+    enumeration and per-activity stats from still re-resolving `activity/` and each `<aid>/` by
+    PATH -- a root-level rename/swap landing after the lock was validated read as a plausible, but
+    wrong or wrongly-empty, listing).
+
+    Returns `(entries, uncertain)` -- same shape/semantics as `stat_owned_segments_detailed`:
+      entries -- [(name, size)].
+      uncertain -- `name` couldn't be opened as a real, non-symlink directory relative to `dfd`
+        (ENOENT here is PROVEN gone -- `False` + `[]`, exactly like the path-based version's
+        `FileNotFoundError` branch; any OTHER open failure -- ELOOP/EACCES/a non-directory
+        squatting on the name -- is uncertain), OR the opened subdirectory itself couldn't be
+        scanned, OR any suffix-matching entry's `lstat` failed with anything other than
+        `FileNotFoundError`."""
+    try:
+        sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+    except FileNotFoundError:
+        return [], False
+    except OSError:
+        return [], True
+    out = []
+    uncertain = False
+    try:
+        try:
+            entries = list(os.scandir(sub))
+        except OSError:
+            return [], True
+        for entry in entries:
+            if not entry.name.endswith(suffix):
+                continue
+            try:
+                st = os.stat(entry.name, dir_fd=sub, follow_symlinks=False)
+            except FileNotFoundError:
+                continue                                          # raced away -- proven gone
+            except OSError:
+                uncertain = True; continue                        # refused -- bytes unproven
+            if not stat.S_ISREG(st.st_mode):
+                continue                                           # symlink / FIFO / dir / device
+            out.append((entry.name, st.st_size))
+    finally:
+        os.close(sub)
+    return out, uncertain
+
 def fsync_owned_segments(directory, suffix=".jsonl"):
     """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT
     reading content (Codex gate round 1, finding 1): before reconcile settles an activity whose
@@ -504,6 +554,57 @@ def list_owned_subdirs(base):
     behavior for existing callers that don't need to distinguish "gone" from "uncertain"."""
     return list_owned_subdirs_detailed(base)[0]
 
+def list_owned_subdirs_dir_fd_detailed(dfd):
+    """Ruling 67 (Round-8 follow-up, "G8b"): fd-bound counterpart to `list_owned_subdirs_detailed`
+    for a LOCKED root enumeration. Same per-entry `lstat`/UUID/symlink classification, but
+    scanning an ALREADY-VALIDATED root directory fd (a locked `quota.LockCtx.afd`) instead of
+    re-resolving the activity ROOT by path. Used by every locked caller (`quota._gather_
+    accounting`, `quota._prune_locked`, `quota._retain_locked`) so the candidate/accounting
+    enumeration itself stays bound to the SAME canonical directory the lock validated -- a
+    root-level rename/swap landing after acquisition can no longer surface as a plausible-looking
+    (or wrongly-empty) path-based listing; see `quota._verify_canonical`'s companion root-identity
+    check, which every caller checks BEFORE trusting this.
+
+    Returns `(subdirs, rejected, uncertain)` -- same shape/semantics as `list_owned_subdirs_
+    detailed`, except there is no "gone" case for the BASE itself (mirrors every other fd-bound
+    primitive in the Ruling-60 section above): `dfd` is assumed already open/validated on entry --
+    callers validate it once, at lock acquisition, and re-verify its continued canonical identity
+    via `quota._verify_canonical` around each use, not here."""
+    subdirs = []
+    rejected = []
+    uncertain = False
+    try:
+        entries = list(os.scandir(dfd))
+    except OSError:
+        return [], [], True
+    for e in entries:
+        try:
+            st = os.lstat(e.name, dir_fd=dfd)
+        except OSError as err:
+            if not ids.valid_activity_id(e.name):
+                continue               # non-UUID name: never hid a real activity's bytes
+            if err.errno == errno.ENOENT:
+                rejected.append((e.name, "gone"))          # raced away -- proven gone
+            elif err.errno == errno.EACCES:
+                rejected.append((e.name, "denied")); uncertain = True
+            else:
+                rejected.append((e.name, "stat-failed")); uncertain = True
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            subdirs.append(e.name)
+        elif ids.valid_activity_id(e.name):
+            if stat.S_ISLNK(st.st_mode):
+                rejected.append((e.name, "symlink"))
+            else:
+                rejected.append((e.name, "not-directory"))
+            uncertain = True
+    return subdirs, rejected, uncertain
+
+def list_owned_subdirs_dir_fd(dfd):
+    """Thin `subdirs`-only wrapper over `list_owned_subdirs_dir_fd_detailed` (Ruling 67): mirrors
+    `list_owned_subdirs`'s existing wrapper pattern for the fd-bound counterpart."""
+    return list_owned_subdirs_dir_fd_detailed(dfd)[0]
+
 def unlink_owned_tree(activity_dir):
     """Delete every entry in an owned activity dir, then rmdir it — all relative to validated dir
     fds, so deletion can NEVER escape the Activity tree (Round-4 #3). Returns bytes freed."""
@@ -534,5 +635,40 @@ def unlink_owned_tree(activity_dir):
         finally:
             os.close(pfd)
     except (UnsafePath, FileNotFoundError):
+        pass
+    return freed
+
+def unlink_owned_tree_dir_fd(dfd, name):
+    """Ruling 67 (Round-8 follow-up, "G8b"): fd-bound counterpart to `unlink_owned_tree` for a
+    LOCKED prune/retain deletion. Deletes activity subdirectory `name` -- every entry inside it,
+    then the directory itself -- relative to an ALREADY-VALIDATED root directory fd `dfd` (a
+    locked `quota.LockCtx.afd`), so a locked deletion never re-resolves the activity ROOT by path
+    either (only `unlink`/`rmdir`, both relative to `dfd` or the freshly-opened subdir fd, ever
+    touch the filesystem here -- deletion can never escape the Activity tree, the same guarantee
+    `unlink_owned_tree` gives an unlocked caller). Best-effort like `unlink_owned_tree`: a failure
+    opening `name`, or unlinking/rmdir-ing any individual entry, is swallowed, never raised --
+    callers (`quota._prune_locked`/`_retain_locked`) already re-verify canonical identity via
+    `quota._verify_canonical` immediately BEFORE calling this for each deletion decision, so this
+    function itself does no identity checking of its own. Returns bytes freed."""
+    try:
+        sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+    except OSError:
+        return 0
+    freed = 0
+    try:
+        for entry in os.scandir(sub):
+            try:
+                freed += os.lstat(entry.name, dir_fd=sub).st_size
+            except OSError:
+                pass
+            try:
+                os.unlink(entry.name, dir_fd=sub)             # relative unlink -> cannot escape
+            except OSError:
+                pass
+    finally:
+        os.close(sub)
+    try:
+        os.rmdir(name, dir_fd=dfd)
+    except OSError:
         pass
     return freed

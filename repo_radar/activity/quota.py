@@ -48,17 +48,40 @@ class LockCtx:
         succeeded, re-checked against the pre-wait capture -- see `_quota_lock`). Every
         `_verify_canonical(ctx)` call compares against this SAME tuple for the lock's entire
         lifetime.
+      root_path -- the activity ROOT's own path (`paths.quota_dir(home).parent`, i.e. what `afd`
+        was opened FROM). Ruling 67 (Round-8 follow-up, "G8b"): `afd` itself is a bare fd -- once
+        opened, the KERNEL never invalidates it on a rename, so a root-level swap (rename
+        `activity/` -> `activity.moved/`, then create a fresh, empty `activity/` in its place)
+        leaves `afd` silently pointing at the now-DETACHED (moved-away) directory while every
+        `afd`-relative identity check (`_canonical_quota_ident(ctx.afd)`, `os.fstat(ctx.qfd)`)
+        keeps comparing detached-afd-relative reads against each other and reports "canonical" --
+        self-consistent, but no longer the ACTUAL `activity/` PATH. `root_path` is what lets
+        `_verify_canonical` catch that: it re-`stat`s THIS path (never following through `afd`)
+        and compares against `root_ident` below.
+      root_ident -- the `(dev, ino)` of the activity root, captured via `os.fstat(afd)` the moment
+        `afd` was opened (Ruling 67) -- i.e. "what `afd` was validated as pointing to". Every
+        `_verify_canonical(ctx)` call re-`stat`s `root_path` by PATH and compares the result
+        against this SAME tuple: a root-level rename/swap changes what's AT `root_path` without
+        changing what `afd` itself refers to, so the two diverge exactly when a swap has
+        happened -- the one signal a purely `afd`-relative check can never produce on its own.
 
     `_unlock` closes all three fds (Ruling 66 / Codex R8-3: each independently, never raising --
     see there). Every operation performed under the lock now threads `ctx` through and is
     fd/identity-bound: `_ledger_entries_detailed_fd`, `_write_entry_fd`, `_unlink_entry_fd`,
     `_reconcile_all_locked`/`_reconcile_one_locked`, `_prune_locked`, `_retain_locked`, and
     `prune.prune_to_ceiling` -- no locked operation may re-resolve the `quota/` PATH after
-    acquisition any more (that was the residual Ruling 60 left open; see `_verify_canonical`)."""
+    acquisition any more (that was the residual Ruling 60 left open; see `_verify_canonical`).
+    Ruling 67 further binds the ACTIVITY-ROOT enumeration and every per-activity segment stat
+    performed under the lock (`_gather_accounting`, `_prune_locked`, `_retain_locked`) to `afd`
+    too, via `paths.list_owned_subdirs_dir_fd_detailed`/`stat_owned_segments_dir_fd_detailed`/
+    `unlink_owned_tree_dir_fd` -- see those call sites and `_verify_canonical`'s root-identity
+    check above."""
     lock_fd: int
     qfd: int
     afd: int
     ident: tuple
+    root_path: object
+    root_ident: tuple
 
 def _canonical_quota_ident(afd):
     """`(dev, ino)` of `quota/`, stat'd relative to the validated `activity/` dir fd `afd`
@@ -80,13 +103,34 @@ def _verify_canonical(ctx):
     that's vanished out from under an already-validated fd is exactly as untrustworthy as a
     swap). Never raises. Call sites invoke this BEFORE and AFTER every ledger enumeration
     (`_ledger_entries_detailed_fd`), every entry write (`_write_entry_fd`), every entry unlink
-    (`_unlink_entry_fd`), and immediately before any prune/retain deletion decision."""
+    (`_unlink_entry_fd`), and immediately before any prune/retain deletion decision.
+
+    Ruling 67 (Round-8 follow-up, "G8b", extends Ruling 64): the checks above alone can be fooled
+    by a swap of the ACTIVITY ROOT itself (`activity/`, `afd`'s own target) -- renaming it aside
+    (e.g. to `activity.moved/`) and creating a fresh, empty `activity/` in its place MOVES
+    `quota/` along with the original directory (a rename does not touch its contents), so
+    `_canonical_quota_ident(ctx.afd)` (still relative to the now-DETACHED `afd`) keeps finding the
+    SAME `quota/` at the SAME identity, and `ctx.qfd` keeps `fstat`ing to that same identity too --
+    both checks above report "canonical" even though `afd` no longer refers to what's actually AT
+    the `activity/` PATH any more. Closed by an independent, PATH-based check: re-`stat`
+    `ctx.root_path` (`follow_symlinks=False`, never resolved through `afd`) and compare its
+    `(dev, ino)` against `ctx.root_ident` (captured via `os.fstat(afd)` the moment `afd` was
+    opened, i.e. what `afd` was validated as pointing to). A root-level rename/swap changes what's
+    AT that path without changing what `afd` itself refers to, so the two values diverge exactly
+    when a swap has happened -- the one signal the purely-`afd`-relative checks above can never
+    produce alone. Also fails (never raises) if `root_path` no longer stats as a real, non-symlink
+    directory."""
     try:
         ident_now = _canonical_quota_ident(ctx.afd)
         qst = os.fstat(ctx.qfd)
+        root_st_now = os.stat(ctx.root_path, follow_symlinks=False)
     except OSError:
         return False
-    return ident_now == ctx.ident and ident_now == (qst.st_dev, qst.st_ino)
+    if ident_now != ctx.ident or ident_now != (qst.st_dev, qst.st_ino):
+        return False
+    if not stat.S_ISDIR(root_st_now.st_mode):
+        return False
+    return (root_st_now.st_dev, root_st_now.st_ino) == ctx.root_ident
 
 def _quota_lock(home):
     """Ruling 64 (Codex R8-1, BLOCKER): captures the CANONICAL identity of `quota/` -- its
@@ -105,8 +149,11 @@ def _quota_lock(home):
     operation from here on -- not just once at acquisition (see R8-1 point 2/3: a swap
     mid-enumeration, mid-write, mid-unlink, or mid-prune is the other half of this fix)."""
     paths.secure_mkdir(paths.quota_dir(home))              # ensure activity/ + quota/ exist
-    afd = paths.open_owned_dir(paths.quota_dir(home).parent)   # validated activity/ dir fd, kept alive
+    root_path = paths.quota_dir(home).parent
+    afd = paths.open_owned_dir(root_path)                   # validated activity/ dir fd, kept alive
     try:
+        root_ident0 = os.fstat(afd)                         # (Ruling 67) what afd itself points to
+        root_ident0 = (root_ident0.st_dev, root_ident0.st_ino)
         ident0 = _canonical_quota_ident(afd)                # captured BEFORE waiting on flock
         qfd = os.open("quota", os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=afd)
         try:
@@ -124,13 +171,21 @@ def _quota_lock(home):
             qst = os.fstat(qfd)
             if ident0 != ident1 or ident0 != (qst.st_dev, qst.st_ino):
                 raise paths.UnsafePath("quota/ identity changed across lock acquisition")
+            # Ruling 67: independently re-verify the ROOT itself (not just quota/ relative to
+            # afd) -- a root-level rename/swap landing during the wait leaves afd-relative checks
+            # self-consistent (see LockCtx's own docstring); only a PATH-based re-stat of
+            # root_path, compared against root_ident0 (what afd was opened FROM), can catch it.
+            root_st1 = os.stat(root_path, follow_symlinks=False)
+            if not stat.S_ISDIR(root_st1.st_mode) or (root_st1.st_dev, root_st1.st_ino) != root_ident0:
+                raise paths.UnsafePath("activity/ root identity changed across lock acquisition")
         except BaseException:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
                 pass
             os.close(fd); os.close(qfd); raise
-        return LockCtx(lock_fd=fd, qfd=qfd, afd=afd, ident=ident0)
+        return LockCtx(lock_fd=fd, qfd=qfd, afd=afd, ident=ident0,
+                        root_path=root_path, root_ident=root_ident0)
     except BaseException:
         os.close(afd); raise
 
@@ -558,19 +613,52 @@ def _gather_accounting(home, ctx=None):
     every other locked caller: `_reconcile_all_locked`, `_prune_locked`, `_retain_locked`,
     `prune_to_ceiling`) never re-resolves `quota/` by path (where a rename/swap AFTER the lock was
     acquired could otherwise surface as a misleading `ENOENT` = "no ledgers yet"). `None` (the
-    default) -- unlocked/introspection callers -- keeps the existing path-based reading."""
-    base = paths.quota_dir(home).parent
-    subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
+    default) -- unlocked/introspection callers -- keeps the existing path-based reading.
+
+    Ruling 67 (Round-8 follow-up, "G8b"): the ROOT enumeration and every per-activity byte stat
+    above are bound to `ctx.afd` too, the SAME way -- `paths.list_owned_subdirs_dir_fd_detailed`/
+    `stat_owned_segments_dir_fd_detailed` instead of the path-based `base = paths.quota_dir(home).
+    parent` forms. Binding `quota/`'s own identity to the lock (Ruling 64) closed the ledger half
+    of this gap but left the ROOT half open: `_gather_accounting` still re-resolved `activity/`
+    (and each `<aid>/` under it) by PATH, so a root-level rename/swap (`activity/` ->
+    `activity.moved/`, fresh empty `activity/` -- which moves `quota/` along with it, since a
+    rename doesn't touch a directory's contents) made `_verify_canonical` keep reporting
+    "canonical" (its `quota/`-relative checks are self-consistent against the now-detached `afd`;
+    see `_verify_canonical`'s own comment) while this function's path-based listing read the
+    swapped-in EMPTY tree -- a certain-empty accounting view under a lock that still looked
+    validly held. `_verify_canonical(ctx)` is now explicitly checked immediately BEFORE the root
+    listing and again immediately AFTER the last per-activity stat, before the ledger step: either
+    failure discards whatever was gathered and reports `root_listable=False` (the same shape a
+    genuine unlistable root already produces), never a partial or stale result."""
+    if ctx is not None:
+        canonical_ok = _verify_canonical(ctx)
+        if canonical_ok:
+            subdirs, rejected, root_uncertain = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
+        else:
+            subdirs, rejected, root_uncertain = [], [], True
+    else:
+        base = paths.quota_dir(home).parent
+        subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
     root_listable = not (root_uncertain and not rejected)
 
     activities = []
-    for name in subdirs:
-        if name == "quota":
-            continue
-        entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
-        on_disk_measured = sum(sz for _n, sz in entries)      # partial-or-full, NEVER discarded
-        activities.append(ActivityInput(aid=name, on_disk_measured=on_disk_measured, uncertain=dir_uncertain))
-    rejected_root_ids = [name for name, reason in rejected if reason != "gone"]
+    if root_listable:
+        for name in subdirs:
+            if name == "quota":
+                continue
+            if ctx is not None:
+                entries, dir_uncertain = paths.stat_owned_segments_dir_fd_detailed(ctx.afd, name)
+            else:
+                entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
+            on_disk_measured = sum(sz for _n, sz in entries)  # partial-or-full, NEVER discarded
+            activities.append(ActivityInput(aid=name, on_disk_measured=on_disk_measured, uncertain=dir_uncertain))
+        if ctx is not None and not _verify_canonical(ctx):
+            # Ruling 67: re-checked AFTER the LAST per-activity stat, before the ledger step -- a
+            # swap landing mid-enumeration invalidates whatever was just gathered; never trust a
+            # partial result read partway through a root that turned out not to be canonical.
+            root_listable = False
+            activities = []
+    rejected_root_ids = [name for name, reason in rejected if reason != "gone"] if root_listable else []
 
     if ctx is not None:
         ledger_entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
@@ -943,15 +1031,26 @@ def _prune_locked(home, need_bytes, ctx):
     covering a swap landing mid-loop, while `_classify` does its own per-candidate I/O) -- on
     failure, stop pruning further candidates entirely (whatever was already freed, genuinely was,
     and is kept; nothing MORE is deleted once canonical identity can no longer be trusted).
-    Activity-directory deletion itself stays `paths.unlink_owned_tree` (already descriptor-relative
-    from the validated root) -- only the GATE controlling whether it fires at all is new here."""
-    base = paths.quota_dir(home).parent
+
+    Ruling 67 (Round-8 follow-up, "G8b"): the CANDIDATE enumeration and the actual deletion are
+    now bound to `ctx.afd` too, not just the live-set ledger read -- `paths.list_owned_subdirs_
+    dir_fd(ctx.afd)` instead of the path-based `paths.list_owned_subdirs(base)`, and `paths.
+    unlink_owned_tree_dir_fd(ctx.afd, aid)` instead of `paths.unlink_owned_tree(paths.activity_dir
+    (home, aid))`. `_verify_canonical(ctx)` is checked ONE MORE TIME, before even building the
+    candidate list at all: a swap detected here means the candidate set itself would be built
+    against a root this lock no longer demonstrably owns -- even though `afd`-relative reads
+    would still (for a root swap specifically) see the real, original tree, per this codebase's
+    fail-closed convention (Ruling 61/64/65) an identity anomaly refuses outright rather than
+    "getting lucky" and continuing; refuse ENTIRELY (return 0, nothing pruned) rather than build a
+    candidate list this pass cannot vouch for."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return 0                                   # live set unproven -- never delete under uncertainty
+    if not _verify_canonical(ctx):
+        return 0                                   # Ruling 67: root identity unproven -- never guess at candidates
     live = {aid for aid, _e in entries}
     items = []
-    for aid in paths.list_owned_subdirs(base):
+    for aid in paths.list_owned_subdirs_dir_fd(ctx.afd):
         if aid == "quota" or aid in live:
             continue
         kind, mtime = _classify(home, aid)
@@ -965,9 +1064,9 @@ def _prune_locked(home, need_bytes, ctx):
     for aid, _, _ in order:
         if freed >= need_bytes:
             break
-        if not _verify_canonical(ctx):             # Ruling 64: re-checked before EACH deletion decision
-            break                                   # quota/ identity no longer trustworthy -- stop
-        freed += paths.unlink_owned_tree(paths.activity_dir(home, aid))   # dir-fd-safe delete
+        if not _verify_canonical(ctx):             # Ruling 64/67: re-checked before EACH deletion decision
+            break                                   # root/quota identity no longer trustworthy -- stop
+        freed += paths.unlink_owned_tree_dir_fd(ctx.afd, aid)   # dir-fd-safe delete, root-bound
     return freed
 
 def prune(home, need_bytes):
@@ -996,13 +1095,23 @@ def _retain_locked(home, ctx):
     is likewise taken through `ctx` (`_accounting_snapshot(home, ctx=ctx)`), never re-resolving
     `quota/` by path. `_verify_canonical(ctx)` is re-checked immediately before each age-based
     deletion (same defense-in-depth rationale as `_prune_locked`) -- on failure, stop deleting
-    further candidates in this pass; whatever was already freed stays freed."""
+    further candidates in this pass; whatever was already freed stays freed.
+
+    Ruling 67 (Round-8 follow-up, "G8b"): the pre/post-deletion candidate snapshots and the actual
+    deletion are now bound to `ctx.afd` too -- `paths.list_owned_subdirs_dir_fd(ctx.afd)` instead
+    of the path-based `paths.list_owned_subdirs(base)`, and `paths.unlink_owned_tree_dir_fd(ctx.
+    afd, aid)` instead of `paths.unlink_owned_tree(paths.activity_dir(home, aid))`. Same extra
+    `_verify_canonical(ctx)` gate as `_prune_locked` before building the candidate list at all --
+    see that function's own comment for why an identity anomaly refuses outright here too, even
+    though a root-swap specifically would still (for THIS pass) resolve `ctx.afd`-relative reads
+    against the real, original tree."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return []                                    # live set unproven -- never delete under uncertainty
+    if not _verify_canonical(ctx):
+        return []                                     # Ruling 67: root identity unproven -- refuse the whole pass
     live = {aid for aid, _e in entries}
-    base = paths.quota_dir(home).parent
-    before = set(paths.list_owned_subdirs(base))            # pre-deletion snapshot (Round-6 #6)
+    before = set(paths.list_owned_subdirs_dir_fd(ctx.afd))   # pre-deletion snapshot (Round-6 #6)
 
     candidates = []
     for aid in before:
@@ -1036,16 +1145,16 @@ def _retain_locked(home, ctx):
         prunable = (kind == "routine" and age > routine_max_age) or \
                    (kind == "problem" and age > problem_max_age)
         if prunable:
-            if not _verify_canonical(ctx):        # Ruling 64: re-checked before EACH deletion decision
-                break                              # quota/ identity no longer trustworthy -- stop
-            paths.unlink_owned_tree(paths.activity_dir(home, aid))
+            if not _verify_canonical(ctx):        # Ruling 64/67: re-checked before EACH deletion decision
+                break                              # root/quota identity no longer trustworthy -- stop
+            paths.unlink_owned_tree_dir_fd(ctx.afd, aid)      # Ruling 67: root-bound, dir-fd-safe delete
 
     snap = _accounting_snapshot(home, ctx=ctx)                # Ruling 64: ctx-bound, never path-based
     over = snap.charge - CEILING
     if over > 0:
         _prune_locked(home, over, ctx)                        # ceiling overrides newest-50 (spec §7)
 
-    return sorted(before - set(paths.list_owned_subdirs(base)))
+    return sorted(before - set(paths.list_owned_subdirs_dir_fd(ctx.afd)))
 
 def retain(home):
     ctx = None

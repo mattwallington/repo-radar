@@ -631,26 +631,61 @@ function _hasTerminal(home, aid) {
 // `lockCtx` (Ruling 60): the lock context from `_quotaLock`, threaded through to
 // `_ledgerEntriesDetailed` so a locked decision re-verifies the ledger dir's identity around its
 // enumeration. Omitted for unlocked readers.
+//
+// Ruling 67 (Round-8 follow-up, "G8b"): pre-fix, the ROOT enumeration (`listOwnedSubdirsDetailed`)
+// and every per-activity `statOwnedSegmentsDetailed` above ran ENTIRELY BEFORE `_verifyCanonical`
+// was ever invoked -- that only happened later, inside `_ledgerEntriesDetailed`. `_verifyCanonical`
+// already checks BOTH bound identities a lock context carries (`ident` for `quota/`, `rootIdent`
+// for the activity root -- Ruling 64), so it WOULD have caught a root-level rename/swap
+// (`activity/` -> `activity.moved/`, fresh empty `activity/`) -- but only once the ledger step
+// finally ran it, by which point the root+per-activity listing had already silently read the
+// swapped-in EMPTY tree and this function had already decided `rootListable`/`activities` from
+// it: a certain-empty accounting view under a lock context that still LOOKED validly bound.
+// Fixed by calling `_verifyCanonical(lockCtx)` explicitly, when locked, immediately BEFORE the
+// root `listOwnedSubdirsDetailed` call and again immediately AFTER the LAST per-activity
+// `statOwnedSegmentsDetailed` call (before the ledger step) -- either failure discards whatever
+// was (or would have been) gathered and reports `rootListable: false` (the same shape a genuine
+// unlistable root already produces), never a partial or stale result.
 function _gatherAccounting(home, lockCtx) {
   const base = path.dirname(paths.quotaDir(home));
-  const root = paths.listOwnedSubdirsDetailed(base);
+  const locked = lockCtx !== undefined && lockCtx !== null;
+
+  let canonicalOk = !locked || _verifyCanonical(lockCtx); // Ruling 67: checked BEFORE root listing
+  let root = { subdirs: [], rejected: [], uncertain: true };
   const activities = [];
-  for (const name of root.subdirs) {
-    if (name === 'quota') continue;
-    const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
-    let size = 0;
-    for (const seg of scan.entries) size += seg.size; // partial measurement is KEPT when uncertain
-    activities.push({ aid: name, onDisk: size, uncertain: Boolean(scan.uncertain) });
+  if (canonicalOk) {
+    root = paths.listOwnedSubdirsDetailed(base);
+    for (const name of root.subdirs) {
+      if (name === 'quota') continue;
+      const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
+      let size = 0;
+      for (const seg of scan.entries) size += seg.size; // partial measurement is KEPT when uncertain
+      activities.push({ aid: name, onDisk: size, uncertain: Boolean(scan.uncertain) });
+    }
+    if (locked && !_verifyCanonical(lockCtx)) {
+      // Ruling 67: re-checked AFTER the LAST per-activity stat, before the ledger step -- a swap
+      // landing mid-enumeration invalidates whatever was just gathered.
+      canonicalOk = false;
+    }
   }
-  const rejectedRootIds = [];
-  for (const rj of root.rejected) {
-    if (rj.reason !== 'gone') rejectedRootIds.push(rj.name); // proven gone hides nothing
+
+  let rejectedRootIds = [];
+  let rootListable;
+  if (!canonicalOk) {
+    rootListable = false; // Ruling 67: identity unproven around the root pass -- same shape as a
+    activities.length = 0; // genuine unlistable root; discard any partial listing gathered above.
+  } else {
+    for (const rj of root.rejected) {
+      if (rj.reason !== 'gone') rejectedRootIds.push(rj.name); // proven gone hides nothing
+    }
+    // `listOwnedSubdirsDetailed.uncertain` covers BOTH "the base could not be validated/listed"
+    // (early return: `subdirs` and `rejected` both empty) AND "an activity-shaped entry was
+    // refused" (the base WAS listed; the entry is in `rejected`). Only the former is "root
+    // unlistable" here -- the latter is per-activity uncertainty (`rejectedRootIds`), charged
+    // max(0, CAP) each.
+    rootListable = !(root.uncertain && rejectedRootIds.length === 0);
   }
-  // `listOwnedSubdirsDetailed.uncertain` covers BOTH "the base could not be validated/listed"
-  // (early return: `subdirs` and `rejected` both empty) AND "an activity-shaped entry was refused"
-  // (the base WAS listed; the entry is in `rejected`). Only the former is "root unlistable" here --
-  // the latter is per-activity uncertainty (`rejectedRootIds`), charged max(0, CAP) each.
-  const rootListable = !(root.uncertain && rejectedRootIds.length === 0);
+
   const led = _ledgerEntriesDetailed(home, lockCtx);
   const ledger = [];
   for (const [aid, e] of led.entries) {

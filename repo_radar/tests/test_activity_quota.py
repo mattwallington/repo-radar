@@ -1,4 +1,4 @@
-import base64, errno, json, os, pathlib, time
+import base64, errno, json, os, pathlib, shutil, time
 import pytest
 from repo_radar.activity import quota, paths, lease, ids, writer, prune
 from repo_radar.activity import reconcile as reconcile_mod
@@ -595,22 +595,27 @@ def test_admit_refuses_from_a_single_snapshot_not_two_separate_scans(tmp_path, m
     `uncertain=True` the FIRST time this activity's directory is measured, `False` any later time.
     The decisive assertion isn't just the refusal (a correct implementation refuses either way
     here) but that it happens from EXACTLY ONE stat call -- proving `admit` never goes on to take
-    a SECOND, later reading of the same directory that could disagree with the first."""
+    a SECOND, later reading of the same directory that could disagree with the first.
+
+    Ruling 67 (Round-8 follow-up, "G8b"): `admit`'s locked decision now stats each activity
+    directory through the fd-bound `paths.stat_owned_segments_dir_fd_detailed(ctx.afd, name)`
+    (never the path-based form, which the unlocked/introspection callers alone still use) -- so
+    this hook target legitimately moved from `stat_owned_segments_detailed` to that fd-bound
+    counterpart, matched by NAME rather than by directory path."""
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
     l.release(); quota.settle(tmp_path, aid)          # one settled activity, real bytes on disk
 
-    real = paths.stat_owned_segments_detailed
-    aid_dir = paths.activity_dir(tmp_path, aid)
+    real = paths.stat_owned_segments_dir_fd_detailed
     calls = {"n": 0}
-    def hooked(directory, suffix=".jsonl"):
-        entries, _uncertain = real(directory, suffix)
-        if str(directory) == str(aid_dir):
+    def hooked(dfd, name, suffix=".jsonl"):
+        entries, _uncertain = real(dfd, name, suffix)
+        if name == aid:
             calls["n"] += 1
             return entries, calls["n"] == 1          # True on call #1, False on any later call
         return entries, _uncertain
-    monkeypatch.setattr(paths, "stat_owned_segments_detailed", hooked)
+    monkeypatch.setattr(paths, "stat_owned_segments_dir_fd_detailed", hooked)
 
     fresh, fl = _new_activity(tmp_path)
     assert quota.admit(tmp_path, fresh, fl) is False   # refused: the single snapshot saw uncertain
@@ -627,22 +632,25 @@ def test_admit_charge_and_uncertain_are_a_matched_pair_from_one_reading(tmp_path
     already see True and silently substitute a PER_ACTIVITY_CAP max-liability guess into the
     charge, with nothing downstream ever learning the accounting had gone uncertain. Fixed code
     takes only ONE reading per activity per decision, so `charge` and `uncertain` are always a
-    matched pair -- proven here by the same call-count assertion, independent of hook ordering."""
+    matched pair -- proven here by the same call-count assertion, independent of hook ordering.
+
+    Ruling 67 (Round-8 follow-up, "G8b"): same hook-target move as the test above -- `admit`'s
+    locked decision stats each activity directory through the fd-bound `paths.stat_owned_
+    segments_dir_fd_detailed(ctx.afd, name)`, matched by NAME rather than by directory path."""
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
     l.release(); quota.settle(tmp_path, aid)
 
-    real = paths.stat_owned_segments_detailed
-    aid_dir = paths.activity_dir(tmp_path, aid)
+    real = paths.stat_owned_segments_dir_fd_detailed
     calls = {"n": 0}
-    def hooked(directory, suffix=".jsonl"):
-        entries, _uncertain = real(directory, suffix)
-        if str(directory) == str(aid_dir):
+    def hooked(dfd, name, suffix=".jsonl"):
+        entries, _uncertain = real(dfd, name, suffix)
+        if name == aid:
             calls["n"] += 1
             return entries, calls["n"] > 1           # False on call #1, True on any later call
         return entries, _uncertain
-    monkeypatch.setattr(paths, "stat_owned_segments_detailed", hooked)
+    monkeypatch.setattr(paths, "stat_owned_segments_dir_fd_detailed", hooked)
 
     fresh, fl = _new_activity(tmp_path)
     admitted = quota.admit(tmp_path, fresh, fl)        # outcome must reflect ONLY the single reading
@@ -1123,6 +1131,238 @@ def test_retain_returns_empty_when_quota_dir_swapped_mid_lock(tmp_path, monkeypa
     assert pruned == []
     assert paths.activity_dir(tmp_path, aid).exists()
     assert paths.ledger_entry_path(tmp_path, aid).exists()
+
+# --- Ruling 67 (Round-8 follow-up, "G8b"): binding `quota/`'s identity to the lock (Ruling 64)
+# left the ACTIVITY ROOT enumeration and every per-activity segment stat performed under the lock
+# still re-resolving `activity/` (and each `<aid>/` under it) by PATH -- `_gather_accounting`,
+# `_prune_locked`, `_retain_locked`. A root-level swap (rename `activity/` -> `activity.moved/`,
+# then a FRESH EMPTY `activity/` created in its place -- which moves `quota/` ALONG WITH the
+# renamed-away original, since a rename doesn't touch a directory's contents) left `_verify_
+# canonical`'s pre-Ruling-67 checks self-consistent against the now-detached `afd` (a rename
+# doesn't invalidate an already-open fd), while the path-based root/per-activity listing silently
+# read the swapped-in EMPTY tree -- a certain-empty accounting view under a lock that still looked
+# validly held. Every test below exercises a REAL rename/swap window (never a stubbed "return
+# uncertain"), matching the style of the Ruling-64 tests above.
+
+def test_admit_refuses_and_writes_nothing_when_activity_root_swapped_mid_enumeration(tmp_path, monkeypatch):
+    """A REAL swap of the ACTIVITY ROOT landing between lock acquisition and the root enumeration
+    inside `_gather_accounting` (injected by wrapping the fd-bound root-listing primitive `_gather_
+    accounting` calls directly -- `paths.list_owned_subdirs_dir_fd_detailed` -- to perform the
+    swap, then delegate to the real, still-afd-relative call, which correctly keeps reading the
+    REAL, detached tree).
+
+    Pre-Ruling-67 this was UNDETECTABLE: a settled activity sitting just under the real 64 MiB
+    ceiling would have measured as 0 committed bytes once the root enumeration silently followed
+    the swapped-in empty path, and `admit` would have WRONGLY admitted a fresh reservation --
+    written into the STALE (moved-aside) `quota/` -- past the real ceiling, with nothing
+    downstream ever learning the accounting had gone uncertain (exactly the undercount-then-
+    over-admit pattern every prior Ruling in this lineage closes one layer at a time). The new,
+    independent PATH-based root-identity check (`_verify_canonical` comparing a fresh `os.stat
+    (root_path)` against what `afd` was originally opened from) is what actually detects this,
+    since it re-resolves `root_path` by PATH -- exactly the thing that changed.
+
+    `admit()` must refuse, write NO reservation under either root, and a standalone snapshot taken
+    through the SAME swap must be uncertain (never "certain, charge 0")."""
+    aid1, l1 = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid1, l1)
+    _write_start(tmp_path, aid1); _write_terminal(tmp_path, aid1)
+    l1.release(); quota.settle(tmp_path, aid1)          # settled: real committed bytes, no ledger entry
+    seg = paths.activity_dir(tmp_path, aid1) / "python-deadbeef.jsonl"
+    with open(seg, "r+b") as f:
+        f.truncate(quota.CEILING - 1000)                # committed bytes just under the real ceiling
+
+    real_snap = quota._compute_snapshot(quota._gather_accounting(tmp_path))
+    assert real_snap.uncertain is False and real_snap.corrupt is False
+    assert real_snap.charge == quota.CEILING - 1000     # sanity: the REAL charge is near-ceiling
+
+    root_dir = paths.quota_dir(tmp_path).parent
+    moved_dir = tmp_path / "activity.moved"
+    real_listing = paths.list_owned_subdirs_dir_fd_detailed
+
+    def make_hook():
+        state = {"done": False}
+        def hooked(dfd):
+            if not state["done"]:
+                state["done"] = True
+                os.rename(root_dir, moved_dir)                    # REAL swap: detach the near-ceiling tree
+                paths.secure_mkdir(paths.quota_dir(tmp_path))       # fresh, EMPTY tree at the canonical path
+            return real_listing(dfd)
+        return hooked
+
+    def restore():
+        if moved_dir.exists():
+            if root_dir.exists():
+                shutil.rmtree(root_dir)
+            os.rename(moved_dir, root_dir)
+
+    # (a) lower-level companion, taken WHILE the swap stands: a snapshot bound to the SAME
+    # validated activity root must be uncertain, never quietly "certain, charge 0".
+    ctx = quota._quota_lock(tmp_path)
+    monkeypatch.setattr(paths, "list_owned_subdirs_dir_fd_detailed", make_hook())
+    try:
+        snap = quota._accounting_snapshot(tmp_path, ctx=ctx)
+    finally:
+        quota._unlock(ctx)
+        monkeypatch.undo()
+        restore()
+    assert snap.uncertain is True
+    assert snap.charge >= quota.CEILING, "an unlistable root floors the charge at the ceiling, never 0"
+
+    # (b) the same repro through the public admit() entrypoint.
+    fresh, fl = _new_activity(tmp_path)
+    monkeypatch.setattr(paths, "list_owned_subdirs_dir_fd_detailed", make_hook())
+    try:
+        assert quota.admit(tmp_path, fresh, fl) is False
+    finally:
+        monkeypatch.undo()
+        restore()
+
+    assert not (moved_dir / "quota" / f"{fresh}.json").exists()   # not written to the stale tree either
+    assert not paths.ledger_entry_path(tmp_path, fresh).exists()
+    assert paths.activity_dir(tmp_path, aid1).exists()
+    assert (paths.activity_dir(tmp_path, aid1) / "python-deadbeef.jsonl").stat().st_size == quota.CEILING - 1000
+
+def test_prune_deletes_nothing_when_activity_root_swapped_mid_lock(tmp_path, monkeypatch):
+    """The CANDIDATE enumeration `_prune_locked` performs directly (`paths.list_owned_subdirs_
+    dir_fd(ctx.afd)`) is root-fd-bound too now, not just the ledger-liability read Ruling 64
+    already protected. A REAL root swap landing right as that enumeration call fires (injected by
+    wrapping the primitive itself to perform the swap, then delegate to the real, still-afd-
+    relative call) must make `_prune_locked` delete NOTHING and return 0 -- via `quota.prune()`,
+    the entrypoint that (unlike `prune_to_ceiling`) calls `_prune_locked` DIRECTLY with no
+    reconcile/pre-snapshot gate in front of it, so this exercises `_prune_locked`'s OWN
+    protections, not an earlier outer refusal.
+
+    A settled, routine activity (`settled_aid`) is deliberately included as a genuine prune
+    candidate: `calls["n"] == 1` proves the enumeration primitive really was reached and really
+    did find it (via the correctly afd-relative, unaffected-by-the-outer-rename listing) -- so the
+    resulting `freed == 0` reflects the locked session refusing to act further once its root
+    identity can no longer be vouched for, not merely an empty candidate list. (The classification
+    step for that candidate independently re-resolves its directory by PATH -- out of this fix's
+    scope, see scan.py -- and would ALSO see nothing at the swapped-in path; `calls["n"] == 1`
+    is what isolates this test to the enumeration primitive's own root-fd binding specifically.)
+
+    `live_l` is released only right before `quota.prune()` runs, AFTER `settled_aid` is fully set
+    up: `admit()`'s OWN reconcile-before-charge pass (unrelated to this fix) would otherwise
+    reconcile away `live_aid`'s durable-terminal-and-lease-free entry the moment `settled_aid` is
+    admitted, before the swap is ever reached."""
+    live_aid, live_l = _new_activity(tmp_path)
+    quota.admit(tmp_path, live_aid, live_l)
+    _write_start(tmp_path, live_aid); _write_terminal(tmp_path, live_aid)   # lease kept HELD for now
+
+    settled_aid, settled_l = _new_activity(tmp_path)
+    quota.admit(tmp_path, settled_aid, settled_l)
+    _write_start(tmp_path, settled_aid); _write_terminal(tmp_path, settled_aid)
+    settled_l.release(); quota.settle(tmp_path, settled_aid)   # settled, routine -> a real candidate
+
+    live_l.release()                              # NOW owner done, terminal durable -- but NEVER settled
+
+    root_dir = paths.quota_dir(tmp_path).parent
+    moved_dir = tmp_path / "activity.moved"
+
+    real_listing = paths.list_owned_subdirs_dir_fd
+    calls = {"n": 0}
+    def hooked(dfd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.rename(root_dir, moved_dir)                      # REAL swap: detach the real tree
+            paths.secure_mkdir(paths.quota_dir(tmp_path))         # fresh, EMPTY tree at the canonical path
+        return real_listing(dfd)
+    monkeypatch.setattr(paths, "list_owned_subdirs_dir_fd", hooked)
+
+    try:
+        freed = quota.prune(tmp_path, need_bytes=10**9)          # heavy pressure, were it not refused
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists():
+            if root_dir.exists():
+                shutil.rmtree(root_dir)
+            os.rename(moved_dir, root_dir)
+
+    assert calls["n"] == 1, "the fd-bound enumeration primitive must actually have been reached"
+    assert freed == 0
+    assert paths.activity_dir(tmp_path, live_aid).exists()
+    assert paths.activity_dir(tmp_path, settled_aid).exists()    # NOTHING deleted, even the real candidate
+    assert paths.ledger_entry_path(tmp_path, live_aid).exists()
+
+def test_retain_returns_empty_when_activity_root_swapped_mid_lock(tmp_path, monkeypatch):
+    """Same technique as the prune test above, via `retain()`'s own candidate enumeration
+    (`_retain_locked`'s `paths.list_owned_subdirs_dir_fd(ctx.afd)` calls -- both the pre-deletion
+    snapshot and the final diff). `live_aid`'s owner lease is kept HELD (not released) so `retain
+    ()`'s own `_reconcile_all_locked` pre-pass -- unrelated to this fix, and unaffected by hooking
+    the ROOT-listing primitive rather than the ledger one -- cannot reconcile it away before the
+    swap is even reached; the durable-terminal-but-still-live shape is preserved by that, not by
+    anything under test here."""
+    live_aid, live_l = _new_activity(tmp_path)
+    quota.admit(tmp_path, live_aid, live_l)
+    _write_start(tmp_path, live_aid); _write_terminal(tmp_path, live_aid)   # lease kept HELD -- never released
+
+    settled_aid, settled_l = _new_activity(tmp_path)
+    quota.admit(tmp_path, settled_aid, settled_l)
+    _write_start(tmp_path, settled_aid); _write_terminal(tmp_path, settled_aid)
+    settled_l.release(); quota.settle(tmp_path, settled_aid)
+    old = time.time() - 999 * 86400
+    seg = paths.segment_path(tmp_path, settled_aid, "python", "deadbeef")
+    os.utime(seg, (old, old))                       # backdate well past the 14d routine threshold
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)     # outside the protected window; would normally prune
+
+    root_dir = paths.quota_dir(tmp_path).parent
+    moved_dir = tmp_path / "activity.moved"
+
+    real_listing = paths.list_owned_subdirs_dir_fd
+    calls = {"n": 0}
+    def hooked(dfd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.rename(root_dir, moved_dir)
+            paths.secure_mkdir(paths.quota_dir(tmp_path))
+        return real_listing(dfd)
+    monkeypatch.setattr(paths, "list_owned_subdirs_dir_fd", hooked)
+
+    try:
+        pruned = quota.retain(tmp_path)
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists():
+            if root_dir.exists():
+                shutil.rmtree(root_dir)
+            os.rename(moved_dir, root_dir)
+
+    assert calls["n"] >= 1, "the fd-bound enumeration primitive must actually have been reached"
+    assert pruned == []
+    assert paths.activity_dir(tmp_path, live_aid).exists()
+    assert paths.activity_dir(tmp_path, settled_aid).exists()
+    assert paths.ledger_entry_path(tmp_path, live_aid).exists()
+    live_l.release()
+
+def test_admit_prune_retain_normal_path_unchanged_via_root_fd_binding(tmp_path):
+    """(iv): sanity companion to the three swap tests above -- with NO swap at all, `_gather_
+    accounting`/`_prune_locked`/`_retain_locked`'s new root-fd-bound enumeration (`ctx.afd` ->
+    `paths.list_owned_subdirs_dir_fd[_detailed]`/`stat_owned_segments_dir_fd_detailed`/`unlink_
+    owned_tree_dir_fd`) must not change ordinary, unswapped behavior at all -- prune must still
+    actually free a genuinely stale/prunable activity (contrasting with the swap tests' `freed ==
+    0`, proving that result is specifically the swap being caught, not prune having simply stopped
+    deleting anything, ever, after this fix)."""
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release(); quota.settle(tmp_path, aid)
+    assert not paths.ledger_entry_path(tmp_path, aid).exists()
+    assert paths.activity_dir(tmp_path, aid).exists()
+
+    old = time.time() - 999 * 86400
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    os.utime(seg, (old, old))
+
+    freed = quota.prune(tmp_path, need_bytes=10**9)
+    assert freed > 0
+    assert not paths.activity_dir(tmp_path, aid).exists()          # normally prunable -> actually pruned
+
+    aid2, l2 = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid2, l2) is True
+    _write_start(tmp_path, aid2); _write_terminal(tmp_path, aid2)
+    l2.release()
+    quota.retain(tmp_path)                                          # reconcile settles it (terminal + free lease)
+    assert not paths.ledger_entry_path(tmp_path, aid2).exists()
 
 # --- Codex R8-3 (IMPORTANT) / Ruling 66: `_unlock` must be fully contained -- an early failure
 # in one cleanup step must never skip the rest, and must never replace a public op's own

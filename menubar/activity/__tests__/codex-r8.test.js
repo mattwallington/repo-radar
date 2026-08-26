@@ -373,3 +373,106 @@ test('Ruling 66: a lock release/close failure never escapes settle -- never thro
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// Ruling 67 (Round-8 follow-up, "G8b"): binding `quota/`'s identity to the lock context (R8-1 /
+// Ruling 64) left `_gatherAccounting`'s ROOT enumeration (`listOwnedSubdirsDetailed`) and every
+// per-activity `statOwnedSegmentsDetailed` call running ENTIRELY BEFORE `_verifyCanonical` was
+// ever invoked -- that only happened later, inside `_ledgerEntriesDetailed`. `_verifyCanonical`
+// already checks BOTH bound identities (`ident` for `quota/`, `rootIdent` for the activity root),
+// so it WOULD have caught a root-level rename/swap (`activity/` -> `activity.moved/`, fresh empty
+// `activity/` in its place) -- but only once the ledger step finally ran it, by which point the
+// root+per-activity listing had already silently read the swapped-in EMPTY tree and decided
+// `rootListable`/`activities` from it: a certain-empty accounting view under a lock context that
+// still looked validly bound. Fixed by calling `_verifyCanonical(lockCtx)` explicitly, when
+// locked, immediately BEFORE the root `listOwnedSubdirsDetailed` call and again immediately AFTER
+// the LAST per-activity `statOwnedSegmentsDetailed` call, before the ledger step.
+// ---------------------------------------------------------------------------------------------
+
+test('Ruling 67 (G8b): activity root swapped for an empty dir right as _gatherAccounting\'s own root listing runs -> uncertain snapshot, admit refused, nothing written under either root', () => {
+  const home = tmpHome();
+  try {
+    const aid1 = seedSettled(home, quota.CEILING - 1000); // committed bytes just under the real ceiling
+    const realSnap = quota._accountingSnapshot(home);
+    assert.strictEqual(realSnap.uncertain, false);
+    assert.strictEqual(realSnap.corrupt, false);
+    assert.strictEqual(realSnap.charge, quota.CEILING - 1000);
+
+    const rootDir = path.dirname(A.quotaDir(home));
+    const movedRoot = `${rootDir}.moved`;
+    const realListing = paths.listOwnedSubdirsDetailed;
+
+    function makeHook() {
+      let fired = false;
+      return (base) => {
+        if (!fired) {
+          fired = true;
+          fs.renameSync(rootDir, movedRoot); // REAL swap: detach the near-ceiling tree
+          fs.mkdirSync(rootDir, 0o700); // fresh, EMPTY activity/ at the canonical path
+        }
+        return realListing(base);
+      };
+    }
+    function restore() {
+      if (fs.existsSync(movedRoot)) {
+        if (fs.existsSync(rootDir)) fs.rmSync(rootDir, { recursive: true, force: true });
+        fs.renameSync(movedRoot, rootDir);
+      }
+    }
+
+    // (a) lower-level companion, taken WHILE the swap stands: a snapshot bound to the SAME
+    // validated activity root must be uncertain, never quietly "certain, charge 0".
+    const ctx = quota._quotaLock(home);
+    paths.listOwnedSubdirsDetailed = makeHook();
+    let snap;
+    try {
+      snap = quota._accountingSnapshot(home, ctx);
+    } finally {
+      quota._unlock(ctx);
+      paths.listOwnedSubdirsDetailed = realListing;
+      restore();
+    }
+    assert.strictEqual(snap.uncertain, true, 'an unlistable root must never look certain-empty');
+    assert.ok(snap.charge >= quota.CEILING, 'an unlistable root floors the charge at the ceiling, never 0');
+
+    // (b) the same repro through the public admit() entrypoint.
+    const [aid2, lease] = newLiveActivity(home);
+    paths.listOwnedSubdirsDetailed = makeHook();
+    let result;
+    withNoPython(() => {
+      try {
+        result = quota.admit(home, aid2, lease);
+      } finally {
+        paths.listOwnedSubdirsDetailed = realListing;
+        restore();
+      }
+    });
+    assert.strictEqual(result, false, 'admit must refuse rather than admit past an unverifiable root');
+    assert.ok(!fs.existsSync(path.join(movedRoot, 'quota', `${aid2}.json`)), 'nothing written to the stale tree');
+    assert.ok(!fs.existsSync(A.ledgerEntryPath(home, aid2)), 'nothing written to the restored real tree either');
+    assert.ok(fs.existsSync(A.activityDir(home, aid1)), 'the real near-ceiling activity is untouched');
+    lease.release();
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Ruling 67 (G8b): normal path unchanged -- with no swap, _gatherAccounting/admit behave exactly as before via the new bracketed _verifyCanonical checks', () => {
+  const home = tmpHome();
+  try {
+    const [aid, lease] = newLiveActivity(home);
+    let result;
+    withNoPython(() => { result = quota.admit(home, aid, lease); });
+    assert.strictEqual(result, true);
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(A.ledgerEntryPath(home, aid), 'utf8')),
+      { reserved: quota.RESERVE, granted: 0 },
+    );
+    const snap = quota._accountingSnapshot(home);
+    assert.strictEqual(snap.uncertain, false);
+    assert.strictEqual(snap.corrupt, false);
+    lease.release();
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
