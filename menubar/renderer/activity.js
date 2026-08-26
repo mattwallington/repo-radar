@@ -522,6 +522,37 @@ function boot(win, doc, api) {
     revealEl.disabled = !view.selectedId;
   }
 
+  // Is the list currently on screen still showing the selected activity?
+  function selectedChipPresent() {
+    for (const chip of listEl.querySelectorAll('.chip')) {
+      if (chip.getAttribute('data-activity-id') === view.selectedId) return true;
+    }
+    return false;
+  }
+
+  // Retention prunes activities between renders, so a selection can outlive the thing it points
+  // at: without this, Reveal stayed enabled aimed at an id that is no longer on disk. Called from
+  // the list render only.
+  //
+  // A TRUNCATED list is deliberately not treated as evidence: absence from a capped page means
+  // "not on this page", not "not in the store", and the deep-linked View Errors target is exactly
+  // the kind of older item that falls off it -- dropping the selection there would blank a pane
+  // the data does not say is stale. `activity:reveal` lstats the directory itself before asking
+  // the shell, so a selection kept over a truncated page can still only ever produce a truthful
+  // answer.
+  //
+  // Dropping it returns the detail pane to "select an activity" rather than announcing the item
+  // was pruned: not being on this page is not proof of deletion, and the reader is the only thing
+  // entitled to make that claim.
+  function dropPrunedSelection(result) {
+    if (!view.selectedId) return;
+    if (result && result.truncated) return;
+    if (selectedChipPresent()) return;
+    view.selectedId = null;
+    view.detail = null;
+    paintDetail();
+  }
+
   function paintDetail() {
     put(detailEl, renderDetail(doc, view.detail, view));
   }
@@ -562,10 +593,13 @@ function boot(win, doc, api) {
       put(listEl, renderList(doc, result));
       listReady = true;
       if (pendingFocus) {
+        // A deep link names an activity by id, which `activity:get` resolves whether or not the
+        // list page happens to show it -- so this path is never second-guessed below.
         const id = pendingFocus;
         pendingFocus = null;
         await select(id);
       } else {
+        dropPrunedSelection(result);
         markSelected();
       }
     } catch (e) {

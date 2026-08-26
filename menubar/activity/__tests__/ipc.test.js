@@ -303,6 +303,60 @@ test('activity:reveal reveals exactly the validated activity directory', async (
   }
 });
 
+// Fix round 1 (Task 4.5 review, Important): Reveal used to be a SILENT no-op once the activity
+// was gone. `paths.activityDir` is a pure `path.join` -- it never touches the disk -- and
+// `shell.showItemInFinder` on a nonexistent path does nothing at all on macOS, so the handler
+// returned `true` and the window had nothing to report. Retention pruning the selected activity
+// between the list render and the click is the ordinary way to reach that.
+test('activity:reveal refuses a pruned activity instead of silently revealing nothing', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const { handlers, calls } = makeHandlers(home);
+    fs.rmSync(paths.activityDir(home, AID), { recursive: true, force: true }); // retention
+
+    const err = await rejects(() => handlers['activity:reveal'](AID), 'not-found', 'pruned activity');
+    assert.deepStrictEqual(calls.revealed, [], 'the shell is never asked to reveal a path that is not there');
+    assert.deepStrictEqual(calls.logs, [],
+      'a pruned activity is an ordinary condition, not an internal failure to log');
+    assert.ok(!err.message.includes(home), 'no absolute path may cross the bridge');
+    assert.ok(!err.message.includes(AID), 'nor the id that was asked for');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('activity:reveal never follows a symlink standing in for an activity directory', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const other = '00000000-0000-4000-8000-00000000000b';
+    const link = paths.activityDir(home, other);
+    fs.symlinkSync(paths.activityDir(home, AID), link);
+    const { handlers, calls } = makeHandlers(home);
+
+    await rejects(() => handlers['activity:reveal'](other), 'not-found', 'symlinked activity');
+    assert.deepStrictEqual(calls.revealed, [], 'a link is treated as not-found, never revealed');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('activity:reveal refuses a plain file sitting at an activity-shaped path', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const other = '00000000-0000-4000-8000-00000000000c';
+    fs.writeFileSync(paths.activityDir(home, other), 'not a directory');
+    const { handlers, calls } = makeHandlers(home);
+
+    await rejects(() => handlers['activity:reveal'](other), 'not-found', 'file at an activity path');
+    assert.deepStrictEqual(calls.revealed, []);
+  } finally {
+    cleanup(home);
+  }
+});
+
 test('activity:reveal rejects an unsafe id and never builds a path or calls the shell', async () => {
   const home = tmpHome();
   const origDir = paths.activityDir;

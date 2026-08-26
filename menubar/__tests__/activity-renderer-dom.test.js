@@ -1320,3 +1320,100 @@ test('the action bar is wired to the page controls the HTML actually provides', 
     assert.ok(html.includes(`id="${id}"`), `activity.html must provide #${id}`);
   }
 });
+
+// -------------------------------------------------------------------------------------------
+// Fix round 1 (Task 4.5 review, Important): the selection must not outlive the activity.
+//
+// Retention prunes activities between renders. `markSelected` only ever toggled a class, so a
+// selection whose chip had vanished stayed live: Reveal remained enabled pointing at an id that
+// was no longer on disk, and (before the ipc.js half of this fix) pressing it did nothing at all
+// -- no Finder window, no message. The list render is where that is noticed.
+// -------------------------------------------------------------------------------------------
+function selectedChips(byId) {
+  return byId.list.querySelectorAll('.chip').filter((c) => c.classList.contains('selected'));
+}
+
+// A list whose items the test can change between calls, to stand in for retention.
+function bootedMutableList(initial, over) {
+  const { doc, byId } = livePage();
+  const state = { items: initial, truncated: false };
+  const { api, calls } = fakeApi(Object.assign({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      return { items: state.items, truncated: state.truncated, available: true, incomplete: false, problems: [] };
+    },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  }, over));
+  return { doc, byId, api, calls, state, win: fakeWindow(''), booted: null };
+}
+
+test('a refresh that no longer lists the selected activity drops the selection', async () => {
+  const t = bootedMutableList([LIVE_ITEM, Object.assign({}, LIVE_ITEM, { id: OTHER_ID })]);
+  await R.boot(t.win, t.doc, t.api);
+
+  fire(t.byId.list, 'click', t.byId.list.querySelectorAll('.chip')[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(t.byId['btn-reveal'].disabled, false, 'guard: the selection took');
+  assert.ok(t.byId.detail.textContent.includes('rate-limited'), 'guard: its detail painted');
+
+  t.state.items = t.state.items.slice(1); // retention pruned the selected one
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(t.byId['btn-reveal'].disabled, true,
+    'Reveal must not stay enabled pointing at an activity that is gone');
+  assert.strictEqual(selectedChips(t.byId).length, 0, 'and no chip is left marked selected');
+  assert.match(t.byId.detail.textContent, /select an activity/i,
+    'the detail pane returns to a state that asserts nothing');
+
+  const before = t.calls.length;
+  fire(t.byId['btn-reveal'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(t.calls.length, before, 'and pressing it reveals nothing');
+});
+
+test('a refresh that still lists the selected activity keeps the selection', async () => {
+  const t = bootedMutableList([LIVE_ITEM, Object.assign({}, LIVE_ITEM, { id: OTHER_ID })]);
+  await R.boot(t.win, t.doc, t.api);
+  fire(t.byId.list, 'click', t.byId.list.querySelectorAll('.chip')[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(t.byId['btn-reveal'].disabled, false, 'nothing was pruned, so nothing is dropped');
+  assert.deepStrictEqual(selectedChips(t.byId).map((c) => c.getAttribute('data-activity-id')), [LIVE_ITEM.id]);
+  assert.ok(t.byId.detail.textContent.includes('rate-limited'), 'and the detail pane is left alone');
+});
+
+test('a TRUNCATED list is not evidence the selected activity is gone', async () => {
+  // Absence from a truncated page means "not on this page", not "not in the store" -- and the
+  // deep-linked View Errors target is exactly the kind of older item that falls off it. Dropping
+  // the selection here would blank a pane the data does not say is stale. `activity:reveal`
+  // re-checks the directory itself, so keeping it costs nothing.
+  const t = bootedMutableList([LIVE_ITEM, Object.assign({}, LIVE_ITEM, { id: OTHER_ID })]);
+  await R.boot(t.win, t.doc, t.api);
+  fire(t.byId.list, 'click', t.byId.list.querySelectorAll('.chip')[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  t.state.items = t.state.items.slice(1);
+  t.state.truncated = true;
+  fire(t.byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(t.byId['btn-reveal'].disabled, false, 'the selection survives an off-page render');
+  assert.ok(t.byId.detail.textContent.includes('rate-limited'));
+});
+
+test('a deep link to an activity outside the listed page still selects it (P4-8)', async () => {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi({
+    list: async (filter) => { calls.push(['list', filter]); return { items: [LIVE_ITEM], truncated: true, available: true, incomplete: false, problems: [] }; },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  });
+  await R.boot(fakeWindow('#' + OTHER_ID), doc, api);
+
+  assert.deepStrictEqual(calls, [['list', {}], ['get', OTHER_ID]], 'the deep link is honoured');
+  assert.strictEqual(byId['btn-reveal'].disabled, false,
+    'the pending-focus path must not be second-guessed by the pruned-selection sweep');
+});

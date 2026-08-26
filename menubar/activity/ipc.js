@@ -39,12 +39,19 @@ const CHANNELS = Object.freeze([
   'activity:reveal',
 ]);
 
-// The two error codes the renderer may branch on. Their messages (see `_guard`) are fixed
-// constants rather than the underlying error's text: read.js's InvalidFilter messages quote the
-// offending value (`invalid level: "trace"`), which would echo renderer-supplied text straight
-// back across the bridge, and an unexpected error's message routinely carries absolute paths.
+// The error codes this module can produce. Their messages (see `_guard`) are fixed constants
+// rather than the underlying error's text: read.js's InvalidFilter messages quote the offending
+// value (`invalid level: "trace"`), which would echo renderer-supplied text straight back across
+// the bridge, and an unexpected error's message routinely carries absolute paths.
+//
+// NOTE (Ruling P4-7): the renderer never BRANCHES on any of these -- Electron's error
+// serialization may not even preserve `code`. They exist for the main side's own bookkeeping:
+// which rejections get logged, and which are ordinary conditions rather than failures.
 const INVALID_REQUEST = 'invalid-request';
 const INTERNAL = 'internal';
+// The requested activity is not on disk any more -- retention pruned it between the list render
+// and the click. An ordinary outcome, not an internal failure: not logged.
+const NOT_FOUND = 'not-found';
 
 class ActivityIpcError extends Error {
   constructor(code, message) {
@@ -104,15 +111,18 @@ function _logInternal(log, channel, e) {
 // failures (InvalidFilter, and its InvalidActivityId subclass) as `invalid-request`, anything
 // else as `internal` -- the latter recorded on the main side first.
 //
-// `invalid-request` is deliberately NOT logged: it is fully attributable renderer input, the UI
-// surfaces it immediately, and read.js's InvalidFilter messages quote the offending value -- which
-// would drop renderer-supplied text (a `search` string the user typed) into the shared diagnostic
-// stream Task 4.3 puts back on screen.
+// Neither `invalid-request` nor an error a handler RAISED ITSELF is logged. The first is fully
+// attributable renderer input, the UI surfaces it immediately, and read.js's InvalidFilter
+// messages quote the offending value -- which would drop renderer-supplied text (a `search`
+// string the user typed) into the shared diagnostic stream Task 4.3 puts back on screen. The
+// second is already bounded and already deliberate (`not-found`), so it passes through untouched
+// rather than being flattened into `internal` and written to the log as if something broke.
 function _guard(channel, log, fn) {
   return async (arg) => {
     try {
       return await fn(arg);
     } catch (e) {
+      if (e instanceof ActivityIpcError) throw e;
       if (e instanceof read.InvalidFilter) {
         throw new ActivityIpcError(INVALID_REQUEST, 'invalid activity request');
       }
@@ -206,9 +216,30 @@ function createHandlers({
     // activity id -> true once the reveal has been dispatched. The path is built ONLY by
     // paths.activityDir from an already-validated id, so it is always the activity's own
     // directory under the owned activity/ root and can never be renderer-controlled.
+    //
+    // The directory is confirmed to BE one before the shell is asked. Two reasons:
+    //   1. Retention can prune the activity between the list render and the click, and
+    //      `shell.showItemInFinder` on a path that is not there is a silent no-op on macOS -- the
+    //      user would press Reveal, get no Finder window and no message, and have no way to tell
+    //      whether the app was broken or the activity was gone. `not-found` gives the renderer
+    //      something to say (it shows its own fixed line; it never reads this code -- P4-7).
+    //   2. `lstat`, never `stat`: a symlink or a plain file sitting at an activity-shaped path is
+    //      treated as not-found and never revealed, the same refusal read.js makes when it
+    //      enumerates the root. Any lstat failure at all (ENOENT, EACCES on the parent) is
+    //      not-found too -- it is not a claim about WHY, only that there is nothing to show.
     'activity:reveal': guard('activity:reveal', async (activityId) => {
       _validateId(activityId);
-      shell.showItemInFinder(paths.activityDir(home, activityId));
+      const dir = paths.activityDir(home, activityId);
+      let stat = null;
+      try {
+        stat = fs.lstatSync(dir);
+      } catch (e) {
+        stat = null;
+      }
+      if (!stat || !stat.isDirectory()) {
+        throw new ActivityIpcError(NOT_FOUND, 'that activity is no longer on disk');
+      }
+      shell.showItemInFinder(dir);
       return true;
     }),
   };
