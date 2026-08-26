@@ -369,6 +369,19 @@ function livePage() {
   return { doc, byId };
 }
 
+// The Activity window is deep-linked into WHILE OPEN by re-issuing loadFile(page, { hash }),
+// which Chromium delivers as a same-document `hashchange` -- so a fake window has to be able to
+// navigate, not just report an initial fragment.
+function fakeWindow(hash) {
+  const win = { location: { hash: hash || '' }, listeners: [] };
+  win.addEventListener = (type, fn) => { win.listeners.push([type, fn]); };
+  win.navigate = (next) => {
+    win.location.hash = next;
+    for (const [type, fn] of win.listeners) if (type === 'hashchange') fn({ type: 'hashchange' });
+  };
+  return win;
+}
+
 function fakeApi(over) {
   const calls = [];
   const api = {
@@ -403,7 +416,7 @@ test('boot loads the list and selects a chip through delegated clicks', async ()
     list: async (filter) => { calls.push(['list', filter]); return { items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }; },
     get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
   });
-  await R.boot({ location: { hash: '' } }, doc, api);
+  await R.boot(fakeWindow(''), doc, api);
 
   assert.deepStrictEqual(calls, [['list', {}]], 'the first load sends an empty (always-valid) filter');
   const chip = byId.list.querySelectorAll('.chip')[0];
@@ -426,7 +439,7 @@ test('boot honours a UUIDv4 fragment and ignores anything else (P4-8)', async ()
       list: async (filter) => { calls.push(['list', filter]); return { items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }; },
       get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
     });
-    await R.boot({ location: { hash } }, doc, api);
+    await R.boot(fakeWindow(hash), doc, api);
     assert.deepStrictEqual(calls, expected, `hash ${JSON.stringify(hash)}`);
   }
 });
@@ -437,7 +450,7 @@ test('boot switches lenses and applies the level/search filter client-side', asy
     list: async (filter) => { calls.push(['list', filter]); return { items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }; },
     get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
   });
-  await R.boot({ location: { hash: '#' + LIVE_ITEM.id }, }, doc, api);
+  await R.boot(fakeWindow('#' + LIVE_ITEM.id), doc, api);
   assert.strictEqual(calls.length, 2);
 
   // Filtering never re-crosses the bridge: `activity:get` takes an id only.
@@ -476,7 +489,7 @@ test('a rejected bridge call shows one generic line plus Retry, never the error 
       return { items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] };
     },
   });
-  await R.boot({ location: { hash: '' } }, doc, api);
+  await R.boot(fakeWindow(''), doc, api);
 
   const shown = byId.list.textContent;
   assert.match(shown, /couldn’t be loaded/);
@@ -498,7 +511,7 @@ test('a rejected activity:get leaves the list intact and offers Retry for that i
     list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
     get: async () => { throw new Error('invalid activity request'); },
   });
-  await R.boot({ location: { hash: '#' + LIVE_ITEM.id } }, doc, api);
+  await R.boot(fakeWindow('#' + LIVE_ITEM.id), doc, api);
 
   assert.strictEqual(byId.list.querySelectorAll('.chip').length, 1, 'the list survived');
   assert.match(byId.detail.textContent, /couldn’t be loaded/);
@@ -513,8 +526,139 @@ test('boot renders the reader null-item reasons rather than treating them as fai
       list: async () => ({ items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
       get: async () => ({ item: null, available: reason !== 'unavailable', reason }),
     });
-    await R.boot({ location: { hash: '#' + LIVE_ITEM.id } }, doc, api);
+    await R.boot(fakeWindow('#' + LIVE_ITEM.id), doc, api);
     assert.match(byId.detail.textContent, needle, reason);
     assert.ok(!walk(byId.detail).some((el) => el.tagName === 'BUTTON'), `${reason} is not an error`);
   }
+});
+
+// -------------------------------------------------------------------------------------------
+// Fix round 1, finding 1: the two duplicate-terminal sources disagree in BOTH directions, so
+// de-duplicating on either one alone loses the anomaly. `item.problems`' rows come from read.js's
+// own fresh segment scan (`_groupTerminals(merged)`); `item.duplicateTerminals` comes from
+// `rec.duplicateTerminalCounts`, which reconcile.js returns as `{}` on six of its eight exits.
+// -------------------------------------------------------------------------------------------
+function problemsOf(item) {
+  return walk(R.renderProblems(makeDoc(), item))
+    .filter((el) => el.className.split(' ').includes('problem'));
+}
+
+const DUP_ROW = { kind: 'duplicate-terminal', outcome: 'succeeded', count: 2 };
+
+test('a duplicate-terminal problem row survives an EMPTY duplicateTerminals array', () => {
+  // The reconcile-derived array is empty (synthesize path); only the fresh scan saw the anomaly.
+  const rows = problemsOf({ events: [], problems: [DUP_ROW], duplicateTerminals: [] });
+  assert.strictEqual(rows.length, 1, 'the anomaly must still be rendered');
+  assert.ok(rows[0].textContent.includes('duplicate-terminal'));
+  assert.ok(rows[0].textContent.includes('recorded 2 times'));
+});
+
+test('a duplicateTerminals entry survives problem-row truncation dropping its row', () => {
+  const rows = problemsOf({
+    events: [], duplicateTerminals: [{ outcome: 'succeeded', count: 2 }],
+    problems: [{ kind: 'truncated', dropped: 12 }],
+  });
+  const kinds = rows.map((r) => r.textContent);
+  assert.strictEqual(rows.length, 2);
+  assert.ok(kinds.some((t) => t.includes('duplicate-terminal') && t.includes('recorded 2 times')));
+  assert.ok(kinds.some((t) => t.includes('truncated')));
+});
+
+test('an anomaly reported by BOTH sources is rendered exactly once', () => {
+  const rows = problemsOf({
+    events: [], problems: [DUP_ROW], duplicateTerminals: [{ outcome: 'succeeded', count: 2 }],
+  });
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rows[0].textContent.split('duplicate-terminal').length - 1, 1);
+});
+
+test('duplicate-terminal rows for outcomes the array does not cover are kept', () => {
+  const rows = problemsOf({
+    events: [],
+    problems: [DUP_ROW, { kind: 'duplicate-terminal', outcome: 'failed', count: 3 }],
+    duplicateTerminals: [{ outcome: 'succeeded', count: 2 }],
+  });
+  const text = rows.map((r) => r.textContent).join(' | ');
+  assert.strictEqual(rows.length, 2, 'succeeded from the array, failed from the problem row');
+  assert.ok(text.includes('succeeded recorded 2 times'));
+  assert.ok(text.includes('failed recorded 3 times'));
+});
+
+// -------------------------------------------------------------------------------------------
+// Fix round 1, finding 2: deep-linking into an ALREADY OPEN window. main re-issues
+// loadFile(page, { hash }); Chromium delivers that as a same-document `hashchange`, so the
+// renderer must listen for it -- reading location.hash once at boot drops the new id.
+// -------------------------------------------------------------------------------------------
+const OTHER_ID = '22222222-3333-4333-9444-666666666666';
+
+function bootedList(hash) {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi({
+    list: async (filter) => { calls.push(['list', filter]); return { items: [LIVE_ITEM, Object.assign({}, LIVE_ITEM, { id: OTHER_ID })], truncated: false, available: true, incomplete: false, problems: [] }; },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  });
+  const win = fakeWindow(hash);
+  return { doc, byId, api, calls, win, booted: R.boot(win, doc, api) };
+}
+
+test('a hashchange with a new UUIDv4 selects that activity in the open window (P4-8)', async () => {
+  const t = bootedList('');
+  await t.booted;
+  assert.deepStrictEqual(t.calls, [['list', {}]], 'no selection yet');
+
+  t.win.navigate(`#${OTHER_ID}`);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepStrictEqual(t.calls[1], ['get', OTHER_ID]);
+  const selected = t.byId.list.querySelectorAll('.chip').filter((c) => c.classList.contains('selected'));
+  assert.strictEqual(selected.length, 1);
+  assert.strictEqual(selected[0].getAttribute('data-activity-id'), OTHER_ID);
+});
+
+test('a hashchange re-selects even when another activity was already open', async () => {
+  const t = bootedList(`#${LIVE_ITEM.id}`);
+  await t.booted;
+  assert.deepStrictEqual(t.calls, [['list', {}], ['get', LIVE_ITEM.id]]);
+
+  t.win.navigate(`#${OTHER_ID}`);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepStrictEqual(t.calls[2], ['get', OTHER_ID]);
+  const selected = t.byId.list.querySelectorAll('.chip').filter((c) => c.classList.contains('selected'));
+  assert.deepStrictEqual(selected.map((c) => c.getAttribute('data-activity-id')), [OTHER_ID]);
+});
+
+test('a hashchange the renderer cannot vouch for selects nothing', async () => {
+  for (const bad of ['#not-an-id', '#../../etc/passwd', `#${OTHER_ID}/../x`, '#', '']) {
+    const t = bootedList('');
+    await t.booted;
+    t.win.navigate(bad);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(t.calls, [['list', {}]], `hash ${JSON.stringify(bad)} must select nothing`);
+  }
+});
+
+test('a hashchange that lands before the first list paints is applied after it', async () => {
+  const { doc, byId } = livePage();
+  let releaseList;
+  const gate = new Promise((resolve) => { releaseList = resolve; });
+  const { api, calls } = fakeApi({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      await gate;
+      return { items: [LIVE_ITEM, Object.assign({}, LIVE_ITEM, { id: OTHER_ID })], truncated: false, available: true, incomplete: false, problems: [] };
+    },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  });
+  const win = fakeWindow('');
+  const booted = R.boot(win, doc, api);
+
+  win.navigate(`#${OTHER_ID}`); // arrives while the list request is still in flight
+  assert.deepStrictEqual(calls, [['list', {}]], 'nothing is fetched before the list has painted');
+
+  releaseList();
+  await booted;
+
+  assert.deepStrictEqual(calls, [['list', {}], ['get', OTHER_ID]], 'the pending focus is honoured');
+  assert.ok(byId.detail.textContent.includes('rate-limited'));
 });

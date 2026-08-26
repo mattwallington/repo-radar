@@ -1780,8 +1780,11 @@ function showActivityWindow(focusId) {
   const loadOptions = focusId ? { hash: String(focusId) } : null;
 
   if (activityWindow && !activityWindow.isDestroyed()) {
-    // Re-issue the load ONLY for a deep link -- an ordinary reopen must not discard whatever the
-    // user already had selected.
+    // Re-issue the load ONLY for a deep link. The URL differs from the open one by its FRAGMENT
+    // alone, so Chromium treats it as a same-document navigation: the page is not reloaded and
+    // the renderer keeps its state -- it learns the new id from the `hashchange` event it listens
+    // for (renderer/activity.js), and selects that activity. An ordinary reopen re-issues nothing,
+    // so whatever the user had selected simply stays on screen.
     if (loadOptions) activityWindow.loadFile(page, loadOptions);
     activityWindow.show();
     activityWindow.focus();

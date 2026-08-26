@@ -338,14 +338,24 @@ function renderEvents(doc, item, filter) {
 // collected into `item.problems` -- plus the grouped duplicate terminals.
 //
 // `item.duplicateTerminals` and the `duplicate-terminal` rows inside `item.problems` describe the
-// SAME anomaly (activity/read.js builds both). The array is authoritative (it comes from
-// reconcile's own counts and survives problem-row truncation), so it is rendered first and the
-// matching rows are filtered out -- otherwise every duplicated outcome would appear twice.
+// SAME anomaly, but activity/read.js builds them from DIFFERENT inputs and they can disagree in
+// both directions:
+//   - the problem rows come from `_groupTerminals(merged)` -- read.js's own fresh segment scan;
+//   - the array comes from `rec.duplicateTerminalCounts`, which reconcile.js returns as `{}` on
+//     six of its eight exits (the synthesize path included).
+// So a terminal appended between reconcile and the fresh scan yields a problem row with an EMPTY
+// array, while problem-row truncation yields the opposite. De-duplicating on either source alone
+// therefore loses the anomaly. Instead: render the array (authoritative where it exists, and it
+// survives truncation) and drop only the problem rows whose outcome the array already covers.
+// Every other row is kept, so an anomaly reported by exactly one source is still shown -- exactly
+// once. read.js's buildExport makes the mirror-image choice for the same reason.
 function renderProblems(doc, item) {
   const it = item && typeof item === 'object' ? item : {};
-  const dups = Array.isArray(it.duplicateTerminals) ? it.duplicateTerminals : [];
+  const dups = (Array.isArray(it.duplicateTerminals) ? it.duplicateTerminals : [])
+    .filter((d) => d && typeof d === 'object');
+  const covered = new Set(dups.map((d) => d.outcome));
   const rows = (Array.isArray(it.problems) ? it.problems : [])
-    .filter((p) => !(p && p.kind === 'duplicate-terminal'));
+    .filter((p) => !(p && p.kind === 'duplicate-terminal' && covered.has(p.outcome)));
   const wrap = el(doc, 'div', 'lens lens-problems');
 
   if (dups.length === 0 && rows.length === 0) {
@@ -415,6 +425,7 @@ function boot(win, doc, api) {
 
   const view = { lens: 'events', filter: {}, selectedId: null, detail: null };
   let pendingFocus = focusIdFromHash(win.location.hash);
+  let listReady = false;
 
   function put(container, node) {
     container.textContent = '';
@@ -475,6 +486,7 @@ function boot(win, doc, api) {
       // owns the Refresh/Export controls that will pass `normalizeFilter(...)` here.
       const result = await api.list({});
       put(listEl, renderList(doc, result));
+      listReady = true;
       if (pendingFocus) {
         const id = pendingFocus;
         pendingFocus = null;
@@ -496,6 +508,19 @@ function boot(win, doc, api) {
     if (!node || node === listEl) return;
     const id = focusIdFromHash(node.getAttribute('data-activity-id'));
     if (id && id !== view.selectedId) select(id);
+  });
+
+  // Ruling P4-8, second half: main deep-links into an ALREADY OPEN window by re-issuing
+  // `loadFile(page, { hash })`. A fragment-only navigation is same-document in Chromium -- the
+  // page is NOT reloaded and this function does not run again -- so the new id arrives here as a
+  // `hashchange` and nowhere else. (Were some build to reload instead, the initial read above
+  // catches it; both paths end in the same `select`.) A fragment that is not a UUIDv4 selects
+  // nothing, and one that lands before the first list has painted becomes the pending focus.
+  win.addEventListener('hashchange', () => {
+    const id = focusIdFromHash(win.location.hash);
+    if (!id) return;
+    if (listReady) select(id);
+    else pendingFocus = id;
   });
 
   function onFilterChange() {
