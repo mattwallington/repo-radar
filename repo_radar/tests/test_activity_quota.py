@@ -1398,3 +1398,20 @@ def test_unlock_survives_injected_lock_un_failure_admit_still_returns_true(tmp_p
     assert json.loads(paths.ledger_entry_path(tmp_path, aid).read_text()) == {
         "reserved": quota.RESERVE, "granted": 0,
     }
+
+def test_verify_canonical_returns_false_when_quota_replaced_by_regular_file(tmp_path):
+    """Non-blocking residual (Codex Round 9 reviewer note, G9-Py): `_verify_canonical` is
+    documented as NEVER raising, but pre-fix only caught `OSError`. Replacing `quota/` with a
+    regular file (a plain, persistent, non-racing path replacement -- squarely still within the
+    spec's §7 threat model) makes `_canonical_quota_ident` raise `paths.UnsafePath` ("quota is not
+    a directory") -- NOT an `OSError` subclass -- so it propagated straight out of `_verify_
+    canonical` instead of returning the documented `False`."""
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        assert quota._verify_canonical(ctx) is True     # sanity: canonical before any tampering
+        qdir = paths.quota_dir(tmp_path)
+        shutil.rmtree(qdir)
+        qdir.write_bytes(b"not a directory")              # quota/ is now a REGULAR FILE
+        assert quota._verify_canonical(ctx) is False       # must not raise
+    finally:
+        quota._unlock(ctx)

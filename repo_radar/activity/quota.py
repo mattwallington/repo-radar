@@ -119,12 +119,25 @@ def _verify_canonical(ctx):
     AT that path without changing what `afd` itself refers to, so the two values diverge exactly
     when a swap has happened -- the one signal the purely-`afd`-relative checks above can never
     produce alone. Also fails (never raises) if `root_path` no longer stats as a real, non-symlink
-    directory."""
+    directory.
+
+    Ruling 68 (G9-Py, Codex Round 9 reviewer note, non-blocking residual -- the ABA-classification
+    half of that review's finding is superseded by the 2026-08-26 Phase-3 gate Round 9 operator
+    threat-model scope ruling in the spec's §7 and is intentionally NOT implemented here; see that
+    ruling for the rationale): this only caught `OSError`, but `_canonical_quota_ident` raises
+    `paths.UnsafePath` (not an `OSError` subclass) when `quota` exists but isn't a directory --
+    e.g. `quota/` persistently replaced by a regular file, a plain, non-racing path replacement
+    the spec's guarantees still explicitly cover. That let a documented never-raising function
+    raise straight out to every caller (`admit`/`grant`/`_write_entry_fd`/`_unlink_entry_fd`/
+    `_gather_accounting`/`_prune_locked`/`_retain_locked`), all of which assume it can't. Now also
+    catches `paths.UnsafePath` (and a defensive `ValueError`, for the same "malformed stat result"
+    class of failure) alongside `OSError` -- any of the three means identity is unproven, so this
+    returns `False` exactly like every other verification failure here, i.e. fails closed."""
     try:
         ident_now = _canonical_quota_ident(ctx.afd)
         qst = os.fstat(ctx.qfd)
         root_st_now = os.stat(ctx.root_path, follow_symlinks=False)
-    except OSError:
+    except (OSError, paths.UnsafePath, ValueError):
         return False
     if ident_now != ctx.ident or ident_now != (qst.st_dev, qst.st_ino):
         return False
