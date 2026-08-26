@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog, Notification } = require('electron');
+const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog, shell, Notification } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const os = require('os');
@@ -21,6 +21,9 @@ const { parseModelLabels, persistConfig } = require('./model-notice');
 // below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
 const activityGlue = require('./activity/trigger-glue');
 const activityQuota = require('./activity/quota');
+// Activity History (Task 4.1): the narrow, allowlisted IPC surface the Activity window talks to.
+// activity/ipc.js is deliberately Electron-free, so the real `shell`/`dialog` are injected here.
+const activityIpc = require('./activity/ipc');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -2252,6 +2255,14 @@ ipcMain.on('stop-sync', (event) => {
 
 ipcMain.handle('model-notice:get', (event) => modelNoticeController ? modelNoticeController.getView(event.sender) : null);
 ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController) modelNoticeController.onAction(event.sender, action); });
+
+// Activity History (Task 4.1): exactly four allowlisted channels, registered once at startup.
+// Every handler validates its own input and returns only bounded, already-redacted DTOs.
+activityIpc.register(ipcMain, activityIpc.createHandlers({
+  home: process.env.HOME,
+  shell,
+  dialog,
+}));
 
 // Check if we need to catch up on a missed sync
 // Adopt a completion receipt written by a sync that ran while this app was closed.

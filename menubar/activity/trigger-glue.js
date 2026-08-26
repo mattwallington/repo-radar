@@ -40,7 +40,11 @@ function secretValues(config) {
 // Best-effort config read for redaction purposes only: a missing/malformed config.json must
 // never block sync start -- the writer just redacts with fewer configured secrets (the built-in
 // credential-shape patterns in redact.js still apply regardless).
-function _loadConfiguredSecrets(home) {
+//
+// Exported (Ruling P4-3) because the READ side needs exactly the same list: activity/ipc.js
+// builds its Redactor from this so the Activity window's list/detail/export mask the same
+// configured secrets the writer masks, rather than a second, drifting copy of this lookup.
+function loadConfiguredSecrets(home) {
   try {
     const configFile = path.join(home, '.config', 'repo-radar', 'config.json');
     if (!fs.existsSync(configFile)) return [];
@@ -61,7 +65,7 @@ function _loadConfiguredSecrets(home) {
 // mint (lease busy, admission refused, durability failure) simply yields an INACTIVE writer whose
 // methods are all safe no-ops -- callers never need to branch on success here.
 function beginManualActivity(home, { channel, trigger } = {}) {
-  const configuredSecrets = _loadConfiguredSecrets(home);
+  const configuredSecrets = loadConfiguredSecrets(home);
   // Codex B6: a null/unresolved `channel` (main.js passes its own `runtimeChannel`, which is
   // `null` until build-info resolves) must not silently sink the whole attempt. records.js's
   // `start` schema requires `channel` to be a STRING -- there is no null-allowing sentinel or
@@ -290,6 +294,9 @@ async function handOff({ writer, child, home, _awaitAck = _defaultAwaitAck, _rec
 
 module.exports = {
   secretValues,
+  loadConfiguredSecrets,
+  // Pre-Ruling-P4-3 name, kept as an alias so any existing caller/test keeps working.
+  _loadConfiguredSecrets: loadConfiguredSecrets,
   beginManualActivity,
   onContention,
   onGuardBlock,
