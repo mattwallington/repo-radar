@@ -106,6 +106,7 @@ The lease is a **held advisory lock** acquired **before `start` is visible** (§
   - Each allocation bounds exactly one record **including its trailing newline** (record + `\n` ≤ 20 KiB). Ordinary `event`/`start` bytes stop at **4 MiB − 60 KiB**; the partitioned reservation always remains for `control`/`terminal`/`integrity`.
 - **Legacy `_rotate_sync_logs` (10 files) stays independent** of Activity retention.
 - Validate activity/writer ids; reject unsafe file types/symlinks; create permissions securely.
+- **Threat model (operator scope ruling, 2026-08-26, Phase-3 gate Round 9):** Quota and lifecycle guarantees cover Repo Radar's concurrent producers, crashes, power loss, unsafe file types, symlinks, and persistent/non-racing path replacement. A same-user process that deliberately renames and restores the Activity root within a single locked operation is outside the threat model. Existing identity checks remain defense-in-depth and fail closed for detectable replacements. This ruling does not weaken the symlink, persistent-swap, descriptor-relative-deletion, or 64 MiB guarantees under app-owned concurrency. Rationale: Repo Radar itself never renames `activity/` or `quota/`, so an ABA rename-and-restore inside one synchronous decision requires an adversarial same-UID process; and delegating Node's accounting to Python to close it would let a missing/broken Python (the motivating pre-Python failure class) prevent Electron from creating the Activity record at all.
 
 ## 8. Reader / Node module (pure, testable)
 
