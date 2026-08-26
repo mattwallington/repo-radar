@@ -494,29 +494,53 @@ function listOwnedEntries(directory, suffix) {
 // real directory is silently ignored -- not a subdir, not rejected, not uncertainty -- exactly
 // like a non-UUID junk NAME already was for the non-directory branch. `_gatherAccounting` still
 // carries its own `ids.validActivityId` guard in the per-activity loop as defense in depth.
+//
+// Ruling 71 (Codex Round-11 BLOCKER; Python implements the identical rule): Ruling 70's silent
+// `continue` threw away the BYTES too -- a 64 MiB `activity/junk/python-deadbeef.jsonl`
+// contributed 0 to the committed charge with `uncertain:false` and admission proceeded, breaking
+// spec §7's sum-of-actual-bytes contract (rename a real activity dir to `junk` and its bytes
+// vanish from the ceiling). Foreign entries are now MEASURED, never MANAGED: the result gains
+// `foreign: [{ name, bytes, uncertain }]`, one per non-UUID root entry other than `quota`:
+//   - real directory: opened O_RDONLY|O_NOFOLLOW|O_DIRECTORY (never through a symlink), each
+//     entry lstat'd -- regular file -> `bytes += size`; anything else (nested dir, symlink, FIFO,
+//     unstat-able) -> `uncertain:true` (never descended, never followed). Open/readdir failure ->
+//     `uncertain:true` with whatever partial bytes were sized (Ruling 62's keep-the-measurement
+//     rule applies here too).
+//   - regular file at the root (`quota.lock`, stray files): `bytes` = its lstat size.
+//   - anything else at the root (symlink, FIFO, device, lstat refused): `uncertain:true`.
+// `foreign` is a THIRD category: never a `subdirs` candidate (Ruling 69/70 id guards stand, so
+// nothing classifies/reconciles/reads/renders it as an activity) and never `rejected` (that list
+// is activity-shaped refusals only). The top-level `uncertain` flag is likewise UNCHANGED --
+// it still means "an activity-shaped entry was refused / the base was unlistable"; foreign
+// uncertainty travels only inside each `foreign[i].uncertain` so quota.js can fold it into the
+// snapshot (`measured += SUM bytes; uncertain |= any`) without mistaking it for an unlistable
+// root (which would floor the charge at CEILING instead). read.js destructures only
+// `subdirs`/`rejected` and is untouched. Node still deletes nothing here (Ruling B).
 function listOwnedSubdirsDetailed(base) {
   let dir;
   try {
     dir = _validateOwnedDir(base);
   } catch (e) {
-    return { subdirs: [], rejected: [], uncertain: e.code !== 'ENOENT' };
+    return { subdirs: [], rejected: [], foreign: [], uncertain: e.code !== 'ENOENT' };
   }
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    return { subdirs: [], rejected: [], uncertain: e.code !== 'ENOENT' };
+    return { subdirs: [], rejected: [], foreign: [], uncertain: e.code !== 'ENOENT' };
   }
   const subdirs = [];
   const rejected = [];
+  const foreign = [];
   let uncertain = false;
   for (const name of names) {
     let st;
     try {
       st = fs.lstatSync(path.join(dir, name));
     } catch (e) {
-      // TOCTOU: entry deleted/swapped mid-scan, or lstat itself refused. Only an ACTIVITY-shaped
-      // name is worth reporting -- anything else was never going to be listed.
+      // TOCTOU: entry deleted/swapped mid-scan, or lstat itself refused. An ACTIVITY-shaped name
+      // is reported as rejected; a foreign name that is proven gone hides nothing, any other
+      // refusal may hide bytes (Ruling 71).
       if (ids.validActivityId(name)) {
         if (e.code === 'ENOENT') {
           rejected.push({ name, reason: 'gone' }); // proven absent: nothing hidden
@@ -524,18 +548,63 @@ function listOwnedSubdirsDetailed(base) {
           rejected.push({ name, reason: 'stat-failed' }); // refused, not gone: an activity may be hidden
           uncertain = true;
         }
+      } else if (name !== 'quota' && e.code !== 'ENOENT') {
+        foreign.push({ name, bytes: 0, uncertain: true });
       }
       continue;
     }
-    // Ruling 70: the id check runs BEFORE the directory check now -- a non-UUID real directory
+    // Ruling 70: the id check runs BEFORE the directory check -- a non-UUID real directory
     // (`quota`, stray junk) is a candidate for neither `subdirs` nor `rejected`, whether or not
-    // it's a directory.
-    if (!ids.validActivityId(name)) continue; // junk name -> not an activity, nothing hidden
+    // it's a directory. Ruling 71: it IS measured, as a foreign entry (except `quota`, whose
+    // contents are the ledger and are accounted separately).
+    if (!ids.validActivityId(name)) {
+      if (name !== 'quota') foreign.push(_measureForeign(path.join(dir, name), name, st));
+      continue;
+    }
     if (st.isDirectory()) { subdirs.push(name); continue; } // lstat: a symlink-to-dir is NOT a dir
     rejected.push({ name, reason: st.isSymbolicLink() ? 'symlink' : 'not-directory' });
     uncertain = true; // an activity-shaped entry we refused to measure
   }
-  return { subdirs, rejected, uncertain };
+  return { subdirs, rejected, foreign, uncertain };
+}
+
+// Ruling 71: conservative byte measurement of ONE foreign (non-UUID, non-`quota`) root entry
+// whose lstat `st` already succeeded. Never follows a symlink, never descends, never deletes.
+// A directory is held open on an O_NOFOLLOW|O_DIRECTORY fd for the duration of its scan (the
+// same idiom `writeOwnedFileAtomic`'s dir fsync and `_validateOwnedDir` use -- Node has no
+// fd-relative readdir/lstat, so the entries themselves are read by path under that open fd) and
+// its identity is re-checked (`fstat(fd)` vs a fresh `lstat(path)`) after the last entry stat:
+// a directory swapped out mid-scan reports `uncertain` rather than a measurement of something
+// else. Over-counting can never breach the 64 MiB cap; under-counting is exactly the Round-11
+// bug, so every doubt resolves to `uncertain:true` with the partial bytes kept.
+function _measureForeign(p, name, st) {
+  if (st.isFile()) return { name, bytes: st.size, uncertain: false };
+  if (!st.isDirectory()) return { name, bytes: 0, uncertain: true }; // symlink / FIFO / device / ...
+  let fd = -1;
+  let bytes = 0;
+  let uncertain = false;
+  try {
+    fd = _openDirNofollow(p);
+    const ident = fs.fstatSync(fd);
+    for (const child of fs.readdirSync(p)) {
+      let cst;
+      try {
+        cst = fs.lstatSync(path.join(p, child));
+      } catch (e) {
+        if (e.code !== 'ENOENT') uncertain = true; // refused (not gone): bytes may be hidden
+        continue;
+      }
+      if (cst.isFile()) bytes += cst.size;
+      else uncertain = true; // nested dir / symlink / FIFO / ...: never descended or followed
+    }
+    const after = fs.lstatSync(p);
+    if (!after.isDirectory() || after.dev !== ident.dev || after.ino !== ident.ino) uncertain = true;
+  } catch (e) {
+    uncertain = true; // unopenable / unlistable: whatever was sized is kept, the rest is unknown
+  } finally {
+    if (fd !== -1) { try { fs.closeSync(fd); } catch (e) { /* best-effort */ } }
+  }
+  return { name, bytes, uncertain };
 }
 
 // Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors

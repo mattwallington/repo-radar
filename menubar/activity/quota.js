@@ -455,18 +455,22 @@ function _writeEntry(home, activityId, reserved, granted, lockCtx) {
   }
 }
 
-// fstat-only sizing (mirrors the I7 fix): sum of every activity's segment sizes EXCEPT quota/.
+// fstat-only sizing (mirrors the I7 fix): sum of every activity's segment sizes EXCEPT quota/,
+// PLUS (Ruling 71) the bytes of every foreign root entry -- the plain unlocked sum must agree
+// with `_charge` on a settled tree, and foreign bytes are part of the committed total now.
 function _committed(home) {
   const base = path.dirname(paths.quotaDir(home));
+  const root = paths.listOwnedSubdirsDetailed(base);
   let total = 0;
-  for (const name of paths.listOwnedSubdirs(base)) {
-    // Ruling 70 (G10-Node, defense in depth): `listOwnedSubdirs` is now already filtered to
+  for (const name of root.subdirs) {
+    // Ruling 70 (G10-Node, defense in depth): `subdirs` is now already filtered to
     // valid-activity-id names, so this guard (and the `'quota'` check beside it) should never
     // fire -- kept so this loop stays correct even if that filtering is ever loosened.
     if (!ids.validActivityId(name)) continue;
     if (name === 'quota') continue;
     for (const seg of paths.statOwnedSegments(path.join(base, name))) total += seg.size;
   }
+  for (const f of root.foreign) total += f.bytes; // Ruling 71: measured, never managed
   return total;
 }
 
@@ -630,7 +634,15 @@ function _hasTerminal(home, aid) {
 //   { rootListable, ledgerListable,
 //     activities: [{ aid, onDisk: int, uncertain: bool }],  // listed activity dirs; partial bytes
 //     rejectedRootIds: [aid],                                // valid-activity-id root entries refused (not 'gone')
+//     foreign: [{ name, onDisk: int, uncertain: bool }],     // Ruling 71: non-UUID, non-quota root entries, measured
 //     ledger: [{ aid, reserved, granted } | { aid, corrupt: true }] }
+//
+// Ruling 71 (Codex Round-11 BLOCKER): `foreign` carries every non-UUID root entry other than
+// `quota` exactly as `paths.listOwnedSubdirsDetailed` measured it (directory contents summed
+// fd-bound; anything not a regular file -> uncertain). It is gathered in the SAME single pass,
+// inside the same Ruling-67 identity window as the activity listing, and is discarded with it
+// when that window fails. Foreign entries are never activity inputs -- no id, no ledger term, no
+// classification -- only bytes and doubt.
 //
 // `lockCtx` (Ruling 60): the lock context from `_quotaLock`, threaded through to
 // `_ledgerEntriesDetailed` so a locked decision re-verifies the ledger dir's identity around its
@@ -655,7 +667,7 @@ function _gatherAccounting(home, lockCtx) {
   const locked = lockCtx !== undefined && lockCtx !== null;
 
   let canonicalOk = !locked || _verifyCanonical(lockCtx); // Ruling 67: checked BEFORE root listing
-  let root = { subdirs: [], rejected: [], uncertain: true };
+  let root = { subdirs: [], rejected: [], foreign: [], uncertain: true };
   const activities = [];
   if (canonicalOk) {
     root = paths.listOwnedSubdirsDetailed(base);
@@ -679,11 +691,15 @@ function _gatherAccounting(home, lockCtx) {
   }
 
   let rejectedRootIds = [];
+  let foreign = [];
   let rootListable;
   if (!canonicalOk) {
     rootListable = false; // Ruling 67: identity unproven around the root pass -- same shape as a
     activities.length = 0; // genuine unlistable root; discard any partial listing gathered above.
   } else {
+    // Ruling 71: foreign root entries, measured in the same pass. Field-for-field the fixture's
+    // `foreign: [{ name, on_disk, uncertain }]` shape (camelCased) -- never an activity input.
+    foreign = root.foreign.map((f) => ({ name: f.name, onDisk: f.bytes, uncertain: Boolean(f.uncertain) }));
     for (const rj of root.rejected) {
       if (rj.reason !== 'gone') rejectedRootIds.push(rj.name); // proven gone hides nothing
     }
@@ -702,7 +718,7 @@ function _gatherAccounting(home, lockCtx) {
   }
   return {
     rootListable, ledgerListable: !led.uncertain,
-    activities, rejectedRootIds, ledger,
+    activities, rejectedRootIds, foreign, ledger,
   };
 }
 
@@ -721,7 +737,19 @@ function _gatherAccounting(home, lockCtx) {
 //                              CEILING), uncertain
 //   unlistable root:       max(SUM (reserved+granted) over live entries + SUM corrupt caps,
 //                              CEILING), uncertain
-//   uncertain = !rootListable || !ledgerListable || any activity uncertain || any rejected root id;
+//   foreign (Ruling 71):   per entry, certain   -> onDisk (no ledger term, no id);
+//                                     uncertain -> max(onDisk, PER_ACTIVITY_CAP) (the same
+//                                                  Ruling 62 term an uncertain activity takes:
+//                                                  fixture `foreign-uncertain-10-bytes-alone-
+//                                                  takes-the-cap-ruling-71`);
+//                          uncertain |= any foreign[i].uncertain. `foreign` absent == empty.
+//                          Under an unlistable ledger the foreign entries join the measured
+//                          pool as raw bytes (like activities there: measured-only, no
+//                          liabilities) before the CEILING floor; the unlistable-root floor
+//                          sums liabilities only, and a root that could not be listed has no
+//                          foreign entries anyway.
+//   uncertain = !rootListable || !ledgerListable || any activity uncertain || any rejected root id
+//               || any foreign uncertain;
 //   corrupt   = any corrupt ledger entry.
 // `constants` (CEILING / PER_ACTIVITY_CAP) defaults to module state; the vector driver overrides.
 function _computeSnapshot(inputs, constants) {
@@ -736,7 +764,17 @@ function _computeSnapshot(inputs, constants) {
     measured.set(a.aid, (measured.get(a.aid) || 0) + bytes);
     if (a.uncertain === true || a.onDisk === null || a.onDisk === undefined) uncertainIds.add(a.aid);
   }
-  const uncertain = !inputs.rootListable || !inputs.ledgerListable || uncertainIds.size > 0;
+  let foreignBytes = 0; // Ruling 71: raw measured bytes (unlistable-ledger floor)
+  let foreignTerm = 0; // Ruling 71: per-entry charge term (normal rule)
+  let foreignUncertain = false;
+  for (const f of inputs.foreign || []) {
+    const bytes = Number.isFinite(f.onDisk) ? f.onDisk : 0;
+    const fUncertain = f.uncertain === true || f.onDisk === null || f.onDisk === undefined;
+    foreignBytes += bytes;
+    foreignTerm += fUncertain ? Math.max(bytes, cap) : bytes;
+    if (fUncertain) foreignUncertain = true;
+  }
+  const uncertain = !inputs.rootListable || !inputs.ledgerListable || uncertainIds.size > 0 || foreignUncertain;
 
   const live = new Map(); // aid -> reserved+granted (non-corrupt entries only)
   const corruptIds = new Set();
@@ -752,13 +790,13 @@ function _computeSnapshot(inputs, constants) {
     return { charge: Math.max(liabilities, ceiling), uncertain, corrupt };
   }
   if (!inputs.ledgerListable) {
-    let bytes = 0;
+    let bytes = foreignBytes; // Ruling 71: foreign bytes are measured bytes
     for (const v of measured.values()) bytes += v;
     return { charge: Math.max(bytes, ceiling), uncertain, corrupt };
   }
 
   const aids = new Set([...uncertainIds, ...measured.keys(), ...live.keys(), ...corruptIds]);
-  let charge = 0;
+  let charge = foreignTerm; // Ruling 71: no id, no ledger term; uncertain entries take the cap
   for (const aid of aids) {
     const disk = measured.get(aid) || 0;
     if (corruptIds.has(aid)) { charge += disk + cap; continue; }

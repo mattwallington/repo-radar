@@ -97,7 +97,9 @@ test('Ruling 49: listOwnedSubdirsDetailed -- a non-ENOENT lstat failure on an ac
     fs.writeFileSync(path.join(root, 'junk'), 'x');
 
     assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), {
-      subdirs: paths.listOwnedSubdirsDetailed(root).subdirs, rejected: [], uncertain: false,
+      subdirs: paths.listOwnedSubdirsDetailed(root).subdirs, rejected: [],
+      foreign: [{ name: 'junk', bytes: 1, uncertain: false }], // Ruling 71: measured, not managed
+      uncertain: false,
     });
     assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root).subdirs.sort(), [aid, other].sort());
 
@@ -119,11 +121,14 @@ test('Ruling 49: listOwnedSubdirsDetailed -- a non-ENOENT lstat failure on an ac
       assert.deepStrictEqual(r.rejected, [{ name: aid, reason: 'gone' }]);
       assert.strictEqual(r.uncertain, false, 'proven gone hides nothing');
     });
-    // a failure on a NON-activity name is not an activity being hidden
+    // a failure on a NON-activity name is not an activity being hidden (activity-shaped
+    // `rejected`/`uncertain` stay clean) -- but Ruling 71 says its BYTES may be: it is reported
+    // as an uncertain foreign entry for the accounting to fold in.
     withLstatFailure(path.join(root, 'junk'), 'EIO', () => {
       const r = paths.listOwnedSubdirsDetailed(root);
       assert.deepStrictEqual(r.rejected, []);
       assert.strictEqual(r.uncertain, false);
+      assert.deepStrictEqual(r.foreign, [{ name: 'junk', bytes: 0, uncertain: true }]);
     });
     // a symlink / plain file squatting on an activity id is refused AND uncertain
     const linkAid = A.mintActivityId();
@@ -140,14 +145,14 @@ test('Ruling 49: listOwnedSubdirsDetailed -- a missing base is not uncertain; a 
   const home = tmpHome();
   const root = rootOf(home);
   try {
-    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [], uncertain: false });
+    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [], foreign: [], uncertain: false });
     seedSettled(home, 16);
     assert.strictEqual(paths.listOwnedSubdirsDetailed(root).uncertain, false);
     if (isRoot()) { t.diagnostic('root ignores permission bits; chmod-000 case skipped'); return; }
     fs.chmodSync(root, 0o000);
     try {
       const r = paths.listOwnedSubdirsDetailed(root);
-      assert.deepStrictEqual(r, { subdirs: [], rejected: [], uncertain: true });
+      assert.deepStrictEqual(r, { subdirs: [], rejected: [], foreign: [], uncertain: true });
       assert.deepStrictEqual(paths.listOwnedSubdirs(root), []);
     } finally {
       fs.chmodSync(root, 0o700);

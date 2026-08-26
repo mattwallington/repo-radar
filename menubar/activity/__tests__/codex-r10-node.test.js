@@ -12,6 +12,12 @@
 // both of quota.js's root-enumeration call sites go through; fixing it there closes the gap for
 // both at once, and the explicit `ids.validActivityId` guards added to each loop are defense in
 // depth (see quota.js `_committed`/`_gatherAccounting`).
+//
+// Ruling 71 (Codex Round-11 BLOCKER) SUPERSEDES the "charged 0" half of the above: ignoring the
+// junk directory as an ACTIVITY was right, ignoring its BYTES was the bug (a 64 MiB junk file
+// slipped under the ceiling with `uncertain:false`). Junk is now MEASURED as a foreign entry --
+// its bytes count, it still never becomes an activity input / subdir / rejection. The charge
+// assertions below were updated accordingly; see `codex-r11-node.test.js` for the full rule.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -46,22 +52,23 @@ function seedSettled(home, nbytes) {
   return aid;
 }
 
-test('Ruling 70: a non-UUID junk directory under activity/ is never counted toward the charge (unlocked AND locked accounting agree); a real activity alongside it still is', () => {
+test('Ruling 70 + 71: a non-UUID junk directory under activity/ is never an accounting ACTIVITY, but its bytes ARE charged (unlocked AND locked accounting agree); a real activity alongside it still is', () => {
   const home = tmpHome();
   try {
     A.secureMkdir(A.quotaDir(home)); // activity/ + activity/quota/ exist
     const root = rootOf(home);
     seedJunk(root, 'junk', 330);
 
-    // junk alone: charge is 0, not 330 -- matches Python's Ruling 69 repro exactly.
-    assert.strictEqual(quota._charge(home), 0);
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 0, uncertain: false, corrupt: false });
+    // junk alone: Ruling 70 charged 0 here; Ruling 71 charges the 330 measured bytes (certain)
+    // -- matches Python's Round-11 rule exactly.
+    assert.strictEqual(quota._charge(home), 330);
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 330, uncertain: false, corrupt: false });
 
     // a real activity alongside the junk directory is still measured and charged normally --
     // the fix must not also start hiding LEGITIMATE activities.
     const aid = seedSettled(home, 4096);
-    assert.strictEqual(quota._charge(home), 4096, 'the junk bytes stay excluded; the real activity is still counted');
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 4096, uncertain: false, corrupt: false });
+    assert.strictEqual(quota._charge(home), 4096 + 330, 'the junk bytes AND the real activity are both counted');
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 4096 + 330, uncertain: false, corrupt: false });
 
     // the LOCKED accounting path (`_gatherAccounting`/`_accountingSnapshot` under a lock context
     // -- what `admit`/`grant`/`settle` actually use) must agree with the unlocked path above.
@@ -69,7 +76,8 @@ test('Ruling 70: a non-UUID junk directory under activity/ is never counted towa
     try {
       const gathered = quota._gatherAccounting(home, ctx);
       assert.deepStrictEqual(gathered.activities.map((a) => a.aid), [aid], '"junk" never became an accounting activity input');
-      assert.deepStrictEqual(quota._accountingSnapshot(home, ctx), { charge: 4096, uncertain: false, corrupt: false });
+      assert.ok(gathered.foreign.some((f) => f.name === 'junk' && f.onDisk === 330 && f.uncertain === false), 'junk is a FOREIGN input (Ruling 71)');
+      assert.deepStrictEqual(quota._accountingSnapshot(home, ctx), { charge: 4096 + 330, uncertain: false, corrupt: false });
     } finally {
       quota._unlock(ctx);
     }
@@ -102,22 +110,30 @@ test('Ruling 70: listOwnedSubdirsDetailed ignores junk/ and quota/ (real, non-UU
   }
 });
 
-test('Ruling 70 counterfactual: with ids.validActivityId patched to accept any string, the junk directory is charged again -- documents exactly what the guard prevents', () => {
+test('Ruling 70 counterfactual (as amended by Ruling 71): with ids.validActivityId patched to accept any string, the junk directory becomes an ACTIVITY input -- the guard prevents management, not measurement', () => {
   const home = tmpHome();
   try {
     A.secureMkdir(A.quotaDir(home));
     const root = rootOf(home);
     seedJunk(root, 'junk', 330);
-    assert.strictEqual(quota._charge(home), 0); // guard in place: junk excluded
+    assert.strictEqual(quota._charge(home), 330); // guard in place: junk measured as foreign
+    let g = quota._gatherAccounting(home);
+    assert.deepStrictEqual(g.activities, [], 'guard in place: junk is not an activity input');
+    assert.ok(g.foreign.some((f) => f.name === 'junk'), 'guard in place: junk is a foreign input');
 
     const real = ids.validActivityId;
     ids.validActivityId = (s) => typeof s === 'string'; // every guard in paths.js/quota.js keys off this one predicate
     try {
-      assert.strictEqual(quota._charge(home), 330, 'BUG reproduced (pre-Ruling-70 behavior): junk bytes are charged once id validation is bypassed');
+      g = quota._gatherAccounting(home);
+      assert.ok(g.activities.some((a) => a.aid === 'junk'), 'BUG reproduced (pre-Ruling-70 behavior): junk is CLASSIFIED as an activity once id validation is bypassed');
+      assert.ok(!g.foreign.some((f) => f.name === 'junk'), 'and is no longer a foreign entry');
+      assert.strictEqual(quota._charge(home), 330, 'the bytes are charged either way (Ruling 71) -- the guard is about identity, not bytes');
     } finally {
       ids.validActivityId = real;
     }
-    assert.strictEqual(quota._charge(home), 0, 'guard restored: junk bytes excluded again');
+    g = quota._gatherAccounting(home);
+    assert.deepStrictEqual(g.activities, [], 'guard restored: junk is foreign again');
+    assert.strictEqual(quota._charge(home), 330);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

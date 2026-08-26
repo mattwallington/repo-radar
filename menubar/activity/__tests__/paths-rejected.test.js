@@ -186,12 +186,19 @@ test('listOwnedSubdirsDetailed: a plain file on an activity id is not-directory;
     fs.symlinkSync(home, path.join(root, 'junk-link'));
     fs.mkdirSync(paths.quotaDir(home)); // a REAL directory, but `quota` is not a valid activity id
 
-    const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(root);
+    const { subdirs, rejected, foreign, uncertain } = paths.listOwnedSubdirsDetailed(root);
     // Ruling 70: `quota` used to sneak into `subdirs` because it IS a real directory -- the id
-    // check only ran on the non-directory branch. It must now be silently ignored: not a subdir,
-    // not rejected, not uncertain -- exactly like the OTHER junk names in this test already are.
+    // check only ran on the non-directory branch. It must be ignored as an ACTIVITY: not a subdir,
+    // not rejected, not (activity-)uncertain -- exactly like the OTHER junk names here.
     assert.deepStrictEqual(subdirs, [VALID]);
     assert.deepStrictEqual(rejected, [{ name: OTHER, reason: 'not-directory' }]);
+    assert.strictEqual(uncertain, true, 'the not-directory refusal above');
+    // Ruling 71: the junk names are still MEASURED as foreign entries (quota/ excluded): the
+    // regular file counts its bytes, the symlink is uncertain.
+    assert.deepStrictEqual(
+      [...foreign].sort((x, y) => (x.name < y.name ? -1 : 1)),
+      [{ name: 'junk-link', bytes: 0, uncertain: true }, { name: 'quota.lock', bytes: 0, uncertain: false }],
+    );
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -201,7 +208,7 @@ test('listOwnedSubdirsDetailed: a missing base yields empty subdirs and no rejec
   const home = tmpHome();
   try {
     const root = path.dirname(paths.quotaDir(home)); // never created
-    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [], uncertain: false }); // Ruling 49: proven absent is not uncertain
+    assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root), { subdirs: [], rejected: [], foreign: [], uncertain: false }); // Ruling 49: proven absent is not uncertain; Ruling 71: nothing foreign either
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

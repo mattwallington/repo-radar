@@ -31,6 +31,13 @@ function toNodeInputs(inp, name) {
       return { aid: a.aid, onDisk: a.on_disk, uncertain: a.uncertain };
     }),
     rejectedRootIds: [...(inp.rejected_root_ids || [])],
+    // Ruling 71: OPTIONAL `foreign: [{ name, on_disk: int, uncertain: bool }]` (absent == empty) --
+    // non-UUID, non-`quota` root entries measured but never managed. Same v2 strictness.
+    foreign: (inp.foreign || []).map((f) => {
+      assert.ok(Number.isInteger(f.on_disk), `${name}: foreign entry ${f.name} has on_disk=${JSON.stringify(f.on_disk)} (expected an integer)`);
+      assert.strictEqual(typeof f.uncertain, 'boolean', `${name}: foreign entry ${f.name} lacks a boolean "uncertain"`);
+      return { name: f.name, onDisk: f.on_disk, uncertain: f.uncertain };
+    }),
     ledger: (inp.ledger || []).map((e) => (e.corrupt === true
       ? { aid: e.aid, corrupt: true }
       : { aid: e.aid, reserved: e.reserved, granted: e.granted })),
