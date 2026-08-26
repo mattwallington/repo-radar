@@ -477,8 +477,23 @@ function listOwnedEntries(directory, suffix) {
 // entry proven absent (ENOENT) hides nothing, every other refusal may. `subdirs`/`rejected`
 // still carry whatever WAS enumerable. A missing base (ENOENT) yields
 // `{ subdirs: [], rejected: [], uncertain: false }` -- read.js probes the root itself, before
-// calling this, and consumes only `rejected` (the flag is additive). Mirrors
-// `paths.list_owned_subdirs_detailed`.
+// calling this, and consumes only `rejected` (the flag is additive).
+//
+// Ruling 70 (G10-Node, parity with Python's Round-10 fix / Ruling 69): `subdirs` now contains
+// ONLY valid-activity-id (UUID-shaped) names. Pre-fix, ANY real directory -- valid id or not --
+// was unconditionally pushed onto `subdirs` (the id check only ran in the non-directory branch),
+// so a non-UUID directory (`quota`, or stray junk like `activity/junk/`) was classified and
+// counted right alongside real activities: `_gatherAccounting`'s root loop has no id guard of its
+// own, so `activity/junk/python-deadbeef.jsonl` (330 bytes) was charged 330 bytes instead of the
+// 0 Python reports. This function is the single implementation both `_committed`'s general
+// enumeration AND `_gatherAccounting`'s locked/accounting enumeration go through (Node has no
+// `dir_fd`, so unlike Python -- which splits a path-based `list_owned_subdirs_detailed` that
+// still lets non-UUID directories through from a `dir_fd`-bound `list_owned_subdirs_dir_fd_
+// detailed` that Ruling 69 tightened -- there is only ever this one function), so it now mirrors
+// Python's TIGHTER `list_owned_subdirs_dir_fd_detailed` behavior for both callers: a non-UUID
+// real directory is silently ignored -- not a subdir, not rejected, not uncertainty -- exactly
+// like a non-UUID junk NAME already was for the non-directory branch. `_gatherAccounting` still
+// carries its own `ids.validActivityId` guard in the per-activity loop as defense in depth.
 function listOwnedSubdirsDetailed(base) {
   let dir;
   try {
@@ -512,8 +527,11 @@ function listOwnedSubdirsDetailed(base) {
       }
       continue;
     }
-    if (st.isDirectory()) { subdirs.push(name); continue; } // lstat: a symlink-to-dir is NOT a dir
+    // Ruling 70: the id check runs BEFORE the directory check now -- a non-UUID real directory
+    // (`quota`, stray junk) is a candidate for neither `subdirs` nor `rejected`, whether or not
+    // it's a directory.
     if (!ids.validActivityId(name)) continue; // junk name -> not an activity, nothing hidden
+    if (st.isDirectory()) { subdirs.push(name); continue; } // lstat: a symlink-to-dir is NOT a dir
     rejected.push({ name, reason: st.isSymbolicLink() ? 'symlink' : 'not-directory' });
     uncertain = true; // an activity-shaped entry we refused to measure
   }
@@ -522,7 +540,11 @@ function listOwnedSubdirsDetailed(base) {
 
 // Immediate real subdir NAMES of an owned base (no symlink follow). Mirrors
 // `paths.list_owned_subdirs`. Thin `.subdirs`-only wrapper over the detailed variant above --
-// single implementation, existing signature/behavior for quota.js's callers unchanged.
+// single implementation. Ruling 70: as a direct consequence of the detailed variant's fix, this
+// wrapper's output NOW EXCLUDES non-UUID real directories (`quota`, stray junk) where it used to
+// include them -- `quota.js`'s `_committed` (its only caller) already had its own explicit
+// `if (name === 'quota') continue`, which is now redundant-but-harmless for `quota` and newly
+// correct for any OTHER junk directory it never guarded against.
 function listOwnedSubdirs(base) {
   return listOwnedSubdirsDetailed(base).subdirs;
 }

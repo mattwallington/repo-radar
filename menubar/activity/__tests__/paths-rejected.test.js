@@ -176,7 +176,7 @@ test('listOwnedSubdirsDetailed: real activity dirs list; a valid-UUID symlink is
   }
 });
 
-test('listOwnedSubdirsDetailed: a plain file on an activity id is not-directory; junk names are ignored', () => {
+test('listOwnedSubdirsDetailed: a plain file on an activity id is not-directory; junk names AND non-UUID real directories (e.g. quota) are ignored (Ruling 70)', () => {
   const home = tmpHome();
   try {
     paths.secureMkdir(paths.activityDir(home, VALID));
@@ -184,10 +184,13 @@ test('listOwnedSubdirsDetailed: a plain file on an activity id is not-directory;
     fs.writeFileSync(path.join(root, OTHER), '');
     fs.writeFileSync(path.join(root, 'quota.lock'), '');
     fs.symlinkSync(home, path.join(root, 'junk-link'));
-    fs.mkdirSync(paths.quotaDir(home));
+    fs.mkdirSync(paths.quotaDir(home)); // a REAL directory, but `quota` is not a valid activity id
 
     const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(root);
-    assert.deepStrictEqual(subdirs.sort(), [VALID, 'quota']);
+    // Ruling 70: `quota` used to sneak into `subdirs` because it IS a real directory -- the id
+    // check only ran on the non-directory branch. It must now be silently ignored: not a subdir,
+    // not rejected, not uncertain -- exactly like the OTHER junk names in this test already are.
+    assert.deepStrictEqual(subdirs, [VALID]);
     assert.deepStrictEqual(rejected, [{ name: OTHER, reason: 'not-directory' }]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

@@ -460,6 +460,10 @@ function _committed(home) {
   const base = path.dirname(paths.quotaDir(home));
   let total = 0;
   for (const name of paths.listOwnedSubdirs(base)) {
+    // Ruling 70 (G10-Node, defense in depth): `listOwnedSubdirs` is now already filtered to
+    // valid-activity-id names, so this guard (and the `'quota'` check beside it) should never
+    // fire -- kept so this loop stays correct even if that filtering is ever loosened.
+    if (!ids.validActivityId(name)) continue;
     if (name === 'quota') continue;
     for (const seg of paths.statOwnedSegments(path.join(base, name))) total += seg.size;
   }
@@ -656,6 +660,11 @@ function _gatherAccounting(home, lockCtx) {
   if (canonicalOk) {
     root = paths.listOwnedSubdirsDetailed(base);
     for (const name of root.subdirs) {
+      // Ruling 70 (G10-Node, defense in depth): `root.subdirs` is now already filtered to
+      // valid-activity-id names by `listOwnedSubdirsDetailed` itself, so this guard (and the
+      // `'quota'` check beside it) should never fire -- kept so this loop stays correct even if
+      // that filtering is ever loosened or bypassed by a future caller.
+      if (!ids.validActivityId(name)) continue;
       if (name === 'quota') continue;
       const scan = paths.statOwnedSegmentsDetailed(path.join(base, name)); // ONE scan per activity
       let size = 0;
