@@ -42,6 +42,10 @@ const reconcileMod = require('./reconcile'); // referenced as `reconcileMod.reco
 // time (never destructured) so a test can inject a failing reconcile by monkeypatching the
 // module export -- the I3 failure-injection seam.
 const idsMod = require('./ids');
+const systemMod = require('./system'); // Task 4.3: the SHARED, uncorrelated diagnostic surfaces
+// (log-stream tails + the legacy status.json error surface). Split into its own module -- they
+// are not Activity data and share none of this file's assembly -- and re-exported here so the
+// reader facade stays the single door Task 4.1's IPC handler calls.
 const limits = require('./limits'); // referenced as `limits.FOO` at call sites throughout (never
 // destructured) so a test monkeypatching a bound (`limits.LIST_MAX = 2`) is observed immediately --
 // see limits.js's own header comment.
@@ -849,6 +853,66 @@ function _describeProblem(p) {
   }
 }
 
+// Indent a multi-line block (a stream tail, a stack trace) so it reads as the body of the line
+// above it rather than as new top-level content. Every line here is already scrubbed and bounded.
+function _indent(text, pad) {
+  return String(text).split('\n').map((line) => `${pad}${line}`);
+}
+
+// The trailing System section of an export. Takes the diagnostics object systemDiagnostics
+// returned (never re-reads anything itself) and appends its lines to `lines`.
+function _appendSystemSection(lines, diag) {
+  // One blank line before the header, however the items section ended (each item already ends
+  // with one; the "no activity recorded" case does not).
+  if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
+  lines.push('--- System (uncorrelated diagnostics) ---');
+  lines.push('Shared app log streams and the legacy status file. These are NOT tied to any');
+  lines.push('activity above and are not time-correlated with them.');
+  if (diag.error) {
+    // A diagnostics-level failure means nothing below was established -- so nothing below is
+    // printed. "(not present)" under a failed collection would be a claim this payload cannot
+    // support, and an export is exactly where such a claim would outlive its context.
+    lines.push(`(diagnostics unavailable: ${diag.error})`);
+    lines.push('');
+    return;
+  }
+  lines.push('');
+
+  for (const s of diag.streams) {
+    const demand = s.onDemand ? '  (on demand)' : '';
+    if (!s.present) {
+      lines.push(`[stream] ${s.name}  (not present${s.error ? `: ${s.error}` : ''})${demand}`);
+      lines.push('');
+      continue;
+    }
+    lines.push(`[stream] ${s.name}  ${s.path}  ${s.bytes} bytes${s.truncated ? '  (tail truncated)' : ''}${demand}`);
+    if (s.redactedTail) lines.push(..._indent(s.redactedTail.replace(/\n$/, ''), '  '));
+    else lines.push('  (empty)');
+    lines.push('');
+  }
+
+  const st = diag.statusDiagnostics;
+  lines.push(`[status] ${systemMod.STATUS_DISPLAY_PATH}`);
+  if (!st.present) {
+    lines.push(`  (not present${st.error ? `: ${st.error}` : ''})`);
+    return;
+  }
+  if (st.errorLog.text) {
+    lines.push(`  errorLog${st.errorLog.truncated ? ' (truncated)' : ''}:`);
+    lines.push(..._indent(st.errorLog.text.replace(/\n$/, ''), '    '));
+  } else {
+    lines.push('  errorLog: (empty)');
+  }
+  lines.push(st.errorList.truncated
+    ? `  errors: ${st.errorList.entries.length} of ${st.errorList.total} shown (newest first)`
+    : `  errors: ${st.errorList.total}`);
+  for (const e of st.errorList.entries) {
+    lines.push(`  [${e.timestamp || '(no timestamp)'}] ${e.repo || '(no repo)'} -- ${e.message || ''}`);
+    if (e.fullError) lines.push(..._indent(e.fullError, '      '));
+    if (e.stackTrace) lines.push(..._indent(e.stackTrace, '      '));
+  }
+}
+
 // Renders the same reconciled+redacted detail items as a stable, human-readable text document.
 // Never reads renderer input -- `filter`/`opts` are the only inputs, exactly like listActivities.
 // Ignores LIST_MAX item paging (that bound is about a single IPC response's item-summary count;
@@ -914,6 +978,14 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
     lines.push('');
   }
 
+  // Trailing System section (Task 4.3): the same bounded, redacted diagnostics the `activity:list`
+  // `system` payload carries, so an export is self-contained -- someone reading it later has the
+  // shared streams and the legacy status surface in front of them, and does not have to trust
+  // that the two views agree. Rendered LAST and counted toward EXPORT_MAX_BYTES like everything
+  // else. The header says "uncorrelated" because that is the one thing a reader must not get
+  // wrong: none of this belongs to the activities above.
+  _appendSystemSection(lines, systemMod.systemDiagnostics(home, { configuredSecrets }));
+
   let text = lines.join('\n');
   const buf = Buffer.from(text, 'utf8');
   if (buf.length > limits.EXPORT_MAX_BYTES) {
@@ -936,4 +1008,6 @@ module.exports = {
   listActivities,
   getActivity,
   buildExport,
+  // Task 4.3: re-exported (not reimplemented) so `read` stays the reader facade ipc.js talks to.
+  systemDiagnostics: systemMod.systemDiagnostics,
 };

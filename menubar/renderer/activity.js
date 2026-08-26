@@ -422,10 +422,15 @@ function boot(win, doc, api) {
   const searchEl = doc.getElementById('event-search');
   const filtersEl = doc.getElementById('event-filters');
   const tabs = { events: doc.getElementById('tab-events'), problems: doc.getElementById('tab-problems') };
+  // Task 4.3: the System disclosure at the bottom of the list pane. `systemEl` is the <details>;
+  // `systemBodyEl` is the only container the diagnostics ever paint into.
+  const systemEl = doc.getElementById('system');
+  const systemBodyEl = doc.getElementById('system-body');
 
   const view = { lens: 'events', filter: {}, selectedId: null, detail: null };
   let pendingFocus = focusIdFromHash(win.location.hash);
   let listReady = false;
+  let systemLoaded = false;
 
   function put(container, node) {
     container.textContent = '';
@@ -498,6 +503,39 @@ function boot(win, doc, api) {
       putError(listEl, loadList);
     }
   }
+
+  // Task 4.3: the System section -- the app's SHARED log streams and the legacy status.json error
+  // surface. Ruling P4-1: these ride on `activity:list` behind a `system:true` flag rather than on
+  // a fifth channel, and are requested ONLY when the section is expanded or refreshed, so an
+  // ordinary list refresh never touches the shared log files. The response's item list is
+  // deliberately IGNORED here: this call updates the section and nothing else, so the diagnostics
+  // can never reorder or blank the Activity list behind the user. They are equally never mixed
+  // into an item or the Problems lens -- they belong to no activity, which the section says on its
+  // face.
+  async function loadSystem() {
+    put(systemBodyEl, el(doc, 'div', 'state state-loading', TEXT.loading));
+    try {
+      const result = await api.list(Object.assign({}, view.filter, { system: true }));
+      const wrap = el(doc, 'div', 'system-wrap');
+      const refresh = el(doc, 'button', 'retry system-refresh', 'Refresh');
+      refresh.setAttribute('type', 'button');
+      refresh.addEventListener('click', loadSystem);
+      wrap.appendChild(refresh);
+      // The section itself is built by the sibling page script (renderer/activity-system.js),
+      // reached through the window because a sandboxed page script has no imports.
+      wrap.appendChild(win.activitySystem.renderSystem(doc, result && result.system));
+      put(systemBodyEl, wrap);
+      systemLoaded = true;
+    } catch (e) {
+      putError(systemBodyEl, loadSystem);
+    }
+  }
+
+  // A native <details>: expanding fires `toggle`, which is the only thing that triggers the first
+  // (and, unless Refresh is pressed, the only) diagnostics read.
+  systemEl.addEventListener('toggle', () => {
+    if (systemEl.open && !systemLoaded) loadSystem();
+  });
 
   // Delegated: the chips themselves are produced by a pure renderer that attaches no listeners.
   listEl.addEventListener('click', (event) => {

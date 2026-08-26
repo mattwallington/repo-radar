@@ -52,6 +52,31 @@ const SEARCH_MAX = 256;
 // with a visible marker line rather than silently cut off.
 const EXPORT_MAX_BYTES = 16 * 1024 * 1024;
 
+// Task 4.3 (System section) bounds. These govern the SHARED, uncorrelated diagnostic surfaces --
+// the app's log streams and the legacy `~/.config/repo-radar/status.json` -- which are not
+// Activity data and are never mixed into it.
+
+// Per-stream tail: only the LAST this-many bytes of a shared log stream are ever read (a bounded
+// `readSync` from `size - SYSTEM_TAIL_MAX_BYTES`, never a whole-file read), and the returned
+// `redactedTail` is re-bounded to the same number AFTER scrubbing -- masking can make text longer
+// than the bytes read. A cut tail carries a visible leading marker line.
+const SYSTEM_TAIL_MAX_BYTES = 64 * 1024;
+
+// Legacy `status.json` `errorList`: the array is written newest-first, so this is the count of
+// NEWEST entries returned. `total` always reports the pre-truncation length.
+const STATUS_ERROR_LIST_MAX = 50;
+
+// Legacy `status.json` `errorLog` (one appended string): the LAST this-many bytes, same leading
+// marker as a stream tail.
+const STATUS_ERROR_LOG_MAX_BYTES = 64 * 1024;
+
+// `status.json` must be parsed whole to be read at all, so unlike a log stream it cannot be
+// tailed -- this is the ceiling on how much will be read before the file is refused outright
+// (reported as `present:false` with an `error`, never as "no legacy errors"). Generous next to a
+// real status file (a repo list plus <=64 KiB of errorLog) and far below anything that could
+// exhaust memory.
+const STATUS_MAX_BYTES = 8 * 1024 * 1024;
+
 // Valid `event.level` values, also the valid `filter.level` values.
 const LEVELS = new Set(['info', 'warn', 'error']);
 
@@ -64,5 +89,6 @@ module.exports = {
   SUMMARY_MAX_BYTES, SUMMARY_FIELD_MAX_BYTES,
   SEARCH_MAX,
   EXPORT_MAX_BYTES,
+  SYSTEM_TAIL_MAX_BYTES, STATUS_ERROR_LIST_MAX, STATUS_ERROR_LOG_MAX_BYTES, STATUS_MAX_BYTES,
   LEVELS,
 };

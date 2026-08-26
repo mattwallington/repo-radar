@@ -19,6 +19,11 @@ const path = require('node:path');
 
 const ACTIVITY_JS = path.join(__dirname, '..', 'renderer', 'activity.js');
 const R = require(ACTIVITY_JS);
+// Task 4.3: the System section lives in its own renderer file (activity.js is already ~550
+// lines) and is loaded by a second <script src> in activity.html. It is exercised through the
+// SAME shim below -- that is why its tests live here rather than in a second file.
+const ACTIVITY_SYSTEM_JS = path.join(__dirname, '..', 'renderer', 'activity-system.js');
+const S = require(ACTIVITY_SYSTEM_JS);
 
 const ESC = '\u001b';
 
@@ -361,10 +366,12 @@ function livePage() {
     };
     return node;
   };
-  for (const id of ['list', 'detail', 'event-level', 'event-search', 'event-filters', 'tab-events', 'tab-problems']) {
+  for (const id of ['list', 'detail', 'event-level', 'event-search', 'event-filters', 'tab-events',
+    'tab-problems', 'system', 'system-body']) {
     byId[id] = doc.createElement('div');
     byId[id].value = '';
   }
+  byId.system.open = false; // the <details> the System disclosure really is
   doc.getElementById = (id) => byId[id];
   return { doc, byId };
 }
@@ -373,7 +380,9 @@ function livePage() {
 // which Chromium delivers as a same-document `hashchange` -- so a fake window has to be able to
 // navigate, not just report an initial fragment.
 function fakeWindow(hash) {
-  const win = { location: { hash: hash || '' }, listeners: [] };
+  // `activitySystem` is what the second <script src> publishes; activity.js reaches the System
+  // renderer through the window exactly as it does in the browser (it may not `require`).
+  const win = { location: { hash: hash || '' }, listeners: [], activitySystem: S };
   win.addEventListener = (type, fn) => { win.listeners.push([type, fn]); };
   win.navigate = (next) => {
     win.location.hash = next;
@@ -661,4 +670,283 @@ test('a hashchange that lands before the first list paints is applied after it',
 
   assert.deepStrictEqual(calls, [['list', {}], ['get', OTHER_ID]], 'the pending focus is honoured');
   assert.ok(byId.detail.textContent.includes('rate-limited'));
+});
+
+// -------------------------------------------------------------------------------------------
+// Task 4.3: the System section (renderer/activity-system.js).
+//
+// These are the app's SHARED log streams and the legacy status.json error surface -- deliberately
+// uncorrelated with any activity. The section therefore says so on its face, never mixes into the
+// item list or the Problems lens, and (like every other render path here) puts untrusted text on
+// the page as literal characters only.
+// -------------------------------------------------------------------------------------------
+function systemPayload(over) {
+  return Object.assign({
+    uncorrelated: true,
+    streams: [
+      { name: 'sync.error.log', path: '~/Library/Logs/repo-radar/sync.error.log', present: true, onDemand: false, bytes: 2048, truncated: false, redactedTail: 'boom\n' },
+      { name: 'menubar.log', present: false, onDemand: false, bytes: 0, truncated: false, redactedTail: '' },
+      { name: 'sync.log', path: '~/Library/Logs/repo-radar/sync.log', present: true, onDemand: true, bytes: 10, truncated: true, redactedTail: '--- tail truncated at 64 KiB ---\nrest\n' },
+      { name: 'renderer.log', present: false, onDemand: true, bytes: 0, truncated: false, redactedTail: '', error: 'symlink' },
+    ],
+    statusDiagnostics: {
+      present: true,
+      errorLog: { text: 'legacy log text', truncated: false },
+      errorList: {
+        entries: [{ timestamp: '2026-08-14T10:00:00.000Z', repo: 'acme/widgets', message: 'clone failed', fullError: 'fatal: no remote', stackTrace: null }],
+        total: 1,
+        truncated: false,
+      },
+    },
+  }, over);
+}
+
+test('renderSystem states, in fixed text, that these streams are uncorrelated', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload());
+  assert.ok(node.textContent.includes('Shared diagnostics — not tied to any activity'));
+});
+
+test('renderSystem inserts a hostile stream tail as inert characters', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload({
+    streams: [{ name: 'sync.error.log', present: true, onDemand: false, bytes: 9, truncated: false, redactedTail: ANSI_XSS }],
+  }));
+  assertInert(node, XSS);
+});
+
+test('renderSystem inserts hostile legacy status text as inert characters', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload({
+    statusDiagnostics: {
+      present: true,
+      errorLog: { text: ANSI_NOISE, truncated: false },
+      errorList: {
+        entries: [{ timestamp: 'x', repo: ANSI_XSS, message: 'm', fullError: 'f', stackTrace: 's' }],
+        total: 1, truncated: false,
+      },
+    },
+  }));
+  assertInert(node, XSS);
+});
+
+test('the two default streams are open and the on-demand ones are collapsed behind "show"', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload());
+  const blocks = walk(node).filter((e) => e.className.split(' ').includes('system-stream'));
+  const byName = {};
+  for (const b of blocks) byName[b.getAttribute('data-stream')] = b;
+
+  assert.strictEqual(byName['sync.error.log'].tagName, 'DETAILS');
+  assert.strictEqual(byName['sync.error.log'].getAttribute('open'), '');
+  assert.strictEqual(byName['sync.log'].getAttribute('open'), null, 'an on-demand stream starts closed');
+  assert.ok(byName['sync.log'].textContent.includes('show'), 'and offers a "show" affordance');
+  assert.ok(!byName['sync.error.log'].textContent.includes('show'));
+});
+
+test('a stream tail lands in a <pre>, as text, on a childless element', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload());
+  const pres = walk(node).filter((e) => e.tagName === 'PRE');
+  assert.ok(pres.length >= 1);
+  const holder = pres.find((e) => e.textContent.includes('boom'));
+  assert.ok(holder, 'the tail is rendered');
+  assert.strictEqual(holder.children.length, 0, 'text only -- never parsed markup');
+});
+
+test('an absent stream is shown as "not present", with its refusal reason when there is one', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload());
+  const text = node.textContent;
+  assert.ok(text.includes('menubar.log'), 'an absent stream is still named');
+  assert.ok(text.includes('not present'));
+  assert.ok(text.includes('symlink'), 'a refusal reason is shown, not hidden as plain absence');
+});
+
+test('renderSystem shows the truncation marker the reader produced', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload());
+  assert.ok(node.textContent.includes('--- tail truncated at 64 KiB ---'));
+});
+
+test('renderSystem renders the legacy errorList as rows, with an honest count when capped', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload({
+    statusDiagnostics: {
+      present: true,
+      errorLog: { text: '', truncated: false },
+      errorList: {
+        entries: [
+          { timestamp: '2026-08-14T10:00:00.000Z', repo: 'a/b', message: 'first', fullError: 'details one', stackTrace: 'at x' },
+          { timestamp: '2026-08-14T09:00:00.000Z', repo: 'c/d', message: 'second', fullError: '', stackTrace: null },
+        ],
+        total: 120, truncated: true,
+      },
+    },
+  }));
+  const rows = walk(node).filter((e) => e.className.split(' ').includes('system-error'));
+  assert.strictEqual(rows.length, 2);
+  assert.ok(rows[0].textContent.includes('first'));
+  assert.ok(rows[0].textContent.includes('a/b'));
+  assert.ok(rows[0].textContent.includes('details one'));
+  assert.ok(rows[0].textContent.includes('at x'));
+  assert.ok(node.textContent.includes('2 of 120'), 'the cap is stated, never silently applied');
+});
+
+test('an absent or unreadable legacy status file says so', () => {
+  const absent = S.renderSystem(makeDoc(), systemPayload({
+    statusDiagnostics: { present: false, errorLog: { text: '', truncated: false }, errorList: { entries: [], total: 0, truncated: false } },
+  }));
+  assert.ok(absent.textContent.includes('status.json'));
+
+  const broken = S.renderSystem(makeDoc(), systemPayload({
+    statusDiagnostics: { present: false, errorLog: { text: '', truncated: false }, errorList: { entries: [], total: 0, truncated: false }, error: 'parse-failed' },
+  }));
+  assert.ok(broken.textContent.includes('parse-failed'));
+});
+
+test('a diagnostics-level failure is shown rather than swallowed', () => {
+  const node = S.renderSystem(makeDoc(), { uncorrelated: true, streams: [], error: 'diagnostics failed' });
+  assert.ok(node.textContent.includes('diagnostics failed'));
+  // ...and nothing below it is claimed: "no legacy errors" over a failed collection would be a
+  // statement the payload cannot support.
+  assert.ok(!node.textContent.includes('No legacy'), 'a failed collection asserts nothing further');
+});
+
+test('renderSystem tolerates a malformed payload and attaches no listeners', () => {
+  for (const bad of [undefined, null, 42, 'nope', {}, { streams: 'not an array' }]) {
+    const node = S.renderSystem(makeDoc(), bad);
+    assert.ok(node, `renderSystem must return a node for ${JSON.stringify(bad)}`);
+    for (const e of walk(node)) assert.deepStrictEqual(e.listeners, [], 'the pure renderer attaches no listeners');
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Source prohibition for the second renderer file -- the same hard guard activity.js carries.
+// -------------------------------------------------------------------------------------------
+test('renderer/activity-system.js never names a markup sink and is sandbox-safe', () => {
+  const src = fs.readFileSync(ACTIVITY_SYSTEM_JS, 'utf8');
+  for (const sink of ['inner' + 'HTML', 'outer' + 'HTML', 'insertAdjacent' + 'HTML',
+    'document.' + 'write', 'createContextualFragment']) {
+    assert.strictEqual(src.includes(sink), false, `activity-system.js must never name ${sink}`);
+  }
+  assert.strictEqual(/\beval\s*\(/.test(src), false, 'no eval');
+  assert.strictEqual(/\bnew\s+Function\s*\(/.test(src), false, 'no Function constructor');
+  assert.strictEqual(/\brequire\s*\(/.test(src), false, 'a sandboxed renderer has no require');
+  assert.strictEqual(/\bprocess\./.test(src), false, 'no process access');
+  assert.strictEqual(/\b__dirname\b|\b__filename\b/.test(src), false, 'no Node path globals');
+  const moduleRefs = src.match(/\bmodule\b/g) || [];
+  assert.strictEqual(moduleRefs.length, 2, 'module is named exactly twice: the typeof guard and the export');
+  assert.ok(/typeof module !== 'undefined'/.test(src), 'the export is typeof-guarded for the browser');
+});
+
+// -------------------------------------------------------------------------------------------
+// boot(): the System disclosure. Ruling P4-1 -- no fifth channel; the diagnostics ride on
+// `activity:list` and are requested ONLY when the section is expanded or refreshed.
+// -------------------------------------------------------------------------------------------
+function bootedSystem(over) {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi(Object.assign({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      return {
+        items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [],
+        system: filter && filter.system ? systemPayload() : undefined,
+      };
+    },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  }, over));
+  const win = fakeWindow('');
+  return { doc, byId, api, calls, win, booted: R.boot(win, doc, api) };
+}
+
+test('the System section is collapsed and unrequested until it is expanded', async () => {
+  const t = bootedSystem();
+  await t.booted;
+  assert.deepStrictEqual(t.calls, [['list', {}]], 'the first load never asks for diagnostics');
+  assert.strictEqual(t.byId['system-body'].textContent, '', 'and paints nothing');
+});
+
+test('expanding the System section requests system:true and paints ONLY that section', async () => {
+  const t = bootedSystem();
+  await t.booted;
+  const chipsBefore = t.byId.list.querySelectorAll('.chip').length;
+
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepStrictEqual(t.calls[1], ['list', { system: true }]);
+  assert.ok(t.byId['system-body'].textContent.includes('sync.error.log'), 'the section painted');
+  assert.strictEqual(t.byId.list.querySelectorAll('.chip').length, chipsBefore,
+    'the item list is not re-rendered from the diagnostics response');
+  assert.ok(!t.byId.list.textContent.includes('Shared diagnostics'),
+    'diagnostics never mix into the Activity item list');
+  assert.ok(!t.byId.detail.textContent.includes('Shared diagnostics'),
+    'nor into the Problems lens');
+});
+
+test('collapsing and re-expanding does not re-request; Refresh does', async () => {
+  const t = bootedSystem();
+  await t.booted;
+
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+  t.byId.system.open = false;
+  fire(t.byId.system, 'toggle');
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(t.calls.length, 2, 'an already-loaded section is not re-fetched on every toggle');
+
+  const refresh = walk(t.byId['system-body']).find((e) => e.className.split(' ').includes('system-refresh'));
+  assert.ok(refresh, 'the section offers a Refresh control');
+  fire(refresh, 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls[2], ['list', { system: true }]);
+});
+
+test('the System request carries the current filter alongside the flag', async () => {
+  const t = bootedSystem();
+  await t.booted;
+  t.byId['event-level'].value = 'error';
+  t.byId['event-search'].value = 'timeout';
+  fire(t.byId['event-level'], 'change');
+
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepStrictEqual(t.calls[1], ['list', { level: 'error', search: 'timeout', system: true }]);
+});
+
+test('a rejected System request shows one generic line plus Retry, never the error itself', async () => {
+  let fail = true;
+  const t = bootedSystem({
+    list: async (filter) => {
+      if (filter && filter.system) {
+        if (fail) { fail = false; throw new Error('EACCES /Users/someone/Library/Logs/repo-radar'); }
+        return { items: [], truncated: false, available: true, incomplete: false, problems: [], system: systemPayload() };
+      }
+      return { items: [LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] };
+    },
+  });
+  await t.booted;
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const text = t.byId['system-body'].textContent;
+  assert.ok(text.includes('Activity history couldn’t be loaded.'));
+  assert.ok(!text.includes('EACCES'), 'the underlying error never reaches the page');
+  assert.ok(!text.includes('/Users/'), 'nor any path from it');
+
+  const retry = walk(t.byId['system-body']).find((e) => e.className.split(' ').includes('retry'));
+  assert.ok(retry, 'and a Retry control is offered');
+  fire(retry, 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(t.byId['system-body'].textContent.includes('sync.error.log'), 'Retry re-issues the request');
+});
+
+test('a response with no `system` payload paints the section without throwing', async () => {
+  const t = bootedSystem({
+    list: async (filter) => { return { items: [], truncated: false, available: true, incomplete: false, problems: [] }; },
+  });
+  await t.booted;
+  t.byId.system.open = true;
+  fire(t.byId.system, 'toggle');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(t.byId['system-body'].textContent.length > 0);
 });

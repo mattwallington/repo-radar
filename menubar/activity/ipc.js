@@ -162,9 +162,22 @@ function createHandlers({
   return {
     // filter -> { items, truncated, available, incomplete, problems }. Summary DTOs only, at most
     // limits.LIST_MAX of them, each already redacted and bounded by read.js.
+    //
+    // Ruling P4-1: `filter.system === true` additionally attaches `system` -- the bounded,
+    // redacted, UNCORRELATED shared-stream + legacy-status diagnostics (Task 4.3). It rides here
+    // rather than on a fifth channel because the renderer asks for it as part of the same view
+    // refresh, and one channel is one thing to keep allowlisted. Absent or `false` means the
+    // response has no `system` key at all -- the diagnostics are read only when asked for, so an
+    // ordinary list refresh never touches the shared log files. The SAME secrets object feeds
+    // both reads, so the two halves can never disagree about what is masked.
     'activity:list': guard('activity:list', async (filter) => {
       _validateFilter(filter);
-      return read.listActivities(home, filter, { configuredSecrets: secrets() });
+      const configuredSecrets = secrets();
+      const result = read.listActivities(home, filter, { configuredSecrets });
+      if (filter && filter.system === true) {
+        result.system = read.systemDiagnostics(home, { configuredSecrets });
+      }
+      return result;
     }),
 
     // activity id -> { item, available, reason? }. One detail item (Events + Problems lenses),

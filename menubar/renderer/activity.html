@@ -150,6 +150,48 @@
     }
     .state-incomplete, .state-truncated { color: #e2c08d; }
     .state-unavailable, .state-error { color: #f48771; }
+    /* ---- Task 4.3: the System section (shared, uncorrelated diagnostics) ---- */
+    .pane-list { display: flex; flex-direction: column; }
+    #list { flex: 1 0 auto; }
+    .system-disclosure {
+      flex: none;
+      margin-top: 8px;
+      border-top: 1px solid #3e3e42;
+      padding-top: 8px;
+    }
+    .system-disclosure-head { color: #9d9d9d; font-size: 12px; padding: 2px 0; }
+    .system-body { margin-top: 6px; }
+    .system-wrap { display: flex; flex-direction: column; gap: 6px; }
+    .system-refresh { align-self: flex-start; margin-top: 0; }
+    .system-uncorrelated { color: #e2c08d; font-size: 11px; line-height: 1.4; }
+    .system-subhead {
+      color: #cccccc; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+      margin-top: 8px;
+    }
+    .system-stream { margin-top: 6px; }
+    .system-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+    .system-name { color: #d4d4d4; }
+    .system-size, .system-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; color: #6e6e6e; }
+    .system-path { font-size: 11px; color: #6e6e6e; overflow-wrap: anywhere; }
+    .system-flag { padding: 0 5px; border-radius: 8px; font-size: 11px; background: #3e3e42; color: #cccccc; }
+    .system-note { color: #9d9d9d; font-size: 11px; line-height: 1.4; }
+    .system-absent { display: flex; align-items: baseline; gap: 6px; font-size: 12px; }
+    .system-tail, .system-detail {
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 11px;
+      color: #b5b5b5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: 240px;
+      overflow-y: auto;
+      margin: 4px 0 0 0;
+      padding-left: 8px;
+      border-left: 2px solid #3e3e42;
+    }
+    .system-error { margin-top: 4px; font-size: 12px; }
+    .system-repo { color: #cccccc; }
+    .system-message { color: #f48771; overflow-wrap: anywhere; }
+
     .retry {
       display: block;
       margin-top: 8px;
@@ -171,7 +213,16 @@
     <div id="toolbar" class="toolbar"></div>
   </div>
   <div class="panes">
-    <div id="list" class="pane pane-list"></div>
+    <div class="pane pane-list">
+      <div id="list"></div>
+      <!-- Task 4.3: the System section. Collapsed by default and NOT loaded with the list -- the
+           shared log streams are only read when this is expanded (or refreshed), and they never
+           mix into the Activity list above or the Problems lens on the right. -->
+      <details id="system" class="system-disclosure">
+        <summary class="system-disclosure-head">System</summary>
+        <div id="system-body" class="system-body"></div>
+      </details>
+    </div>
     <div class="pane-detail">
       <div class="tabs">
         <button id="tab-events" class="tab" type="button">Events</button>
@@ -189,6 +240,9 @@
       <div id="detail" class="detail"></div>
     </div>
   </div>
+  <!-- activity-system.js FIRST: it publishes window.activitySystem, which activity.js's boot()
+       reaches for when the System disclosure is expanded. -->
+  <script src="activity-system.js"></script>
   <script src="activity.js"></script>
 </body>
 </html>

@@ -117,6 +117,12 @@ test('renderer/activity.html carries a strict CSP and loads its script from a fi
 
   assert.ok(/<script\s+src=["']activity\.js["']\s*><\/script>/.test(html),
     'the renderer is loaded from a file, never inlined');
+  // Task 4.3: the System section is a second page script, and it must load FIRST -- activity.js's
+  // boot() reaches it through `window.activitySystem`, which only exists once it has run.
+  assert.ok(/<script\s+src=["']activity-system\.js["']\s*><\/script>/.test(html),
+    'the System renderer is loaded from a file too');
+  assert.ok(html.indexOf('activity-system.js') < html.indexOf('src="activity.js"'),
+    'activity-system.js must be loaded before activity.js');
   assert.strictEqual(/<script(?![^>]*\ssrc=)/i.test(html), false, 'no inline script block');
   assert.strictEqual(/\son[a-z]+=/i.test(html), false, 'no inline event-handler attributes');
   assert.strictEqual(/https?:\/\//.test(html), false, 'no remote asset may be referenced');
