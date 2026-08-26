@@ -1,7 +1,7 @@
 'use strict';
 // Task 4.2 / Ruling P4-5: the Activity window's `webPreferences`, in ONE place.
 //
-// Every other content window in this app -- `showLogWindow`, `showErrorWindow`, Settings -- runs
+// The app's legacy content windows -- `showLogWindow`, Settings -- run
 // `nodeIntegration:true` with `contextIsolation:false`, because they load renderers that
 // `require()` Node modules directly. The Activity window is the opposite posture: its renderer
 // is untrusted-input-facing (it displays text produced by external tooling), so it runs fully

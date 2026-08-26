@@ -1003,11 +1003,49 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   return text;
 }
 
+// -------------------------------------------------------------------------------------------
+// Task 4.4 / Ruling P4-12: the tray's "⚠️ View Errors" target.
+//
+// Answers the only question the tray menu is allowed to ask -- "is there anything worth showing,
+// and which activity is it?" -- as the id of the NEWEST item that carries Problems or a
+// failure-like outcome, or `null` when there is nothing. That makes the motivating bug structural
+// rather than remembered: the affordance cannot exist without an item behind it, so it can never
+// open an empty view. A pre-attempt failure (a dev-guard block, an unresolved runtime channel, a
+// spawn that never happened) is durably recorded as a `blocked`/`failed` activity with no error
+// EVENTS at all, and is caught here by its outcome -- that is exactly the incident the old
+// `status.json`-only error window rendered as a blank page.
+//
+// NEVER THROWS. The tray menu is rebuilt on a 30s timer, on every tray click and at every sync
+// transition; a reader that could raise here would take the whole menu down. Every failure mode --
+// no store, an unreadable store, a malformed bound, an fs error mid-scan -- is `null`, which the
+// caller reads as "no affordance".
+//
+// `hasProblems` is `isProblemBearing` over the whole scan (warn/error events, integrity records
+// and findings, rejected segments, duplicate terminals) and already subsumes PROBLEM_OUTCOMES for
+// a recorded terminal; the outcome check is kept alongside it so an item whose outcome is
+// failure-like can never be skipped, whatever future shape produces it.
+function viewErrorsTarget(home, { configuredSecrets = [] } = {}) {
+  try {
+    // The full page: `listActivities` already returns items newest-first, so the first match IS
+    // the newest problem-bearing one. Scanning past the newest item matters -- a clean run after a
+    // failure must not hide the failure.
+    const result = listActivities(home, { limit: limits.LIST_MAX }, { configuredSecrets });
+    if (!result || result.available === false) return null;
+    for (const item of result.items) {
+      if (item.hasProblems || PROBLEM_OUTCOMES.has(item.outcome)) return item.id;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 module.exports = {
   InvalidFilter,
   InvalidActivityId,
   validateFilter,
   isProblemBearing,
+  viewErrorsTarget,
   PROBLEM_EVENT_LEVELS,
   PROBLEM_OUTCOMES,
   listActivities,

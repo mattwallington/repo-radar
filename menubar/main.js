@@ -27,6 +27,9 @@ const activityIpc = require('./activity/ipc');
 // Activity History (Task 4.2 / Ruling P4-5): the Activity window's hardened webPreferences, kept
 // as one frozen constant so they can be asserted by a test main.js itself can never be loaded in.
 const { ACTIVITY_WEB_PREFERENCES } = require('./activity/window-options');
+// Activity History (Task 4.4 / Ruling P4-12): the reader, for the ONE question the tray asks it --
+// `viewErrorsTarget`. Every richer read still goes through activity/ipc.js on behalf of the window.
+const activityRead = require('./activity/read');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -158,7 +161,6 @@ if (!fs.existsSync(CONFIG_DIR) && fs.existsSync(OLD_CONFIG_DIR)) {
 let tray = null;
 let logWindow = null;
 let settingsWindow = null;
-let errorWindow = null;
 let activityWindow = null; // Activity History (Task 4.2) -- the one context-isolated content window
 let statusServer = null;
 let currentSyncProcess = null;
@@ -490,6 +492,45 @@ Note: Read-only reference. Current working directory may differ.
   }
 }
 
+// Activity History (Task 4.4 / Rulings P4-6, P4-12): the tray's "⚠️ View Errors" target.
+//
+// `updateTrayMenu()` is called from ~24 sites -- several per progress event while a sync is
+// running -- and the reader answer costs a scan of the activity store, so it is memoized behind a
+// short TTL and consulted ONLY from the idle branch of the menu build (a running sync shows
+// "View Progress" instead and never asks). The TTL is a ceiling on staleness, not the primary
+// freshness mechanism: the memo is dropped explicitly the moment a sync completes, which is when
+// the answer actually changes.
+const VIEW_ERRORS_TTL_MS = 5000;
+let viewErrorsMemo = { at: 0, id: null };
+
+function _invalidateViewErrorsTarget() {
+  viewErrorsMemo = { at: 0, id: null };
+}
+
+function _viewErrorsTarget() {
+  const now = Date.now();
+  // `age >= 0` matters on a laptop: a backwards wall-clock correction after a sleep/wake would
+  // otherwise make the cached answer look permanently fresh.
+  const age = now - viewErrorsMemo.at;
+  if (viewErrorsMemo.at !== 0 && age >= 0 && age < VIEW_ERRORS_TTL_MS) {
+    return viewErrorsMemo.id;
+  }
+  let id = null;
+  try {
+    // Same HOME the Activity IPC handlers are registered with, so the tray and the window it
+    // opens always read the same store. `configuredSecrets` is defense in depth: the reader
+    // redacts with exactly the list the writer masks (Ruling P4-3).
+    const home = process.env.HOME;
+    id = activityRead.viewErrorsTarget(home, {
+      configuredSecrets: activityGlue.loadConfiguredSecrets(home),
+    });
+  } catch (e) {
+    id = null; // the reader never throws, but the tray menu must not depend on that
+  }
+  viewErrorsMemo = { at: now, id };
+  return id;
+}
+
 // Update tray menu
 function updateTrayMenu() {
   const status = loadStatus();
@@ -568,11 +609,16 @@ function updateTrayMenu() {
       click: () => triggerSync()
     });
     
-    // Optionally show View Errors if there are errors
-    if (status.hasErrors) {
+    // Activity History (Task 4.4 / Ruling P4-6): the affordance exists only when the reader has
+    // an actual item to open, and it deep-links straight to that item. `status.hasErrors` no
+    // longer gates it -- that flag was set by pre-attempt failures which produce no `errorList`,
+    // so it could offer "View Errors" for a window that had nothing to render. It still drives
+    // the tray icon above, unchanged.
+    const viewErrorsId = _viewErrorsTarget();
+    if (viewErrorsId) {
       menuItems.push({
         label: '⚠️  View Errors',
-        click: () => showErrorWindow()
+        click: () => showActivityWindow(viewErrorsId)
       });
     }
   }
@@ -1405,6 +1451,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
+          // Activity History (Task 4.4): the child wrote its terminal record before exiting, so
+          // this attempt's outcome is durable NOW -- drop the memoized "View Errors" target so the
+          // menu rebuilds below (and again 500ms later, once status is finalized) read it fresh.
+          _invalidateViewErrorsTarget();
           updateTrayMenu();
 
           // If user cancelled, stay on idle icon — don't show error
@@ -1722,46 +1772,18 @@ function showSettingsWindow() {
   });
 }
 
-// Show error window
-function sendErrorData(win) {
-  const status = loadStatus();
-  win.webContents.send('error-log-loaded', {
-    errors: status.errorList || [],
-    errorLog: status.errorLog || ''
-  });
-}
-
+// Activity History (Task 4.4): the legacy "Sync Errors" window is subsumed by the Activity
+// window. It rendered `status.json`'s `errorList`/`errorLog` and nothing else, so a failure that
+// produced no per-repo errors -- a dev-guard block, an unresolved runtime channel, a sync that
+// never spawned -- opened it completely empty. Both of those legacy surfaces are now the Activity
+// window's System section (Task 4.3), alongside the durable per-attempt history that actually
+// explains such a failure.
+//
+// This is kept as the ONE named entry point the remaining legacy caller uses (the progress
+// window's error-stat click, via `open-error-window` below). A null target simply opens the
+// Activity window unfocused -- the user still lands somewhere with content, never on a blank page.
 function showErrorWindow() {
-  if (errorWindow && !errorWindow.isDestroyed()) {
-    errorWindow.show();
-    errorWindow.focus();
-    // Re-send error data to refresh the display
-    sendErrorData(errorWindow);
-    return;
-  }
-
-  errorWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
-    title: 'Sync Errors',
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    },
-    show: false
-  });
-
-  errorWindow.loadFile(path.join(__dirname, 'renderer', 'error.html'));
-
-  errorWindow.once('ready-to-show', () => {
-    errorWindow.show();
-    // Push error data after window is ready (don't rely solely on renderer requesting it)
-    setTimeout(() => sendErrorData(errorWindow), 100);
-  });
-
-  errorWindow.on('closed', () => {
-    errorWindow = null;
-  });
+  return showActivityWindow(_viewErrorsTarget());
 }
 
 // Activity History (Task 4.2). The ONE context-isolated content window in this app: its renderer
@@ -2159,33 +2181,12 @@ ipcMain.on('load-config', (event) => {
   event.reply('config-loaded', config);
 });
 
-ipcMain.on('load-error-log', (event) => {
-  const status = loadStatus();
-  event.reply('error-log-loaded', {
-    errors: status.errorList || [],
-    errorLog: status.errorLog || ''
-  });
-});
-
+// Activity History (Task 4.4): the progress window's error-stat click. The channel keeps its name
+// -- renderer/renderer.js still sends it -- but it now opens the Activity window at the newest
+// item worth showing. The channels the deleted error page owned (`load-error-log`,
+// `error-log-loaded`, `clear-errors`) went with it: renderer/error.html was their only sender.
 ipcMain.on('open-error-window', (event) => {
   showErrorWindow();
-});
-
-ipcMain.on('clear-errors', (event) => {
-  const status = loadStatus();
-  status.errorList = [];
-  status.errorLog = '';
-  status.hasErrors = false;
-  saveStatus(status);
-  updateTrayMenu();
-  
-  // Notify error window if open
-  if (errorWindow && !errorWindow.isDestroyed()) {
-    errorWindow.webContents.send('error-log-loaded', {
-      errors: [],
-      errorLog: ''
-    });
-  }
 });
 
 ipcMain.on('save-config', (event, config) => {
