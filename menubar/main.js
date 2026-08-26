@@ -24,6 +24,9 @@ const activityQuota = require('./activity/quota');
 // Activity History (Task 4.1): the narrow, allowlisted IPC surface the Activity window talks to.
 // activity/ipc.js is deliberately Electron-free, so the real `shell`/`dialog` are injected here.
 const activityIpc = require('./activity/ipc');
+// Activity History (Task 4.2 / Ruling P4-5): the Activity window's hardened webPreferences, kept
+// as one frozen constant so they can be asserted by a test main.js itself can never be loaded in.
+const { ACTIVITY_WEB_PREFERENCES } = require('./activity/window-options');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -156,6 +159,7 @@ let tray = null;
 let logWindow = null;
 let settingsWindow = null;
 let errorWindow = null;
+let activityWindow = null; // Activity History (Task 4.2) -- the one context-isolated content window
 let statusServer = null;
 let currentSyncProcess = null;
 let syncCancelledByUser = false;
@@ -1758,6 +1762,50 @@ function showErrorWindow() {
   errorWindow.on('closed', () => {
     errorWindow = null;
   });
+}
+
+// Activity History (Task 4.2). The ONE context-isolated content window in this app: its renderer
+// displays text produced by external tooling, so it runs sandboxed, with no Node integration, and
+// reaches main only through the four allowlisted channels of renderer/activity-preload.js. Every
+// other window above deliberately keeps its legacy nodeIntegration:true preferences -- do not copy
+// them here, and do not add a preload literal: ACTIVITY_WEB_PREFERENCES is the single source of
+// that posture (activity/window-options.js), asserted by __tests__/activity-window-security.test.js.
+//
+// `focusId` (optional, Ruling P4-8) selects one activity once the list loads. It travels as the
+// loaded URL's FRAGMENT rather than over a channel, so the preload's four-method allowlist stays
+// exact; the renderer accepts it only if it is a UUIDv4, so a malformed one simply selects nothing.
+// Task 4.4 wires the caller.
+function showActivityWindow(focusId) {
+  const page = path.join(__dirname, 'renderer', 'activity.html');
+  const loadOptions = focusId ? { hash: String(focusId) } : null;
+
+  if (activityWindow && !activityWindow.isDestroyed()) {
+    // Re-issue the load ONLY for a deep link -- an ordinary reopen must not discard whatever the
+    // user already had selected.
+    if (loadOptions) activityWindow.loadFile(page, loadOptions);
+    activityWindow.show();
+    activityWindow.focus();
+    return activityWindow;
+  }
+
+  activityWindow = new BrowserWindow({
+    width: 1000,
+    height: 680,
+    minWidth: 720,
+    minHeight: 460,
+    title: `${getAppDisplayName()} - Activity`,
+    backgroundColor: '#1e1e1e',
+    show: false,
+    center: true,
+    webPreferences: Object.assign({}, ACTIVITY_WEB_PREFERENCES)
+  });
+
+  if (loadOptions) activityWindow.loadFile(page, loadOptions);
+  else activityWindow.loadFile(page);
+
+  activityWindow.once('ready-to-show', () => activityWindow.show());
+  activityWindow.on('closed', () => { activityWindow = null; });
+  return activityWindow;
 }
 
 // Load config and send to settings window

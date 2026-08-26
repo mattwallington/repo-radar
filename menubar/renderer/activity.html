@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <!-- Task 4.2: the Activity window is the app's only context-isolated, sandboxed window, and this
+       policy is the second half of that posture. 'none' by default: no remote anything, no inline
+       script, no eval, no frames, no network. The only relaxation is 'unsafe-inline' for STYLE, so
+       the small stylesheet below can live in the page instead of becoming a second file. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'none'; font-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .topbar {
+      background: #252526;
+      border-bottom: 1px solid #3e3e42;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .topbar h1 { font-size: 15px; font-weight: 600; color: #cccccc; }
+    .toolbar { display: flex; gap: 8px; }
+
+    .panes { flex: 1; display: flex; min-height: 0; }
+    .pane { overflow-y: auto; min-height: 0; }
+    .pane-list { width: 340px; flex: none; border-right: 1px solid #3e3e42; padding: 8px; }
+    .pane-detail { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ---- list chips ---- */
+    .chip {
+      padding: 8px 10px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-bottom: 4px;
+    }
+    .chip:hover { background: #2a2d2e; }
+    .chip.selected { background: #094771; border-color: #0e639c; }
+    .chip-head { display: flex; align-items: center; gap: 8px; }
+    .chip-meta { display: flex; align-items: center; gap: 8px; margin-top: 3px; color: #9d9d9d; font-size: 12px; }
+    .chip-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; color: #cccccc; }
+    .chip-outcome { font-size: 12px; color: #cccccc; }
+    .chip-source { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chip-count { padding: 0 5px; border-radius: 8px; font-size: 11px; }
+    .count-error { background: #5a1d1d; color: #f48771; }
+    .count-warn { background: #5a4a1d; color: #e2c08d; }
+    .chip-flag { padding: 0 5px; border-radius: 8px; font-size: 11px; background: #3e3e42; color: #cccccc; }
+
+    /* ---- outcome dot ---- */
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; background: #6e6e6e; }
+    .dot-succeeded { background: #4ec94e; }
+    .dot-succeeded-with-warnings { background: #e2c08d; }
+    .dot-blocked, .dot-failed { background: #f14c4c; }
+    .dot-cancelled, .dot-skipped { background: #6e6e6e; }
+    .dot-interrupted { background: #ff9d40; }
+    .dot-running { background: #3794ff; }
+    .dot-unknown { background: #6e6e6e; }
+
+    /* ---- lens chrome ---- */
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid #3e3e42;
+      background: #252526;
+    }
+    .tab {
+      background: transparent;
+      border: 1px solid #3e3e42;
+      border-radius: 4px;
+      color: #cccccc;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    .tab.active { background: #0e639c; border-color: #0e639c; color: #ffffff; }
+    .filters { margin-left: auto; display: flex; gap: 8px; }
+    .filters.hidden { display: none; }
+    .control {
+      background: #1e1e1e;
+      border: 1px solid #3e3e42;
+      border-radius: 4px;
+      color: #d4d4d4;
+      font-size: 12px;
+      padding: 3px 7px;
+    }
+    .control:focus { outline: none; border-color: #0e639c; }
+
+    .detail { flex: 1; overflow-y: auto; padding: 12px; min-height: 0; }
+    .detail-head { border-bottom: 1px solid #3e3e42; padding-bottom: 10px; margin-bottom: 10px; }
+    .detail-title { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #cccccc; }
+    .detail-time, .detail-duration { font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; color: #9d9d9d; }
+    .detail-meta { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: #9d9d9d; font-size: 12px; }
+
+    /* ---- event / problem rows ---- */
+    .row { padding: 5px 8px; border-radius: 4px; }
+    .row:nth-child(odd) { background: #232323; }
+    .row-head { display: flex; align-items: baseline; gap: 8px; }
+    .row-level {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+      width: 44px; flex: none; color: #9d9d9d;
+    }
+    .level-warn { color: #e2c08d; }
+    .level-error { color: #f48771; }
+    .row-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; color: #6e6e6e; flex: none; }
+    .row-name { color: #d4d4d4; overflow-wrap: anywhere; }
+    .row-detail {
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 11px;
+      color: #b5b5b5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      margin: 5px 0 3px 52px;
+      padding-left: 8px;
+      border-left: 2px solid #3e3e42;
+    }
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary::before { content: '\25B8'; color: #6e6e6e; margin-right: 2px; }
+    details[open] > summary::before { content: '\25BE'; }
+
+    .problem { display: flex; align-items: baseline; gap: 8px; }
+    .problem-kind {
+      font-size: 11px; flex: none; padding: 0 5px; border-radius: 8px;
+      background: #3e3e42; color: #cccccc;
+    }
+    .problem-error .problem-kind { background: #5a1d1d; color: #f48771; }
+    .problem-warn .problem-kind { background: #5a4a1d; color: #e2c08d; }
+    .problem-time { font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; color: #6e6e6e; flex: none; }
+    .problem-text { overflow-wrap: anywhere; }
+
+    /* ---- states (Task 4.5 replaces these with the first-class three-state UI) ---- */
+    .state {
+      padding: 10px;
+      color: #9d9d9d;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .state-incomplete, .state-truncated { color: #e2c08d; }
+    .state-unavailable, .state-error { color: #f48771; }
+    .retry {
+      display: block;
+      margin-top: 8px;
+      background: #0e639c;
+      border: none;
+      border-radius: 4px;
+      color: #ffffff;
+      font-size: 12px;
+      padding: 4px 12px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Activity</h1>
+    <!-- Task 4.5 hook: the Refresh / Export / Reveal controls mount here and call
+         activityApi.list / activityApi.export / activityApi.reveal. -->
+    <div id="toolbar" class="toolbar"></div>
+  </div>
+  <div class="panes">
+    <div id="list" class="pane pane-list"></div>
+    <div class="pane-detail">
+      <div class="tabs">
+        <button id="tab-events" class="tab" type="button">Events</button>
+        <button id="tab-problems" class="tab" type="button">Problems</button>
+        <div id="event-filters" class="filters">
+          <select id="event-level" class="control">
+            <option value="all">All levels</option>
+            <option value="info">Info</option>
+            <option value="warn">Warnings</option>
+            <option value="error">Errors</option>
+          </select>
+          <input id="event-search" class="control" type="search" placeholder="Search events" maxlength="256" />
+        </div>
+      </div>
+      <div id="detail" class="detail"></div>
+    </div>
+  </div>
+  <script src="activity.js"></script>
+</body>
+</html>
