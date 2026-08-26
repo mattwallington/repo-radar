@@ -763,12 +763,116 @@ function _collectItems(home, filter, redactor) {
 }
 
 // -------------------------------------------------------------------------------------------
+// Task 4.4 / Ruling P4-14: the SUMMARY-ONLY scan.
+//
+// `_buildItem` above is the expensive path: it renders every event and every problem row through
+// the Redactor, bounds each string, assembles a detail DTO and then measures it. `listActivities`
+// pays that for EVERY activity in the store before it sorts and slices -- `filter.limit` bounds
+// the page it returns, never the work it does -- which is fine for the window (someone asked to
+// look at history) and far too expensive for a tray menu.
+//
+// This derives the same three facts `viewErrorsTarget` needs -- ordering key, lifecycle outcome,
+// problem-bearing yes/no -- from the same inputs, and stops there. It still runs `reconcile`
+// FIRST (that is what derives `outcome`, and it is the read-triggered reconciliation the spec
+// requires) and still does the same fresh parse, but it renders NOTHING: no Redactor, no lens, no
+// DTO, no byte measurement. `isProblemBearing` only cares whether the findings/rejected lists are
+// non-EMPTY, so this counts them instead of building rows -- the predicate sees the same scan and
+// therefore returns the same answer as the item the window would show.
+//
+// Returns `null` for a live reserve-before-start directory (same rule, same place in the order as
+// `_buildItem`'s): a producer has been admitted but has not written `start` yet, so it is not
+// history and must not be offered as an incident.
+function _scanActivity(home, aid) {
+  const rec = reconcileMod.reconcile(home, aid);
+
+  let structuralCount = 0; // what `_buildItem` would have RENDERED into `structural`
+  let mtime = 0;
+  const perSegment = [];
+
+  const { segments, rejected } = paths.readOwnedSegmentsDetailed(paths.activityDir(home, aid));
+  structuralCount += rejected.length;
+
+  for (const seg of segments) {
+    const prov = _parseSegmentName(home, aid, seg.name);
+    if (prov === null) {
+      structuralCount += 1; // rendered as a `rejected-segment` row over there
+      continue; // never parsed: an unvalidated name is not a segment
+    }
+    if (seg.mtime > mtime) mtime = seg.mtime;
+    const { records: recs, integrity } = parseMod.parseSegment(seg.data, aid);
+    structuralCount += integrity.length;
+    // The provenance copy stays even though nothing here renders it: `mergeHeads` tie-breaks
+    // equal timestamps on `record.writerId`, so dropping it would give this scan a different
+    // interleave from `_buildItem`'s -- and parity with the item the window shows is the whole
+    // contract of this path.
+    perSegment.push(recs.map((r) => Object.assign({}, r, prov)));
+  }
+  const merged = mergeMod.mergeHeads(perSegment);
+
+  for (const p of rec.problems || []) {
+    if (_PARSE_INTEGRITY_KINDS.has(String((p && p.kind) || ''))) continue; // already counted above
+    structuralCount += 1;
+  }
+
+  const startRecord = merged.find((r) => r.type === 'start') || null;
+
+  // Reserve-before-start, checked at exactly the point `_buildItem` checks it (before the
+  // no-start finding below would inflate `structuralCount`).
+  if (segments.length === 0 && rejected.length === 0 && structuralCount === 0 && rec.outcome === null) {
+    return null;
+  }
+
+  let outcome;
+  if (!startRecord) {
+    outcome = 'unknown';
+    structuralCount += 1; // the `no-start` integrity finding
+  } else if (rec.outcome !== null && rec.outcome !== undefined) {
+    outcome = String(rec.outcome);
+  } else if ((rec.problems || []).some((p) => p && p.kind === 'reconcile-view-uncertain')) {
+    outcome = 'unknown';
+  } else {
+    outcome = 'running';
+  }
+
+  // Rules (d) findings and (e) rejected are "is the list non-empty", so `structuralCount` is the
+  // whole of what the predicate would have learned from the rendered rows -- every entry
+  // `_buildItem` pushes into `structural` has a counterpart increment above, and every rejected
+  // entry (including a bad segment name) is counted with it. Rules (a)/(b)/(c)/(f) are read off
+  // the merged records directly, by the same shared predicate.
+  const problemBearing = structuralCount > 0
+    || isProblemBearing({ records: merged, findings: [], rejected: [] });
+
+  // The same ordering key `_sortKey` gives `listActivities`, so "newest" means the same thing in
+  // both places: the start timestamp, falling back to segment mtime (seconds -> ms).
+  const started = startRecord && startRecord.ts ? Date.parse(startRecord.ts) : NaN;
+  const sortKey = Number.isFinite(started) ? started : (mtime || 0) * 1000;
+
+  return { id: aid, outcome, problemBearing, sortKey };
+}
+
+// Same containment posture as `_safeBuildItem`: an unexpected throw from reconcile, a segment
+// read or the parse becomes an `unknown`, PROBLEM-BEARING entry rather than escaping -- an
+// activity the reader cannot scan is exactly the kind of thing the user should be able to open.
+function _safeScanActivity(home, aid) {
+  try {
+    return _scanActivity(home, aid);
+  } catch (e) {
+    return { id: aid, outcome: 'unknown', problemBearing: true, sortKey: 0 };
+  }
+}
+
+// -------------------------------------------------------------------------------------------
 // Public API
 // -------------------------------------------------------------------------------------------
 
 // Summary DTOs only (no `events`/`problems`/`duplicateTerminals`), each <= SUMMARY_MAX_BYTES,
-// at most LIST_MAX per call. `filter.level`/`filter.search` are validated here but only affect
-// the Events lens (getActivity/buildExport); they never remove items from the list. The
+// at most LIST_MAX per call. NOTE (Ruling P4-14) that `offset`/`limit` page the RESULT, not the
+// work: `_collectItems` below assembles a full detail item for every activity in the store before
+// this slices, so the cost of any call here is the whole store. That is the right trade for the
+// window (someone asked to look at history) and the wrong one for a background poll --
+// `viewErrorsTarget` has its own summary-only path for that. `filter.level`/`filter.search` are
+// validated here but only affect the Events lens (getActivity/buildExport); they never remove
+// items from the list. The
 // response-level `problems` array (Ruling 39) holds root diagnostics that belong to no item --
 // `[]` when there are none.
 function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
@@ -1004,7 +1108,7 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
 }
 
 // -------------------------------------------------------------------------------------------
-// Task 4.4 / Ruling P4-12: the tray's "⚠️ View Errors" target.
+// Task 4.4 / Rulings P4-12, P4-14: the tray's "⚠️ View Errors" target.
 //
 // Answers the only question the tray menu is allowed to ask -- "is there anything worth showing,
 // and which activity is it?" -- as the id of the NEWEST item that carries Problems or a
@@ -1015,24 +1119,38 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
 // EVENTS at all, and is caught here by its outcome -- that is exactly the incident the old
 // `status.json`-only error window rendered as a blank page.
 //
-// NEVER THROWS. The tray menu is rebuilt on a 30s timer, on every tray click and at every sync
-// transition; a reader that could raise here would take the whole menu down. Every failure mode --
-// no store, an unreadable store, a malformed bound, an fs error mid-scan -- is `null`, which the
-// caller reads as "no affordance".
+// Ruling P4-14: this deliberately does NOT go through `listActivities`. That path assembles a full
+// detail item per activity (every event parsed, redacted, rendered and measured) before it sorts
+// and pages, so its cost is the whole store no matter what `filter.limit` says. This walks the
+// same activities through `_scanActivity` instead -- reconcile + parse, then the shared
+// `isProblemBearing` predicate and the terminal outcome -- and renders nothing at all.
 //
-// `hasProblems` is `isProblemBearing` over the whole scan (warn/error events, integrity records
-// and findings, rejected segments, duplicate terminals) and already subsumes PROBLEM_OUTCOMES for
-// a recorded terminal; the outcome check is kept alongside it so an item whose outcome is
-// failure-like can never be skipped, whatever future shape produces it.
-function viewErrorsTarget(home, { configuredSecrets = [] } = {}) {
+// NEVER THROWS. Every failure mode -- no store, an unreadable store, an fs error mid-scan -- is
+// `null`, which the caller reads as "no affordance".
+//
+// `configuredSecrets` is accepted for signature parity with the other reader entry points (and so
+// a caller cannot be wrong to pass it), but is unused BY CONSTRUCTION: the only value that leaves
+// this function is an activity id that `idsMod.validActivityId` has already accepted. No
+// producer-supplied text is read, returned or logged here, so there is nothing to redact. If that
+// ever stops being true, a Redactor must come back with it.
+function viewErrorsTarget(home, { configuredSecrets = [] } = {}) { // eslint-disable-line no-unused-vars
   try {
-    // The full page: `listActivities` already returns items newest-first, so the first match IS
-    // the newest problem-bearing one. Scanning past the newest item matters -- a clean run after a
-    // failure must not hide the failure.
-    const result = listActivities(home, { limit: limits.LIST_MAX }, { configuredSecrets });
-    if (!result || result.available === false) return null;
-    for (const item of result.items) {
-      if (item.hasProblems || PROBLEM_OUTCOMES.has(item.outcome)) return item.id;
+    const base = _activityRoot(home);
+    if (_probeRoot(base) !== 'ok') return null; // missing or unreadable: no affordance either way
+
+    const { subdirs } = paths.listOwnedSubdirsDetailed(base);
+    const scans = [];
+    for (const name of subdirs) {
+      if (name === 'quota' || !idsMod.validActivityId(name)) continue;
+      const scan = _safeScanActivity(home, name);
+      if (scan !== null) scans.push(scan); // null: reserve-before-start, not history yet
+    }
+
+    // Newest-first, same key and same direction as `_collectItems`, then take the first match --
+    // a clean run after a failure must not hide the failure.
+    scans.sort((a, b) => b.sortKey - a.sortKey);
+    for (const scan of scans) {
+      if (scan.problemBearing || PROBLEM_OUTCOMES.has(scan.outcome)) return scan.id;
     }
     return null;
   } catch (e) {

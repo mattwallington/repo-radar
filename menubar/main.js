@@ -492,43 +492,42 @@ Note: Read-only reference. Current working directory may differ.
   }
 }
 
-// Activity History (Task 4.4 / Rulings P4-6, P4-12): the tray's "⚠️ View Errors" target.
+// Activity History (Task 4.4 / Ruling P4-14): the tray's "⚠️ View Errors" target, as a CACHE.
 //
-// `updateTrayMenu()` is called from ~24 sites -- several per progress event while a sync is
-// running -- and the reader answer costs a scan of the activity store, so it is memoized behind a
-// short TTL and consulted ONLY from the idle branch of the menu build (a running sync shows
-// "View Progress" instead and never asks). The TTL is a ceiling on staleness, not the primary
-// freshness mechanism: the memo is dropped explicitly the moment a sync completes, which is when
-// the answer actually changes.
-const VIEW_ERRORS_TTL_MS = 5000;
-let viewErrorsMemo = { at: 0, id: null };
+// `updateTrayMenu()` is called from ~24 sites -- several per progress event during a sync, once
+// per tray click, once every 30s -- and it is also on the sync path itself (triggerSync rebuilds
+// the menu before the child is spawned). The reader answer costs a walk of the activity store, so
+// the menu build must never compute it: it reads this variable and nothing else.
+//
+// The cache is instead recomputed at the EVENTS that can change the answer, each of which already
+// rebuilds the menu right afterwards: startup, a sync child exiting, and each of the three
+// pre-attempt failures that write a `blocked`/`failed` terminal without ever spawning a child.
+// The 30s menu tick refreshes it too, so a change made by anything outside this process (a
+// scheduled run's activity, a manual `repo-radar` invocation) is picked up within one tick.
+//
+// `null` means "no affordance" and is the correct answer whenever the reader cannot say otherwise.
+let viewErrorsTargetId = null;
 
-function _invalidateViewErrorsTarget() {
-  viewErrorsMemo = { at: 0, id: null };
-}
-
-function _viewErrorsTarget() {
-  const now = Date.now();
-  // `age >= 0` matters on a laptop: a backwards wall-clock correction after a sleep/wake would
-  // otherwise make the cached answer look permanently fresh.
-  const age = now - viewErrorsMemo.at;
-  if (viewErrorsMemo.at !== 0 && age >= 0 && age < VIEW_ERRORS_TTL_MS) {
-    return viewErrorsMemo.id;
-  }
-  let id = null;
+// Recompute the cache. Never throws -- the callers are icon/menu paths and a sync's exit handler.
+// `viewErrorsTarget` is itself never-throws, so the catch is the second line of defence; it leaves
+// one bounded breadcrumb rather than failing silently, because a persistently unreadable store is
+// something a user reporting "the tray never offers View Errors" would need explained.
+function _refreshViewErrorsTarget() {
   try {
     // Same HOME the Activity IPC handlers are registered with, so the tray and the window it
-    // opens always read the same store. `configuredSecrets` is defense in depth: the reader
-    // redacts with exactly the list the writer masks (Ruling P4-3).
+    // opens always read the same store. `configuredSecrets` is passed for parity with every other
+    // reader call site (Ruling P4-3); this particular path returns only a validated id, so it has
+    // nothing to redact -- see read.js.
     const home = process.env.HOME;
-    id = activityRead.viewErrorsTarget(home, {
+    viewErrorsTargetId = activityRead.viewErrorsTarget(home, {
       configuredSecrets: activityGlue.loadConfiguredSecrets(home),
     });
   } catch (e) {
-    id = null; // the reader never throws, but the tray menu must not depend on that
+    viewErrorsTargetId = null;
+    console.warn('View Errors target refresh failed:',
+      String((e && e.message) || e).slice(0, 200));
   }
-  viewErrorsMemo = { at: now, id };
-  return id;
+  return viewErrorsTargetId;
 }
 
 // Update tray menu
@@ -609,12 +608,13 @@ function updateTrayMenu() {
       click: () => triggerSync()
     });
     
-    // Activity History (Task 4.4 / Ruling P4-6): the affordance exists only when the reader has
-    // an actual item to open, and it deep-links straight to that item. `status.hasErrors` no
-    // longer gates it -- that flag was set by pre-attempt failures which produce no `errorList`,
-    // so it could offer "View Errors" for a window that had nothing to render. It still drives
-    // the tray icon above, unchanged.
-    const viewErrorsId = _viewErrorsTarget();
+    // Activity History (Task 4.4 / Rulings P4-6, P4-14): the affordance exists only when the
+    // cache holds an actual item to open, and it deep-links straight to that item.
+    // `status.hasErrors` no longer gates it -- that flag was set by pre-attempt failures which
+    // produce no `errorList`, so it could offer "View Errors" for a window that had nothing to
+    // render. It still drives the tray icon above, unchanged. This is a plain READ: the reader is
+    // never called from a menu build (P4-14 (a)).
+    const viewErrorsId = viewErrorsTargetId;
     if (viewErrorsId) {
       menuItems.push({
         label: '⚠️  View Errors',
@@ -1172,11 +1172,16 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       blockedStatus.errorLog = (blockedStatus.errorLog || '') + `\n⚠️ ${reason}\n`;
       saveStatus(blockedStatus);
       showErrorIcon();
-      updateTrayMenu();
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('terminal-output', `\n⚠️ ${reason}\n`);
       }
+      // Activity History (Task 4.4 / Ruling P4-14): write the `blocked` terminal FIRST (onGuardBlock
+      // is synchronous), then refresh, then rebuild -- so the menu this produces already offers the
+      // incident. This is the exact failure the feature exists to surface; the old order rebuilt
+      // the menu before the terminal existed and left it missing until the next 30s tick.
       activityGlue.onGuardBlock(activity.writer, reason);
+      _refreshViewErrorsTarget();
+      updateTrayMenu();
       return;
     }
   }
@@ -1370,11 +1375,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     status.errorLog = (status.errorLog || '') + `\n⚠️ Sync unavailable: ${reason}\n`;
     saveStatus(status);
     showErrorIcon();
-    updateTrayMenu();
     if (logWindow && !logWindow.isDestroyed()) {
       logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
     }
+    // Activity History (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild.
     activityGlue.onGuardBlock(activity.writer, reason);
+    _refreshViewErrorsTarget();
+    updateTrayMenu();
     return;
   }
 
@@ -1451,10 +1458,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
-          // Activity History (Task 4.4): the child wrote its terminal record before exiting, so
-          // this attempt's outcome is durable NOW -- drop the memoized "View Errors" target so the
-          // menu rebuilds below (and again 500ms later, once status is finalized) read it fresh.
-          _invalidateViewErrorsTarget();
+          // Activity History (Task 4.4 / Ruling P4-14): the child wrote its terminal record before
+          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target before
+          // the rebuild below (and the one 500ms later, once status is finalized) reads it.
+          _refreshViewErrorsTarget();
           updateTrayMenu();
 
           // If user cancelled, stay on idle icon — don't show error
@@ -1605,9 +1612,12 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     saveStatus(status);
 
     showErrorIcon();
-    updateTrayMenu();
     // Activity History (Task 2.3): no child ever ran -- Electron finalizes this attempt itself.
+    // (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild -- same ordering as the
+    // two guard blocks above, for the same reason.
     activity.writer.terminal('failed');
+    _refreshViewErrorsTarget();
+    updateTrayMenu();
   });
 }
 
@@ -1783,7 +1793,7 @@ function showSettingsWindow() {
 // window's error-stat click, via `open-error-window` below). A null target simply opens the
 // Activity window unfocused -- the user still lands somewhere with content, never on a blank page.
 function showErrorWindow() {
-  return showActivityWindow(_viewErrorsTarget());
+  return showActivityWindow(viewErrorsTargetId);
 }
 
 // Activity History (Task 4.2). The ONE context-isolated content window in this app: its renderer
@@ -2596,11 +2606,19 @@ app.whenReady().then(async () => {
     return;
   }
 
-  // Update menu initially
+  // Update menu initially. Activity History (Task 4.4 / Ruling P4-14): seed the View Errors cache
+  // first, so a failure from a previous session (or from a scheduled run made while the app was
+  // closed) is offered on the very first menu rather than 30s later.
+  _refreshViewErrorsTarget();
   updateTrayMenu();
   
-  // Update menu every 30 seconds to keep "Last Sync" time accurate
+  // Update menu every 30 seconds to keep "Last Sync" time accurate. The View Errors cache is
+  // refreshed on the same tick -- it is the only thing that picks up an activity written by
+  // ANOTHER process (a scheduled run, a manual `repo-radar` invocation), since this process sees
+  // no event for those. Deliberately NOT done in the tray-click handler below: a click must not
+  // pay for a store walk.
   setInterval(() => {
+    _refreshViewErrorsTarget();
     updateTrayMenu();
   }, 30000);
   

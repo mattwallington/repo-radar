@@ -7,13 +7,19 @@
 // parses, and assert the wiring is actually present in the source. The BEHAVIOUR of the reader
 // half is proven by activity/__tests__/view-errors-target.test.js.
 //
-// What must hold (Rulings P4-6 / P4-12):
-//   * the menu item is gated on the MEMOIZED reader target, not on `status.hasErrors` -- an
+// What must hold (Rulings P4-6, P4-12, P4-14):
+//   * the menu item is gated on the CACHED target, not on `status.hasErrors` -- an
 //     empty-but-flagged status can no longer produce an affordance that opens nothing;
 //   * clicking it opens the ACTIVITY window focused on that id;
+//   * a menu build NEVER calls the reader (P4-14 (a)): `updateTrayMenu` runs on the sync path
+//     itself, on every tray click and several times per progress event, and the reader walks the
+//     whole activity store;
+//   * the cache is refreshed at the event points that can change it, and only there (P4-14 (b)):
+//     startup, the sync child's `close`, and each of the three pre-attempt failures -- in each of
+//     those three, AFTER the terminal is written and BEFORE the menu is rebuilt, which is the
+//     ordering bug this fix round exists to close -- plus the existing 30s tick;
 //   * the legacy `showErrorWindow` entry point routes to the Activity window too, so the log
-//     window's error-stat click (`open-error-window`) can never resurrect the old empty view;
-//   * the memo is invalidated when a sync completes, so the menu built at completion is fresh.
+//     window's error-stat click (`open-error-window`) can never resurrect the old empty view.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -50,28 +56,58 @@ function functionBody(name) {
   throw new Error(`unbalanced braces in ${name}`);
 }
 
+// The source between two anchors, both of which must be unique.
+function between(startAnchor, endAnchor) {
+  const a = src.indexOf(startAnchor);
+  assert.notStrictEqual(a, -1, `anchor not found: ${startAnchor}`);
+  assert.strictEqual(src.indexOf(startAnchor, a + 1), -1, `anchor is not unique: ${startAnchor}`);
+  const b = src.indexOf(endAnchor, a + startAnchor.length);
+  assert.notStrictEqual(b, -1, `end anchor not found after ${startAnchor}: ${endAnchor}`);
+  return src.slice(a, b);
+}
+
+// Asserts `markers` appear in the given order inside `slice`. `unique` (the default) also requires
+// each to appear exactly once -- true of the small guard-block slices, but not of the sync `close`
+// handler, which legitimately rebuilds the menu more than once.
+function inOrder(slice, markers, label, { unique = true } = {}) {
+  let last = -1;
+  markers.forEach((marker, i) => {
+    const at = slice.indexOf(marker);
+    assert.notStrictEqual(at, -1, `${label}: missing ${marker}`);
+    if (unique) {
+      assert.strictEqual(slice.indexOf(marker, at + 1), -1, `${label}: ${marker} appears more than once`);
+    }
+    assert.ok(at > last, `${label}: ${marker} must come after ${markers[i - 1]}`);
+    last = at;
+  });
+}
+
 test('main.js still parses', () => {
   execFileSync(process.execPath, ['--check', MAIN_JS], { stdio: 'pipe' });
 });
 
-test('the memo helper asks the reader, with configured secrets, and can never throw', () => {
+test('the refresh helper asks the reader, with configured secrets, and can never throw', () => {
   assert.ok(/require\(['"]\.\/activity\/read['"]\)/.test(src), "main.js must require('./activity/read')");
-  const body = functionBody('_viewErrorsTarget');
+  const body = functionBody('_refreshViewErrorsTarget');
   assert.ok(/activityRead\.viewErrorsTarget\(/.test(body), 'the helper delegates to the reader');
   assert.ok(/configuredSecrets/.test(body) && /loadConfiguredSecrets\(/.test(body),
-    'redaction is defense-in-depth: the reader call is given the configured secrets');
-  assert.ok(/Date\.now\(\)/.test(body), 'the memo is TTL-based');
-  assert.ok(/try\s*\{/.test(body) && /catch/.test(body), 'a reader failure must degrade to null, never throw into the tray');
-  assert.ok(/function _invalidateViewErrorsTarget\(/.test(src), 'there is an explicit invalidation seam');
+    'the reader call is given the configured secrets, like every other reader call site');
+  assert.ok(/try\s*\{/.test(body) && /catch/.test(body),
+    'a reader failure must degrade to null, never throw into a tray/icon path');
+  assert.ok(/console\.warn\(/.test(body) && /slice\(0,\s*\d+\)/.test(body),
+    'one BOUNDED breadcrumb on failure, rather than failing silently');
+  assert.ok(/let viewErrorsTargetId = null;/.test(src), 'the target is cached in a module variable');
+  // Ruling P4-14 replaced the TTL memo outright -- no time-based staleness anywhere.
+  assert.strictEqual(/VIEW_ERRORS_TTL|viewErrorsMemo|_invalidateViewErrorsTarget/.test(src), false,
+    'the 5s TTL memo is gone, cache + event-point refresh replaced it');
 });
 
-test('the tray "View Errors" item is gated on the memoized target, not on status.hasErrors', () => {
+test('the tray "View Errors" item is gated on the cached target, not on status.hasErrors', () => {
   const body = functionBody('updateTrayMenu');
-  const label = body.indexOf('View Errors');
-  assert.notStrictEqual(label, -1, 'the tray still offers View Errors');
+  assert.notStrictEqual(body.indexOf('View Errors'), -1, 'the tray still offers View Errors');
 
-  assert.ok(/const viewErrorsId = _viewErrorsTarget\(\);/.test(body),
-    'the item is built from the memoized reader target');
+  assert.ok(/const viewErrorsId = viewErrorsTargetId;/.test(body),
+    'the item is built from the cached target');
   assert.ok(/if \(viewErrorsId\) \{/.test(body), 'the item exists only when there is something to show');
   assert.ok(/click: \(\) => showActivityWindow\(viewErrorsId\)/.test(body),
     'the click deep-links the Activity window at that id');
@@ -79,23 +115,68 @@ test('the tray "View Errors" item is gated on the memoized target, not on status
     'the tray no longer routes through the legacy error window');
 
   // `status.hasErrors` keeps driving the tray ICON and nothing else in this function.
-  const hits = body.match(/status\.hasErrors/g) || [];
-  assert.strictEqual(hits.length, 1, 'status.hasErrors survives only as the icon gate');
+  assert.strictEqual((body.match(/status\.hasErrors/g) || []).length, 1,
+    'status.hasErrors survives only as the icon gate');
   assert.ok(body.indexOf('status.hasErrors') < body.indexOf('showErrorIcon()'),
     'the one surviving hasErrors read is the icon branch');
+});
 
-  // Evaluated only in the idle branch: the memo call comes after the `isSyncing()` split, on the
-  // same side as "Sync Now". updateTrayMenu runs several times per progress event during a sync.
-  assert.ok(body.indexOf('_viewErrorsTarget()') > body.indexOf("'▶ Sync Now'"),
-    'the reader is never consulted while a sync is running');
-  assert.strictEqual((body.match(/_viewErrorsTarget\(\)/g) || []).length, 1,
-    'exactly one reader consultation per menu build');
+test('P4-14 (a): a menu build never calls the reader', () => {
+  const body = functionBody('updateTrayMenu');
+  assert.strictEqual(/_refreshViewErrorsTarget/.test(body), false,
+    'updateTrayMenu must not refresh -- it is on the sync path and runs per progress event');
+  assert.strictEqual(/activityRead\./.test(body), false, 'updateTrayMenu must not reach the reader at all');
+
+  // The tray-click handler rebuilds the menu; it must not pay for a store walk either.
+  const click = between("tray.on('click'", '});');
+  assert.ok(/updateTrayMenu\(\)/.test(click), 'guard: the click handler still rebuilds the menu');
+  assert.strictEqual(/_refreshViewErrorsTarget/.test(click), false, 'a tray click must not walk the store');
+
+  // triggerSync rebuilds the menu BEFORE the child is spawned (currentSyncProcess is still null,
+  // so the idle branch runs). Its four refreshes are the two guard blocks, the child's `close`
+  // and the runSync rejection -- the pre-spawn rebuild is not one of them.
+  const trigger = between('function triggerSync(', 'function showLogWindow(');
+  assert.strictEqual((trigger.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 4,
+    'exactly the four failure/completion refreshes inside triggerSync, none on the pre-spawn path');
+});
+
+test('P4-14 (b): the cache is refreshed at startup and on the 30s tick, in that order', () => {
+  const startup = between("'Tray creation failed silently, quitting to avoid invisible process'", "tray.on('click'");
+  assert.strictEqual((startup.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 2,
+    'once to seed the first menu, once per 30s tick');
+  assert.strictEqual((startup.match(/_refreshViewErrorsTarget\(\);\s*updateTrayMenu\(\);/g) || []).length, 2,
+    'each refresh immediately precedes the rebuild that reads it');
+  assert.ok(/\}, 30000\);/.test(startup), 'the second one is the 30s tick');
+});
+
+test('P4-14 (b): the sync completion path refreshes before it rebuilds', () => {
+  const close = between("currentSyncProcess.on('close'", "currentSyncProcess.on('error'");
+  inOrder(close, ['_refreshViewErrorsTarget()', 'updateTrayMenu()'], 'sync close', { unique: false });
+  assert.strictEqual((close.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 1,
+    'one refresh at completion -- the later rebuilds in this handler read what it cached');
+});
+
+test('P4-14 (b): each pre-attempt failure writes its terminal, THEN refreshes, THEN rebuilds', () => {
+  // The ordering bug this fix round closes: these three rebuilt the tray before the
+  // `blocked`/`failed` terminal existed, so the affordance was missing until the next 30s tick --
+  // after exactly the incident the feature exists to surface.
+  inOrder(between('const blockedStatus = loadStatus();', 'return;'),
+    ['activityGlue.onGuardBlock(', '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'dev-ownership guard block');
+
+  inOrder(between("console.error('Sync disabled:', reason);", 'return;'),
+    ['activityGlue.onGuardBlock(', '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'runtime-disabled guard block');
+
+  inOrder(between("console.error('runSync failed to start sync:', e);", '});'),
+    ["activity.writer.terminal('failed')", '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'runSync rejection');
 });
 
 test('showErrorWindow routes to the Activity window and creates no window of its own', () => {
   const body = functionBody('showErrorWindow');
-  assert.ok(/showActivityWindow\(_viewErrorsTarget\(\)\)/.test(body),
-    'the legacy entry point opens the Activity window at the memoized target');
+  assert.ok(/showActivityWindow\(viewErrorsTargetId\)/.test(body),
+    'the legacy entry point opens the Activity window at the cached target');
   assert.strictEqual(/new BrowserWindow\(/.test(body), false, 'no second error window is ever created');
   assert.strictEqual(/error\.html/.test(body), false, 'the legacy error page is never loaded');
 });
@@ -115,14 +196,4 @@ test('the legacy Sync Errors window is gone -- page, data pump and its two chann
     'error-log-loaded', 'clear-errors']) {
     assert.strictEqual(src.includes(gone), false, `main.js must no longer mention ${gone}`);
   }
-});
-
-test('the memo is invalidated when a sync completes', () => {
-  const close = src.indexOf("currentSyncProcess.on('close'");
-  assert.notStrictEqual(close, -1, 'the sync-completion path must still exist');
-  const end = src.indexOf("currentSyncProcess.on('error'", close);
-  assert.notStrictEqual(end, -1, 'the error handler follows the close handler');
-  const body = src.slice(close, end);
-  assert.ok(/_invalidateViewErrorsTarget\(\)/.test(body),
-    'the completion path drops the memo so the menu it rebuilds is read fresh');
 });

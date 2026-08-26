@@ -21,7 +21,9 @@ const os = require('node:os');
 const path = require('node:path');
 const A = require('../index');
 const read = require('../read');
-const limits = require('../limits');
+const paths = require('../paths');
+const reconcileMod = require('../reconcile');
+const redactMod = require('../redact');
 
 // The same shape activity/ids.js validates and renderer/activity.js re-checks before it will
 // select anything. Asserted on the returned id because that id is handed to `showActivityWindow`,
@@ -206,25 +208,201 @@ test('viewErrorsTarget: an unreadable store (available:false) yields null', (t) 
 });
 
 // -----------------------------------------------------------------------------------------------
-// 8. Never throws. `limits.LIST_MAX` is the documented monkeypatch seam (limits.js's own header):
-//    read.js reads it through the shared module object at call time, so a bad bound makes the very
-//    `listActivities` call inside `viewErrorsTarget` raise `InvalidFilter`. The tray must see
-//    `null`, not an exception.
+// 8/9. Never throws, at either level.
+//
+// `_safeScanActivity` contains a per-activity failure (the documented `reconcileMod.reconcile`
+// injection seam) and surfaces it AS an incident -- an activity the reader cannot scan is exactly
+// the kind of thing the user should be able to open. A failure OUTSIDE that containment (root
+// enumeration) has no item to attach to and must degrade to "no affordance".
 // -----------------------------------------------------------------------------------------------
-test('viewErrorsTarget: a reader throw yields null rather than propagating', () => {
+test('viewErrorsTarget: an activity that cannot be scanned is surfaced, not silently skipped', () => {
   const home = tmpHome();
-  const realMax = limits.LIST_MAX;
+  const realReconcile = reconcileMod.reconcile;
+  try {
+    seedClean(home, AID.a, '12'); // otherwise a clean store -> null
+    reconcileMod.reconcile = () => { throw new Error('injected reconcile failure'); };
+    assert.strictEqual(read.viewErrorsTarget(home), AID.a);
+  } finally {
+    reconcileMod.reconcile = realReconcile;
+    cleanup(home);
+  }
+});
+
+test('viewErrorsTarget: a throw outside per-activity containment yields null rather than propagating', () => {
+  const home = tmpHome();
+  const realList = paths.listOwnedSubdirsDetailed;
   try {
     seedSegment(home, AID.a, [
       startRec(AID.a, 0, '2026-08-14T09:00:00-07:00'),
       terminalRec(AID.a, 1, '2026-08-14T09:01:00-07:00', 'failed'),
     ]);
-    limits.LIST_MAX = -1; // `{ limit: -1 }` -> InvalidFilter from validateFilter
-    assert.throws(() => read.listActivities(home, { limit: limits.LIST_MAX }), read.InvalidFilter,
-      'guard: the seam must really make listActivities throw, or this test proves nothing');
+    assert.strictEqual(read.viewErrorsTarget(home), AID.a, 'guard: the store really has a target');
+
+    paths.listOwnedSubdirsDetailed = () => { throw new Error('injected enumeration failure'); };
     assert.strictEqual(read.viewErrorsTarget(home), null);
   } finally {
-    limits.LIST_MAX = realMax;
+    paths.listOwnedSubdirsDetailed = realList;
+    cleanup(home);
+  }
+});
+
+// -----------------------------------------------------------------------------------------------
+// 10. Ruling P4-14, the cost shape. The tray must not pay for rendering it never displays: this
+//     path returns an id and nothing else, so no Redactor may be constructed and no string may be
+//     scrubbed or bounded. `read.js` builds its Redactor as `new redactMod.Redactor(...)` through
+//     the shared module object, so replacing the class here observes every construction.
+//
+//     The `listActivities` half is not decoration -- it proves the spy is actually wired to the
+//     seam, so the assertion above cannot pass because the probe was broken.
+// -----------------------------------------------------------------------------------------------
+test('viewErrorsTarget: renders nothing -- no Redactor is ever constructed (P4-14)', () => {
+  const home = tmpHome();
+  const RealRedactor = redactMod.Redactor;
+  let constructed = 0;
+  try {
+    for (const [aid, day] of [[AID.a, '10'], [AID.b, '11'], [AID.c, '12']]) {
+      seedSegment(home, aid, [
+        startRec(aid, 0, `2026-08-${day}T00:00:00-07:00`),
+        eventRec(aid, 1, `2026-08-${day}T00:00:01-07:00`, 'info', 'repo.synced'),
+        eventRec(aid, 2, `2026-08-${day}T00:00:02-07:00`, 'error', 'repo.failed'),
+        terminalRec(aid, 3, `2026-08-${day}T00:01:00-07:00`, 'failed'),
+      ]);
+    }
+    redactMod.Redactor = class extends RealRedactor {
+      constructor(...args) { super(...args); constructed += 1; }
+    };
+
+    assert.strictEqual(read.viewErrorsTarget(home, { configuredSecrets: ['ghp_deadbeefdeadbeef'] }), AID.c);
+    assert.strictEqual(constructed, 0,
+      'viewErrorsTarget must not build a Redactor -- it renders no producer-supplied text at all');
+
+    read.listActivities(home, {}, { configuredSecrets: ['ghp_deadbeefdeadbeef'] });
+    assert.ok(constructed > 0, 'guard: the spy is wired to the real seam, so the assertion above means something');
+  } finally {
+    redactMod.Redactor = RealRedactor;
+    cleanup(home);
+  }
+});
+
+// -----------------------------------------------------------------------------------------------
+// 11. PARITY, the property that makes Ruling P4-14's fast path safe. `viewErrorsTarget` now derives
+//     ordering, outcome and problem-bearing WITHOUT building the DTOs, so the one thing that can
+//     silently go wrong is disagreeing with the item the window would actually show. This computes
+//     the answer the old implementation computed -- `listActivities` newest-first, first summary
+//     with `hasProblems || PROBLEM_OUTCOMES.has(outcome)` -- over a store deliberately stocked with
+//     every shape the predicate's six rules react to, and requires the two to match exactly.
+// -----------------------------------------------------------------------------------------------
+function viaListActivities(home) {
+  const result = read.listActivities(home, {});
+  if (!result.available) return null;
+  for (const item of result.items) {
+    if (item.hasProblems || read.PROBLEM_OUTCOMES.has(item.outcome)) return item.id;
+  }
+  return null;
+}
+
+const SHAPES = {
+  clean: '00000000-0000-4000-8000-0000000000c1',
+  warned: '00000000-0000-4000-8000-0000000000c2',
+  failed: '00000000-0000-4000-8000-0000000000c3',
+  blocked: '00000000-0000-4000-8000-0000000000c4',
+  duplicateTerminal: '00000000-0000-4000-8000-0000000000c5',
+  noStart: '00000000-0000-4000-8000-0000000000c6',
+  badSegmentName: '00000000-0000-4000-8000-0000000000c7',
+  corruptLine: '00000000-0000-4000-8000-0000000000c8',
+  multiWriter: '00000000-0000-4000-8000-0000000000c9',
+};
+// Oldest first, so seeding in this order also makes each successive shape the newest.
+const SHAPE_ORDER = ['clean', 'warned', 'failed', 'blocked', 'duplicateTerminal', 'noStart',
+  'badSegmentName', 'corruptLine', 'multiWriter'];
+
+// One activity per shape, each on its own day. The shapes are chosen to hit all six rules of the
+// shared problem-bearing predicate plus the routine cases that must NOT trigger it.
+function seedShape(home, shape, day) {
+  const aid = SHAPES[shape];
+  const d = String(day);
+  const ts = (n) => `2026-08-${d}T00:0${n}:00-07:00`;
+  const dir = () => A.activityDir(home, aid);
+  switch (shape) {
+    case 'clean': // routine: succeeded, info only
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), eventRec(aid, 1, ts(1), 'info', 'repo.synced'),
+        terminalRec(aid, 2, ts(2), 'succeeded')]);
+    case 'warned': // rule (a) via warn, with a routine outcome
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), eventRec(aid, 1, ts(1), 'warn', 'repo.degraded'),
+        terminalRec(aid, 2, ts(2), 'succeeded')]);
+    case 'failed': // rules (a) + (b)
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), eventRec(aid, 1, ts(1), 'error', 'repo.failed'),
+        terminalRec(aid, 2, ts(2), 'failed')]);
+    case 'blocked': // rule (b) alone -- the motivating incident, no events at all
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), terminalRec(aid, 1, ts(1), 'blocked', { summary: { reason: 'guard' } })]);
+    case 'duplicateTerminal': // rule (f): two identical ROUTINE terminals is still a writer anomaly
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), terminalRec(aid, 1, ts(1), 'succeeded'),
+        terminalRec(aid, 2, ts(1), 'succeeded')]);
+    case 'noStart': // no valid start -> 'unknown' + a no-start integrity finding
+      return seedSegment(home, aid, [eventRec(aid, 0, ts(0), 'info', 'repo.synced')]);
+    case 'badSegmentName': { // rule (e): an entry the reader refused outright
+      A.secureMkdir(dir());
+      fs.writeFileSync(path.join(dir(), 'not-a-segment.jsonl'), '{}\n');
+      return seedSegment(home, aid, [
+        startRec(aid, 0, ts(0)), terminalRec(aid, 1, ts(1), 'succeeded')]);
+    }
+    case 'corruptLine': { // rule (d): a parse-level integrity finding on an otherwise clean run
+      A.secureMkdir(dir());
+      const text = [JSON.stringify(startRec(aid, 0, ts(0))), '{ not json',
+        JSON.stringify(terminalRec(aid, 1, ts(1), 'succeeded'))].join('\n') + '\n';
+      return fs.writeFileSync(A.segmentPath(home, aid, 'electron', 'deadbeef'), text);
+    }
+    case 'multiWriter': // routine, but two segments -> exercises mergeHeads and its writerId tie-break
+      seedSegment(home, aid, [startRec(aid, 0, ts(0)),
+        eventRec(aid, 1, ts(1), 'info', 'a')], 'electron', 'deadbeef');
+      return seedSegment(home, aid, [eventRec(aid, 2, ts(1), 'info', 'b'),
+        terminalRec(aid, 3, ts(2), 'succeeded')], 'python', 'cafebabe');
+    default:
+      throw new Error(`unseeded shape ${shape}`);
+  }
+}
+
+test('viewErrorsTarget: per shape, agrees with the listActivities-derived answer', () => {
+  // A store of ONE activity per case, so every shape's problem-bearing verdict is pinned on its
+  // own -- in a mixed store the newest match masks the rest, and rules (d)/(e) would never be the
+  // selected answer.
+  for (const shape of SHAPE_ORDER) {
+    const home = tmpHome();
+    try {
+      seedShape(home, shape, 12);
+      const expected = viaListActivities(home); // the pre-P4-14 implementation, verbatim
+      assert.strictEqual(read.viewErrorsTarget(home), expected, `shape ${shape} disagreed`);
+      // Guard: the routine shapes must really be null and the rest really an id, or "agreement"
+      // would be satisfied by both sides being uniformly blind.
+      const routine = ['clean', 'multiWriter'].includes(shape);
+      assert.strictEqual(expected, routine ? null : SHAPES[shape],
+        `shape ${shape} is miscategorised by the reference implementation itself`);
+    } finally {
+      cleanup(home);
+    }
+  }
+});
+
+test('viewErrorsTarget: agrees with the listActivities-derived answer as a mixed store narrows', () => {
+  // The same shapes together, then narrowed one activity at a time (newest dropped each round):
+  // nine different stores, so ORDERING -- not just per-item classification -- is compared too.
+  const home = tmpHome();
+  try {
+    SHAPE_ORDER.forEach((shape, i) => seedShape(home, shape, 10 + i));
+
+    for (let i = SHAPE_ORDER.length; i > 0; i--) {
+      const expected = viaListActivities(home);
+      assert.strictEqual(read.viewErrorsTarget(home), expected,
+        `disagreed with listActivities over a store of ${i} activities`);
+      fs.rmSync(A.activityDir(home, SHAPES[SHAPE_ORDER[i - 1]]), { recursive: true, force: true });
+    }
+    assert.strictEqual(read.viewErrorsTarget(home), null, 'the emptied store offers nothing');
+  } finally {
     cleanup(home);
   }
 });
