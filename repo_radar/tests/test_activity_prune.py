@@ -127,6 +127,12 @@ def test_prune_to_ceiling_deletes_nothing_when_ledger_listing_is_uncertain(tmp_p
     # Codex's exact repro shape: three settled, routine (prunable-looking) activities, plus a
     # forced ledger-listing failure. Pre-fix this deleted all three (charge pinned at the
     # ceiling sentinel kept the loop going); fixed, prune_to_ceiling must refuse outright.
+    #
+    # Ruling 64 (Codex R8-1, BLOCKER): `prune_to_ceiling` now threads the SAME `LockCtx` through
+    # `_reconcile_all_locked`/`_accounting_snapshot`/`_prune_locked`, all reading the ledger via
+    # the fd-bound `_ledger_entries_detailed_fd(ctx)` -- so the hook target moved from the
+    # path-based `paths.list_owned_entries_detailed` to the fd-bound `paths.list_owned_dir_fd_
+    # detailed` (this test's assumption legitimately changed with the fix).
     aids = []
     for _ in range(3):
         aid, l = _new_activity(tmp_path)
@@ -137,12 +143,7 @@ def test_prune_to_ceiling_deletes_nothing_when_ledger_listing_is_uncertain(tmp_p
 
     monkeypatch.setattr(quota, "CEILING", 1)   # any nonzero charge would look "over ceiling"
 
-    real = paths.list_owned_entries_detailed
-    def hooked(directory, suffix=None):
-        if str(directory) == str(paths.quota_dir(tmp_path)):
-            return [], True                     # simulated unlistable ledger dir
-        return real(directory, suffix)
-    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", lambda dfd, suffix=None: ([], True))
 
     freed = prune.prune_to_ceiling(tmp_path, requested=quota.RESERVE)
 

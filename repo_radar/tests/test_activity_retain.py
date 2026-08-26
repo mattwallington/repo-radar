@@ -130,7 +130,12 @@ def test_ceiling_override_keeps_newest_problem(tmp_path, monkeypatch):
 def test_prune_skips_items_in_the_live_ledger(tmp_path):
     aid = ids.mint_activity_id(); paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
     l = lease.acquire(paths.owner_lock_path(tmp_path, aid)); quota.admit(tmp_path, aid, l)
-    quota._prune_locked(tmp_path, need_bytes=10**9)          # a live-ledger item is never a candidate
+    # Ruling 64 (Codex R8-1, BLOCKER): `_prune_locked` now requires the active `LockCtx`.
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        quota._prune_locked(tmp_path, 10**9, ctx)             # a live-ledger item is never a candidate
+    finally:
+        quota._unlock(ctx)
     assert paths.activity_dir(tmp_path, aid).exists(); l.release()
 
 def test_error_event_makes_succeeded_activity_problem_bearing_and_governs_90d_not_14d(tmp_path, monkeypatch):

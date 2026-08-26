@@ -1,6 +1,6 @@
 import base64, errno, json, os, pathlib, time
 import pytest
-from repo_radar.activity import quota, paths, lease, ids, writer
+from repo_radar.activity import quota, paths, lease, ids, writer, prune
 from repo_radar.activity import reconcile as reconcile_mod
 
 LEDGER_VECTORS = json.loads(
@@ -722,18 +722,13 @@ def test_ledger_dir_listing_failure_refuses_admit_and_grant(tmp_path, monkeypatc
     live, ll = _new_activity(tmp_path)
     assert quota.admit(tmp_path, live, ll) is True
 
-    real = paths.list_owned_entries_detailed
-    def hooked(directory, suffix=None):
-        if str(directory) == str(paths.quota_dir(tmp_path)):
-            return [], True
-        return real(directory, suffix)
-    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
-
-    # Ruling 60 (Codex R7-1, BLOCKER): admit()/grant()'s own DECISION snapshot now reads the
-    # ledger descriptor-relative to `ctx.qfd` (`_ledger_entries_detailed_fd` ->
-    # `paths.list_owned_dir_fd_detailed`), never the path-based function hooked above -- so the
-    # fd-bound listing must ALSO be forced uncertain here for the decision itself to see it (the
-    # path-based hook above still covers `_reconcile_all_locked`'s own, separate, path-based pass).
+    # Ruling 60 (Codex R7-1, BLOCKER): admit()/grant()'s own DECISION snapshot reads the ledger
+    # descriptor-relative to `ctx.qfd` (`_ledger_entries_detailed_fd` -> `paths.list_owned_dir_
+    # fd_detailed`), never the path-based `list_owned_entries_detailed`. Ruling 64 (Codex R8-1,
+    # BLOCKER) then moved `_reconcile_all_locked`'s own pass onto that SAME fd-bound seam too, so
+    # there is no longer any path-based ledger listing anywhere in this locked flow -- a single
+    # unconditional hook on the fd-bound primitive covers both `_reconcile_all_locked`'s pass and
+    # the decision snapshot's own pass.
     monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", lambda dfd, suffix=None: ([], True))
 
     fresh, fl = _new_activity(tmp_path)
@@ -767,12 +762,13 @@ def test_admit_uses_one_ledger_entries_pass_per_decision_snapshot(tmp_path, monk
     tries to acquire the lock, finds it busy, and leaves the entry in place.
 
     Ruling 60 (Codex R7-1, BLOCKER) split what used to be ONE shared function into two
-    structurally distinct ones: `_reconcile_all_locked` still reads the ledger path-based
-    (`_ledger_entries` -> `_ledger_entries_detailed`), while the DECISION snapshot now reads it
-    fd-bound (`_ledger_entries_detailed_fd(ctx.qfd)`), bypassing the path entirely. Hooking each
-    separately and asserting each is called exactly once proves the same property the original
-    `calls["n"] == 2` assertion did (no separate, extra corrupt-only check anywhere) under the new
-    structure -- and additionally proves the decision truly went through the fd-bound path."""
+    structurally distinct ones, and Ruling 64 (Codex R8-1, BLOCKER) then moved `_reconcile_all_
+    locked` onto the SAME fd-bound seam as the decision snapshot (closing exactly the residual
+    Codex R8 flagged: a path-based reconcile pass could re-resolve a swapped `quota/` as "certain
+    empty"). So this test's assumption CHANGED: there is no longer a separate path-based ledger
+    pass in this flow at all -- `_reconcile_all_locked`'s own pass AND `admit`'s own decision
+    snapshot both go through `_ledger_entries_detailed_fd`, proving TWO fd-bound passes (not one
+    path-based + one fd-bound) and ZERO path-based passes."""
     held, hl = _new_activity(tmp_path)                      # owner.lock HELD (never released below)
     paths.ledger_entry_path(tmp_path, held).write_text(
         json.dumps({"reserved": quota.RESERVE, "granted": 0}))   # a real, CLEAN ledger entry
@@ -786,22 +782,22 @@ def test_admit_uses_one_ledger_entries_pass_per_decision_snapshot(tmp_path, monk
 
     real_fd = quota._ledger_entries_detailed_fd
     fd_calls = {"n": 0}
-    def staged_fd(qfd):
+    def staged_fd(ctx):
         fd_calls["n"] += 1
-        entries, uncertain = real_fd(qfd)
+        entries, uncertain = real_fd(ctx)
         return [(a, "CORRUPT" if a == held else e) for a, e in entries], uncertain   # force CORRUPT
     monkeypatch.setattr(quota, "_ledger_entries_detailed_fd", staged_fd)
 
     try:
         fresh, fl = _new_activity(tmp_path)
         assert quota.admit(tmp_path, fresh, fl) is False    # refused: the decision snapshot saw corrupt
-        assert path_calls["n"] == 1, (
-            f"expected exactly 1 path-based ledger pass (reconcile's own iteration), saw "
-            f"{path_calls['n']}"
+        assert path_calls["n"] == 0, (
+            f"expected NO path-based ledger pass at all any more (Ruling 64 moved reconcile's own "
+            f"pass onto the fd-bound seam too), saw {path_calls['n']}"
         )
-        assert fd_calls["n"] == 1, (
-            f"expected exactly 1 fd-bound ledger pass (the decision snapshot itself), saw "
-            f"{fd_calls['n']} -- an extra pass means a separate corrupt-only check still exists"
+        assert fd_calls["n"] == 2, (
+            f"expected exactly 2 fd-bound ledger passes -- _reconcile_all_locked's own pass, and "
+            f"the decision snapshot itself -- saw {fd_calls['n']}"
         )
     finally:
         hl.release()
@@ -841,7 +837,7 @@ def test_admit_decision_refuses_and_writes_nothing_when_quota_dir_fd_listing_fai
     unable to enumerate, simulating the swap. admit must refuse, write NO reservation anywhere
     (neither the fresh activity's own entry nor any of the 16 pre-existing ones), and a snapshot
     taken through that SAME fd while the failure stands must be uncertain."""
-    monkeypatch.setattr(quota, "_reconcile_all_locked", lambda home: None)
+    monkeypatch.setattr(quota, "_reconcile_all_locked", lambda home, ctx: None)
 
     aids = []
     for _ in range(16):
@@ -861,7 +857,7 @@ def test_admit_decision_refuses_and_writes_nothing_when_quota_dir_fd_listing_fai
     # the SAME validated `quota/` fd must be uncertain, never quietly "empty"
     ctx = quota._quota_lock(tmp_path)
     try:
-        snap = quota._accounting_snapshot(tmp_path, qfd=ctx.qfd)
+        snap = quota._accounting_snapshot(tmp_path, ctx=ctx)
     finally:
         quota._unlock(ctx)
     assert snap.uncertain is True
@@ -898,20 +894,24 @@ def test_prune_locked_refuses_and_deletes_nothing_when_ledger_listing_is_uncerta
     """Pre-fix, `_prune_locked`'s live set came from the lossy `_ledger_entries`, which collapses
     an unlistable ledger dir to `[]` -- so every settled activity looked prunable even though the
     true live set (whether anything is actually still reserved) was entirely unproven. A settled,
-    routine (prunable-looking) activity must survive when the ledger dir can't be listed."""
+    routine (prunable-looking) activity must survive when the ledger dir can't be listed.
+
+    Ruling 64 (Codex R8-1, BLOCKER): `_prune_locked` now requires the active `LockCtx` and reads
+    its live set through the fd-bound `_ledger_entries_detailed_fd(ctx)` -- so the hook target
+    moved from the path-based `paths.list_owned_entries_detailed` to the fd-bound `paths.
+    list_owned_dir_fd_detailed` (this test's assumption legitimately changed with the fix)."""
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
     quota.settle(tmp_path, aid)          # settled, routine -> would normally be prunable
 
-    real = paths.list_owned_entries_detailed
-    def hooked(directory, suffix=None):
-        if str(directory) == str(paths.quota_dir(tmp_path)):
-            return [], True
-        return real(directory, suffix)
-    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", lambda dfd, suffix=None: ([], True))
 
-    freed = quota._prune_locked(tmp_path, need_bytes=10**9)
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        freed = quota._prune_locked(tmp_path, 10**9, ctx)
+    finally:
+        quota._unlock(ctx)
     assert freed == 0
     assert paths.activity_dir(tmp_path, aid).exists()   # nothing deleted under uncertainty
 
@@ -919,6 +919,12 @@ def test_retain_locked_refuses_and_deletes_nothing_when_ledger_listing_is_uncert
     # Same guard, via `retain()`'s own live-set read: a routine item that's normally well outside
     # the newest-50/age protections (and so would be pruned) must survive when the ledger listing
     # itself is uncertain.
+    #
+    # Ruling 64 (Codex R8-1, BLOCKER): `_retain_locked` (and `_reconcile_all_locked`, which
+    # `retain()` calls first) now read the ledger through the fd-bound `_ledger_entries_detailed_
+    # fd(ctx)` -- so the hook target moved from the path-based `paths.list_owned_entries_detailed`
+    # to the fd-bound `paths.list_owned_dir_fd_detailed` (this test's assumption legitimately
+    # changed with the fix).
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
     _write_start(tmp_path, aid)
@@ -929,13 +935,226 @@ def test_retain_locked_refuses_and_deletes_nothing_when_ledger_listing_is_uncert
     os.utime(seg, (old, old))                      # backdate well past the 14d routine threshold
     monkeypatch.setattr(quota, "NEWEST_KEEP", 0)   # outside the protected window; would normally prune
 
-    real = paths.list_owned_entries_detailed
-    def hooked(directory, suffix=None):
-        if str(directory) == str(paths.quota_dir(tmp_path)):
-            return [], True
-        return real(directory, suffix)
-    monkeypatch.setattr(paths, "list_owned_entries_detailed", hooked)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", lambda dfd, suffix=None: ([], True))
 
     pruned = quota.retain(tmp_path)
     assert pruned == []
     assert paths.activity_dir(tmp_path, aid).exists()   # nothing deleted under uncertainty
+
+# --- Codex R8-1 (BLOCKER) / Ruling 64: `qfd` alone survives a rename -- canonical identity must
+# be re-verified across the ENTIRE lock lifetime, not just validated once before `flock`. Every
+# test below exercises a REAL rename/swap window (never a stubbed "return uncertain") so the
+# actual `_verify_canonical` comparison logic is what catches each case, exactly as instructed.
+
+def test_quota_lock_raises_when_quota_dir_renamed_during_flock_wait(tmp_path, monkeypatch):
+    """(i): a REAL rename of `quota/` landing during the `flock` WAIT window (injected by
+    wrapping `fcntl.flock` to perform the rename, then delegate to the real call) -- the pre-wait
+    identity capture can no longer match the post-acquisition re-check -- must make `_quota_lock`
+    itself refuse. `admit()` must write NO reservation under either the original or the renamed
+    path."""
+    aid, l = _new_activity(tmp_path)
+    quota_dir = paths.quota_dir(tmp_path)
+    moved_dir = tmp_path / "quota.moved"
+
+    real_flock = quota.fcntl.flock
+    state = {"done": False}
+    def hooked_flock(fd, op):
+        if op == quota.fcntl.LOCK_EX and not state["done"]:
+            state["done"] = True
+            os.rename(quota_dir, moved_dir)          # REAL rename during the wait window
+        return real_flock(fd, op)
+    monkeypatch.setattr(quota.fcntl, "flock", hooked_flock)
+
+    try:
+        assert quota.admit(tmp_path, aid, l) is False
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists() and not quota_dir.exists():
+            os.rename(moved_dir, quota_dir)           # restore for a clean tmp_path teardown
+
+    assert not (quota_dir / f"{aid}.json").exists()
+    assert not (moved_dir / f"{aid}.json").exists()
+
+def test_admit_refuses_and_writes_nothing_when_quota_dir_renamed_mid_enumeration(tmp_path, monkeypatch):
+    """(ii): a REAL rename landing between the pre- and post-enumeration canonical checks inside
+    `_ledger_entries_detailed_fd` (injected by wrapping the fd-bound listing primitive to rename
+    the real dir, then delegate to the real call) -- the post-check must independently detect it.
+    `admit()` refuses and writes nothing into the moved directory."""
+    live, ll = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, live, ll) is True   # a real, live reservation already on disk
+
+    quota_dir = paths.quota_dir(tmp_path)
+    moved_dir = tmp_path / "quota.moved"
+
+    real_listing = paths.list_owned_dir_fd_detailed
+    state = {"done": False}
+    def hooked(dfd, suffix=None):
+        if not state["done"]:
+            state["done"] = True
+            os.rename(quota_dir, moved_dir)          # REAL rename mid-enumeration
+        return real_listing(dfd, suffix)              # fd-based: still lists the real, detached content
+
+    fresh, fl = _new_activity(tmp_path)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", hooked)
+    try:
+        assert quota.admit(tmp_path, fresh, fl) is False
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists() and not quota_dir.exists():
+            os.rename(moved_dir, quota_dir)
+
+    assert not (quota_dir / f"{fresh}.json").exists()
+    assert not (moved_dir / f"{fresh}.json").exists()
+
+def test_prune_to_ceiling_deletes_nothing_when_quota_dir_swapped_mid_lock(tmp_path, monkeypatch):
+    """(iii): Codex's destructive case -- a durable terminal + a still-LIVE ledger entry (the
+    owner is done and the terminal is fsync'd durable, but `settle()` was never called). A REAL
+    swap of `quota/` for a fresh, empty directory lands while `prune_to_ceiling` holds its lock
+    (injected via the shared fd-bound listing primitive its reconcile/snapshot/prune passes all
+    go through -- rename the real dir away, then create a fresh empty one at the same path, then
+    delegate to the real call). This must make every subsequent read in this locked session
+    uncertain -- `prune_to_ceiling` must delete NOTHING and return 0, never mistake the
+    swapped-in empty directory for proof the entry is gone."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release()                                   # owner done, terminal durable -- but NEVER settled
+
+    quota_dir = paths.quota_dir(tmp_path)
+    moved_dir = tmp_path / "quota.moved"
+    monkeypatch.setattr(quota, "CEILING", 1)       # real pressure to prune, were it not refused
+
+    real_listing = paths.list_owned_dir_fd_detailed
+    state = {"done": False}
+    def hooked(dfd, suffix=None):
+        if not state["done"]:
+            state["done"] = True
+            os.rename(quota_dir, moved_dir)        # REAL swap: detach the live-entry-bearing dir
+            paths.secure_mkdir(quota_dir)           # ...and put a fresh, EMPTY dir at the canonical path
+        return real_listing(dfd, suffix)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", hooked)
+
+    try:
+        freed = prune.prune_to_ceiling(tmp_path, requested=quota.RESERVE)
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists():
+            if quota_dir.exists():
+                for p in quota_dir.iterdir():
+                    p.unlink()
+                quota_dir.rmdir()
+            os.rename(moved_dir, quota_dir)
+
+    assert freed == 0
+    assert paths.activity_dir(tmp_path, aid).exists()          # NOTHING deleted
+    assert paths.ledger_entry_path(tmp_path, aid).exists()     # the live entry survives, untouched
+
+def test_settle_no_unlink_no_crash_when_quota_dir_swapped_under_the_lock(tmp_path, monkeypatch):
+    """(iv): the same real swap technique as (iii), but landing during `settle()`'s own locked
+    unlink. `settle()` has no enumeration step to hook, so the swap is injected as a side effect
+    of the FIRST real `_verify_canonical` check `_unlink_entry_fd` performs (immediately before
+    the unlink) -- the identity-mismatch detection that follows is the SAME real comparison
+    logic, not a stub. `settle()` must not unlink anything and must not raise."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release()                                    # durable terminal, ledger entry still live
+
+    quota_dir = paths.quota_dir(tmp_path)
+    moved_dir = tmp_path / "quota.moved"
+
+    real_verify = quota._verify_canonical
+    state = {"done": False}
+    def hooked(ctx):
+        if not state["done"]:
+            state["done"] = True
+            os.rename(quota_dir, moved_dir)
+            paths.secure_mkdir(quota_dir)
+        return real_verify(ctx)
+    monkeypatch.setattr(quota, "_verify_canonical", hooked)
+
+    try:
+        result = quota.settle(tmp_path, aid)        # must not raise
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists():
+            if quota_dir.exists():
+                for p in quota_dir.iterdir():
+                    p.unlink()
+                quota_dir.rmdir()
+            os.rename(moved_dir, quota_dir)
+
+    assert result is None                           # settle() is always best-effort, never raises
+    assert paths.ledger_entry_path(tmp_path, aid).exists()   # NOT unlinked -- swap caught before unlink
+
+def test_retain_returns_empty_when_quota_dir_swapped_mid_lock(tmp_path, monkeypatch):
+    """(v): the same real swap technique as (iii), via `retain()`'s own live-set listing. Must
+    refuse the whole pass and return `[]`; nothing prunable is actually deleted."""
+    aid, l = _new_activity(tmp_path)
+    quota.admit(tmp_path, aid, l)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release()                                     # durable terminal, ledger entry still live
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)     # would normally be outside the protected window
+
+    quota_dir = paths.quota_dir(tmp_path)
+    moved_dir = tmp_path / "quota.moved"
+
+    real_listing = paths.list_owned_dir_fd_detailed
+    state = {"done": False}
+    def hooked(dfd, suffix=None):
+        if not state["done"]:
+            state["done"] = True
+            os.rename(quota_dir, moved_dir)
+            paths.secure_mkdir(quota_dir)
+        return real_listing(dfd, suffix)
+    monkeypatch.setattr(paths, "list_owned_dir_fd_detailed", hooked)
+
+    try:
+        pruned = quota.retain(tmp_path)
+    finally:
+        monkeypatch.undo()
+        if moved_dir.exists():
+            if quota_dir.exists():
+                for p in quota_dir.iterdir():
+                    p.unlink()
+                quota_dir.rmdir()
+            os.rename(moved_dir, quota_dir)
+
+    assert pruned == []
+    assert paths.activity_dir(tmp_path, aid).exists()
+    assert paths.ledger_entry_path(tmp_path, aid).exists()
+
+# --- Codex R8-3 (IMPORTANT) / Ruling 66: `_unlock` must be fully contained -- an early failure
+# in one cleanup step must never skip the rest, and must never replace a public op's own
+# already-durable result with a raised exception.
+
+def test_unlock_survives_injected_lock_un_failure_admit_still_returns_true(tmp_path, monkeypatch):
+    aid, l = _new_activity(tmp_path)
+
+    fds = {}
+    real_flock = quota.fcntl.flock
+    def hooked_flock(fd, op):
+        if op == quota.fcntl.LOCK_UN:
+            raise OSError("injected LOCK_UN failure")
+        return real_flock(fd, op)
+
+    real_quota_lock = quota._quota_lock
+    def tracking_quota_lock(home):
+        ctx = real_quota_lock(home)
+        fds["lock_fd"] = ctx.lock_fd; fds["qfd"] = ctx.qfd; fds["afd"] = ctx.afd
+        return ctx
+    monkeypatch.setattr(quota, "_quota_lock", tracking_quota_lock)
+    monkeypatch.setattr(quota.fcntl, "flock", hooked_flock)
+
+    result = quota.admit(tmp_path, aid, l)
+    monkeypatch.undo()   # restore the real flock/_quota_lock BEFORE any further real file I/O below
+
+    assert result is True, "an admit() whose reservation was already durably written must still return True"
+    for name in ("lock_fd", "qfd", "afd"):
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(fds[name])                     # every fd from the (failed-unlock) LockCtx was closed
+        assert exc_info.value.errno == errno.EBADF, name
+
+    assert json.loads(paths.ledger_entry_path(tmp_path, aid).read_text()) == {
+        "reserved": quota.RESERVE, "granted": 0,
+    }

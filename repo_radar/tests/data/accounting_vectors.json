@@ -453,5 +453,63 @@
       "uncertain": true,
       "corrupt": false
     }
+  },
+  {
+    "name": "corrupt-plus-uncertain-activity",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000a",
+          "on_disk": 1024,
+          "uncertain": true
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000a",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4195328,
+      "uncertain": true,
+      "corrupt": true
+    }
+  },
+  {
+    "name": "corrupt-plus-rejected-root",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [
+        "00000000-0000-4000-8000-00000000000b"
+      ],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000b",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": true
+    }
   }
 ]

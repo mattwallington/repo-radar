@@ -35,6 +35,16 @@ def _write_terminal(home, aid, writer_id="cafebabe", outcome="succeeded"):
     return _write_rec(home, aid, writer_id, type="terminal", seq=9,
                        outcome=outcome, summary={}, by="deadbeef")
 
+def _reconcile_one_locked(home, aid):
+    # Ruling 64 (Codex R8-1, BLOCKER): `_reconcile_one_locked` now requires the active `LockCtx`
+    # (identity-bound ledger unlinks via `_unlink_entry_fd`) -- this test helper acquires+releases
+    # a real lock around the call, exactly like the production `_reconcile_all_locked` does.
+    ctx = quota._quota_lock(home)
+    try:
+        quota._reconcile_one_locked(home, aid, ctx)
+    finally:
+        quota._unlock(ctx)
+
 def test_unreadable_conforming_terminal_segment_preserves_ledger_and_synthesizes_nothing(tmp_path):
     aid, l = _new_activity(tmp_path)
     quota.admit(tmp_path, aid, l)
@@ -153,7 +163,7 @@ def test_reconcile_one_locked_under_lease_rescan_blocks_stale_synthesis(tmp_path
                                 rejected=[{"name": "x", "reason": "denied"}], view_uncertain=True)
     calls = _patch_scan_sequence(monkeypatch, certain_has_start, now_uncertain)
 
-    quota._reconcile_one_locked(tmp_path, aid)
+    _reconcile_one_locked(tmp_path, aid)
 
     assert calls["n"] == 2                                  # pre-lease scan + the under-lease rescan
     assert paths.ledger_entry_path(tmp_path, aid).exists()  # NOT settled -- rescan blocked the write
@@ -177,7 +187,7 @@ def test_reconcile_one_locked_under_lease_rescan_blocks_when_terminal_landed(tmp
     calls = _patch_scan_sequence(monkeypatch, certain_has_start, now_terminated)
     before = set(os.listdir(paths.activity_dir(tmp_path, aid)))
 
-    quota._reconcile_one_locked(tmp_path, aid)
+    _reconcile_one_locked(tmp_path, aid)
 
     assert calls["n"] == 2
     assert paths.ledger_entry_path(tmp_path, aid).exists()
@@ -189,7 +199,7 @@ def test_reconcile_one_locked_under_lease_rescan_allows_synthesis_when_view_stil
     _write_start(tmp_path, aid)
     l.release()                                            # owner gone; lock now free
 
-    quota._reconcile_one_locked(tmp_path, aid)
+    _reconcile_one_locked(tmp_path, aid)
 
     assert not paths.ledger_entry_path(tmp_path, aid).exists()  # settled: rescan reaffirmed, synth wrote
 
