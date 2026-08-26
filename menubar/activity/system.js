@@ -21,14 +21,26 @@
 // second channel -- Ruling P4-1) and the renderer keeps them collapsed behind a "show" toggle.
 //
 // Three postures carried over from the rest of the subsystem:
-//   1. NEVER FOLLOW A SYMLINK. Every open is O_RDONLY|O_NOFOLLOW|O_NONBLOCK + fstat + S_ISREG,
-//      the same shape paths.js uses for the owned subtree. A symlink where a log should be is
-//      `present:false, error:'symlink'` -- refused, never read through. (These paths are SHARED,
-//      not subsystem-owned, so paths.js's owned-prefix validators deliberately do not apply; the
-//      per-file posture is identical.)
+//   1. NEVER FOLLOW A SYMLINK -- ON ANY COMPONENT. Fix round 1: O_NOFOLLOW on the FILE alone was
+//      not enough. It constrains only the final component, so with `~/Library/Logs/repo-radar`
+//      itself symlinked to an attacker-chosen directory, every stream under it was read from
+//      there and returned as if it were ours (same for `~/.config/repo-radar` -> status.json).
+//      Every directory component below `home` is now walked and opened with
+//      O_RDONLY|O_NOFOLLOW|O_DIRECTORY first (`_validateDir`), which is the shape paths.js's
+//      `_validateOwnedDir` uses for the owned subtree, so an intermediate OR final symlinked or
+//      non-directory component is refused rather than followed. Only then is the file itself
+//      opened, O_RDONLY|O_NOFOLLOW|O_NONBLOCK + fstat + S_ISREG. A refused parent makes EVERY
+//      stream under it `present:false, error:'symlink'` (or 'not-regular'/'denied'), and the same
+//      for the status surface. Node has no dirfd-relative open, so -- exactly as paths.js
+//      documents for the same reason -- the child is opened by path AFTER its parents validate;
+//      the residual TOCTOU window is the same one paths.js accepts, and O_NOFOLLOW on the child
+//      still refuses anything swapped in as a symlink inside it.
 //   2. NEVER READ A WHOLE FILE. A stream is tailed: one bounded `readSync` from
-//      `size - SYSTEM_TAIL_MAX_BYTES`. `status.json` cannot be tailed (it must parse), so it is
-//      refused outright above `limits.STATUS_MAX_BYTES`.
+//      `size - SYSTEM_TAIL_MAX_BYTES`. The window starts mid-line, so a truncated tail is
+//      advanced past its first newline (fix round 1): a credential split by the cut would
+//      otherwise survive as a partial that matches neither a configured secret nor a redact.js
+//      pattern. `status.json` cannot be tailed (it must parse), so it is refused outright above
+//      `limits.STATUS_MAX_BYTES`.
 //   3. REDACTION IS DEFENSE-IN-DEPTH. Every string returned -- tails, errorLog, and every
 //      errorList field INCLUDING `stackTrace` -- goes through one `redact.Redactor` built from
 //      `opts.configuredSecrets`, then is byte-bounded. Masking can make text LONGER than what was
@@ -86,15 +98,27 @@ function _truncationMarker(maxBytes) {
   return `--- tail truncated at ${_sizeLabel(maxBytes)} ---\n`;
 }
 
+// Drop the partial FIRST LINE of a truncated tail (fix round 1). A byte-offset cut lands
+// mid-line, and a credential straddling it survives as a fragment -- which matches neither a
+// configured secret (a literal substring the fragment is only part of) nor any redact.js pattern
+// (they are anchored on a complete prefix like `ghp_`), so it would reach the payload in the
+// clear. Advancing past the first newline is also just what `tail` does: a partial line is not a
+// log line. Edge case, documented rather than worked around: a window with NO newline in it is a
+// single >=64 KiB line, and is kept as-is -- dropping it would return nothing at all.
+function _dropPartialLine(buf) {
+  const nl = buf.indexOf(0x0a);
+  return nl === -1 ? buf : buf.subarray(nl + 1);
+}
+
 // The last `maxBytes` of `buf`, WITHOUT a marker (the marker is applied once, at the end, by
 // `_scrubTail`). `cut` says that bytes were already dropped before this buffer began -- which is
 // the normal case for a stream, where the tail window is chosen by the read itself -- so the
-// partial-leading-code-point trim still has to run even when nothing more needs dropping here.
+// leading trims still have to run even when nothing more needs dropping here.
 function _tailBody(buf, maxBytes, cut) {
   if (buf.length > maxBytes) {
-    return { buf: _utf8SafeLeadingCut(buf.subarray(buf.length - maxBytes)), truncated: true };
+    return { buf: _dropPartialLine(_utf8SafeLeadingCut(buf.subarray(buf.length - maxBytes))), truncated: true };
   }
-  return { buf: cut ? _utf8SafeLeadingCut(buf) : buf, truncated: Boolean(cut) };
+  return { buf: cut ? _dropPartialLine(_utf8SafeLeadingCut(buf)) : buf, truncated: Boolean(cut) };
 }
 
 // Scrub, then re-bound: `Redactor.scrub` replaces each secret with a fixed marker that may be
@@ -149,6 +173,47 @@ function _openReason(e) {
   if (e.code === 'EACCES' || e.code === 'EPERM') return 'denied';
   if (e.code === 'ENOENT') return 'absent';
   return 'read-failed';
+}
+
+// A refused DIRECTORY component, in the same vocabulary as a refused file. Either way the
+// component was NOT followed -- this only decides which word to report.
+function _dirReason(p, e) {
+  if (e.code === 'ELOOP') return 'symlink'; // O_NOFOLLOW hit a symlinked component
+  if (e.code === 'ENOTDIR') {
+    // Darwin reports ENOTDIR (not ELOOP) for O_NOFOLLOW|O_DIRECTORY over a symlink-to-directory:
+    // the symlink itself is not a directory, and O_NOFOLLOW stopped the walk there. Told apart
+    // from a plain file squatting on the path by an `lstat`, which reports the LINK itself and so
+    // never follows anything either.
+    try {
+      if (fs.lstatSync(p).isSymbolicLink()) return 'symlink';
+    } catch (e2) {
+      // raced away between the open and the lstat -- fall through to the generic answer
+    }
+    return 'not-regular';
+  }
+  if (e.code === 'EACCES' || e.code === 'EPERM') return 'denied';
+  if (e.code === 'ENOENT') return 'absent';
+  return 'read-failed';
+}
+
+// Walk `home/<...parts>` one component at a time, opening each with O_NOFOLLOW|O_DIRECTORY, so a
+// symlinked or non-directory component -- INTERMEDIATE or final -- is refused instead of followed.
+// The same shape (and the same close-immediately, no-dirfd caveat) as paths.js's
+// `_validateOwnedDir`. Returns `{ dir }` when every component is a real directory, `{ reason }`
+// otherwise. `home` itself is the app's own `process.env.HOME` and is not second-guessed here.
+function _validateDir(home, parts) {
+  let cur = home;
+  for (const name of parts) {
+    cur = path.join(cur, name);
+    let fd;
+    try {
+      fd = fs.openSync(cur, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
+    } catch (e) {
+      return { reason: _dirReason(cur, e) };
+    }
+    try { fs.closeSync(fd); } catch (_) { /* best effort */ }
+  }
+  return { dir: cur };
 }
 
 function _openRegular(p) {
@@ -241,9 +306,15 @@ function _emptyStatus(error) {
 }
 
 function _readStatus(home, redactor) {
+  // Every directory component first (see posture 1): a symlinked `~/.config/repo-radar` must not
+  // hand us an attacker-chosen status.json.
+  const parentParts = STATUS_SUBPATH.slice(0, -1);
+  const parent = _validateDir(home, parentParts);
+  if (!parent.dir) return _emptyStatus(parent.reason === 'absent' ? null : parent.reason);
+
   let opened;
   try {
-    opened = _openRegular(path.join(home, ...STATUS_SUBPATH));
+    opened = _openRegular(path.join(parent.dir, STATUS_BASENAME));
   } catch (e) {
     return _emptyStatus('read-failed');
   }
@@ -279,11 +350,28 @@ function _readStatus(home, redactor) {
     return _emptyStatus(`${STATUS_BASENAME} is not an object`);
   }
 
-  const errorLog = typeof parsed.errorLog === 'string'
-    ? _scrubTail(Buffer.from(parsed.errorLog, 'utf8'), limits.STATUS_ERROR_LOG_MAX_BYTES, redactor)
-    : { text: '', truncated: false };
+  // Fix round 1: a MALFORMED-but-present field is not the same as an absent one. Folding
+  // `errorList: "not-an-array"` into `total: 0` made the renderer print "No legacy errors
+  // recorded." -- a claim the payload cannot support, and the exact failure mode this module's
+  // stop-after-error standard exists to prevent. Absent/null stays absent (main.js's own
+  // `if (!status.errorList) status.errorList = []` treats a falsy value as "not written yet");
+  // anything else present but of the wrong type sets a bounded `error` while `present` stays
+  // true, since the rest of the file was read fine.
+  const malformed = [];
 
-  const rawList = Array.isArray(parsed.errorList) ? parsed.errorList : [];
+  let errorLog = { text: '', truncated: false };
+  if (typeof parsed.errorLog === 'string') {
+    errorLog = _scrubTail(Buffer.from(parsed.errorLog, 'utf8'), limits.STATUS_ERROR_LOG_MAX_BYTES, redactor);
+  } else if (parsed.errorLog !== undefined && parsed.errorLog !== null) {
+    malformed.push('errorLog-not-string');
+  }
+
+  let rawList = [];
+  if (Array.isArray(parsed.errorList)) {
+    rawList = parsed.errorList;
+  } else if (parsed.errorList !== undefined && parsed.errorList !== null) {
+    malformed.push('errorList-not-array');
+  }
   // Newest-first on disk (main.js `unshift`es), so the newest N are simply the first N.
   const kept = rawList.slice(0, limits.STATUS_ERROR_LIST_MAX);
   const entries = kept.map((raw) => {
@@ -293,7 +381,7 @@ function _readStatus(home, redactor) {
     return out;
   });
 
-  return {
+  const out = {
     present: true,
     errorLog: { text: errorLog.text, truncated: errorLog.truncated },
     errorList: {
@@ -302,6 +390,8 @@ function _readStatus(home, redactor) {
       truncated: rawList.length > kept.length,
     },
   };
+  if (malformed.length > 0) out.error = malformed.join(', ');
+  return out;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -320,10 +410,16 @@ function systemDiagnostics(home, { configuredSecrets = [] } = {}) {
     return { uncorrelated: true, streams: [], statusDiagnostics: _emptyStatus(null), error: 'diagnostics unavailable' };
   }
   try {
-    const dir = path.join(home, ...LOG_SUBPATH);
+    // The shared log directory is validated ONCE (every component, O_NOFOLLOW|O_DIRECTORY) and
+    // the four streams are read under the directory that check accepted. A refused parent is
+    // reported on every stream -- silently returning "absent" would read as "no logs yet" over a
+    // path someone has swapped.
+    const logs = _validateDir(home, LOG_SUBPATH);
     return {
       uncorrelated: true,
-      streams: STREAMS.map((spec) => _readStream(dir, spec, redactor)),
+      streams: STREAMS.map((spec) => (logs.dir
+        ? _readStream(logs.dir, spec, redactor)
+        : _absentStream(spec, logs.reason))),
       statusDiagnostics: _readStatus(home, redactor),
     };
   } catch (e) {

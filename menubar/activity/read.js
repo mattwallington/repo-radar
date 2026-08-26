@@ -897,15 +897,20 @@ function _appendSystemSection(lines, diag) {
     lines.push(`  (not present${st.error ? `: ${st.error}` : ''})`);
     return;
   }
+  // Present, but a field in it was malformed: say so, and let it suppress the "(empty)" / "errors:
+  // 0" lines below -- over a field that could not be read those are claims, not observations.
+  if (st.error) lines.push(`  (partial: ${st.error})`);
   if (st.errorLog.text) {
     lines.push(`  errorLog${st.errorLog.truncated ? ' (truncated)' : ''}:`);
     lines.push(..._indent(st.errorLog.text.replace(/\n$/, ''), '    '));
-  } else {
+  } else if (!st.error) {
     lines.push('  errorLog: (empty)');
   }
-  lines.push(st.errorList.truncated
-    ? `  errors: ${st.errorList.entries.length} of ${st.errorList.total} shown (newest first)`
-    : `  errors: ${st.errorList.total}`);
+  if (st.errorList.entries.length > 0 || !st.error) {
+    lines.push(st.errorList.truncated
+      ? `  errors: ${st.errorList.entries.length} of ${st.errorList.total} shown (newest first)`
+      : `  errors: ${st.errorList.total}`);
+  }
   for (const e of st.errorList.entries) {
     lines.push(`  [${e.timestamp || '(no timestamp)'}] ${e.repo || '(no repo)'} -- ${e.message || ''}`);
     if (e.fullError) lines.push(..._indent(e.fullError, '      '));

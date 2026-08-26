@@ -32,6 +32,7 @@ const TEXT = {
   statusHeading: 'Legacy status.json',
   statusAbsent: 'No legacy status.json diagnostics were found.',
   statusUnreadable: 'status.json could not be read',
+  statusPartial: 'Some of status.json could not be read',
   errorLogLabel: 'error log',
   noErrors: 'No legacy errors recorded.',
 };
@@ -152,6 +153,13 @@ function renderStatus(doc, statusDiagnostics) {
     return wrap;
   }
 
+  // Present, but something in it was malformed (a non-array errorList, a non-string errorLog).
+  // Shown, and -- below -- allowed to suppress the "nothing here" lines, which over a field we
+  // could not read would be a claim rather than an observation.
+  if (st.error) {
+    wrap.appendChild(el(doc, 'div', 'system-note state-error', `${TEXT.statusPartial}: ${st.error}`));
+  }
+
   const log = st.errorLog && typeof st.errorLog === 'object' ? st.errorLog : {};
   if (log.text) {
     const block = el(doc, 'details', 'system-stream');
@@ -167,7 +175,7 @@ function renderStatus(doc, statusDiagnostics) {
   const list = st.errorList && typeof st.errorList === 'object' ? st.errorList : {};
   const entries = Array.isArray(list.entries) ? list.entries : [];
   if (entries.length === 0) {
-    wrap.appendChild(el(doc, 'div', 'system-note', TEXT.noErrors));
+    if (!st.error) wrap.appendChild(el(doc, 'div', 'system-note', TEXT.noErrors));
     return wrap;
   }
   // The cap is STATED, never silently applied: "50 of 120" is the difference between a bounded

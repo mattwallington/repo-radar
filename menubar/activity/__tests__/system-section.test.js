@@ -7,8 +7,12 @@
 //     in-tree writer) honestly reported ABSENT rather than invented;
 //   * a stream is never read whole -- only the last SYSTEM_TAIL_MAX_BYTES, with a visible leading
 //     marker and a UTF-8-safe leading cut;
-//   * a symlink where a log should be is REFUSED, never followed (the same O_NOFOLLOW posture
-//     paths.js holds for the owned subtree);
+//   * a symlink is REFUSED, never followed -- on ANY component: a symlinked log FILE, and (fix
+//     round 1) a symlinked PARENT DIRECTORY, which O_NOFOLLOW on the file alone did not catch;
+//   * a truncated tail starts at a LINE boundary, so a credential straddling the byte cut cannot
+//     survive as an unmatchable fragment (fix round 1);
+//   * a malformed-but-present status.json field is reported, never folded into "nothing here"
+//     (fix round 1);
 //   * the legacy status surface is bounded on BOTH axes (50 newest entries, 64 KiB of errorLog)
 //     and every string on it -- `stackTrace` included -- is redacted;
 //   * redaction is WIRED, not merely available: a configured secret that matches none of
@@ -185,6 +189,42 @@ test('the truncation marker names whatever bound is in force', () => {
   }
 });
 
+test('a secret straddling the 64 KiB cut cannot survive as an unmatchable fragment', () => {
+  const home = tmpHome();
+  try {
+    // Sized so the window opens 8 bytes INTO the secret: head(100) + SECRET(16) + '\n' +
+    // 65526 x 'B' + '\n' = 65645 bytes, so the cut at 65645 - 65536 = 109 lands at head+9.
+    // The surviving fragment matches no redact.js pattern and is only PART of the configured
+    // secret, so nothing would mask it -- only dropping the partial LINE removes it.
+    const head = 'A'.repeat(100);
+    seedStream(home, 'sync.error.log', `${head}${SECRET}\n${'B'.repeat(65526)}\n`);
+
+    const s = streamsByName(system.systemDiagnostics(home, { configuredSecrets: [SECRET] }))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!s.redactedTail.includes(SECRET.slice(cut)),
+        `a ${SECRET.length - cut}-character tail of the secret leaked: ${JSON.stringify(SECRET.slice(cut))}`);
+    }
+    assert.ok(s.redactedTail.startsWith('--- tail truncated at 64 KiB ---\nBBB'),
+      'the tail resumes at the first whole line');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a truncated window with no newline at all is kept as the single long line it is', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', 'y'.repeat(70 * 1024)); // one 70 KiB line, no newline
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    assert.ok(s.redactedTail.endsWith('y'.repeat(64)), 'dropping it entirely would return nothing');
+    assert.ok(Buffer.byteLength(s.redactedTail, 'utf8') <= limits.SYSTEM_TAIL_MAX_BYTES + 64);
+  } finally {
+    cleanup(home);
+  }
+});
+
 // -------------------------------------------------------------------------------------------
 // Refusals -- never follow a symlink, never mistake a refusal for absence
 // -------------------------------------------------------------------------------------------
@@ -214,6 +254,80 @@ test('a non-regular entry (a directory) where a log should be is refused', () =>
     const s = streamsByName(system.systemDiagnostics(home, {}))['renderer.log'];
     assert.strictEqual(s.present, false);
     assert.strictEqual(s.error, 'not-regular');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a SYMLINKED LOG DIRECTORY is refused for every stream, never followed', () => {
+  const home = tmpHome();
+  try {
+    // The attacker-chosen directory the symlink points at holds a real, readable sync.error.log.
+    // O_NOFOLLOW on the FILE alone accepted this: the final component was not a symlink.
+    const elsewhere = path.join(home, 'attacker');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'sync.error.log'), 'CONTENT-FROM-THE-WRONG-DIRECTORY\n');
+    fs.mkdirSync(path.join(home, 'Library', 'Logs'), { recursive: true });
+    fs.symlinkSync(elsewhere, logDir(home));
+
+    const diag = system.systemDiagnostics(home, {});
+    for (const s of diag.streams) {
+      assert.strictEqual(s.present, false, `${s.name} must be refused under a symlinked parent`);
+      assert.strictEqual(s.error, 'symlink');
+      assert.strictEqual(s.redactedTail, '');
+    }
+    assert.ok(!JSON.stringify(diag).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'),
+      'nothing under the symlinked directory may be read');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a symlinked INTERMEDIATE directory component is refused too', () => {
+  const home = tmpHome();
+  try {
+    const elsewhere = path.join(home, 'attacker');
+    fs.mkdirSync(path.join(elsewhere, 'repo-radar'), { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'repo-radar', 'sync.log'), 'CONTENT-FROM-THE-WRONG-DIRECTORY\n');
+    fs.mkdirSync(path.join(home, 'Library'), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, 'Library', 'Logs')); // one level ABOVE repo-radar
+
+    const diag = system.systemDiagnostics(home, {});
+    for (const s of diag.streams) assert.strictEqual(s.error, 'symlink', `${s.name}`);
+    assert.ok(!JSON.stringify(diag).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a non-directory standing in for the log directory is refused', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, 'Library', 'Logs'), { recursive: true });
+    fs.writeFileSync(logDir(home), 'not a directory');
+    for (const s of system.systemDiagnostics(home, {}).streams) {
+      assert.strictEqual(s.present, false);
+      assert.strictEqual(s.error, 'not-regular');
+    }
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a SYMLINKED .config/repo-radar is refused, never followed to a status.json', () => {
+  const home = tmpHome();
+  try {
+    const elsewhere = path.join(home, 'attacker-config');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'status.json'),
+      JSON.stringify({ errorLog: 'CONTENT-FROM-THE-WRONG-DIRECTORY', errorList: [] }));
+    fs.mkdirSync(path.join(home, '.config'), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, '.config', 'repo-radar'));
+
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(st.error, 'symlink');
+    assert.ok(!JSON.stringify(st).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'));
   } finally {
     cleanup(home);
   }
@@ -364,6 +478,68 @@ test('a status.json with neither errorLog nor errorList is present and empty', (
     assert.strictEqual(st.present, true);
     assert.deepStrictEqual(st.errorLog, { text: '', truncated: false });
     assert.deepStrictEqual(st.errorList, { entries: [], total: 0, truncated: false });
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a malformed-but-present errorList is reported, never folded into "no errors"', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 'real log text', errorList: 'not-an-array' });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true, 'the rest of the file read fine');
+    assert.strictEqual(st.error, 'errorList-not-array');
+    assert.deepStrictEqual(st.errorList.entries, []);
+    assert.ok(st.errorLog.text.includes('real log text'), 'the readable half is still returned');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a malformed-but-present errorLog is reported', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: { not: 'a string' }, errorList: [errorEntry({ message: 'kept' })] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.error, 'errorLog-not-string');
+    assert.strictEqual(st.errorList.entries[0].message, 'kept');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('both fields malformed are reported together, and a null field is absence not damage', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 42, errorList: { nope: true } });
+    assert.strictEqual(system.systemDiagnostics(home, {}).statusDiagnostics.error,
+      'errorLog-not-string, errorList-not-array');
+    cleanup(home);
+  } finally { /* re-seeded below in a fresh home */ }
+
+  const home2 = tmpHome();
+  try {
+    // main.js's own `if (!status.errorList) status.errorList = []` treats a falsy value as
+    // "not written yet", so null/absent is not a malformation.
+    seedStatus(home2, { errorLog: null, errorList: null });
+    const st = system.systemDiagnostics(home2, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.error, undefined);
+  } finally {
+    cleanup(home2);
+  }
+});
+
+test('an export never claims "errors: 0" over an errorList it could not read', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 'real log text', errorList: 'not-an-array' });
+    const text = read.buildExport(home, {}, { configuredSecrets: [] });
+    assert.ok(text.includes('(partial: errorList-not-array)'));
+    assert.ok(!text.includes('errors: 0'), 'a count is a claim this payload cannot support');
+    assert.ok(text.includes('real log text'), 'the readable half is still exported');
   } finally {
     cleanup(home);
   }

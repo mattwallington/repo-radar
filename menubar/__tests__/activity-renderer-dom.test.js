@@ -797,6 +797,22 @@ test('an absent or unreadable legacy status file says so', () => {
   assert.ok(broken.textContent.includes('parse-failed'));
 });
 
+test('a present-but-malformed status file is reported instead of "no legacy errors"', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload({
+    statusDiagnostics: {
+      present: true,
+      errorLog: { text: 'real log text', truncated: false },
+      errorList: { entries: [], total: 0, truncated: false },
+      error: 'errorList-not-array',
+    },
+  }));
+  const text = node.textContent;
+  assert.ok(text.includes('errorList-not-array'), 'the malformation is named');
+  assert.ok(!text.includes('No legacy errors recorded'),
+    'a field we could not read cannot be reported as empty');
+  assert.ok(text.includes('real log text'), 'the readable half is still shown');
+});
+
 test('a diagnostics-level failure is shown rather than swallowed', () => {
   const node = S.renderSystem(makeDoc(), { uncorrelated: true, streams: [], error: 'diagnostics failed' });
   assert.ok(node.textContent.includes('diagnostics failed'));
