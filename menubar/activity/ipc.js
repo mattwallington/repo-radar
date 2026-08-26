@@ -81,17 +81,43 @@ function _validateId(activityId) {
   }
 }
 
+// The main-side record of an `internal` failure. The renderer deliberately gets a stack-stripped
+// generic error, and Electron's ipcMain.handle only ever console.errors the error it was THROWN --
+// i.e. the generic one -- so without this the root cause of an internal failure (an EACCES on the
+// user's chosen export path, a corrupt segment escaping read.js's containment) would leave no
+// trace anywhere in the app. The original is logged here, on the main side only, bounded so a
+// pathological error text can't flood the log. Never attached as `cause`: that would ride along
+// on Electron's error serialization and undo the whole point of the generic message.
+const LOG_MAX_CHARS = 4000;
+
+function _logInternal(log, channel, e) {
+  try {
+    const detail = String((e && e.stack) || e);
+    const suffix = detail.length > LOG_MAX_CHARS ? ' …[truncated]' : '';
+    log(`[activity] ${channel} failed: ${detail.slice(0, LOG_MAX_CHARS)}${suffix}`);
+  } catch (_) {
+    // A failing logger must never turn an internal failure into a different one.
+  }
+}
+
 // Wraps a handler so every rejection leaving this module is an ActivityIpcError: caller-input
 // failures (InvalidFilter, and its InvalidActivityId subclass) as `invalid-request`, anything
-// else as `internal`.
-function _guard(fn) {
+// else as `internal` -- the latter recorded on the main side first.
+//
+// `invalid-request` is deliberately NOT logged: it is fully attributable renderer input, the UI
+// surfaces it immediately, and read.js's InvalidFilter messages quote the offending value -- which
+// would drop renderer-supplied text (a `search` string the user typed) into the shared diagnostic
+// stream Task 4.3 puts back on screen.
+function _guard(channel, log, fn) {
   return async (arg) => {
     try {
       return await fn(arg);
     } catch (e) {
-      throw e instanceof read.InvalidFilter
-        ? new ActivityIpcError(INVALID_REQUEST, 'invalid activity request')
-        : new ActivityIpcError(INTERNAL, 'the activity request could not be completed');
+      if (e instanceof read.InvalidFilter) {
+        throw new ActivityIpcError(INVALID_REQUEST, 'invalid activity request');
+      }
+      _logInternal(log, channel, e);
+      throw new ActivityIpcError(INTERNAL, 'the activity request could not be completed');
     }
   };
 }
@@ -116,30 +142,34 @@ function _exportFileName() {
 //   shell                 Electron's shell (activity:reveal only)
 //   dialog                Electron's dialog (activity:export only)
 //   writeFile             fs.writeFileSync by default (activity:export only)
+//   log                   main-side sink for the ORIGINAL error behind an `internal` rejection;
+//                         console.error by default, matching main.js's own logging
 function createHandlers({
   home,
   loadConfiguredSecrets = triggerGlue.loadConfiguredSecrets,
   shell,
   dialog,
   writeFile = fs.writeFileSync,
+  log = console.error,
 } = {}) {
   if (typeof home !== 'string' || home.length === 0) {
     throw new TypeError('createHandlers requires a home directory path');
   }
 
   const secrets = () => loadConfiguredSecrets(home);
+  const guard = (channel, fn) => _guard(channel, log, fn);
 
   return {
     // filter -> { items, truncated, available, incomplete, problems }. Summary DTOs only, at most
     // limits.LIST_MAX of them, each already redacted and bounded by read.js.
-    'activity:list': _guard(async (filter) => {
+    'activity:list': guard('activity:list', async (filter) => {
       _validateFilter(filter);
       return read.listActivities(home, filter, { configuredSecrets: secrets() });
     }),
 
     // activity id -> { item, available, reason? }. One detail item (Events + Problems lenses),
     // never larger than limits.DETAIL_MAX_BYTES.
-    'activity:get': _guard(async (activityId) => {
+    'activity:get': guard('activity:get', async (activityId) => {
       _validateId(activityId);
       return read.getActivity(home, activityId, { configuredSecrets: secrets() });
     }),
@@ -147,7 +177,7 @@ function createHandlers({
     // filter -> the saved path, or null if the user cancelled. The export TEXT is built here in
     // main (already redacted and byte-capped by read.buildExport); the renderer never sees it,
     // and never supplies the destination -- that comes from the OS save dialog.
-    'activity:export': _guard(async (filter) => {
+    'activity:export': guard('activity:export', async (filter) => {
       _validateFilter(filter);
       const text = read.buildExport(home, filter, { configuredSecrets: secrets() });
       const result = await dialog.showSaveDialog({
@@ -163,7 +193,7 @@ function createHandlers({
     // activity id -> true once the reveal has been dispatched. The path is built ONLY by
     // paths.activityDir from an already-validated id, so it is always the activity's own
     // directory under the owned activity/ root and can never be renderer-controlled.
-    'activity:reveal': _guard(async (activityId) => {
+    'activity:reveal': guard('activity:reveal', async (activityId) => {
       _validateId(activityId);
       shell.showItemInFinder(paths.activityDir(home, activityId));
       return true;

@@ -67,7 +67,7 @@ function seedOne(home, aid = AID, over = {}) {
 
 // Handlers wired to recording fakes for the three injected Electron/fs seams.
 function makeHandlers(home, over = {}) {
-  const calls = { revealed: [], dialogs: [], writes: [] };
+  const calls = { revealed: [], dialogs: [], writes: [], logs: [] };
   const chosen = path.join(home, 'activity-export.txt');
   const handlers = ipc.createHandlers({
     home,
@@ -76,6 +76,7 @@ function makeHandlers(home, over = {}) {
       showSaveDialog: async (opts) => { calls.dialogs.push(opts); return { canceled: false, filePath: chosen }; },
     },
     writeFile: (p, data, opts) => { calls.writes.push({ path: p, data, opts }); },
+    log: (line) => { calls.logs.push(line); },
     ...over,
   });
   return { handlers, calls, chosen };
@@ -399,8 +400,22 @@ test('an unexpected failure surfaces as a bounded generic error with no path or 
       assert.ok(err.message.length <= 120, `${label}: the message must stay bounded`);
       assert.ok(!/\.js:\d+/.test(err.stack), `${label}: no stack frames may reach the renderer`);
       assert.ok(!err.stack.includes(home), `${label}: no path may reach the renderer via the stack`);
+      assert.strictEqual(err.cause, undefined,
+        `${label}: the original error must not ride along as \`cause\` across the bridge`);
     }
     assert.deepStrictEqual(calls.writes, [], 'a failed export writes nothing');
+
+    // ...but the ORIGINAL error IS recorded on the main side, naming the channel, or an internal
+    // failure would leave no trace anywhere in the app (Electron only console.errors the THROWN
+    // error, which is the stack-stripped generic one).
+    assert.strictEqual(calls.logs.length, 2, 'each internal failure is logged exactly once');
+    assert.ok(calls.logs[0].includes('activity:list'), 'the log names the failing channel');
+    assert.ok(calls.logs[1].includes('activity:export'), 'the log names the failing channel');
+    for (const line of calls.logs) {
+      assert.ok(line.includes('ENOSPC'), 'the ORIGINAL message is recorded main-side');
+      assert.ok(line.includes(home), 'the original path is recorded main-side');
+      assert.ok(/ipc\.js:\d+/.test(line), 'the original stack is recorded main-side');
+    }
   } finally {
     read.listActivities = origList;
     read.buildExport = origExport;
@@ -417,6 +432,48 @@ test('a rejected filter never echoes the renderer-supplied value back', async ()
     assert.ok(!err.message.includes('sup3r-s3cret-marker'), 'renderer input must not be echoed back');
     assert.ok(!/\.js:\d+/.test(err.stack), 'no stack frames may reach the renderer');
   } finally {
+    cleanup(home);
+  }
+});
+
+test('a rejected filter is not logged: renderer-supplied text stays out of the diagnostic stream', async () => {
+  const home = tmpHome();
+  try {
+    const { handlers, calls } = makeHandlers(home);
+    await rejects(() => handlers['activity:list']({ level: 'sup3r-s3cret-marker' }),
+      'invalid-request', 'no-log check');
+    assert.deepStrictEqual(calls.logs, [], 'attributable caller input must not be logged main-side');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an unlogged handler defaults to console.error and survives a failing logger', async () => {
+  const home = tmpHome();
+  const origList = read.listActivities;
+  const origConsoleError = console.error;
+  const captured = [];
+  try {
+    seedOne(home);
+    read.listActivities = () => { throw new Error('kaboom'); };
+
+    // Default sink: console.error (captured here so the test output stays pristine).
+    console.error = (...args) => { captured.push(args.join(' ')); };
+    const defaulted = ipc.createHandlers({ home, shell: {}, dialog: {}, writeFile: () => {} });
+    await rejects(() => defaulted['activity:list']({}), 'internal', 'default logger');
+    console.error = origConsoleError;
+    assert.strictEqual(captured.length, 1);
+    assert.ok(captured[0].includes('activity:list') && captured[0].includes('kaboom'));
+
+    // A logger that itself throws must not change what the renderer sees.
+    const hostile = ipc.createHandlers({
+      home, shell: {}, dialog: {}, writeFile: () => {}, log: () => { throw new Error('logger down'); },
+    });
+    const err = await rejects(() => hostile['activity:list']({}), 'internal', 'failing logger');
+    assert.ok(!err.message.includes('logger down'));
+  } finally {
+    console.error = origConsoleError;
+    read.listActivities = origList;
     cleanup(home);
   }
 });
