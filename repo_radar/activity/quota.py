@@ -673,7 +673,15 @@ def _gather_accounting(home, ctx=None):
     activities = []
     if root_listable:
         for name in subdirs:
-            if name == "quota":
+            # Ruling 69 (G10-Py, Codex Round 10 BLOCKER): explicit defense-in-depth guard, shared
+            # by BOTH the locked (`ctx.afd`-bound `list_owned_subdirs_dir_fd_detailed`, which now
+            # filters to valid ids at its own source) and unlocked (`list_owned_subdirs_detailed`,
+            # which does NOT filter -- it deliberately still returns every real directory, "quota"
+            # included) branches: neither branch may ever measure or charge a non-UUID directory's
+            # bytes as if it were a real activity. This keeps the two accounting forms consistent
+            # with each other -- pre-fix, BOTH counted a stray `activity/junk/`'s bytes toward the
+            # charge (Codex repro measured 330 bytes counted via either form).
+            if name == "quota" or not ids.valid_activity_id(name):
                 continue
             if ctx is not None:
                 entries, dir_uncertain = paths.stat_owned_segments_dir_fd_detailed(ctx.afd, name)
@@ -969,11 +977,18 @@ def _reconcile_all_locked(home, ctx):
     `_ledger_entries(home)` -- so a `quota/` swap that lands after the lock was acquired can never
     be misread as "certain empty" (which pre-fix let `_reconcile_one_locked` silently skip every
     real, still-live entry hiding in the swapped-away directory). If the ledger can't be verified
-    this pass, do nothing at all -- never guess at which aids to reconcile."""
+    this pass, do nothing at all -- never guess at which aids to reconcile.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `_ledger_entries_detailed_fd` already filters to
+    valid-activity-id-shaped ledger entry names (`name[:-5]`), so `aid` here is always valid in
+    practice -- the explicit guard below is pure defense-in-depth, matching the same belt-and-
+    braces pattern added to `_prune_locked`'s/`_retain_locked`'s own candidate loops."""
     entries, uncertain = _ledger_entries_detailed_fd(ctx)
     if uncertain:
         return
     for aid, _e in entries:
+        if not ids.valid_activity_id(aid):
+            continue
         _reconcile_one_locked(home, aid, ctx)
 
 def reconcile(home):
@@ -1092,7 +1107,15 @@ def _prune_locked(home, need_bytes, ctx):
     (below) is now ALSO bound to `ctx.afd`, closing the one piece of this function's own I/O that
     Ruling 67 left path-based -- `_classify` used to re-resolve `<aid>/` from scratch via `paths.
     activity_dir(home, aid)`, a walk entirely independent of the enumeration/deletion above. See
-    `_classify` and `_scan`'s own docstrings for the ABA this closes."""
+    `_classify` and `_scan`'s own docstrings for the ABA this closes.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): the candidate loop below adds its own explicit
+    `ids.valid_activity_id(aid)` guard -- defense-in-depth on top of `list_owned_subdirs_dir_fd`
+    already filtering to valid ids at its source (paths.py) -- so a non-UUID name can NEVER reach
+    `_classify` or `unlink_owned_tree_dir_fd` from this loop, however it got here. Pre-fix, a
+    non-UUID directory (e.g. `activity/junk/`) holding a fabricated `succeeded` terminal was
+    classified 'routine' and then genuinely DELETED here (Codex repro: `quota.prune(home, 1)`
+    freed 330 bytes and removed `activity/junk/` entirely)."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return 0                                   # live set unproven -- never delete under uncertainty
@@ -1101,7 +1124,7 @@ def _prune_locked(home, need_bytes, ctx):
     live = {aid for aid, _e in entries}
     items = []
     for aid in paths.list_owned_subdirs_dir_fd(ctx.afd):
-        if aid == "quota" or aid in live:
+        if aid == "quota" or aid in live or not ids.valid_activity_id(aid):
             continue
         kind, mtime = _classify(home, aid, ctx)
         if kind == "running":
@@ -1159,7 +1182,12 @@ def _retain_locked(home, ctx):
     Ruling 68 (G9-Py, Codex Round 9 BLOCKER; Python-side defense-in-depth per the spec's
     2026-08-26 §7 threat-model scope ruling): each candidate's `_classify(home, aid, ctx)` call
     (below) is now ALSO bound to `ctx.afd`, same rationale/fix as `_prune_locked`'s own -- see
-    `_classify`/`_scan`'s own docstrings."""
+    `_classify`/`_scan`'s own docstrings.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): same explicit `ids.valid_activity_id(aid)` guard
+    as `_prune_locked`'s candidate loop -- defense-in-depth on top of `list_owned_subdirs_dir_fd`
+    already filtering to valid ids at its source -- so a non-UUID directory can never be classified
+    or deleted (via `unlink_owned_tree_dir_fd`, below) from this loop either."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return []                                    # live set unproven -- never delete under uncertainty
@@ -1170,7 +1198,7 @@ def _retain_locked(home, ctx):
 
     candidates = []
     for aid in before:
-        if aid == "quota" or aid in live:
+        if aid == "quota" or aid in live or not ids.valid_activity_id(aid):
             continue
         kind, mtime = _classify(home, aid, ctx)
         if kind == "running":

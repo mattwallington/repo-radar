@@ -1515,3 +1515,158 @@ def test_verify_canonical_returns_false_when_quota_replaced_by_regular_file(tmp_
         assert quota._verify_canonical(ctx) is False       # must not raise
     finally:
         quota._unlock(ctx)
+
+# --- Ruling 69 (G10-Py, Codex Round 10 BLOCKER): the fd-bound scan/stat/read/unlink primitives
+# Ruling 67/68 introduced dropped the activity-id VALIDATION `paths.activity_dir()` always enforced
+# for the path-based form -- `scan.scan_activity_dir_fd`/`paths.unlink_owned_tree_dir_fd`/`paths.
+# stat_owned_segments_dir_fd_detailed`/`paths.read_owned_segments_dir_fd_detailed` all opened
+# WHATEVER real directory sat at a given name relative to an already-validated root fd, with no
+# check the name was ever a valid activity id. `paths.list_owned_subdirs_dir_fd_detailed` made this
+# reachable: pre-fix it returned EVERY real directory unconditionally (not just UUID-shaped ones),
+# so a non-UUID directory (e.g. `activity/junk/`) sailed straight into `_prune_locked`'s candidate
+# loop -- classified via that same unguarded fd-bound scan, then genuinely DELETED (Codex repro:
+# `activity/junk/python-deadbeef.jsonl` holding a valid start+succeeded terminal with `activity_id:
+# "junk"` -> `quota.prune(home, 1)` freed the segment's bytes and removed `activity/junk/`
+# entirely). Before Ruling 68 this failed closed -- the path-based `scan_activity` always went
+# through `paths.activity_dir()`, which validates; Ruling 68's fd-bound classification removed that
+# safety net without replacing it.
+
+def _mk_junk(tmp_path, name="junk"):
+    """A non-UUID activity-like directory sitting directly under `activity/` -- bypasses `paths.
+    activity_dir`'s id validation entirely (the whole point is to plant something that guard would
+    otherwise refuse to even name). Mirrors `_mk`'s shape for a real activity."""
+    paths.secure_mkdir(paths.quota_dir(tmp_path))          # activity/ + activity/quota/ exist
+    d = paths.quota_dir(tmp_path).parent / name
+    d.mkdir(mode=0o700, exist_ok=True)
+    return d
+
+def _write_junk_rec(tmp_path, name, **rec):
+    rec.setdefault("schema_version", 1); rec.setdefault("activity_id", name)
+    rec.setdefault("ts", "2026-08-14T00:00:00-07:00")
+    d = paths.quota_dir(tmp_path).parent / name
+    seg = d / "python-deadbeef.jsonl"
+    with open(seg, "ab") as f:
+        f.write((json.dumps(rec) + "\n").encode())
+
+def _write_junk_start(tmp_path, name):
+    _write_junk_rec(tmp_path, name, type="start", seq=0, kind="sync", channel="stable",
+                     trigger="cli", created_by="python")
+
+def _write_junk_terminal(tmp_path, name, outcome="succeeded"):
+    _write_junk_rec(tmp_path, name, type="terminal", seq=9, outcome=outcome, summary={}, by="deadbeef")
+
+def test_prune_never_deletes_a_non_uuid_activity_directory(tmp_path):
+    """Codex Round 10 repro, direct: `activity/junk/` holds a parse-valid start+succeeded terminal
+    with `activity_id: "junk"`. `quota.prune` must never classify or delete it -- `"junk"` can never
+    be a genuine prune candidate no matter what its segments contain."""
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    freed = quota.prune(tmp_path, 1)
+
+    assert freed == 0
+    assert (paths.quota_dir(tmp_path).parent / "junk").exists()
+
+def test_retain_never_deletes_a_non_uuid_activity_directory(tmp_path):
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    pruned = quota.retain(tmp_path)
+
+    assert pruned == []
+    assert (paths.quota_dir(tmp_path).parent / "junk").exists()
+
+def test_accounting_never_counts_a_non_uuid_activity_directorys_bytes(tmp_path):
+    """Both accounting forms -- the unlocked/path-based `_charge`/`_accounting_snapshot(home)` AND
+    the locked, `ctx`-bound form real `admit`/`grant`/`prune`/`retain` actually use -- must agree
+    that a non-UUID directory's bytes never count toward the charge. Pre-fix, BOTH forms counted
+    it (a stray `activity/junk/`'s segment bytes were charged either way, via `_gather_accounting`'s
+    single shared per-activity loop); the Ruling 69 guard added there closes it for both branches
+    at once, keeping the two forms consistent with each other."""
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    assert quota._charge(tmp_path) == 0
+    assert quota._accounting_snapshot(tmp_path) == quota.Snapshot(charge=0, uncertain=False, corrupt=False)
+
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        gathered = quota._gather_accounting(tmp_path, ctx=ctx)
+        assert gathered.activities == []                 # "junk" never became an ActivityInput
+        snap = quota._accounting_snapshot(tmp_path, ctx=ctx)
+        assert snap == quota.Snapshot(charge=0, uncertain=False, corrupt=False)
+    finally:
+        quota._unlock(ctx)
+
+def test_scan_activity_dir_fd_rejects_a_non_uuid_name(tmp_path):
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        with pytest.raises(paths.UnsafePath):
+            quota.scan_mod.scan_activity_dir_fd(ctx.afd, "junk")
+    finally:
+        quota._unlock(ctx)
+
+def test_unlink_owned_tree_dir_fd_rejects_a_non_uuid_name_and_deletes_nothing(tmp_path):
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        with pytest.raises(paths.UnsafePath):
+            paths.unlink_owned_tree_dir_fd(ctx.afd, "junk")
+    finally:
+        quota._unlock(ctx)
+
+    assert (paths.quota_dir(tmp_path).parent / "junk").exists()
+    assert (paths.quota_dir(tmp_path).parent / "junk" / "python-deadbeef.jsonl").exists()
+
+def test_prune_never_deletes_a_symlink_named_like_a_valid_uuid_at_the_root(tmp_path):
+    """A symlink squatting on a VALID-UUID-shaped name at the activity root (e.g. pointing outside
+    the activity tree) must still be rejected -- never treated as a real subdir, never classified,
+    never deleted -- via the fd-bound root listing exactly like the path-based `list_owned_subdirs_
+    detailed` already guarantees for its own symlink handling."""
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    outside = tmp_path / "outside"; outside.mkdir()
+    aid = ids.mint_activity_id()
+    link = paths.quota_dir(tmp_path).parent / aid
+    os.symlink(outside, link)
+
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        subdirs, rejected, uncertain = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
+        assert aid not in subdirs
+        assert (aid, "symlink") in rejected
+        assert uncertain is True
+    finally:
+        quota._unlock(ctx)
+
+    freed = quota.prune(tmp_path, 1)
+
+    assert freed == 0
+    assert link.is_symlink()
+    assert outside.exists()                   # the symlink target was never touched either
+
+def test_prune_deletes_a_junk_directory_when_validation_is_bypassed_counterfactual(tmp_path, monkeypatch):
+    """Counterfactual (Codex Round 10 repro, confirms the pre-fix vulnerability): with `ids.valid_
+    activity_id` forced to accept any string, EVERY Ruling 69 guard reverts at once -- they all key
+    off this single predicate: the source-level filter in `list_owned_subdirs_dir_fd_detailed`, the
+    explicit loop guards in `_prune_locked`/`_retain_locked`/`_gather_accounting`, and the raising
+    preconditions in `scan.scan_activity_dir_fd`/`paths.unlink_owned_tree_dir_fd`/`stat_owned_
+    segments_dir_fd_detailed`/`read_owned_segments_dir_fd_detailed`/`_dir_provably_gone_dir_fd`.
+    With all of that reverted, the exact `1c61b42` behavior reproduces: `activity/junk/` is
+    classified 'routine' and genuinely deleted. (`"quota"` stays excluded via the separate,
+    unaffected `aid == "quota"` name check at each call site, so this doesn't also try to classify/
+    delete the real ledger directory.) This test is expected to keep passing as a canary: if the
+    id-validation guards are ever silently reverted, this documents exactly why that regresses."""
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+
+    monkeypatch.setattr(ids, "valid_activity_id", lambda s: isinstance(s, str))
+
+    freed = quota.prune(tmp_path, 1)
+
+    assert freed > 0
+    assert not (paths.quota_dir(tmp_path).parent / "junk").exists()   # BUG (pre-fix): junk was deleted

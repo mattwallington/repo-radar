@@ -127,7 +127,14 @@ def _dir_provably_gone_dir_fd(dfd, name):
     opposed to existing but unsafe to open (ELOOP/ENOTDIR/etc.) or any other `OSError`, both of
     which must stay uncertain (preserve). Mirrors `_dir_provably_gone`'s identical distinction,
     just resolved via an already-validated directory fd (a locked `quota.LockCtx.afd`) instead of
-    a fresh path walk."""
+    a fresh path walk.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `name` MUST be a valid activity id -- raises
+    `paths.UnsafePath` otherwise, mirroring `paths.activity_dir()`'s guard. `scan_activity_dir_fd`
+    (the only caller) already validates `aid` before ever reaching this, so this is defense-in-
+    depth for any other/future caller, not a reachable path today."""
+    if not ids.valid_activity_id(name):
+        raise paths.UnsafePath(f"invalid activity_id: {name!r}")
     try:
         sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except FileNotFoundError:
@@ -191,7 +198,18 @@ def scan_activity_dir_fd(dfd, aid):
     with -- never a directory a same-ID pathname swap re-resolved to mid-decision. Otherwise
     IDENTICAL segment enumeration/finding/seq-regression/cancel-requested rules to `scan_activity`
     -- see the module docstring; only the read primitive and the provably-gone check
-    (`_dir_provably_gone_dir_fd` instead of `_dir_provably_gone`) differ."""
+    (`_dir_provably_gone_dir_fd` instead of `_dir_provably_gone`) differ.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `aid` MUST be a valid activity id -- raises `paths.
+    UnsafePath` otherwise, mirroring `paths.activity_dir()`'s guard for the path-based `scan_
+    activity` above (which gets this for free via `activity_dir(home, aid)`; this fd-bound sibling
+    never called anything that validated `aid` at all). Checked explicitly here, up front, even
+    though `paths.read_owned_segments_dir_fd_detailed` now also refuses an invalid name on its own
+    -- a same-ID directory swapped in with a fabricated `succeeded` terminal (Codex Round 10 repro:
+    `activity/junk/python-*.jsonl`) must never be classified 'routine' by a locked prune/retain
+    pass in the first place."""
+    if not ids.valid_activity_id(aid):
+        raise paths.UnsafePath(f"invalid activity_id: {aid!r}")
     segments, rejected_raw = paths.read_owned_segments_dir_fd_detailed(dfd, aid)
     rejected = [{"name": name, "reason": reason} for name, reason in rejected_raw]
 

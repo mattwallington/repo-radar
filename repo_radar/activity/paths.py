@@ -294,7 +294,15 @@ def stat_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
         `FileNotFoundError` branch; any OTHER open failure -- ELOOP/EACCES/a non-directory
         squatting on the name -- is uncertain), OR the opened subdirectory itself couldn't be
         scanned, OR any suffix-matching entry's `lstat` failed with anything other than
-        `FileNotFoundError`."""
+        `FileNotFoundError`.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `name` MUST be a valid activity id (`ids.valid_
+    activity_id`) -- raises `UnsafePath` otherwise, mirroring `activity_dir()`'s own guard for the
+    path-based form. Pre-fix, this opened WHATEVER real directory sat at `name` relative to `dfd`
+    with no validation at all, so a non-UUID directory (e.g. `activity/junk/`) fed straight into a
+    LOCKED byte measurement as if it were a real activity."""
+    if not ids.valid_activity_id(name):
+        raise UnsafePath(f"invalid activity_id: {name!r}")
     try:
         sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except FileNotFoundError:
@@ -354,7 +362,17 @@ def read_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
         opened/listed relative to `dfd` (mirrors the path-based form folding both 'never existed'
         and 'unsafe to open' into the same dir-unreadable signal; `scan.scan_activity_dir_fd`'s own
         provably-gone companion check distinguishes the two independently, exactly like `scan.
-        scan_activity`'s `_dir_provably_gone` does for the path-based form)."""
+        scan_activity`'s `_dir_provably_gone` does for the path-based form).
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `name` MUST be a valid activity id (`ids.valid_
+    activity_id`) -- raises `UnsafePath` otherwise, mirroring `activity_dir()`'s own guard. Pre-fix,
+    this read WHATEVER real directory sat at `name` relative to `dfd` -- and, driven by `scan.
+    scan_activity_dir_fd`, fed the result straight into a LOCKED classification decision -- with no
+    validation that `name` was ever a real activity id at all, letting a non-UUID directory (e.g.
+    `activity/junk/`) planted with a fabricated `succeeded` terminal get classified 'routine' and
+    then deleted by `_prune_locked`/`_retain_locked` (Codex repro)."""
+    if not ids.valid_activity_id(name):
+        raise UnsafePath(f"invalid activity_id: {name!r}")
     try:
         sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except OSError:
@@ -640,7 +658,21 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
     detailed`, except there is no "gone" case for the BASE itself (mirrors every other fd-bound
     primitive in the Ruling-60 section above): `dfd` is assumed already open/validated on entry --
     callers validate it once, at lock acquisition, and re-verify its continued canonical identity
-    via `quota._verify_canonical` around each use, not here."""
+    via `quota._verify_canonical` around each use, not here.
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `subdirs` now contains ONLY valid-activity-id
+    (UUID-shaped) names -- a real directory whose name is NOT a valid activity id (e.g. `quota`,
+    or stray junk like `activity/junk/`) is silently ignored: neither a subdir nor a rejected entry,
+    exactly like a non-directory junk NAME already was for `list_owned_subdirs_detailed`. Pre-fix,
+    ANY real directory (valid id or not) was unconditionally appended to `subdirs` -- every locked
+    caller (`_gather_accounting`, `_prune_locked`, `_retain_locked`) then fed that name straight
+    into an fd-relative stat/read/unlink with no id validation of its own (see `stat_owned_segments_
+    dir_fd_detailed`/`read_owned_segments_dir_fd_detailed`/`unlink_owned_tree_dir_fd`'s own Ruling
+    69 guards), so a non-UUID directory holding a fabricated `succeeded` terminal was classified and
+    then DELETED by `_prune_locked` (Codex Round 10 repro: `activity/junk/` survived only because
+    `quota` happened to be skipped by an explicit name check at each call site -- ANY other non-UUID
+    name sailed straight through). Filtering here closes the gap at its single shared source instead
+    of relying on every call site to separately guard against it."""
     subdirs = []
     rejected = []
     uncertain = False
@@ -661,9 +693,11 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
             else:
                 rejected.append((e.name, "stat-failed")); uncertain = True
             continue
+        if not ids.valid_activity_id(e.name):
+            continue                   # non-UUID name (e.g. "quota", stray junk): not a candidate
         if stat.S_ISDIR(st.st_mode):
             subdirs.append(e.name)
-        elif ids.valid_activity_id(e.name):
+        else:
             if stat.S_ISLNK(st.st_mode):
                 rejected.append((e.name, "symlink"))
             else:
@@ -720,7 +754,17 @@ def unlink_owned_tree_dir_fd(dfd, name):
     opening `name`, or unlinking/rmdir-ing any individual entry, is swallowed, never raised --
     callers (`quota._prune_locked`/`_retain_locked`) already re-verify canonical identity via
     `quota._verify_canonical` immediately BEFORE calling this for each deletion decision, so this
-    function itself does no identity checking of its own. Returns bytes freed."""
+    function itself does no identity checking of its own beyond `name` validity (below).
+
+    Ruling 69 (G10-Py, Codex Round 10 BLOCKER): `name` MUST be a valid activity id -- raises
+    `UnsafePath` (NOT swallowed like the best-effort failures above) BEFORE opening anything, so a
+    caller can never delete an arbitrary, non-UUID directory sitting under the activity root. This
+    is the last line of defense: `list_owned_subdirs_dir_fd_detailed` (Ruling 69) already filters
+    candidates to valid ids, and `_prune_locked`/`_retain_locked` (Ruling 69) each add their own
+    explicit guard before ever reaching this call -- this raise should be unreachable in practice,
+    but a deletion primitive must never trust its caller alone for something this destructive."""
+    if not ids.valid_activity_id(name):
+        raise UnsafePath(f"invalid activity_id: {name!r}")
     try:
         sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except OSError:
