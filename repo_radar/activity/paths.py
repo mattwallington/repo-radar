@@ -355,7 +355,13 @@ def read_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
     never-prune-running guarantee fully descriptor-bound even though the underlying same-UID ABA
     class is outside the documented threat model.
 
-    Returns `(segments, rejected)` -- same shape/semantics as `read_owned_segments_detailed`:
+    Returns `(segments, rejected, ident)` -- the first two exactly as `read_owned_segments_
+    detailed` returns them, plus (Ruling 72, G11-Py, Codex Round 11 B2, BLOCKER) `ident`: the
+    `(st_dev, st_ino)` of the subdirectory fd this call ACTUALLY opened and read through (`os.
+    fstat` on that fd -- never a by-name stat), or `None` when the subdirectory couldn't be opened
+    at all. `scan.scan_activity_dir_fd` carries it into `Scan.ident` so `quota._classify` can hand
+    it to `unlink_owned_tree_dir_fd(dfd, name, expect_ident)`, binding the classified identity
+    THROUGH deletion (see there for the persistent same-UUID-replacement repro this closes).
       segments -- [(name, data_bytes, size, mtime)].
       rejected -- [(name, reason)] per suffix-matching entry ('symlink'/'not-regular'/'denied'/
         'gone'/'read-failed'), OR `[('', 'dir-unreadable')]` if the SUBDIRECTORY itself couldn't be
@@ -376,14 +382,16 @@ def read_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
     try:
         sfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except OSError:
-        return [], [("", "dir-unreadable")]
+        return [], [("", "dir-unreadable")], None
     segments = []
     rejected = []
     try:
         try:
+            dst = os.fstat(sfd)                                   # Ruling 72: identity of THIS dir
+            ident = (dst.st_dev, dst.st_ino)
             entries = list(os.scandir(sfd))
         except OSError:
-            return [], [("", "dir-unreadable")]
+            return [], [("", "dir-unreadable")], None
         for entry in entries:
             if not entry.name.endswith(suffix):
                 continue
@@ -411,7 +419,7 @@ def read_owned_segments_dir_fd_detailed(dfd, name, suffix=".jsonl"):
                 os.close(ffd)
     finally:
         os.close(sfd)
-    return segments, rejected
+    return segments, rejected, ident
 
 def fsync_owned_segments(directory, suffix=".jsonl"):
     """Durabilize every safe regular segment under an owned dir, descriptor-relative, WITHOUT
@@ -598,45 +606,124 @@ def list_owned_subdirs_detailed(base):
     behavior for callers that don't need to distinguish "gone" from "uncertain". Every quota
     enumeration that feeds byte accounting (`_committed_detailed`, `_accounting_snapshot`) uses
     this detailed form directly so root-level uncertainty folds into the same snapshot as
-    per-activity uncertainty (Ruling 50)."""
+    per-activity uncertainty (Ruling 50).
+
+    Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): returns a FOURTH element, `foreign` --
+    `[(name, on_disk, uncertain)]`, one per non-UUID root entry other than `quota` -- measured
+    conservatively via `_measure_foreign_entry` (a real directory of regular files is summed; a
+    regular file at the root is its lstat size; ANYTHING else -- a symlink, a FIFO, a directory
+    holding a subdirectory/symlink, an unopenable/unlistable/unstat-able entry -- is `uncertain`).
+    Foreign entries are NEVER returned in `rejected`; a foreign DIRECTORY still appears in
+    `subdirs` here exactly as it always has for this path form (every real directory, `quota`
+    included -- callers filter by `ids.valid_activity_id`, and every fd-bound mutation/read
+    primitive raises `UnsafePath` on a non-UUID name, so a foreign entry can never be
+    classified/pruned/reconciled/read as an activity -- every Ruling 69 guard stands). The
+    fd-bound `list_owned_subdirs_dir_fd_detailed` sibling filters `subdirs` to valid ids (Ruling
+    69) and reports the same `foreign` list. Foreign entries do NOT touch the activity-level
+    `uncertain` flag either: their uncertainty rides in their own
+    tuple, which `quota._gather_accounting` folds into the snapshot (`measured += Σ on_disk`;
+    `uncertain |= any foreign uncertain`). Pre-fix, a non-UUID name was `continue`d before ANY
+    measurement, so 64 MiB in `activity/junk/` charged 0 bytes with `uncertain=False` and a fresh
+    activity was admitted on top of it -- violating spec §7's Σ-of-actual-bytes contract and its
+    persistent-path-replacement coverage (`<aid>/` renamed to `junk/` hid its committed bytes).
+    Returns `(subdirs, rejected, uncertain, foreign)`."""
     try:
         dfd = open_owned_dir(base)
     except FileNotFoundError:
-        return [], [], False              # base provably never existed -- nothing here to hide
+        return [], [], False, []          # base provably never existed -- nothing here to hide
     except (UnsafePath, OSError):
-        return [], [], True               # base exists but is unsafe/inaccessible -- uncertain
-    subdirs = []
-    rejected = []
+        return [], [], True, []           # base exists but is unsafe/inaccessible -- uncertain
+    try:
+        return _classify_root_entries(dfd)
+    finally:
+        os.close(dfd)
+
+def _measure_foreign_entry(dfd, name, st):
+    """Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): conservative byte measurement of ONE
+    foreign root entry `name` (a non-UUID name other than `quota`) whose root-level `lstat` is
+    `st`, relative to the already-open root dir fd `dfd`. Returns `(on_disk, uncertain)`:
+      regular file -> `(st_size, False)`.
+      directory -> opened `O_RDONLY|O_NOFOLLOW|O_DIRECTORY` relative to `dfd` and every entry
+        `lstat`'d relative to THAT fd: regular files are summed; any other entry (a subdirectory,
+        symlink, FIFO, device -- bytes this pass cannot see) makes it uncertain; a failed open,
+        scandir or per-entry lstat makes it uncertain (whatever DID stat is still counted --
+        partial measurement is real liability, never discarded, mirroring Ruling 62).
+      anything else (symlink, FIFO, ...) -> `(0, True)`.
+    Never recurses, never follows a symlink, never reads content, never deletes: measured, not
+    managed."""
+    if stat.S_ISREG(st.st_mode):
+        return st.st_size, False
+    if not stat.S_ISDIR(st.st_mode):
+        return 0, True
+    try:
+        sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+    except OSError:
+        return 0, True
+    total = 0
     uncertain = False
     try:
         try:
-            entries = list(os.scandir(dfd))
+            entries = list(os.scandir(sub))
         except OSError:
-            return [], [], True           # base opened fine but couldn't be listed -- uncertain
-        for e in entries:
+            return 0, True
+        for entry in entries:
             try:
-                st = os.lstat(e.name, dir_fd=dfd)
-            except OSError as err:
-                if not ids.valid_activity_id(e.name):
-                    continue               # non-UUID name: never hid a real activity's bytes
-                if err.errno == errno.ENOENT:
-                    rejected.append((e.name, "gone"))          # raced away -- proven gone
-                elif err.errno == errno.EACCES:
-                    rejected.append((e.name, "denied")); uncertain = True
-                else:
-                    rejected.append((e.name, "stat-failed")); uncertain = True
-                continue
-            if stat.S_ISDIR(st.st_mode):
-                subdirs.append(e.name)
-            elif ids.valid_activity_id(e.name):
-                if stat.S_ISLNK(st.st_mode):
-                    rejected.append((e.name, "symlink"))
-                else:
-                    rejected.append((e.name, "not-directory"))
+                est = os.lstat(entry.name, dir_fd=sub)
+            except OSError:
+                uncertain = True; continue
+            if stat.S_ISREG(est.st_mode):
+                total += est.st_size
+            else:
                 uncertain = True
     finally:
-        os.close(dfd)
-    return subdirs, rejected, uncertain
+        os.close(sub)
+    return total, uncertain
+
+def _classify_root_entries(dfd):
+    """The shared per-entry classification behind `list_owned_subdirs_detailed` (path form; its
+    `subdirs` still includes EVERY real directory, `quota` too) -- see that docstring for the
+    `(subdirs, rejected, uncertain, foreign)` contract. `list_owned_subdirs_dir_fd_detailed` is the
+    fd-bound sibling with its own Ruling 69 valid-id filter on `subdirs`; the two are kept as
+    separate loops on purpose so each stays a faithful mirror of its documented history."""
+    subdirs = []
+    rejected = []
+    foreign = []
+    uncertain = False
+    try:
+        entries = list(os.scandir(dfd))
+    except OSError:
+        return [], [], True, []           # base opened fine but couldn't be listed -- uncertain
+    for e in entries:
+        is_activity_name = ids.valid_activity_id(e.name)
+        try:
+            st = os.lstat(e.name, dir_fd=dfd)
+        except OSError as err:
+            if not is_activity_name:
+                if e.name != "quota":
+                    foreign.append((e.name, 0, True))   # Ruling 71: unstat-able foreign -> uncertain
+                continue
+            if err.errno == errno.ENOENT:
+                rejected.append((e.name, "gone"))          # raced away -- proven gone
+            elif err.errno == errno.EACCES:
+                rejected.append((e.name, "denied")); uncertain = True
+            else:
+                rejected.append((e.name, "stat-failed")); uncertain = True
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            subdirs.append(e.name)
+            if not is_activity_name and e.name != "quota":
+                on_disk, f_uncertain = _measure_foreign_entry(dfd, e.name, st)   # Ruling 71
+                foreign.append((e.name, on_disk, f_uncertain))
+        elif is_activity_name:
+            if stat.S_ISLNK(st.st_mode):
+                rejected.append((e.name, "symlink"))
+            else:
+                rejected.append((e.name, "not-directory"))
+            uncertain = True
+        elif e.name != "quota":
+            on_disk, f_uncertain = _measure_foreign_entry(dfd, e.name, st)       # Ruling 71
+            foreign.append((e.name, on_disk, f_uncertain))
+    return subdirs, rejected, uncertain, foreign
 
 def list_owned_subdirs(base):
     """Thin `subdirs`-only wrapper over `list_owned_subdirs_detailed` (Ruling 49): unchanged
@@ -654,8 +741,8 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
     (or wrongly-empty) path-based listing; see `quota._verify_canonical`'s companion root-identity
     check, which every caller checks BEFORE trusting this.
 
-    Returns `(subdirs, rejected, uncertain)` -- same shape/semantics as `list_owned_subdirs_
-    detailed`, except there is no "gone" case for the BASE itself (mirrors every other fd-bound
+    Returns `(subdirs, rejected, uncertain, foreign)` -- same shape/semantics as `list_owned_
+    subdirs_detailed`, except there is no "gone" case for the BASE itself (mirrors every other fd-bound
     primitive in the Ruling-60 section above): `dfd` is assumed already open/validated on entry --
     callers validate it once, at lock acquisition, and re-verify its continued canonical identity
     via `quota._verify_canonical` around each use, not here.
@@ -672,20 +759,33 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
     then DELETED by `_prune_locked` (Codex Round 10 repro: `activity/junk/` survived only because
     `quota` happened to be skipped by an explicit name check at each call site -- ANY other non-UUID
     name sailed straight through). Filtering here closes the gap at its single shared source instead
-    of relying on every call site to separately guard against it."""
+    of relying on every call site to separately guard against it.
+
+    Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): "silently ignored" above now means "never a
+    subdir, never rejected, never a candidate" -- but NOT "never measured". Every non-UUID entry
+    other than `quota` is returned in the FOURTH element, `foreign` (`[(name, on_disk,
+    uncertain)]`), measured conservatively via `_measure_foreign_entry` exactly like the path form
+    (see `list_owned_subdirs_detailed`'s Ruling 71 note for the full contract and the Codex repro:
+    64 MiB in `activity/junk/` charged 0 and a fresh activity was admitted). Foreign entries never
+    touch the activity-level `uncertain` flag; their own uncertainty rides in their tuple.
+    Returns `(subdirs, rejected, uncertain, foreign)`."""
     subdirs = []
     rejected = []
+    foreign = []
     uncertain = False
     try:
         entries = list(os.scandir(dfd))
     except OSError:
-        return [], [], True
+        return [], [], True, []
     for e in entries:
+        is_activity_name = ids.valid_activity_id(e.name)
         try:
             st = os.lstat(e.name, dir_fd=dfd)
         except OSError as err:
-            if not ids.valid_activity_id(e.name):
-                continue               # non-UUID name: never hid a real activity's bytes
+            if not is_activity_name:
+                if e.name != "quota":
+                    foreign.append((e.name, 0, True))   # Ruling 71: unstat-able foreign -> uncertain
+                continue
             if err.errno == errno.ENOENT:
                 rejected.append((e.name, "gone"))          # raced away -- proven gone
             elif err.errno == errno.EACCES:
@@ -693,7 +793,10 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
             else:
                 rejected.append((e.name, "stat-failed")); uncertain = True
             continue
-        if not ids.valid_activity_id(e.name):
+        if not is_activity_name:
+            if e.name != "quota":                          # Ruling 71: measured, never managed
+                on_disk, f_uncertain = _measure_foreign_entry(dfd, e.name, st)
+                foreign.append((e.name, on_disk, f_uncertain))
             continue                   # non-UUID name (e.g. "quota", stray junk): not a candidate
         if stat.S_ISDIR(st.st_mode):
             subdirs.append(e.name)
@@ -703,7 +806,7 @@ def list_owned_subdirs_dir_fd_detailed(dfd):
             else:
                 rejected.append((e.name, "not-directory"))
             uncertain = True
-    return subdirs, rejected, uncertain
+    return subdirs, rejected, uncertain, foreign
 
 def list_owned_subdirs_dir_fd(dfd):
     """Thin `subdirs`-only wrapper over `list_owned_subdirs_dir_fd_detailed` (Ruling 67): mirrors
@@ -743,7 +846,7 @@ def unlink_owned_tree(activity_dir):
         pass
     return freed
 
-def unlink_owned_tree_dir_fd(dfd, name):
+def unlink_owned_tree_dir_fd(dfd, name, expect_ident):
     """Ruling 67 (Round-8 follow-up, "G8b"): fd-bound counterpart to `unlink_owned_tree` for a
     LOCKED prune/retain deletion. Deletes activity subdirectory `name` -- every entry inside it,
     then the directory itself -- relative to an ALREADY-VALIDATED root directory fd `dfd` (a
@@ -762,7 +865,23 @@ def unlink_owned_tree_dir_fd(dfd, name):
     is the last line of defense: `list_owned_subdirs_dir_fd_detailed` (Ruling 69) already filters
     candidates to valid ids, and `_prune_locked`/`_retain_locked` (Ruling 69) each add their own
     explicit guard before ever reaching this call -- this raise should be unreachable in practice,
-    but a deletion primitive must never trust its caller alone for something this destructive."""
+    but a deletion primitive must never trust its caller alone for something this destructive.
+
+    Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): `expect_ident` -- a REQUIRED positional
+    `(st_dev, st_ino)` pair, the identity of the directory the caller actually CLASSIFIED (from
+    `quota._classify` -> `scan.Scan.ident` -> `read_owned_segments_dir_fd_detailed`'s `fstat` of
+    the fd it read through). After opening `name`, this function `fstat`s the fd it got and, on
+    ANY mismatch (including `expect_ident is None` -- "the classifier never had a directory to
+    bind", which can never match anything), closes it and returns 0 having deleted NOTHING: no
+    per-entry unlink, no rmdir. Callers (`_prune_locked`/`_retain_locked`) treat 0 as "skip this
+    candidate". Pre-fix, this re-opened `<name>` BY NAME and deleted whatever sat there, so a
+    persistent same-UUID replacement landing between classification and deletion (Codex repro:
+    classify a settled `<aid>/`, rename it to `<aid>.old`, create `<aid>/sentinel`, `quota.prune
+    (home, 1)`) deleted the REPLACEMENT and its sentinel while the classified original survived
+    untouched -- in scope per §7 (persistent replacement, not the excluded transient ABA). The
+    final by-name `rmdir` is likewise guarded by an `lstat` identity re-check immediately before
+    it (an `rmdir` has no fd-bound form); the residual window between that check and the `rmdir`
+    can only ever remove an EMPTY replacement directory, never any bytes."""
     if not ids.valid_activity_id(name):
         raise UnsafePath(f"invalid activity_id: {name!r}")
     try:
@@ -771,6 +890,12 @@ def unlink_owned_tree_dir_fd(dfd, name):
         return 0
     freed = 0
     try:
+        try:
+            st = os.fstat(sub)
+        except OSError:
+            return 0
+        if expect_ident is None or (st.st_dev, st.st_ino) != tuple(expect_ident):
+            return 0                                          # Ruling 72: not the dir we classified
         for entry in os.scandir(sub):
             try:
                 freed += os.lstat(entry.name, dir_fd=sub).st_size
@@ -783,7 +908,9 @@ def unlink_owned_tree_dir_fd(dfd, name):
     finally:
         os.close(sub)
     try:
-        os.rmdir(name, dir_fd=dfd)
+        st = os.lstat(name, dir_fd=dfd)                       # Ruling 72: re-check before by-name rmdir
+        if stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == tuple(expect_ident):
+            os.rmdir(name, dir_fd=dfd)
     except OSError:
         pass
     return freed

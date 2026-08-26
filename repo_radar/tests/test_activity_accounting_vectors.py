@@ -29,13 +29,26 @@ def _inputs_from_json(d):
         else:
             ledger.append(quota.LedgerInput(
                 aid=entry["aid"], reserved=entry["reserved"], granted=entry["granted"]))
+    # Ruling 71 (Codex R11 B1): OPTIONAL `foreign` key -- non-UUID root entries (other than
+    # `quota`) measured conservatively, never managed. Absent => empty (every pre-R11 vector).
+    foreign = [
+        quota.ForeignInput(name=f["name"], on_disk_measured=f["on_disk"], uncertain=f["uncertain"])
+        for f in d.get("foreign", [])
+    ]
     return quota.AccountingInputs(
         root_listable=d["root_listable"],
         ledger_listable=d["ledger_listable"],
         activities=activities,
         rejected_root_ids=list(d["rejected_root_ids"]),
         ledger=ledger,
+        foreign=foreign,
     )
+
+
+def test_fixture_carries_the_three_ruling_71_foreign_vectors():
+    names = [c["name"] for c in VECTORS]
+    assert sum(1 for n in names if n.endswith("-ruling-71")) == 3
+    assert sum(1 for c in VECTORS if c["inputs"].get("foreign")) == 3   # and ONLY those three
 
 
 def test_accounting_vectors_fixture_schema():
@@ -43,15 +56,17 @@ def test_accounting_vectors_fixture_schema():
     assert VECTORS, "fixture must not be empty"
     for case in VECTORS:
         assert set(case) == {"name", "inputs", "constants", "expected"}, case.get("name")
-        assert set(case["inputs"]) == {
-            "root_listable", "ledger_listable", "activities", "rejected_root_ids", "ledger",
-        }, case["name"]
+        required = {"root_listable", "ledger_listable", "activities", "rejected_root_ids", "ledger"}
+        assert required <= set(case["inputs"]) <= required | {"foreign"}, case["name"]
         assert set(case["constants"]) == {"CEILING", "PER_ACTIVITY_CAP", "RESERVE"}, case["name"]
         assert set(case["expected"]) == {"charge", "uncertain", "corrupt"}, case["name"]
         for a in case["inputs"]["activities"]:
             assert set(a) == {"aid", "on_disk", "uncertain"}, case["name"]
         for e in case["inputs"]["ledger"]:
             assert set(e) == {"aid", "corrupt"} or set(e) == {"aid", "reserved", "granted"}, case["name"]
+        for f in case["inputs"].get("foreign", []):          # Ruling 71: optional, default empty
+            assert set(f) == {"name", "on_disk", "uncertain"}, case["name"]
+            assert not quota.ids.valid_activity_id(f["name"]) and f["name"] != "quota", case["name"]
         # the real constants (Ruling 56: "use the REAL constants so the vectors read naturally")
         assert case["constants"] == {
             "CEILING": 64 * 1024 * 1024, "PER_ACTIVITY_CAP": 4 * 1024 * 1024, "RESERVE": 60 * 1024,

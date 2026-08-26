@@ -61,7 +61,7 @@ def test_unreadable_conforming_terminal_segment_preserves_ledger_and_synthesizes
         after = set(os.listdir(paths.activity_dir(tmp_path, aid)))
         assert after == before                                  # no synthetic segment written
 
-        kind, _mtime = quota._classify(tmp_path, aid)
+        kind, _mtime, _ident = quota._classify(tmp_path, aid)
         assert kind == "running"                                # uncertain view -> never guessed
     finally:
         os.chmod(terminal_seg, 0o600)                           # restore perms before teardown
@@ -77,7 +77,7 @@ def test_unreadable_conforming_terminal_segment_reconciles_normally_once_perms_r
     assert paths.ledger_entry_path(tmp_path, aid).exists()      # preserved while unreadable
 
     os.chmod(terminal_seg, 0o600)                                # restore
-    kind, _mtime = quota._classify(tmp_path, aid)
+    kind, _mtime, _ident = quota._classify(tmp_path, aid)
     assert kind == "routine"                                     # succeeded, no problems -> routine
 
     quota.reconcile(tmp_path)
@@ -105,7 +105,7 @@ def test_terminal_segment_replaced_by_symlink_preserves_ledger_and_synthesizes_n
     after = set(os.listdir(paths.activity_dir(tmp_path, aid)))
     assert after == before                                       # no synthetic segment written
 
-    kind, _mtime = quota._classify(tmp_path, aid)
+    kind, _mtime, _ident = quota._classify(tmp_path, aid)
     assert kind == "running"
 
 # --- direct `_scan` coverage: the Scan field contract itself -------------------------------

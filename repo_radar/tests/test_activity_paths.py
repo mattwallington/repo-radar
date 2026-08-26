@@ -260,7 +260,7 @@ def test_list_owned_subdirs_detailed_classifies_symlink_and_not_directory(tmp_pa
     outside = tmp_path / "outside"; outside.mkdir()
     os.symlink(outside, base / AID_B)                                # AID_B: symlink
     (base / AID_C).write_bytes(b"not a directory")                   # AID_C: regular file
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_detailed(base)
     assert set(subdirs) == {"quota", AID_A}
     assert dict(rejected) == {AID_B: "symlink", AID_C: "not-directory"}
     assert uncertain is True
@@ -275,7 +275,7 @@ def test_list_owned_subdirs_detailed_gone_entry_is_rejected_but_not_uncertain(tm
             raise OSError(errno.ENOENT, "raced away")
         return real_lstat(name, dir_fd=dir_fd)
     monkeypatch.setattr(paths.os, "lstat", hooked)
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_detailed(base)
     assert AID_A not in subdirs
     assert (AID_A, "gone") in rejected
     assert uncertain is False                     # ENOENT is proven-gone, never uncertain
@@ -293,7 +293,7 @@ def test_list_owned_subdirs_detailed_stat_failure_is_uncertain_not_gone(tmp_path
             raise OSError(errno.EIO, "Input/output error")
         return real_lstat(name, dir_fd=dir_fd)
     monkeypatch.setattr(paths.os, "lstat", hooked)
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_detailed(base)
     assert AID_A not in subdirs
     assert (AID_A, "stat-failed") in rejected
     assert uncertain is True
@@ -308,7 +308,7 @@ def test_list_owned_subdirs_detailed_denied_entry_is_uncertain(tmp_path, monkeyp
             raise OSError(errno.EACCES, "Permission denied")
         return real_lstat(name, dir_fd=dir_fd)
     monkeypatch.setattr(paths.os, "lstat", hooked)
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_detailed(base)
     assert AID_A not in subdirs
     assert (AID_A, "denied") in rejected
     assert uncertain is True
@@ -316,7 +316,7 @@ def test_list_owned_subdirs_detailed_denied_entry_is_uncertain(tmp_path, monkeyp
 def test_list_owned_subdirs_detailed_base_missing_is_not_uncertain(tmp_path):
     base = paths.quota_dir(tmp_path).parent            # the "activity" dir path, never created
     base.parent.mkdir(parents=True)                     # the shared "repo-radar" prefix DOES exist
-    assert paths.list_owned_subdirs_detailed(base) == ([], [], False)
+    assert paths.list_owned_subdirs_detailed(base) == ([], [], False, [])
 
 def test_list_owned_subdirs_detailed_symlinked_base_is_uncertain(tmp_path):
     import shutil
@@ -325,7 +325,7 @@ def test_list_owned_subdirs_detailed_symlinked_base_is_uncertain(tmp_path):
     activity_root = paths.quota_dir(tmp_path).parent
     shutil.rmtree(activity_root)
     os.symlink(outside, activity_root)                  # base itself is a symlink
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(activity_root)
+    subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_detailed(activity_root)
     assert subdirs == [] and rejected == [] and uncertain is True
 
 def test_list_owned_subdirs_is_a_thin_wrapper_over_detailed(tmp_path):
@@ -343,10 +343,12 @@ def test_list_owned_subdirs_detailed_ignores_non_uuid_names_in_rejected(tmp_path
     (base / "junk").write_bytes(b"not an activity")
     outside = tmp_path / "outside"; outside.mkdir()
     os.symlink(outside, base / "also-junk")
-    subdirs, rejected, uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, uncertain, foreign = paths.list_owned_subdirs_detailed(base)
     assert set(subdirs) == {"quota"}
     assert rejected == []
     assert uncertain is False
+    # Ruling 71: ...but they ARE measured -- the file's bytes count, the symlink is uncertain.
+    assert sorted(foreign) == [("also-junk", 0, True), ("junk", len(b"not an activity"), False)]
 
 # --- Ruling 54 (Codex R6-1, BLOCKER): list_owned_entries_detailed must never collapse a LEDGER-
 # directory listing failure to the same "[]" a genuinely-empty/never-created dir returns ---------
@@ -384,3 +386,59 @@ def test_list_owned_entries_is_a_thin_wrapper_over_detailed(tmp_path):
     assert paths.list_owned_entries(d, suffix=".json") == \
         paths.list_owned_entries_detailed(d, suffix=".json")[0]
     assert paths.list_owned_entries(d) == paths.list_owned_entries_detailed(d)[0]
+
+# --- Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): the root enumerators gain a fourth `foreign`
+# element -- [(name, on_disk, uncertain)] per non-UUID root entry other than `quota` -- measured
+# conservatively (regular files counted, anything else uncertain), never returned as a subdir.
+
+def _foreign_fixture(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, VALID))
+    (base / "stray.bin").write_bytes(b"s" * 7)                        # regular file at root: 7
+    plain = base / "plain"; plain.mkdir(mode=0o700)                    # dir of regular files: 5+6
+    (plain / "a").write_bytes(b"a" * 5); (plain / "b").write_bytes(b"b" * 6)
+    nested = base / "nested"; nested.mkdir(mode=0o700)                 # dir with a subdir: uncertain
+    (nested / "x").write_bytes(b"x" * 3); (nested / "deeper").mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, base / "rootlink")                             # symlink at root: uncertain
+    linked = base / "linked"; linked.mkdir(mode=0o700)                 # dir with a symlink: uncertain
+    os.symlink(outside, linked / "l")
+    return base
+
+_EXPECT_FOREIGN = {
+    "stray.bin": (7, False), "plain": (11, False), "nested": (3, True),
+    "rootlink": (0, True), "linked": (0, True),
+}
+
+def test_list_owned_subdirs_detailed_reports_foreign_entries(tmp_path):
+    base = _foreign_fixture(tmp_path)
+    subdirs, rejected, uncertain, foreign = paths.list_owned_subdirs_detailed(base)
+    # unchanged for the path form: EVERY real directory (quota + foreign dirs included; callers
+    # filter by id) -- the root symlink and stray file are still never subdirs
+    assert set(subdirs) == {"quota", VALID, "plain", "nested", "linked"}
+    assert rejected == [] and uncertain is False               # activity-level view unchanged
+    assert {n: (b, u) for n, b, u in foreign} == _EXPECT_FOREIGN
+
+def test_list_owned_subdirs_dir_fd_detailed_reports_foreign_entries(tmp_path):
+    base = _foreign_fixture(tmp_path)
+    dfd = paths.open_owned_dir(base)
+    try:
+        subdirs, rejected, uncertain, foreign = paths.list_owned_subdirs_dir_fd_detailed(dfd)
+    finally:
+        os.close(dfd)
+    assert subdirs == [VALID]                                  # Ruling 69: valid ids only
+    assert rejected == [] and uncertain is False
+    assert {n: (b, u) for n, b, u in foreign} == _EXPECT_FOREIGN
+
+def test_foreign_measurement_never_names_quota_or_a_valid_activity_id(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    paths.secure_mkdir(paths.activity_dir(tmp_path, VALID))
+    (paths.quota_dir(tmp_path) / f"{VALID}.json").write_bytes(b"{}")
+    assert paths.list_owned_subdirs_detailed(base)[3] == []
+    dfd = paths.open_owned_dir(base)
+    try:
+        assert paths.list_owned_subdirs_dir_fd_detailed(dfd)[3] == []
+    finally:
+        os.close(dfd)

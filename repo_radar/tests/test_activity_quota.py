@@ -1465,8 +1465,21 @@ def test_prune_locked_classify_via_path_form_deletes_running_item_on_activity_ro
     start-only (still-running) activity is what's actually at that path, and `quota.prune` deletes
     it -- reproducing "never prune running/unreconciled" being violated. This test is expected to
     keep passing as a canary: if `_classify`/`_scan` is ever silently reverted to the path form,
-    this documents exactly why that regresses."""
+    this documents exactly why that regresses.
+
+    Ruling 72 (G11-Py, Codex Round 11 B2) added a SECOND, independent guard on the same seam --
+    deletion is bound to the classified directory's `(st_dev, st_ino)`, and a path-based scan has
+    no fd to bind (`Scan.ident is None` never matches) -- so reverting Ruling 68 ALONE no longer
+    reproduces this (see `test_ruling_72_alone_blocks_the_round_9_path_form_swap` below). To stay
+    a faithful pre-fix counterfactual this test now ALSO reverts Ruling 72: `unlink_owned_tree_
+    dir_fd` is rerouted to delete whatever sits at `<aid>` BY NAME (its identity looked up at
+    deletion time -- exactly the pre-Ruling-72 behavior)."""
     monkeypatch.setattr(quota, "_scan", lambda home, aid, ctx=None: quota.scan_mod.scan_activity(home, aid))
+    real_unlink = paths.unlink_owned_tree_dir_fd
+    def unlink_by_name(dfd, name, _expect_ident):              # pre-Ruling-72: trust the NAME
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        return real_unlink(dfd, name, (st.st_dev, st.st_ino))
+    monkeypatch.setattr(paths, "unlink_owned_tree_dir_fd", unlink_by_name)
 
     aid, l = _new_activity(tmp_path)
     _write_start(tmp_path, aid)
@@ -1497,6 +1510,44 @@ def test_prune_locked_classify_via_path_form_deletes_running_item_on_activity_ro
     assert state["done"], "the path-based classification read must actually have been reached"
     assert freed > 0
     assert not paths.activity_dir(tmp_path, aid).exists()    # BUG (pre-fix): the running item was deleted
+    l.release()
+
+def test_ruling_72_alone_blocks_the_round_9_path_form_swap(tmp_path, monkeypatch):
+    """Defense in depth (Ruling 72 / G11-Py): the Round-9 swap with ONLY Ruling 68 reverted
+    (`_scan` forced path-based) is now ALSO refused by the identity binding alone -- a path-based
+    scan carries no `ident`, and `unlink_owned_tree_dir_fd` never deletes without a matching one.
+    The still-running activity survives."""
+    monkeypatch.setattr(quota, "_scan", lambda home, aid, ctx=None: quota.scan_mod.scan_activity(home, aid))
+
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid)
+    root_dir = paths.quota_dir(tmp_path).parent
+    moved_dir = tmp_path / "activity.moved"
+    real_read = paths.read_owned_segments_detailed
+    state = {"done": False}
+
+    def hooked(directory, suffix=".jsonl"):
+        if not state["done"] and pathlib.Path(directory) == paths.activity_dir(tmp_path, aid):
+            state["done"] = True
+            os.rename(root_dir, moved_dir)
+            paths.secure_mkdir(paths.activity_dir(tmp_path, aid))
+            _write_terminal(tmp_path, aid, outcome="succeeded")
+            try:
+                return real_read(directory, suffix)
+            finally:
+                shutil.rmtree(root_dir)
+                os.rename(moved_dir, root_dir)
+        return real_read(directory, suffix)
+    monkeypatch.setattr(paths, "read_owned_segments_detailed", hooked)
+
+    try:
+        freed = quota.prune(tmp_path, need_bytes=1)
+    finally:
+        monkeypatch.undo()
+
+    assert state["done"]
+    assert freed == 0
+    assert paths.activity_dir(tmp_path, aid).exists()        # Ruling 72 held the line on its own
     l.release()
 
 def test_verify_canonical_returns_false_when_quota_replaced_by_regular_file(tmp_path):
@@ -1576,25 +1627,31 @@ def test_retain_never_deletes_a_non_uuid_activity_directory(tmp_path):
     assert pruned == []
     assert (paths.quota_dir(tmp_path).parent / "junk").exists()
 
-def test_accounting_never_counts_a_non_uuid_activity_directorys_bytes(tmp_path):
+def test_accounting_never_treats_a_non_uuid_directory_as_an_activity_but_still_charges_its_bytes(tmp_path):
     """Both accounting forms -- the unlocked/path-based `_charge`/`_accounting_snapshot(home)` AND
-    the locked, `ctx`-bound form real `admit`/`grant`/`prune`/`retain` actually use -- must agree
-    that a non-UUID directory's bytes never count toward the charge. Pre-fix, BOTH forms counted
-    it (a stray `activity/junk/`'s segment bytes were charged either way, via `_gather_accounting`'s
-    single shared per-activity loop); the Ruling 69 guard added there closes it for both branches
-    at once, keeping the two forms consistent with each other."""
+    the locked, `ctx`-bound form real `admit`/`grant`/`prune`/`retain` actually use -- must agree.
+    Ruling 69 (this test's original form) pinned "a non-UUID directory is never an ACTIVITY" by
+    asserting its bytes charged 0 -- Ruling 71 (Codex Round 11 B1) overturned THAT half: the
+    bytes are real committed bytes under the activity root and spec §7's Σ contract says they
+    count. What survives from Ruling 69 is the management half: `junk` never becomes an
+    `ActivityInput` (never stat'd/read/classified as an activity); its bytes now arrive through
+    the separate `foreign` measurement instead, identically in both forms."""
     _mk_junk(tmp_path, "junk")
     _write_junk_start(tmp_path, "junk"); _write_junk_terminal(tmp_path, "junk")
+    junk_bytes = (paths.quota_dir(tmp_path).parent / "junk" / "python-deadbeef.jsonl").stat().st_size
+    assert junk_bytes > 0
 
-    assert quota._charge(tmp_path) == 0
-    assert quota._accounting_snapshot(tmp_path) == quota.Snapshot(charge=0, uncertain=False, corrupt=False)
+    assert quota._charge(tmp_path) == junk_bytes
+    assert quota._accounting_snapshot(tmp_path) == quota.Snapshot(charge=junk_bytes, uncertain=False, corrupt=False)
 
     ctx = quota._quota_lock(tmp_path)
     try:
         gathered = quota._gather_accounting(tmp_path, ctx=ctx)
         assert gathered.activities == []                 # "junk" never became an ActivityInput
+        assert ("junk", junk_bytes, False) in [
+            (f.name, f.on_disk_measured, f.uncertain) for f in gathered.foreign]   # ...but IS measured
         snap = quota._accounting_snapshot(tmp_path, ctx=ctx)
-        assert snap == quota.Snapshot(charge=0, uncertain=False, corrupt=False)
+        assert snap == quota.Snapshot(charge=junk_bytes, uncertain=False, corrupt=False)
     finally:
         quota._unlock(ctx)
 
@@ -1616,7 +1673,7 @@ def test_unlink_owned_tree_dir_fd_rejects_a_non_uuid_name_and_deletes_nothing(tm
     ctx = quota._quota_lock(tmp_path)
     try:
         with pytest.raises(paths.UnsafePath):
-            paths.unlink_owned_tree_dir_fd(ctx.afd, "junk")
+            paths.unlink_owned_tree_dir_fd(ctx.afd, "junk", (0, 0))   # id check precedes identity
     finally:
         quota._unlock(ctx)
 
@@ -1636,7 +1693,7 @@ def test_prune_never_deletes_a_symlink_named_like_a_valid_uuid_at_the_root(tmp_p
 
     ctx = quota._quota_lock(tmp_path)
     try:
-        subdirs, rejected, uncertain = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
+        subdirs, rejected, uncertain, _foreign = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
         assert aid not in subdirs
         assert (aid, "symlink") in rejected
         assert uncertain is True
@@ -1670,3 +1727,305 @@ def test_prune_deletes_a_junk_directory_when_validation_is_bypassed_counterfactu
 
     assert freed > 0
     assert not (paths.quota_dir(tmp_path).parent / "junk").exists()   # BUG (pre-fix): junk was deleted
+
+# --- Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): foreign entries are MEASURED, never managed.
+# Rulings 69/70 made a non-UUID real directory vanish from accounting entirely (`continue` before
+# any measurement), so 64 MiB sitting in `activity/junk/` charged 0 bytes with `uncertain=False`
+# and Python admitted a fresh activity on top of it -- violating spec §7's Σ-of-actual-bytes
+# contract and its persistent-path-replacement coverage (renaming a real `<aid>/` to `junk/`
+# hides its committed bytes). Now: a "foreign" root entry is any non-UUID name other than `quota`.
+# Directory -> opened O_NOFOLLOW|O_DIRECTORY relative to the root fd, each entry lstat'd: regular
+# file -> bytes counted; anything else -> uncertain; unopenable/unlistable -> uncertain. Regular
+# file at the root -> its lstat size counted. Any other non-UUID root entry -> uncertain. Foreign
+# entries are still NEVER classified/pruned/reconciled/read as activities (every Ruling 69 guard
+# stands exactly as it was).
+
+MIB = 1024 * 1024
+
+def _write_junk_bytes(tmp_path, name, nbytes, fname="python-deadbeef.jsonl"):
+    d = _mk_junk(tmp_path, name)
+    with open(d / fname, "wb") as f:
+        f.truncate(nbytes)                                   # sparse -- instant, real st_size
+    return d / fname
+
+def _both_snapshots(tmp_path):
+    unlocked = quota._accounting_snapshot(tmp_path)
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        locked = quota._accounting_snapshot(tmp_path, ctx=ctx)
+    finally:
+        quota._unlock(ctx)
+    return unlocked, locked
+
+def test_foreign_junk_dir_64mib_file_is_charged_and_certain(tmp_path):
+    """Codex Round 11 B1 repro: 64 MiB in `activity/junk/python-deadbeef.jsonl` must be CHARGED
+    (Σ of actual bytes), not vanished -- and it's a plain regular file in a plain directory, so
+    the measurement is certain (no blanket-uncertain that would refuse every admission forever)."""
+    _write_junk_bytes(tmp_path, "junk", 64 * MIB)
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    assert unlocked == quota.Snapshot(charge=64 * MIB, uncertain=False, corrupt=False)
+    assert locked == unlocked
+    assert quota._charge(tmp_path) == 64 * MIB
+    assert quota._committed(tmp_path) == 64 * MIB           # path-based charge agrees
+
+def test_foreign_bytes_add_to_real_activity_bytes_in_the_same_snapshot(tmp_path):
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+    _write_start(tmp_path, aid)
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    real_bytes = seg.stat().st_size
+    _write_junk_bytes(tmp_path, "junk", 1000)
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    # live aid: on_disk + max(0, RESERVE + 0 - on_disk) == RESERVE (Ruling 62, certain live case)
+    assert unlocked.charge == quota.RESERVE + 1000
+    assert unlocked.uncertain is False and locked == unlocked
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        g = quota._gather_accounting(tmp_path, ctx=ctx)
+        assert [a.aid for a in g.activities] == [aid]        # junk is NOT an activity
+        by_name = {f.name: (f.on_disk_measured, f.uncertain) for f in g.foreign}
+        assert by_name.pop("junk") == (1000, False)
+        # the runtime's own `activity/quota.lock` is a foreign regular file too (Ruling 71 exempts
+        # ONLY `quota`): measured literally -- 0 bytes, certain -- so it can never move the charge
+        assert by_name == {"quota.lock": (0, False)}
+    finally:
+        quota._unlock(ctx)
+    assert real_bytes > 0
+    l.release()
+
+def test_foreign_dir_containing_a_symlink_is_uncertain(tmp_path):
+    d = _mk_junk(tmp_path, "junk")
+    (d / "a.bin").write_bytes(b"x" * 10)
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, d / "link")
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    assert unlocked.uncertain is True and locked.uncertain is True
+    assert unlocked.charge >= 10 and locked == unlocked
+    assert quota._committed_detailed(tmp_path)[1]            # path-based charge is uncertain too
+
+def test_foreign_dir_containing_a_subdirectory_is_uncertain(tmp_path):
+    d = _mk_junk(tmp_path, "junk")
+    (d / "nested").mkdir()                                     # bytes below this are unmeasured
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    assert unlocked.uncertain is True and locked == unlocked
+
+def test_stray_regular_file_at_the_root_is_counted(tmp_path):
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    (paths.quota_dir(tmp_path).parent / "stray.bin").write_bytes(b"z" * 4321)
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    assert unlocked == quota.Snapshot(charge=4321, uncertain=False, corrupt=False)
+    assert locked == unlocked
+    assert quota._committed(tmp_path) == 4321
+
+def test_stray_symlink_at_the_root_is_uncertain(tmp_path):
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, paths.quota_dir(tmp_path).parent / "also-junk")
+
+    unlocked, locked = _both_snapshots(tmp_path)
+
+    assert unlocked.uncertain is True and locked == unlocked
+    assert outside.exists()                                    # never followed, never touched
+
+def test_admit_refuses_when_foreign_junk_fills_the_cap(tmp_path):
+    """Codex's exact repro at the REAL 64 MiB ceiling: 64 MiB of junk -> a new admission must be
+    REFUSED (charge + RESERVE > CEILING, nothing prunable), not admitted on a 0-byte view."""
+    _write_junk_bytes(tmp_path, "junk", 64 * MIB)
+    fresh, fl = _new_activity(tmp_path)
+    try:
+        assert quota.admit(tmp_path, fresh, fl) is False
+    finally:
+        fl.release()
+    assert not paths.ledger_entry_path(tmp_path, fresh).exists()
+
+def test_grant_refuses_when_foreign_junk_fills_the_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(quota, "CEILING", 10 ** 9)            # admit first, with room
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+    monkeypatch.setattr(quota, "CEILING", 64 * MIB)           # real ceiling for the decision
+    _write_junk_bytes(tmp_path, "junk", 64 * MIB)
+    try:
+        assert quota.grant(tmp_path, aid, 1) is False
+    finally:
+        l.release()
+
+def test_foreign_junk_that_fills_the_cap_still_survives_prune_and_retain(tmp_path, monkeypatch):
+    """Ruling 69 stands: measured, never managed -- even when the junk is what's over the ceiling,
+    neither `prune` nor `retain` (with the full age/newest-N matrix wide open) may touch it."""
+    seg = _write_junk_bytes(tmp_path, "junk", 64 * MIB)
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+
+    assert quota.prune(tmp_path, 64 * MIB) == 0
+    assert quota.retain(tmp_path) == []
+    assert seg.exists() and seg.stat().st_size == 64 * MIB
+
+def test_renaming_a_real_activity_dir_to_a_foreign_name_hides_nothing(tmp_path):
+    """spec §7 persistent-path-replacement coverage: `<aid>/` -> `junk/` keeps its bytes charged."""
+    aid, l = _new_activity(tmp_path)
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid); l.release()
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    with open(seg, "r+b") as f:
+        f.truncate(3 * MIB)
+    before = quota._charge(tmp_path)
+    assert before == 3 * MIB
+
+    os.rename(paths.activity_dir(tmp_path, aid), paths.quota_dir(tmp_path).parent / "junk")
+
+    unlocked, locked = _both_snapshots(tmp_path)
+    assert unlocked.charge == before and unlocked.uncertain is False and locked == unlocked
+
+# --- Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): classified identity bound THROUGH deletion.
+# `_prune_locked`/`_retain_locked` classified `<aid>` through the bound root fd (Ruling 68) but
+# `unlink_owned_tree_dir_fd(ctx.afd, aid)` then re-opened `<aid>` BY NAME and deleted whatever
+# was there. Persistent same-UUID replacement (rename the original to `<aid>.old`, create a fresh
+# `<aid>/sentinel`) between classification and deletion got the REPLACEMENT deleted while the
+# original survived -- in scope per §7 (persistent replacement, not the excluded transient ABA).
+# Now `_classify(home, aid, ctx)` returns the `(st_dev, st_ino)` of the directory it actually
+# scanned, and `unlink_owned_tree_dir_fd(dfd, name, expect_ident)` fstat's the directory it opens
+# and refuses (frees 0, unlinks nothing, no rmdir) on mismatch; the caller just skips that one.
+
+def _ident(path):
+    st = os.stat(path, follow_symlinks=False)
+    return (st.st_dev, st.st_ino)
+
+def _settled_routine(tmp_path, age_days=0.0):
+    aid, l = _new_activity(tmp_path)
+    assert quota.admit(tmp_path, aid, l) is True
+    _write_start(tmp_path, aid); _write_terminal(tmp_path, aid)
+    l.release(); quota.settle(tmp_path, aid)
+    seg = paths.segment_path(tmp_path, aid, "python", "deadbeef")
+    old = time.time() - age_days * 86400; os.utime(seg, (old, old))
+    return aid, seg
+
+def _swap_after_classify(monkeypatch, tmp_path, aid):
+    """Codex's exact repro, staged at the only seam between classification and deletion: let the
+    REAL `_classify` run, then rename the just-classified `<aid>/` aside to `<aid>.old` and plant
+    a fresh `<aid>/sentinel` for the deletion step to find by name."""
+    root = paths.quota_dir(tmp_path).parent
+    real_classify = quota._classify
+    state = {"swapped": False}
+    def hooked(home, a, ctx=None):
+        out = real_classify(home, a, ctx)
+        if a == aid and not state["swapped"]:
+            state["swapped"] = True
+            os.rename(root / aid, root / f"{aid}.old")
+            (root / aid).mkdir(mode=0o700)
+            (root / aid / "sentinel").write_bytes(b"replacement")
+        return out
+    monkeypatch.setattr(quota, "_classify", hooked)
+    return state
+
+def test_prune_never_deletes_a_same_uuid_replacement_swapped_in_after_classification(tmp_path, monkeypatch):
+    aid, seg = _settled_routine(tmp_path)
+    root = paths.quota_dir(tmp_path).parent
+    state = _swap_after_classify(monkeypatch, tmp_path, aid)
+
+    freed = quota.prune(tmp_path, 1)
+
+    assert state["swapped"] is True                           # the repro actually fired
+    assert freed == 0
+    assert (root / aid / "sentinel").read_bytes() == b"replacement"   # replacement untouched
+    assert (root / f"{aid}.old" / seg.name).exists()          # original untouched too
+
+def test_retain_never_deletes_a_same_uuid_replacement_swapped_in_after_classification(tmp_path, monkeypatch):
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)              # window wide open: age alone decides
+    aid, seg = _settled_routine(tmp_path, age_days=20)        # 20d > 14d routine rule -> eligible
+    root = paths.quota_dir(tmp_path).parent
+    state = _swap_after_classify(monkeypatch, tmp_path, aid)
+
+    pruned = quota.retain(tmp_path)
+
+    assert state["swapped"] is True
+    assert pruned == []
+    assert (root / aid / "sentinel").read_bytes() == b"replacement"
+    assert (root / f"{aid}.old" / seg.name).exists()
+
+def test_retain_still_prunes_an_age_eligible_routine_when_identity_holds(tmp_path, monkeypatch):
+    monkeypatch.setattr(quota, "NEWEST_KEEP", 0)
+    aid, _seg = _settled_routine(tmp_path, age_days=20)
+    assert quota.retain(tmp_path) == [aid]
+    assert not paths.activity_dir(tmp_path, aid).exists()
+
+def test_classify_under_ctx_returns_the_identity_of_the_directory_it_scanned(tmp_path):
+    aid, _seg = _settled_routine(tmp_path)
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        kind, _mtime, ident = quota._classify(tmp_path, aid, ctx)
+        assert kind == "routine"
+        assert ident == _ident(paths.activity_dir(tmp_path, aid))
+        # a provably-absent directory has no identity to bind
+        gone = ids.mint_activity_id()
+        assert quota._classify(tmp_path, gone, ctx)[2] is None
+    finally:
+        quota._unlock(ctx)
+    assert quota._classify(tmp_path, aid)[2] is None          # path-based (no ctx): no fd, no ident
+
+def test_unlink_owned_tree_dir_fd_refuses_on_identity_mismatch_and_deletes_nothing(tmp_path):
+    aid, seg = _settled_routine(tmp_path)
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        wrong = _ident(paths.quota_dir(tmp_path))             # a real, but DIFFERENT, directory
+        assert paths.unlink_owned_tree_dir_fd(ctx.afd, aid, wrong) == 0
+        assert paths.unlink_owned_tree_dir_fd(ctx.afd, aid, None) == 0   # "unknown" never matches
+    finally:
+        quota._unlock(ctx)
+    assert seg.exists() and paths.activity_dir(tmp_path, aid).is_dir()
+
+def test_unlink_owned_tree_dir_fd_deletes_when_identity_matches(tmp_path):
+    aid, seg = _settled_routine(tmp_path)
+    size = seg.stat().st_size
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        assert paths.unlink_owned_tree_dir_fd(ctx.afd, aid, _ident(paths.activity_dir(tmp_path, aid))) == size
+    finally:
+        quota._unlock(ctx)
+    assert not paths.activity_dir(tmp_path, aid).exists()
+
+def test_unlink_owned_tree_dir_fd_requires_an_expected_identity(tmp_path):
+    aid, _seg = _settled_routine(tmp_path)
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        with pytest.raises(TypeError):
+            paths.unlink_owned_tree_dir_fd(ctx.afd, aid)      # positional, never optional
+    finally:
+        quota._unlock(ctx)
+    assert paths.activity_dir(tmp_path, aid).is_dir()
+
+# --- Codex Round 11 non-blocking: direct invalid-id tests for the fd-relative stat/read guards
+# (Ruling 69 preconditions on `stat_owned_segments_dir_fd_detailed`/`read_owned_segments_dir_fd_
+# detailed`, mirroring the existing direct scan/unlink tests above).
+
+def test_stat_owned_segments_dir_fd_detailed_rejects_a_non_uuid_name(tmp_path):
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk")
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        with pytest.raises(paths.UnsafePath):
+            paths.stat_owned_segments_dir_fd_detailed(ctx.afd, "junk")
+        with pytest.raises(paths.UnsafePath):
+            paths.stat_owned_segments_dir_fd_detailed(ctx.afd, "../junk")
+    finally:
+        quota._unlock(ctx)
+
+def test_read_owned_segments_dir_fd_detailed_rejects_a_non_uuid_name(tmp_path):
+    _mk_junk(tmp_path, "junk")
+    _write_junk_start(tmp_path, "junk")
+    ctx = quota._quota_lock(tmp_path)
+    try:
+        with pytest.raises(paths.UnsafePath):
+            paths.read_owned_segments_dir_fd_detailed(ctx.afd, "junk")
+        with pytest.raises(paths.UnsafePath):
+            paths.read_owned_segments_dir_fd_detailed(ctx.afd, "quota")
+    finally:
+        quota._unlock(ctx)
+    assert (paths.quota_dir(tmp_path).parent / "junk" / "python-deadbeef.jsonl").exists()

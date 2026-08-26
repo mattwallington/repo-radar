@@ -1,5 +1,5 @@
 import fcntl, json, os, stat, time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from repo_radar.activity import paths, records, ids
 from repo_radar.activity import scan as scan_mod
 from repo_radar.activity import lease as lease_mod
@@ -453,20 +453,32 @@ def _sized_subdirs(home):
       uncertain_names -- every activity-id whose bytes couldn't be fully measured this pass: a
         per-activity directory whose `stat_owned_segments_detailed` came back uncertain, UNION a
         root-level entry rejected for any reason other than 'gone' (ENOENT -- proven absent, never
-        uncertain). Kept for `_committed_detailed`'s established (bytes, uncertain_aids) shape."""
+        uncertain). Kept for `_committed_detailed`'s established (bytes, uncertain_aids) shape.
+
+    Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): FOREIGN root entries (non-UUID names other
+    than `quota`, as measured by `paths.list_owned_subdirs_detailed`'s fourth element) are folded
+    in the same way -- their measured bytes land in `sizes` under their own (non-UUID) name and an
+    uncertain one lands in `uncertain_names` -- so the path-based `_committed`/`_committed_
+    detailed` charge agrees with `_gather_accounting`/`_compute_snapshot` (measured, never
+    managed: nothing here ever stats INTO a foreign entry as if it were an activity). A non-UUID
+    real directory is still skipped by the activity loop below (Ruling 69)."""
     base = paths.quota_dir(home).parent
-    subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
+    subdirs, rejected, root_uncertain, foreign = paths.list_owned_subdirs_detailed(base)
     sizes = {}
     uncertain_names = set()
     for name in subdirs:
-        if name == "quota":
-            continue
+        if name == "quota" or not ids.valid_activity_id(name):
+            continue                        # Ruling 69/71: a foreign dir is measured below, never here
         entries, dir_uncertain = paths.stat_owned_segments_detailed(base / name)
         sizes[name] = sum(sz for _n, sz in entries)
         if dir_uncertain:
             uncertain_names.add(name)
     for name, reason in rejected:
         if reason != "gone":                # ENOENT alone is proven absent -- 0 bytes, not uncertain
+            uncertain_names.add(name)
+    for name, on_disk, f_uncertain in foreign:          # Ruling 71: measured, never managed
+        sizes[name] = on_disk
+        if f_uncertain:
             uncertain_names.add(name)
     return sizes, root_uncertain or bool(uncertain_names), uncertain_names
 
@@ -575,6 +587,21 @@ class ActivityInput:
     uncertain: bool
 
 @dataclass
+class ForeignInput:
+    """One FOREIGN root entry's byte measurement (Ruling 71 / G11-Py, Codex Round 11 B1,
+    BLOCKER): a non-UUID name under the activity root other than `quota` -- stray junk, a renamed
+    activity directory, a loose file. `on_disk_measured` is whatever `paths._measure_foreign_
+    entry` could actually `lstat` (a regular file's size, or the sum of a directory's regular
+    files -- partial-or-full, NEVER discarded); `uncertain` is True iff the entry is anything but
+    a plain regular file / a plain directory of regular files, or couldn't be opened/listed/stat'd.
+    Foreign entries are measured, never managed: no ledger entry, never classified/pruned/
+    reconciled/read as an activity -- they contribute measured bytes (and uncertainty) to the
+    snapshot and nothing else."""
+    name: str
+    on_disk_measured: int
+    uncertain: bool
+
+@dataclass
 class LedgerInput:
     """One ledger entry for the accounting pass: either a live, well-formed reservation
     (`reserved`/`granted`) or a `corrupt` entry (unsafe/unreadable/malformed — see
@@ -609,12 +636,17 @@ class AccountingInputs:
         failure) -- these never became a listed activity directory this pass, so they carry no
         `on_disk` measurement at all.
       ledger -- one `LedgerInput` per valid-activity-id-shaped ledger entry actually read this
-        pass (empty if `ledger_listable` is False)."""
+        pass (empty if `ledger_listable` is False).
+      foreign -- (Ruling 71 / G11-Py, Codex Round 11 B1, BLOCKER) one `ForeignInput` per
+        non-UUID root entry other than `quota`, measured conservatively by the root enumeration
+        itself (empty if `root_listable` is False). Fixture key `foreign` is OPTIONAL there
+        (absent => empty), so every pre-Ruling-71 vector is unchanged."""
     root_listable: bool
     ledger_listable: bool
     activities: list
     rejected_root_ids: list
     ledger: list
+    foreign: list = field(default_factory=list)
 
 def _gather_accounting(home, ctx=None):
     """ALL filesystem + ledger reads for one accounting decision, in a single pass (Ruling 56 /
@@ -658,20 +690,32 @@ def _gather_accounting(home, ctx=None):
     validly held. `_verify_canonical(ctx)` is now explicitly checked immediately BEFORE the root
     listing and again immediately AFTER the last per-activity stat, before the ledger step: either
     failure discards whatever was gathered and reports `root_listable=False` (the same shape a
-    genuine unlistable root already produces), never a partial or stale result."""
+    genuine unlistable root already produces), never a partial or stale result.
+
+    Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER): the SAME single root enumeration (locked or
+    unlocked) now also returns the FOREIGN entries -- non-UUID names other than `quota`, measured
+    conservatively at the source (`paths._measure_foreign_entry`: regular files counted, anything
+    else uncertain) -- carried into `AccountingInputs.foreign` as `ForeignInput`s. They are never
+    stat'd/read/classified as activities here (the Ruling 69 guard below still skips a non-UUID
+    name in the activity loop); `_compute_snapshot` adds their bytes and folds their uncertainty.
+    Same discard rule as `activities`: a canonical-identity failure after enumeration drops them
+    with `root_listable=False`. Pre-fix, 64 MiB in `activity/junk/` charged 0, certain, and a fresh
+    activity was admitted (Codex Round 11 repro)."""
     if ctx is not None:
         canonical_ok = _verify_canonical(ctx)
         if canonical_ok:
-            subdirs, rejected, root_uncertain = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
+            subdirs, rejected, root_uncertain, foreign_raw = paths.list_owned_subdirs_dir_fd_detailed(ctx.afd)
         else:
-            subdirs, rejected, root_uncertain = [], [], True
+            subdirs, rejected, root_uncertain, foreign_raw = [], [], True, []
     else:
         base = paths.quota_dir(home).parent
-        subdirs, rejected, root_uncertain = paths.list_owned_subdirs_detailed(base)
+        subdirs, rejected, root_uncertain, foreign_raw = paths.list_owned_subdirs_detailed(base)
     root_listable = not (root_uncertain and not rejected)
 
     activities = []
+    foreign = []
     if root_listable:
+        foreign = [ForeignInput(name=n, on_disk_measured=b, uncertain=u) for n, b, u in foreign_raw]
         for name in subdirs:
             # Ruling 69 (G10-Py, Codex Round 10 BLOCKER): explicit defense-in-depth guard, shared
             # by BOTH the locked (`ctx.afd`-bound `list_owned_subdirs_dir_fd_detailed`, which now
@@ -695,6 +739,7 @@ def _gather_accounting(home, ctx=None):
             # partial result read partway through a root that turned out not to be canonical.
             root_listable = False
             activities = []
+            foreign = []
     rejected_root_ids = [name for name, reason in rejected if reason != "gone"] if root_listable else []
 
     if ctx is not None:
@@ -712,6 +757,7 @@ def _gather_accounting(home, ctx=None):
         activities=activities,
         rejected_root_ids=rejected_root_ids,
         ledger=ledger,
+        foreign=foreign,
     )
 
 def _compute_snapshot(inputs):
@@ -762,7 +808,21 @@ def _compute_snapshot(inputs):
         activity whose own stat pass came back uncertain) -- Ruling 65 / Codex R8-2: corruption
         alone (an aid that is corrupt-ledger but otherwise certain) does NOT set uncertain.
       corrupt = any corrupt entry in `inputs.ledger` -- computed UNCONDITIONALLY, even when root/
-        ledger enumeration itself failed."""
+        ledger enumeration itself failed.
+
+    Ruling 71 (G11-Py, Codex Round 11 B1, BLOCKER) -- FOREIGN entries (`inputs.foreign`, fixture
+    key `foreign`, optional, default empty; mirrored 1:1 by the Node agent): measured, never
+    managed. They have no ledger entry and no aid, so they contribute ONLY measured bytes plus
+    their own uncertainty, per entry, under the same Ruling 62 shape an activity gets:
+        - CERTAIN foreign entry: `+ on_disk_measured`.
+        - UNCERTAIN foreign entry: `+ max(on_disk_measured, PER_ACTIVITY_CAP)`, and `uncertain=
+          True` -- what it hides (a subdirectory, a symlink target, an unlistable dir) is
+          unknowable, so it takes at least the per-activity cap, never a flat cap that discards a
+          larger partial measurement.
+      In the unlistable-LEDGER case foreign bytes join the measured total before the `max(...,
+      CEILING)` floor; in the unlistable-ROOT case `inputs.foreign` is always empty (nothing was
+      enumerated). Over-counting can never violate the 64 MiB cap; a stray directory costs
+      proportional quota instead of permanently refusing every admission."""
     corrupt = any(entry.corrupt for entry in inputs.ledger)
 
     live_ledger = {e.aid: e for e in inputs.ledger if not e.corrupt}
@@ -775,6 +835,7 @@ def _compute_snapshot(inputs):
 
     if not inputs.ledger_listable:
         total = sum(a.on_disk_measured for a in inputs.activities)
+        total += sum(f.on_disk_measured for f in inputs.foreign)      # Ruling 71: measured bytes count
         return Snapshot(charge=max(total, CEILING), uncertain=True, corrupt=corrupt)
 
     by_aid = {a.aid: a for a in inputs.activities}
@@ -800,6 +861,12 @@ def _compute_snapshot(inputs):
             e = live_ledger[aid]
             liability = max(0, e.reserved + e.granted - measured)
         total += measured + liability
+    for f in inputs.foreign:                        # Ruling 71: foreign = measured bytes, never managed
+        if f.uncertain:
+            uncertain = True
+            total += max(f.on_disk_measured, PER_ACTIVITY_CAP)
+        else:
+            total += f.on_disk_measured
     return Snapshot(charge=total, uncertain=uncertain, corrupt=corrupt)
 
 def _accounting_snapshot(home, ctx=None):
@@ -1057,15 +1124,27 @@ def _classify(home, aid, ctx=None):
     deletion a moment later hit the RESTORED original -- `quota.prune` deleting a running,
     unreconciled item (Codex Round 9 repro). `_prune_locked`/`_retain_locked` now pass their own
     `ctx` here; unlocked callers (tests, introspection) keep passing no `ctx` and get the
-    path-based scan, exactly as before."""
+    path-based scan, exactly as before.
+
+    Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): returns a THIRD element, `ident` -- the
+    `(st_dev, st_ino)` of the directory this classification ACTUALLY scanned (`Scan.ident`, from
+    `paths.read_owned_segments_dir_fd_detailed`'s own `fstat` of the fd it read through), or
+    `None` when there was no such directory (provably gone / never opened) or the scan was
+    path-based (no `ctx`). `_prune_locked`/`_retain_locked` hand it to `paths.unlink_owned_tree_
+    dir_fd(ctx.afd, aid, ident)`, which refuses to delete anything whose identity differs --
+    Ruling 68 bound classification to the root fd, but deletion still re-opened `<aid>` BY NAME,
+    so a persistent same-UUID replacement (original renamed to `<aid>.old`, fresh `<aid>/
+    sentinel`) landing between the two got the REPLACEMENT deleted (Codex Round 11 repro).
+    Returns `('running'|'problem'|'routine', newest_mtime, ident)`."""
     scan = _scan(home, aid, ctx)
+    ident = scan.ident
     if scan.view_uncertain:
-        return ("running", scan.mtime)
+        return ("running", scan.mtime, ident)
     types = {r.get("type") for r in scan.records}
     if "terminal" not in types:
-        return ("running", scan.mtime)
+        return ("running", scan.mtime, ident)
     problem = is_problem_bearing(scan)
-    return ("problem" if problem else "routine", scan.mtime)
+    return ("problem" if problem else "routine", scan.mtime, ident)
 
 def _prune_locked(home, need_bytes, ctx):
     """Ceiling-override pruner (CALLER HOLDS quota.lock): SETTLED items only (no live ledger
@@ -1115,7 +1194,16 @@ def _prune_locked(home, need_bytes, ctx):
     `_classify` or `unlink_owned_tree_dir_fd` from this loop, however it got here. Pre-fix, a
     non-UUID directory (e.g. `activity/junk/`) holding a fabricated `succeeded` terminal was
     classified 'routine' and then genuinely DELETED here (Codex repro: `quota.prune(home, 1)`
-    freed 330 bytes and removed `activity/junk/` entirely)."""
+    freed 330 bytes and removed `activity/junk/` entirely).
+
+    Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): each candidate's classified directory
+    IDENTITY (`_classify`'s third element -- the `fstat` of the fd it actually read) is carried
+    into `paths.unlink_owned_tree_dir_fd(ctx.afd, aid, ident)`, which refuses (frees 0, deletes
+    nothing) on mismatch; a refused candidate is simply skipped. Closes the persistent same-UUID
+    replacement Ruling 68 left open: classification was fd-bound, but deletion re-opened `<aid>`
+    BY NAME and removed whatever sat there (Codex repro: rename the classified original to
+    `<aid>.old`, create `<aid>/sentinel`, `quota.prune(home, 1)` deleted the replacement and left
+    the original intact)."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return 0                                   # live set unproven -- never delete under uncertainty
@@ -1126,20 +1214,21 @@ def _prune_locked(home, need_bytes, ctx):
     for aid in paths.list_owned_subdirs_dir_fd(ctx.afd):
         if aid == "quota" or aid in live or not ids.valid_activity_id(aid):
             continue
-        kind, mtime = _classify(home, aid, ctx)
+        kind, mtime, ident = _classify(home, aid, ctx)
         if kind == "running":
             continue                               # never prune running/unreconciled
-        items.append((aid, kind, mtime))
+        items.append((aid, kind, mtime, ident))
     routine = sorted([i for i in items if i[1] == "routine"], key=lambda x: x[2])
     problems = sorted([i for i in items if i[1] == "problem"], key=lambda x: x[2])
     order = routine + (problems[:-1] if problems else [])   # keep newest problem
     freed = 0
-    for aid, _, _ in order:
+    for aid, _, _, ident in order:
         if freed >= need_bytes:
             break
         if not _verify_canonical(ctx):             # Ruling 64/67: re-checked before EACH deletion decision
             break                                   # root/quota identity no longer trustworthy -- stop
-        freed += paths.unlink_owned_tree_dir_fd(ctx.afd, aid)   # dir-fd-safe delete, root-bound
+        # Ruling 72: identity-bound delete -- refuses (0) if `<aid>` is no longer the dir classified
+        freed += paths.unlink_owned_tree_dir_fd(ctx.afd, aid, ident)   # dir-fd-safe delete, root-bound
     return freed
 
 def prune(home, need_bytes):
@@ -1187,7 +1276,14 @@ def _retain_locked(home, ctx):
     Ruling 69 (G10-Py, Codex Round 10 BLOCKER): same explicit `ids.valid_activity_id(aid)` guard
     as `_prune_locked`'s candidate loop -- defense-in-depth on top of `list_owned_subdirs_dir_fd`
     already filtering to valid ids at its source -- so a non-UUID directory can never be classified
-    or deleted (via `unlink_owned_tree_dir_fd`, below) from this loop either."""
+    or deleted (via `unlink_owned_tree_dir_fd`, below) from this loop either.
+
+    Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): same identity binding as `_prune_locked` --
+    each age-based deletion passes the candidate's classified `ident` (third element of
+    `_classify`) to `paths.unlink_owned_tree_dir_fd(ctx.afd, aid, ident)`, which refuses on
+    mismatch; the ceiling-override at the end goes through `_prune_locked`, which binds its own.
+    A persistent same-UUID replacement landing after classification is therefore skipped, never
+    deleted, by BOTH passes (Codex Round 11 repro, applied to retain)."""
     entries, ledger_uncertain = _ledger_entries_detailed_fd(ctx)
     if ledger_uncertain:
         return []                                    # live set unproven -- never delete under uncertainty
@@ -1200,23 +1296,23 @@ def _retain_locked(home, ctx):
     for aid in before:
         if aid == "quota" or aid in live or not ids.valid_activity_id(aid):
             continue
-        kind, mtime = _classify(home, aid, ctx)
+        kind, mtime, ident = _classify(home, aid, ctx)
         if kind == "running":
             continue                                         # never prune running/unreconciled
-        candidates.append((aid, kind, mtime))
+        candidates.append((aid, kind, mtime, ident))
 
     newest_keep = NEWEST_KEEP                                # read at call time (monkeypatch-friendly)
     protected = {
         # secondary tiebreaker (aid) makes the boundary deterministic on a true mtime tie --
         # `candidates` is built from a `set` (hash-randomized iteration order), so sorting on
         # mtime alone could break a tie differently between runs (Fix R1).
-        aid for aid, _k, _mt in
+        aid for aid, _k, _mt, _id in
         sorted(candidates, key=lambda c: (c[2], c[0]), reverse=True)[:newest_keep]
     }
     now = time.time()
     routine_max_age = ROUTINE_MAX_AGE_S
     problem_max_age = PROBLEM_MAX_AGE_S
-    for aid, kind, mtime in candidates:
+    for aid, kind, mtime, ident in candidates:
         # Codex R1 finding I1: the newest problem is NOT shielded here. Spec §7 ties "always
         # preserve the newest problem" to the ceiling-override specifically (see _prune_locked,
         # unchanged); the age pass applies age AND outside-newest-50 uniformly to routine and
@@ -1230,7 +1326,8 @@ def _retain_locked(home, ctx):
         if prunable:
             if not _verify_canonical(ctx):        # Ruling 64/67: re-checked before EACH deletion decision
                 break                              # root/quota identity no longer trustworthy -- stop
-            paths.unlink_owned_tree_dir_fd(ctx.afd, aid)      # Ruling 67: root-bound, dir-fd-safe delete
+            # Ruling 67: root-bound, dir-fd-safe delete; Ruling 72: identity-bound (refuses on mismatch)
+            paths.unlink_owned_tree_dir_fd(ctx.afd, aid, ident)
 
     snap = _accounting_snapshot(home, ctx=ctx)                # Ruling 64: ctx-bound, never path-based
     over = snap.charge - CEILING

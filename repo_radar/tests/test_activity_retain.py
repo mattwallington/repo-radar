@@ -179,7 +179,7 @@ def test_bad_named_segment_holding_a_failure_terminal_does_not_make_classify_ret
     rec = dict(schema_version=1, activity_id=aid, ts="2026-08-14T00:00:00-07:00",
                 type="terminal", seq=9, outcome="failed", summary={}, by="deadbeef")
     bad.write_text(json.dumps(rec) + "\n")
-    kind, _mtime = quota._classify(tmp_path, aid)
+    kind, _mtime, _ident = quota._classify(tmp_path, aid)
     assert kind != "problem"
     assert kind == "running"                          # no conforming segment -> no types at all
     assert quota._segments_data(tmp_path, aid) == []   # the bad-named file never enters the lifecycle view

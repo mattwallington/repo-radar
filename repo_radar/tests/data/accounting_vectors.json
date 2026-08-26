@@ -511,5 +511,98 @@
       "uncertain": true,
       "corrupt": true
     }
+  },
+  {
+    "name": "foreign-only-64mib-file-is-charged-certain-ruling-71",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 67108864,
+          "uncertain": false
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-1000-plus-live-activity-2000-reserved-2000-ruling-71",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 2000,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "reserved": 2000,
+          "granted": 0
+        }
+      ],
+      "foreign": [
+        {
+          "name": "stray.bin",
+          "on_disk": 1000,
+          "uncertain": false
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 3000,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-uncertain-10-bytes-alone-takes-the-cap-ruling-71",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 10,
+          "uncertain": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": false
+    }
   }
 ]

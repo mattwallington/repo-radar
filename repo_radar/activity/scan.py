@@ -46,6 +46,8 @@ class Scan:
     view_uncertain: bool           # True => the view may be missing a real record; PRESERVE, never guess
     mtime: float = 0.0             # newest mtime among the readable conforming segments (0.0 if none)
     cancel_requested: bool = False # any accepted `control` record named "cancel_requested"
+    ident: tuple = None            # Ruling 72: (st_dev, st_ino) of the dir fd an fd-bound scan actually
+                                   # read through (scan_activity_dir_fd only); None if never opened / path-based
 
 _UNSUPPORTED = object()     # sentinel: line is a JSON object, but schema_version != 1
 
@@ -207,10 +209,17 @@ def scan_activity_dir_fd(dfd, aid):
     though `paths.read_owned_segments_dir_fd_detailed` now also refuses an invalid name on its own
     -- a same-ID directory swapped in with a fabricated `succeeded` terminal (Codex Round 10 repro:
     `activity/junk/python-*.jsonl`) must never be classified 'routine' by a locked prune/retain
-    pass in the first place."""
+    pass in the first place.
+
+    Ruling 72 (G11-Py, Codex Round 11 B2, BLOCKER): the returned `Scan.ident` is the `(st_dev,
+    st_ino)` of the subdirectory fd `paths.read_owned_segments_dir_fd_detailed` ACTUALLY read
+    through (its own `fstat`, never a by-name stat) -- `None` if it could never open one. `quota.
+    _classify` returns it so `_prune_locked`/`_retain_locked` can bind the classified identity
+    through `paths.unlink_owned_tree_dir_fd(dfd, aid, expect_ident)`: a persistent same-UUID
+    replacement landing between classification and deletion is then refused, never deleted."""
     if not ids.valid_activity_id(aid):
         raise paths.UnsafePath(f"invalid activity_id: {aid!r}")
-    segments, rejected_raw = paths.read_owned_segments_dir_fd_detailed(dfd, aid)
+    segments, rejected_raw, ident = paths.read_owned_segments_dir_fd_detailed(dfd, aid)
     rejected = [{"name": name, "reason": reason} for name, reason in rejected_raw]
 
     if any(r["reason"] == "dir-unreadable" for r in rejected) and _dir_provably_gone_dir_fd(dfd, aid):
@@ -238,4 +247,4 @@ def scan_activity_dir_fd(dfd, aid):
     cancel = any(r.get("type") == "control" and r.get("name") == "cancel_requested"
                  for r in records_out)
     return Scan(records=records_out, findings=findings, rejected=rejected,
-                view_uncertain=view_uncertain, mtime=mtime, cancel_requested=cancel)
+                view_uncertain=view_uncertain, mtime=mtime, cancel_requested=cancel, ident=ident)
