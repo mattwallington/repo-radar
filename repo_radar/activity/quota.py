@@ -815,14 +815,18 @@ def _compute_snapshot(inputs):
     managed. They have no ledger entry and no aid, so they contribute ONLY measured bytes plus
     their own uncertainty, per entry, under the same Ruling 62 shape an activity gets:
         - CERTAIN foreign entry: `+ on_disk_measured`.
-        - UNCERTAIN foreign entry: `+ max(on_disk_measured, PER_ACTIVITY_CAP)`, and `uncertain=
-          True` -- what it hides (a subdirectory, a symlink target, an unlistable dir) is
-          unknowable, so it takes at least the per-activity cap, never a flat cap that discards a
-          larger partial measurement.
+        - UNCERTAIN foreign entry: `+ on_disk_measured` and `uncertain=True`; then, after ALL
+          summation, `charge = max(charge, CEILING)` (Ruling 74, Codex Round 12 -- REPLACES
+          Ruling 71's `max(on_disk_measured, PER_ACTIVITY_CAP)` term). A foreign entry is
+          unmanaged and was never capped at PER_ACTIVITY_CAP, so what it hides (a nested
+          directory, a symlink target, a swapped-out original -- Ruling 73) can exceed 4 MiB;
+          the only safe floor is the same CEILING an unlistable ledger/root takes. Measured
+          bytes above CEILING are still kept (never discarded).
       In the unlistable-LEDGER case foreign bytes join the measured total before the `max(...,
       CEILING)` floor; in the unlistable-ROOT case `inputs.foreign` is always empty (nothing was
-      enumerated). Over-counting can never violate the 64 MiB cap; a stray directory costs
-      proportional quota instead of permanently refusing every admission."""
+      enumerated). Over-counting can never violate the 64 MiB cap; a CERTAIN stray directory
+      costs proportional quota instead of permanently refusing every admission (pinned by the
+      `-ruling-71` vectors; the `-ruling-74` vectors pin the uncertain floor)."""
     corrupt = any(entry.corrupt for entry in inputs.ledger)
 
     live_ledger = {e.aid: e for e in inputs.ledger if not e.corrupt}
@@ -861,12 +865,13 @@ def _compute_snapshot(inputs):
             e = live_ledger[aid]
             liability = max(0, e.reserved + e.granted - measured)
         total += measured + liability
+    foreign_uncertain = False
     for f in inputs.foreign:                        # Ruling 71: foreign = measured bytes, never managed
+        total += f.on_disk_measured
         if f.uncertain:
-            uncertain = True
-            total += max(f.on_disk_measured, PER_ACTIVITY_CAP)
-        else:
-            total += f.on_disk_measured
+            uncertain = True; foreign_uncertain = True
+    if foreign_uncertain:
+        total = max(total, CEILING)                  # Ruling 74: unmanaged + unknowable -> CEILING floor
     return Snapshot(charge=total, uncertain=uncertain, corrupt=corrupt)
 
 def _accounting_snapshot(home, ctx=None):

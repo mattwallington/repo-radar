@@ -650,7 +650,19 @@ def _measure_foreign_entry(dfd, name, st):
         partial measurement is real liability, never discarded, mirroring Ruling 62).
       anything else (symlink, FIFO, ...) -> `(0, True)`.
     Never recurses, never follows a symlink, never reads content, never deletes: measured, not
-    managed."""
+    managed.
+
+    Ruling 73 (Codex Round 12, BLOCKER; parity with Node's `_measureForeign`): the directory
+    measurement is IDENTITY-BOUND to the enumeration that produced `st`:
+      (a) after the open, `os.fstat(sub)`'s `(st_dev, st_ino)` must equal `st`'s -- a mismatch
+          means the name was re-pointed between the root lstat and this open (Codex's sequence:
+          `junk/` -> `junk.old/`, fresh empty `junk/`), so the entry is `(0, True)` and the
+          replacement is NOT scanned (what was enumerated is unknown; Ruling 74 floors the charge);
+      (b) after the scan, `os.lstat(name, dir_fd=dfd)` must still carry that identity -- a
+          mismatch or an OSError makes the entry uncertain (bytes already counted are kept --
+          partial measurement is real liability, never discarded, mirroring Ruling 62).
+    Pre-fix the open was unchecked, so the swap measured the empty replacement as a CERTAIN
+    0 bytes and `admit()` proceeded with 64 MiB hidden under `junk.old/`."""
     if stat.S_ISREG(st.st_mode):
         return st.st_size, False
     if not stat.S_ISDIR(st.st_mode):
@@ -659,9 +671,16 @@ def _measure_foreign_entry(dfd, name, st):
         sub = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
     except OSError:
         return 0, True
+    ident = (st.st_dev, st.st_ino)
     total = 0
     uncertain = False
     try:
+        try:
+            opened = os.fstat(sub)
+        except OSError:
+            return 0, True
+        if (opened.st_dev, opened.st_ino) != ident:
+            return 0, True                       # Ruling 73 (a): not what was enumerated -- no scan
         try:
             entries = list(os.scandir(sub))
         except OSError:
@@ -675,6 +694,12 @@ def _measure_foreign_entry(dfd, name, st):
                 total += est.st_size
             else:
                 uncertain = True
+        try:
+            after = os.lstat(name, dir_fd=dfd)
+        except OSError:
+            return total, True                   # Ruling 73 (b): identity unprovable after the scan
+        if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != ident:
+            uncertain = True                     # Ruling 73 (b): swapped out mid-scan
     finally:
         os.close(sub)
     return total, uncertain

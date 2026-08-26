@@ -579,7 +579,7 @@
     }
   },
   {
-    "name": "foreign-uncertain-10-bytes-alone-takes-the-cap-ruling-71",
+    "name": "foreign-uncertain-10-bytes-alone-takes-the-ceiling-ruling-74",
     "inputs": {
       "root_listable": true,
       "ledger_listable": true,
@@ -600,7 +600,38 @@
       "RESERVE": 61440
     },
     "expected": {
-      "charge": 4194304,
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-uncertain-with-certain-activity-and-ledger-floors-at-ceiling-ruling-74",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        { "aid": "00000000-0000-4000-8000-000000000001", "on_disk": 2000, "uncertain": false }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        { "aid": "00000000-0000-4000-8000-000000000001", "reserved": 61440, "granted": 0 }
+      ],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 1000,
+          "uncertain": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
       "uncertain": true,
       "corrupt": false
     }

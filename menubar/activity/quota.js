@@ -738,10 +738,17 @@ function _gatherAccounting(home, lockCtx) {
 //   unlistable root:       max(SUM (reserved+granted) over live entries + SUM corrupt caps,
 //                              CEILING), uncertain
 //   foreign (Ruling 71):   per entry, certain   -> onDisk (no ledger term, no id);
-//                                     uncertain -> max(onDisk, PER_ACTIVITY_CAP) (the same
-//                                                  Ruling 62 term an uncertain activity takes:
-//                                                  fixture `foreign-uncertain-10-bytes-alone-
-//                                                  takes-the-cap-ruling-71`);
+//                                     uncertain -> onDisk, and after ALL summation
+//                                                  charge = max(charge, CEILING) (Ruling 74,
+//                                                  Codex Round 12 -- REPLACES Ruling 71's
+//                                                  max(onDisk, PER_ACTIVITY_CAP): a foreign
+//                                                  entry is unmanaged and never capped at 4 MiB,
+//                                                  so what it hides can exceed that; the only
+//                                                  safe floor is the unlistable-ledger/root one.
+//                                                  Fixture `foreign-uncertain-10-bytes-alone-
+//                                                  takes-the-ceiling-ruling-74` and `foreign-
+//                                                  uncertain-with-certain-activity-and-ledger-
+//                                                  floors-at-ceiling-ruling-74`);
 //                          uncertain |= any foreign[i].uncertain. `foreign` absent == empty.
 //                          Under an unlistable ledger the foreign entries join the measured
 //                          pool as raw bytes (like activities there: measured-only, no
@@ -764,14 +771,12 @@ function _computeSnapshot(inputs, constants) {
     measured.set(a.aid, (measured.get(a.aid) || 0) + bytes);
     if (a.uncertain === true || a.onDisk === null || a.onDisk === undefined) uncertainIds.add(a.aid);
   }
-  let foreignBytes = 0; // Ruling 71: raw measured bytes (unlistable-ledger floor)
-  let foreignTerm = 0; // Ruling 71: per-entry charge term (normal rule)
-  let foreignUncertain = false;
+  let foreignBytes = 0; // Ruling 71: raw measured bytes (every rule: measured, never managed)
+  let foreignUncertain = false; // Ruling 74: any uncertain foreign entry -> CEILING floor below
   for (const f of inputs.foreign || []) {
     const bytes = Number.isFinite(f.onDisk) ? f.onDisk : 0;
     const fUncertain = f.uncertain === true || f.onDisk === null || f.onDisk === undefined;
     foreignBytes += bytes;
-    foreignTerm += fUncertain ? Math.max(bytes, cap) : bytes;
     if (fUncertain) foreignUncertain = true;
   }
   const uncertain = !inputs.rootListable || !inputs.ledgerListable || uncertainIds.size > 0 || foreignUncertain;
@@ -796,7 +801,7 @@ function _computeSnapshot(inputs, constants) {
   }
 
   const aids = new Set([...uncertainIds, ...measured.keys(), ...live.keys(), ...corruptIds]);
-  let charge = foreignTerm; // Ruling 71: no id, no ledger term; uncertain entries take the cap
+  let charge = foreignBytes; // Ruling 71: no id, no ledger term -- measured bytes only
   for (const aid of aids) {
     const disk = measured.get(aid) || 0;
     if (corruptIds.has(aid)) { charge += disk + cap; continue; }
@@ -804,6 +809,7 @@ function _computeSnapshot(inputs, constants) {
     charge += disk;
     if (live.has(aid)) charge += Math.max(0, live.get(aid) - disk);
   }
+  if (foreignUncertain) charge = Math.max(charge, ceiling); // Ruling 74: unmanaged + unknowable
   return { charge, uncertain, corrupt };
 }
 

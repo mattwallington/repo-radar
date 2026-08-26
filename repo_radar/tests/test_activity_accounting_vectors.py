@@ -45,10 +45,18 @@ def _inputs_from_json(d):
     )
 
 
-def test_fixture_carries_the_three_ruling_71_foreign_vectors():
+def test_fixture_carries_the_ruling_71_and_74_foreign_vectors():
     names = [c["name"] for c in VECTORS]
-    assert sum(1 for n in names if n.endswith("-ruling-71")) == 3
-    assert sum(1 for c in VECTORS if c["inputs"].get("foreign")) == 3   # and ONLY those three
+    assert sum(1 for n in names if n.endswith("-ruling-71")) == 2   # the two CERTAIN foreign cases
+    # Ruling 74: the uncertain-foreign vector moved from the per-activity cap to the CEILING floor
+    # (renamed), plus one where an uncertain foreign entry coexists with a certain live activity
+    assert sum(1 for n in names if n.endswith("-ruling-74")) == 2
+    assert "foreign-uncertain-10-bytes-alone-takes-the-cap-ruling-71" not in names
+    assert sum(1 for c in VECTORS if c["inputs"].get("foreign")) == 4   # and ONLY those four
+    for c in VECTORS:
+        if any(f["uncertain"] for f in c["inputs"].get("foreign", [])):
+            assert c["expected"]["charge"] >= c["constants"]["CEILING"], c["name"]
+            assert c["expected"]["uncertain"] is True, c["name"]
 
 
 def test_accounting_vectors_fixture_schema():

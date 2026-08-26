@@ -573,10 +573,17 @@ function listOwnedSubdirsDetailed(base) {
 // A directory is held open on an O_NOFOLLOW|O_DIRECTORY fd for the duration of its scan (the
 // same idiom `writeOwnedFileAtomic`'s dir fsync and `_validateOwnedDir` use -- Node has no
 // fd-relative readdir/lstat, so the entries themselves are read by path under that open fd) and
-// its identity is re-checked (`fstat(fd)` vs a fresh `lstat(path)`) after the last entry stat:
-// a directory swapped out mid-scan reports `uncertain` rather than a measurement of something
-// else. Over-counting can never breach the 64 MiB cap; under-counting is exactly the Round-11
-// bug, so every doubt resolves to `uncertain:true` with the partial bytes kept.
+// its identity is bound to the enumeration on BOTH sides of the scan (Ruling 73, Codex Round 12
+// -- the same two checks Python's `_measure_foreign_entry` makes):
+//   (a) `fstat(fd)` must carry the `(dev, ino)` of the root enumeration's `st` -- a mismatch
+//       means the name was re-pointed between the root lstat and this open (`junk/` ->
+//       `junk.old/`, fresh empty `junk/`), so the entry is `{bytes: 0, uncertain: true}` and the
+//       replacement is NOT scanned (Ruling 74 floors the charge). Pre-fix only (b) existed, so
+//       that swap measured the empty replacement as a CERTAIN 0 bytes and admission proceeded.
+//   (b) a fresh `lstat(path)` after the last entry stat must still match: a directory swapped out
+//       mid-scan reports `uncertain` rather than a measurement of something else.
+// Over-counting can never breach the 64 MiB cap; under-counting is exactly the Round-11 bug, so
+// every doubt resolves to `uncertain:true` with the partial bytes kept.
 function _measureForeign(p, name, st) {
   if (st.isFile()) return { name, bytes: st.size, uncertain: false };
   if (!st.isDirectory()) return { name, bytes: 0, uncertain: true }; // symlink / FIFO / device / ...
@@ -586,6 +593,9 @@ function _measureForeign(p, name, st) {
   try {
     fd = _openDirNofollow(p);
     const ident = fs.fstatSync(fd);
+    if (ident.dev !== st.dev || ident.ino !== st.ino) {
+      return { name, bytes: 0, uncertain: true }; // Ruling 73 (a): not what was enumerated -- no scan
+    }
     for (const child of fs.readdirSync(p)) {
       let cst;
       try {
@@ -597,7 +607,7 @@ function _measureForeign(p, name, st) {
       if (cst.isFile()) bytes += cst.size;
       else uncertain = true; // nested dir / symlink / FIFO / ...: never descended or followed
     }
-    const after = fs.lstatSync(p);
+    const after = fs.lstatSync(p); // Ruling 73 (b): still the enumerated directory after the scan?
     if (!after.isDirectory() || after.dev !== ident.dev || after.ino !== ident.ino) uncertain = true;
   } catch (e) {
     uncertain = true; // unopenable / unlistable: whatever was sized is kept, the rest is unknown

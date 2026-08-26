@@ -123,27 +123,27 @@ test('Ruling 71: foreign bytes add to real activity bytes; quota/ stays excluded
   }
 });
 
-test('Ruling 71: a foreign directory holding anything but regular files (symlink / subdir / fifo) makes the accounting uncertain -- partial bytes kept, entry takes max(bytes, cap)', () => {
+test('Ruling 71/74: a foreign directory holding anything but regular files (symlink / subdir / fifo) makes the accounting uncertain -- partial bytes kept, charge floors at CEILING', () => {
   const home = tmpHome();
   try {
     A.secureMkdir(A.quotaDir(home));
     const root = rootOf(home);
-    const CAP = quota.PER_ACTIVITY_CAP;
+    const CEIL = quota.CEILING;
 
     seedJunk(root, 'junk', 100);
     assert.deepStrictEqual(quota._accountingSnapshot(home), certain(100));
 
     fs.symlinkSync(home, path.join(root, 'junk', 'link'));
     assert.deepStrictEqual(paths.listOwnedSubdirsDetailed(root).foreign.find((f) => f.name === 'junk'), { name: 'junk', bytes: 100, uncertain: true }, 'partial bytes kept');
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CAP, uncertain: true, corrupt: false }, 'a symlink inside junk/ -> uncertain; the entry is charged max(100, PER_ACTIVITY_CAP) like an uncertain activity (fixture parity)');
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CEIL, uncertain: true, corrupt: false }, 'a symlink inside junk/ -> uncertain; the charge floors at CEILING (Ruling 74, fixture parity)');
     fs.unlinkSync(path.join(root, 'junk', 'link'));
     assert.deepStrictEqual(quota._accountingSnapshot(home), certain(100), 'back to certain once removed');
 
     fs.mkdirSync(path.join(root, 'junk', 'nested'));
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CAP, uncertain: true, corrupt: false }, 'a nested directory is never descended into -> uncertain');
-    // a big partial measurement is never discarded: max(bytes, cap) keeps the bytes
-    fs.truncateSync(path.join(root, 'junk', 'python-deadbeef.jsonl'), CAP + 1);
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CAP + 1, uncertain: true, corrupt: false });
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CEIL, uncertain: true, corrupt: false }, 'a nested directory is never descended into -> uncertain, CEILING floor');
+    // a big partial measurement is never discarded: max(bytes, CEILING) keeps the bytes
+    fs.truncateSync(path.join(root, 'junk', 'python-deadbeef.jsonl'), CEIL + 1);
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CEIL + 1, uncertain: true, corrupt: false });
 
     const [live, lease] = newLiveActivity(home);
     try {
@@ -163,9 +163,9 @@ test('Ruling 71: a stray regular file at the root is counted; a stray symlink at
     fs.writeFileSync(path.join(root, 'notes.txt'), Buffer.alloc(500), { mode: 0o600 });
     assert.deepStrictEqual(quota._accountingSnapshot(home), certain(500));
 
-    const CAP = quota.PER_ACTIVITY_CAP;
+    const CEIL = quota.CEILING;
     fs.symlinkSync(home, path.join(root, 'stray-link'));
-    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 500 + CAP, uncertain: true, corrupt: false }, 'stray symlink -> uncertain foreign entry charged the cap; notes.txt still counted');
+    assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CEIL, uncertain: true, corrupt: false }, 'stray symlink -> uncertain foreign entry; the charge floors at CEILING (Ruling 74)');
     fs.unlinkSync(path.join(root, 'stray-link'));
     assert.deepStrictEqual(quota._accountingSnapshot(home), certain(500));
 
@@ -174,7 +174,7 @@ test('Ruling 71: a stray regular file at the root is counted; a stray symlink at
     if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root ignores modes
     fs.chmodSync(junk, 0o000);
     try {
-      assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: 500 + CAP, uncertain: true, corrupt: false }, 'unlistable junk/ -> uncertain (cap), other bytes kept');
+      assert.deepStrictEqual(quota._accountingSnapshot(home), { charge: CEIL, uncertain: true, corrupt: false }, 'unlistable junk/ -> uncertain, CEILING floor (Ruling 74)');
     } finally {
       fs.chmodSync(junk, 0o700);
     }
@@ -225,8 +225,8 @@ test('Ruling 71: _computeSnapshot is pure over foreign inputs -- absent means em
   assert.deepStrictEqual(quota._computeSnapshot(base, C), certain(10), 'no `foreign` key -> empty list');
   assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [] }, C), certain(10));
   assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [{ name: 'j', onDisk: 5, uncertain: false }] }, C), certain(15));
-  assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [{ name: 'j', onDisk: 5, uncertain: true }] }, C), { charge: 10 + quota.PER_ACTIVITY_CAP, uncertain: true, corrupt: false }, 'uncertain foreign entry takes max(bytes, cap), same as an uncertain activity');
-  assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [{ name: 'j', onDisk: quota.PER_ACTIVITY_CAP + 7, uncertain: true }] }, C), { charge: 10 + quota.PER_ACTIVITY_CAP + 7, uncertain: true, corrupt: false }, 'measured bytes above the cap are never discarded');
+  assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [{ name: 'j', onDisk: 5, uncertain: true }] }, C), { charge: quota.CEILING, uncertain: true, corrupt: false }, 'uncertain foreign entry floors the whole charge at CEILING (Ruling 74)');
+  assert.deepStrictEqual(quota._computeSnapshot({ ...base, foreign: [{ name: 'j', onDisk: quota.CEILING + 7, uncertain: true }] }, C), { charge: 10 + quota.CEILING + 7, uncertain: true, corrupt: false }, 'measured bytes above the CEILING floor are never discarded');
   // unlistable ledger: max(SUM measured incl. foreign, CEILING)
   assert.deepStrictEqual(
     quota._computeSnapshot({ ...base, ledgerListable: false, activities: [{ aid: 'a', onDisk: quota.CEILING, uncertain: false }], foreign: [{ name: 'j', onDisk: 5, uncertain: false }] }, C),

@@ -1806,7 +1806,7 @@ def test_foreign_dir_containing_a_symlink_is_uncertain(tmp_path):
     unlocked, locked = _both_snapshots(tmp_path)
 
     assert unlocked.uncertain is True and locked.uncertain is True
-    assert unlocked.charge >= 10 and locked == unlocked
+    assert unlocked.charge == quota.CEILING and locked == unlocked   # Ruling 74: CEILING floor
     assert quota._committed_detailed(tmp_path)[1]            # path-based charge is uncertain too
 
 def test_foreign_dir_containing_a_subdirectory_is_uncertain(tmp_path):
@@ -2029,3 +2029,93 @@ def test_read_owned_segments_dir_fd_detailed_rejects_a_non_uuid_name(tmp_path):
     finally:
         quota._unlock(ctx)
     assert (paths.quota_dir(tmp_path).parent / "junk" / "python-deadbeef.jsonl").exists()
+
+# --- Ruling 73 (Codex Round 12 BLOCKER): Python's foreign measurement must be identity-bound
+# (parity with Node's `_measureForeign`). `paths._measure_foreign_entry` opened the foreign dir
+# by name relative to the root fd and scanned it WITHOUT checking that what it opened is what the
+# root enumeration lstat'd. Codex's sequence: `activity/junk/` holds 64 MiB; between enumeration's
+# lstat and the open, `junk/` is renamed to `junk.old/` and an empty `junk/` is created. The
+# measurement returned (0, certain), the snapshot was certain, and `admit()` succeeded with
+# 64 MiB hidden under `junk.old/`. Now the open is fstat-checked against the enumeration identity
+# (mismatch -> uncertain, no scan) and re-checked after the scan (mismatch -> uncertain, bytes
+# kept), so this sequence yields an UNCERTAIN snapshot and admission is refused (Ruling 61).
+
+def test_admit_refuses_when_foreign_dir_is_swapped_between_enumeration_and_measurement(monkeypatch):
+    import tempfile
+    home = pathlib.Path(tempfile.mkdtemp(prefix="rr-r12-py-"))
+    try:
+        base = paths.quota_dir(home).parent
+        _write_junk_bytes(home, "junk", 64 * MIB)
+        real_measure = paths._measure_foreign_entry
+        fired = []
+        def hooked(dfd, name, st):
+            if name == "junk" and not fired:
+                fired.append(True)
+                os.rename(base / "junk", base / "junk.old")   # persistent replacement, right
+                (base / "junk").mkdir(mode=0o700)             # after enumeration's lstat
+            return real_measure(dfd, name, st)
+        monkeypatch.setattr(paths, "_measure_foreign_entry", hooked)
+
+        fresh, fl = _new_activity(home)
+        try:
+            admitted = quota.admit(home, fresh, fl)
+        finally:
+            fl.release()
+        assert fired, "the swap must have landed inside admit's enumeration"
+        assert admitted is False                              # BUG (pre-fix): True
+        assert not paths.ledger_entry_path(home, fresh).exists()
+        assert (base / "junk.old" / "python-deadbeef.jsonl").stat().st_size == 64 * MIB
+
+        # the same sequence against a direct snapshot: uncertain, never a certain 0-byte view
+        fired.clear()
+        shutil.rmtree(base / "junk"); os.rename(base / "junk.old", base / "junk")
+        snap = quota._accounting_snapshot(home)
+        assert fired and snap.uncertain is True
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+# --- Ruling 74 (Codex Round 12): ANY uncertain foreign entry floors the charge at CEILING. A
+# foreign entry is unmanaged and never capped at PER_ACTIVITY_CAP, so `max(on_disk, PER_ACTIVITY_
+# CAP)` could understate what it hides (a nested directory, a swapped-out original). Now an
+# uncertain foreign entry adds its measured bytes, sets `uncertain`, and after summation
+# `charge = max(charge, CEILING)` -- the same floor an unlistable ledger/root takes. Certain
+# foreign entries are unchanged. Both runtimes; pinned by the `-ruling-74` fixture vectors.
+
+def _F(name, on_disk, uncertain):
+    return quota.ForeignInput(name=name, on_disk_measured=on_disk, uncertain=uncertain)
+
+def _inputs(**kw):
+    base = dict(root_listable=True, ledger_listable=True, activities=[], rejected_root_ids=[],
+                ledger=[], foreign=[])
+    base.update(kw)
+    return quota.AccountingInputs(**base)
+
+def test_compute_snapshot_uncertain_foreign_floors_at_ceiling_not_per_activity_cap():
+    snap = quota._compute_snapshot(_inputs(foreign=[_F("junk", 10, True)]))
+    assert snap == quota.Snapshot(charge=quota.CEILING, uncertain=True, corrupt=False)
+    assert snap.charge > quota.PER_ACTIVITY_CAP                # the old 4 MiB rule is gone
+
+def test_compute_snapshot_uncertain_foreign_above_ceiling_keeps_measured_bytes():
+    snap = quota._compute_snapshot(_inputs(foreign=[_F("junk", quota.CEILING + 7, True)]))
+    assert snap == quota.Snapshot(charge=quota.CEILING + 7, uncertain=True, corrupt=False)
+
+def test_compute_snapshot_uncertain_foreign_with_certain_activity_and_ledger_floors_sum():
+    aid = "00000000-0000-4000-8000-000000000001"
+    snap = quota._compute_snapshot(_inputs(
+        activities=[quota.ActivityInput(aid=aid, on_disk_measured=2000, uncertain=False)],
+        ledger=[quota.LedgerInput(aid=aid, reserved=quota.RESERVE, granted=0)],
+        foreign=[_F("junk", 1000, True)]))
+    assert snap == quota.Snapshot(charge=max(quota.RESERVE + 1000, quota.CEILING),
+                                  uncertain=True, corrupt=False)
+
+def test_compute_snapshot_certain_foreign_unchanged_by_ruling_74():
+    snap = quota._compute_snapshot(_inputs(foreign=[_F("junk", 1000, False), _F("s.bin", 5, False)]))
+    assert snap == quota.Snapshot(charge=1005, uncertain=False, corrupt=False)
+
+def test_stray_symlink_at_root_charges_the_ceiling(tmp_path):
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    outside = tmp_path / "outside"; outside.mkdir()
+    os.symlink(outside, paths.quota_dir(tmp_path).parent / "also-junk")
+    unlocked, locked = _both_snapshots(tmp_path)
+    assert unlocked == quota.Snapshot(charge=quota.CEILING, uncertain=True, corrupt=False)
+    assert locked == unlocked

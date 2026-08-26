@@ -442,3 +442,98 @@ def test_foreign_measurement_never_names_quota_or_a_valid_activity_id(tmp_path):
         assert paths.list_owned_subdirs_dir_fd_detailed(dfd)[3] == []
     finally:
         os.close(dfd)
+
+# --- Ruling 73 (Codex Round 12 BLOCKER): foreign measurement is IDENTITY-BOUND, mirroring Node's
+# `_measureForeign`. `_measure_foreign_entry` opened `name` relative to the root fd and scanned
+# whatever it got -- never checking that what it opened is what the root enumeration lstat'd. A
+# persistent swap (`junk/` -> `junk.old/`, fresh empty `junk/`) between enumeration and open
+# measured the EMPTY replacement as certain (0 bytes), hiding the original's bytes. Now: after
+# open, `fstat(sub)` must match the enumeration lstat's (st_dev, st_ino) -- mismatch -> (0, True)
+# without scanning; after the scan, `lstat(name, dir_fd=dfd)` must still match -- mismatch or
+# OSError -> uncertain (bytes already counted are kept).
+
+def _swap_dir(base, name):
+    """Persistent replacement: rename `base/name` -> `base/name.old`, create a fresh empty
+    `base/name` in its place. Not the transient ABA §7 excludes -- the original persists."""
+    os.rename(base / name, base / f"{name}.old")
+    (base / name).mkdir(mode=0o700)
+
+def _junk_with_sparse(base, name, nbytes):
+    d = base / name; d.mkdir(mode=0o700)
+    with open(d / "python-deadbeef.jsonl", "wb") as f:
+        f.truncate(nbytes)
+    return d
+
+def test_measure_foreign_entry_swap_before_open_is_uncertain(tmp_path, monkeypatch):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    _junk_with_sparse(base, "junk", 64 * 1024 * 1024)
+    dfd = paths.open_owned_dir(base)
+    try:
+        st = os.lstat("junk", dir_fd=dfd)                     # the enumeration's view
+        real_open = os.open
+        fired = []
+        def hooked(p, flags, *a, **kw):
+            if p == "junk" and kw.get("dir_fd") == dfd and not fired:
+                fired.append(True); _swap_dir(base, "junk")   # land the swap right before open
+            return real_open(p, flags, *a, **kw)
+        monkeypatch.setattr(paths.os, "open", hooked)
+        on_disk, uncertain = paths._measure_foreign_entry(dfd, "junk", st)
+    finally:
+        os.close(dfd)
+    assert fired
+    assert uncertain is True                                    # BUG (pre-fix): (0, False)
+    assert on_disk == 0                                         # never scanned the replacement
+    assert (base / "junk.old" / "python-deadbeef.jsonl").stat().st_size == 64 * 1024 * 1024
+
+def test_measure_foreign_entry_swap_after_scan_is_uncertain_bytes_kept(tmp_path, monkeypatch):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    _junk_with_sparse(base, "junk", 4321)
+    dfd = paths.open_owned_dir(base)
+    try:
+        st = os.lstat("junk", dir_fd=dfd)
+        real_scandir = os.scandir
+        fired = []
+        def hooked(arg):
+            entries = list(real_scandir(arg))
+            if isinstance(arg, int) and arg != dfd and not fired:
+                fired.append(True); _swap_dir(base, "junk")   # swap AFTER the listing
+            return entries
+        monkeypatch.setattr(paths.os, "scandir", hooked)
+        on_disk, uncertain = paths._measure_foreign_entry(dfd, "junk", st)
+    finally:
+        os.close(dfd)
+    assert fired
+    assert uncertain is True                                    # BUG (pre-fix): (4321, False)
+    assert on_disk == 4321                                      # what DID stat is kept
+
+def test_measure_foreign_entry_unchanged_dir_is_certain(tmp_path):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    _junk_with_sparse(base, "junk", 4321)
+    dfd = paths.open_owned_dir(base)
+    try:
+        st = os.lstat("junk", dir_fd=dfd)
+        assert paths._measure_foreign_entry(dfd, "junk", st) == (4321, False)
+    finally:
+        os.close(dfd)
+
+def test_measure_foreign_entry_post_scan_lstat_failure_is_uncertain(tmp_path, monkeypatch):
+    base = paths.quota_dir(tmp_path).parent
+    paths.secure_mkdir(paths.quota_dir(tmp_path))
+    _junk_with_sparse(base, "junk", 4321)
+    dfd = paths.open_owned_dir(base)
+    try:
+        st = os.lstat("junk", dir_fd=dfd)
+        real_lstat = os.lstat
+        seen = []
+        def hooked(p, *a, **kw):
+            if p == "junk" and kw.get("dir_fd") == dfd:
+                seen.append(True); raise OSError(5, "EIO")    # the post-scan re-check fails
+            return real_lstat(p, *a, **kw)
+        monkeypatch.setattr(paths.os, "lstat", hooked)
+        on_disk, uncertain = paths._measure_foreign_entry(dfd, "junk", st)
+    finally:
+        os.close(dfd)
+    assert seen and uncertain is True and on_disk == 4321
