@@ -190,6 +190,61 @@ test('P4-14 (b): the hand-off wait and the spawn-failure handler refresh before 
     'spawn failure', { unique: false });
 });
 
+test('a refused sync is refused BEFORE the progress window is opened or the status reset', () => {
+  // The acceptance bug (Ruling P4-21): the runtime-disabled guard sat AFTER showLogWindow() and
+  // the sendSyncStartedWhenReady timer, so a refusal opened the progress window, sent it
+  // `sync-started` with the full repo grid, and then hung it at "Starting sync..." forever -- the
+  // guard's `terminal-output` line goes to a stream the repos-grid view does not render.
+  // NB: functionBody() cannot be used on triggerSync -- its destructured signature
+  // (`function triggerSync({ showWindow = true, ... } = {})`) opens and closes a brace before the
+  // body does, so the brace matcher stops at the parameter list. The existing tests above use
+  // this same anchored slice for exactly that reason.
+  const body = between('function triggerSync(', 'function showLogWindow(');
+  const guard = body.indexOf('if (runtimeDisabled || !runtimeChannel) {');
+  assert.notStrictEqual(guard, -1, 'triggerSync still carries the runtime-disabled guard');
+  assert.strictEqual(body.indexOf('if (runtimeDisabled || !runtimeChannel) {', guard + 1), -1,
+    'the guard appears exactly once');
+
+  const showLog = body.indexOf('showLogWindow()');
+  assert.notStrictEqual(showLog, -1, 'triggerSync still opens the progress window for manual syncs');
+  assert.ok(guard < showLog, 'the guard must refuse before the progress window is ever created');
+
+  const reset = body.indexOf("status.logOutput = ''");
+  assert.notStrictEqual(reset, -1, 'triggerSync still resets status for a real sync');
+  assert.ok(guard < reset,
+    'a refusal must leave the previous errorLog/errorList intact -- the reset belongs to the spawn path');
+
+  assert.ok(guard < body.indexOf('sendSyncStartedWhenReady'),
+    'no sync-started may be scheduled for an attempt that is about to be refused');
+
+  // The env hand-off belongs to the spawn path and stays BELOW the guard's new home.
+  assert.ok(guard < body.indexOf('activity.writer.handOffEnv()'),
+    'handOffEnv() stays on the spawn path, below the guard');
+});
+
+test('both pre-attempt guard blocks open the Activity window on a manual sync', () => {
+  // Ruling P4-21: a manual "Sync Now" that is refused must land the user somewhere that explains
+  // it -- the Activity window deep-linked at the fresh `blocked` item -- instead of silently doing
+  // nothing. Scheduled syncs (showWindow=false, from checkMissedSync) stay headless.
+  const deepLink = 'if (showWindow) showActivityWindow(activity.writer.activityId);';
+
+  inOrder(between('const blockedStatus = loadStatus();', 'return;'),
+    ['activityGlue.onGuardBlock(', '_refreshViewErrorsTarget()', 'updateTrayMenu()', deepLink],
+    'dev-ownership guard block');
+
+  inOrder(between("console.error('Sync disabled:', reason);", 'return;'),
+    ['activityGlue.onGuardBlock(', '_refreshViewErrorsTarget()', 'updateTrayMenu()', deepLink],
+    'runtime-disabled guard block');
+
+  // Exactly the two guard blocks -- the contention (already-syncing) return stays silent, and the
+  // scheduled path must never open a window.
+  const body = between('function triggerSync(', 'function showLogWindow(');
+  assert.strictEqual((body.match(/if \(showWindow\) showActivityWindow\(/g) || []).length, 2,
+    'the two pre-attempt guard blocks, and only those, deep-link the Activity window');
+  assert.strictEqual((body.match(/showActivityWindow\(/g) || []).length, 2,
+    'every showActivityWindow call inside triggerSync is gated on showWindow');
+});
+
 test('showErrorWindow routes to the Activity window and creates no window of its own', () => {
   const body = functionBody('showErrorWindow');
   assert.ok(/showActivityWindow\(viewErrorsTargetId\)/.test(body),

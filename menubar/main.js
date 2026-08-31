@@ -1199,8 +1199,46 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       activityGlue.onGuardBlock(activity.writer, reason);
       _refreshViewErrorsTarget();
       updateTrayMenu();
+      // Ruling P4-21: same silent-refusal problem as the runtime-disabled guard below -- a manual
+      // click got a tray icon change and nothing else. Deep-link the Activity window at the
+      // `blocked` item; scheduled syncs stay headless.
+      if (showWindow) showActivityWindow(activity.writer.activityId);
       return;
     }
+  }
+
+  // Sync disabled: either the build channel couldn't be resolved, or
+  // ensureRuntime() failed during startup (see app.whenReady()). Surface the
+  // same way a failed spawn would have, rather than silently doing nothing.
+  //
+  // Ruling P4-21: this sits ABOVE the status reset and showLogWindow() deliberately. It depends
+  // only on module state and `activity.writer`, both settled by now, and when it fires nothing
+  // about the previous sync may be disturbed: the reset never runs (the prior errorLog/errorList
+  // survive for the Activity window to explain), no progress window is created, and no
+  // `sync-started` is scheduled. Below the reset -- where this used to live -- a refusal opened
+  // the progress window, handed it the full repo grid, and hung it at "Starting sync..." forever,
+  // because the ⚠️ terminal-output line below goes to a stream the repos grid never renders.
+  if (runtimeDisabled || !runtimeChannel) {
+    const reason = runtimeDisabledReason || 'runtime channel unresolved';
+    console.error('Sync disabled:', reason);
+    const status = loadStatus();
+    status.hasErrors = true;
+    status.errorLog = (status.errorLog || '') + `\n⚠️ Sync unavailable: ${reason}\n`;
+    saveStatus(status);
+    showErrorIcon();
+    if (logWindow && !logWindow.isDestroyed()) {
+      logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
+    }
+    // Activity History (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild.
+    activityGlue.onGuardBlock(activity.writer, reason);
+    _refreshViewErrorsTarget();
+    updateTrayMenu();
+    // Ruling P4-21: a MANUAL "Sync Now" that is refused must land the user on the incident. The
+    // id is the `blocked` item onGuardBlock just wrote; a refused/inactive writer has none, and
+    // showActivityWindow() simply opens the list unfocused then. Scheduled syncs
+    // (showWindow=false, from checkMissedSync) stay headless -- no window of any kind.
+    if (showWindow) showActivityWindow(activity.writer.activityId);
+    return;
   }
 
   syncCancelledByUser = false;
@@ -1380,27 +1418,6 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   // runtime.runSync() (Task 2.4) maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD
   // to that child-side fd number.
   Object.assign(shellEnv, activity.writer.handOffEnv());
-
-  // Sync disabled: either the build channel couldn't be resolved, or
-  // ensureRuntime() failed during startup (see app.whenReady()). Surface the
-  // same way a failed spawn would have, rather than silently doing nothing.
-  if (runtimeDisabled || !runtimeChannel) {
-    const reason = runtimeDisabledReason || 'runtime channel unresolved';
-    console.error('Sync disabled:', reason);
-    const status = loadStatus();
-    status.hasErrors = true;
-    status.errorLog = (status.errorLog || '') + `\n⚠️ Sync unavailable: ${reason}\n`;
-    saveStatus(status);
-    showErrorIcon();
-    if (logWindow && !logWindow.isDestroyed()) {
-      logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
-    }
-    // Activity History (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild.
-    activityGlue.onGuardBlock(activity.writer, reason);
-    _refreshViewErrorsTarget();
-    updateTrayMenu();
-    return;
-  }
 
   console.log('Starting sync via runtime.runSync (channel:', runtimeChannel, ')', ['sync', '--status-server']);
   console.log('Environment - GEMINI_API_KEY:', !!shellEnv.GEMINI_API_KEY);
