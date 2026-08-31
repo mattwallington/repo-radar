@@ -1,4 +1,18 @@
 'use strict';
+// ---------------------------------------------------------------------------------------------
+// Why this whole file is one IIFE: activity.html loads it and activity-system.js as two plain
+// <script src> tags, and classic scripts share ONE global scope -- there is no scope per file.
+// Both files declare `TEXT`, `el`, `sanitizeText` and the four escape regexes, a duplication that
+// is deliberate and documented below (a sandboxed page script cannot import). Unwrapped, the
+// second script to load therefore died on parse with "Identifier 'TEXT' has already been
+// declared", `start()` never ran, and the window painted an empty list pane. This wrapper is the
+// isolation that makes the duplication safe; `__tests__/activity-browser-scope.test.js` runs both
+// files in a single vm context so it stays that way. The body below is left un-indented: the
+// wrapper is a pure addition, and the source-scanning tests keep finding their landmarks at the
+// start of a line.
+// ---------------------------------------------------------------------------------------------
+(() => {
+'use strict';
 // Task 4.2: the Activity History renderer.
 //
 // This file runs in a SANDBOXED, context-isolated window (see activity/window-options.js). It has
@@ -786,3 +800,4 @@ if (typeof module !== 'undefined') {
     boot, start,
   };
 }
+})();

@@ -1,4 +1,17 @@
 'use strict';
+// ---------------------------------------------------------------------------------------------
+// Why this whole file is one IIFE: activity.html loads it and activity.js as two plain
+// <script src> tags, and classic scripts share ONE global scope -- there is no scope per file.
+// The helpers re-declared below (`TEXT`, `el`, `sanitizeText`, the four escape regexes) are the
+// same names activity.js declares; unwrapped, the second script to load died on parse with
+// "Identifier 'TEXT' has already been declared" and the Activity window painted nothing. This
+// wrapper is the isolation that makes the deliberate duplication safe -- `window.activitySystem`
+// below stays the one intentional global. `__tests__/activity-browser-scope.test.js` runs both
+// files in a single vm context so it stays that way. The body is left un-indented: the wrapper is
+// a pure addition, and the source-scanning tests keep finding their landmarks at line start.
+// ---------------------------------------------------------------------------------------------
+(() => {
+'use strict';
 // Task 4.3: the System section of the Activity window -- the shared, UNCORRELATED diagnostics.
 //
 // Why this is a second file: activity.js is already ~550 lines, and this section shares none of
@@ -221,3 +234,4 @@ if (typeof window !== 'undefined') {
 if (typeof module !== 'undefined') {
   module.exports = { renderSystem };
 }
+})();
