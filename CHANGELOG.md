@@ -8,6 +8,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 On the **dev channel** (Repo Radar Dev) for testing before the next stable release.
 
+### Fixed
+- **GPT-5.6 Sol / Terra / Luna input limits.** The catalog recorded the models' 1,050,000-token *total* context as their *input* window; corrected to the real 922,000 (total minus the 128,000 output reservation), caught by the release-time model-window gate.
+
 ### Changed
 - **Authoritative token counting for Claude.** Metadata generation now preflights each prompt through Anthropic's Count-Tokens endpoint and accepts, splits, or (for a single oversized item) trims it against the model's *real* window — replacing the conservative multiplier added in 1.0.29. When an authoritative count isn't available (non-Anthropic models, provider errors, or transient failures) it falls back to the existing safe behaviour, so it is never less safe than before, and a batch that still can't fit is only ever split further — never silently merged past what fits. A repository that genuinely cannot be summarised is recorded as a visible `degraded` entry instead of failing quietly.
 
