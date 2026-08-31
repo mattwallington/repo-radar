@@ -1,0 +1,249 @@
+[
+  {
+    "accept": true,
+    "why": "valid terminal",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "terminal",
+      "seq": 4,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "outcome": "succeeded",
+      "summary": {
+        "errors": 0
+      },
+      "by": "deadbeef"
+    }
+  },
+  {
+    "accept": false,
+    "why": "scalar summary",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "terminal",
+      "seq": 4,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "outcome": "succeeded",
+      "summary": 5,
+      "by": "deadbeef"
+    }
+  },
+  {
+    "accept": false,
+    "why": "bad by token",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "terminal",
+      "seq": 4,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "outcome": "succeeded",
+      "summary": {},
+      "by": "NOTHEX"
+    }
+  },
+  {
+    "accept": false,
+    "why": "negative seq",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "start",
+      "seq": -1,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "kind": "sync",
+      "channel": "stable",
+      "trigger": "cli",
+      "created_by": "python"
+    }
+  },
+  {
+    "accept": false,
+    "why": "invalid kind",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "start",
+      "seq": 0,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "kind": "weird",
+      "channel": "stable",
+      "trigger": "cli",
+      "created_by": "python"
+    }
+  },
+  {
+    "accept": false,
+    "why": "non-ISO ts",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 0,
+      "ts": "2026-08-14 00:00:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": false,
+    "why": "nested field value",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 0,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {
+        "a": {
+          "b": 1
+        }
+      }
+    }
+  },
+  {
+    "accept": true,
+    "why": "ignores unknown additive field",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 0,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {},
+      "future_field": "ok"
+    }
+  },
+  {
+    "accept": true,
+    "why": "valid ownership w/ evidence",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "ownership",
+      "seq": 1,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "owner_token": "deadbeef",
+      "role": "initial",
+      "producer": "python",
+      "pid": 1234,
+      "boot_id": "a1b2c3d4e5f60718",
+      "proc_birth": "2026-08-14T00:00:00-07:00"
+    }
+  },
+  {
+    "accept": false,
+    "why": "ownership missing pid/boot_id/proc_birth",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "ownership",
+      "seq": 1,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "owner_token": "deadbeef",
+      "role": "initial",
+      "producer": "python"
+    }
+  },
+  {
+    "accept": false,
+    "why": "non-ISO calendar ts (regex-shaped but invalid)",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 0,
+      "ts": "2026-13-40T99:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": true,
+    "why": "seq at the shared safe-integer boundary (2^53-1)",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 9007199254740991,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": false,
+    "why": "seq past the shared safe-integer boundary (2^53) -- Node JSON.parse would round/collide",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 9007199254740992,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": false,
+    "why": "seq is not an integer (1.5)",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": 1.5,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": false,
+    "why": "seq is a bool, not an int",
+    "raw": {
+      "schema_version": 1,
+      "activity_id": "00000000-0000-4000-8000-000000000000",
+      "type": "event",
+      "seq": true,
+      "ts": "2026-08-14T00:00:00-07:00",
+      "level": "info",
+      "event": "x",
+      "fields": {}
+    }
+  },
+  {
+    "accept": false,
+    "why": "seq is a non-integer JSON literal (1.0) -- 'raw' (a parsed object) can't represent this: both languages' JSON parsers reconstruct a value from it, and JS's JSON.parse/JSON.stringify round-trip collapses 1.0 to the indistinguishable literal 1, silently losing the case this vector exists to cover. 'raw_text' carries the literal JSON line text verbatim instead so the exact source spelling reaches parse_valid/parseValid unchanged (G5-Node2 cross-runtime literal-integer parity)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1.0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "seq is a non-integer JSON literal via exponent notation (1e0) -- see the 1.0 case above for why 'raw_text' (not 'raw') is used",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1e0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "schema_version is the non-integer JSON literal 1.0 -- Python's `1.0 != 1` is False so an untyped check accepts it while Node rejects the literal; both must reject (type-strict int, Ruling 53)",
+    "raw_text": "{\"schema_version\":1.0,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{}}"
+  },
+  {
+    "accept": false,
+    "why": "ownership pid is the non-integer JSON literal 1.0 -- Python's isinstance(1.0, int) is already False so this is rejected by type either way, but (like the seq/schema_version 1.0 cases above) 'raw' can't carry the exact literal spelling since round-tripping a parsed object loses the int/float distinction on the Node side; 'raw_text' carries the literal JSON line text verbatim so both languages' parsers see the identical source bytes (Codex R6-3 fixture half)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"ownership\",\"seq\":1,\"ts\":\"2026-08-14T00:00:00-07:00\",\"owner_token\":\"deadbeef\",\"role\":\"initial\",\"producer\":\"python\",\"pid\":1.0,\"boot_id\":\"a1b2c3d4e5f60718\",\"proc_birth\":\"2026-08-14T00:00:00-07:00\"}"
+  },
+  {
+    "accept": true,
+    "why": "additive pid on a non-ownership record (event) is accepted -- Python's _validate only type-checks 'pid' for type:'ownership'; on any other record type an unknown additive field (even the non-integer literal 1.0, which WOULD be rejected on an ownership record) is simply ignored. 'raw_text' carries the literal 1.0 spelling verbatim, matching the 'raw_text' convention the 1.0-literal cases above already use, so the Node cross-runtime driver sees the identical source bytes (Ruling 63 / Codex R7-4: the Node reader scopes its strict-literal pid check to ownership only, same as Python)",
+    "raw_text": "{\"schema_version\":1,\"activity_id\":\"00000000-0000-4000-8000-000000000000\",\"type\":\"event\",\"seq\":0,\"ts\":\"2026-08-14T00:00:00-07:00\",\"level\":\"info\",\"event\":\"x\",\"fields\":{},\"pid\":1.0}"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {"secrets": [], "raw": "Authorization: Bearer sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA", "expected": "Authorization: [REDACTED authorization]"},
+  {"secrets": [], "raw": "key sk-proj-ABCDEFGHIJKLMNOPQRSTUV", "expected": "key [REDACTED api key]"},
+  {"secrets": [], "raw": "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "expected": "token [REDACTED github token]"},
+  {"secrets": [], "raw": "token github_pat_11ABCDE0000abcdefghij_KLMNOPQRSTUVWXYZ0123456789", "expected": "token [REDACTED github token]"},
+  {"secrets": [], "raw": "gemini AIzaSyA0000000000000000000000000000000", "expected": "gemini [REDACTED google key]"},
+  {"secrets": [], "raw": "clone https://user:s3cr3t@github.com/x/y.git", "expected": "clone https://<redacted>@github.com/x/y.git"},
+  {"secrets": ["hunter2-configured-token-value"], "raw": "debug password=hunter2-configured-token-value end", "expected": "debug password=[REDACTED] end"},
+  {"secrets": ["abc", "abcdef123456"], "raw": "val=abcdef123456", "expected": "val=[REDACTED]"}
+]

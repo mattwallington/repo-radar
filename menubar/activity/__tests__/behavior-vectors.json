@@ -1,0 +1,47 @@
+[
+  {
+    "name": "grant_enforces_per_activity_cap_and_reserve_partition",
+    "scenario": "grant_cap_and_reserve_partition",
+    "description": "admit's one-shot 60 KiB reserve is a partition separate from grant's ordinary bytes: grant may fill up to ORDINARY_CAP (PER_ACTIVITY_CAP - RESERVE = 4132864), one more byte is refused, and `reserved` never changes across any of it.",
+    "params": { "ordinary_cap": 4132864, "reserve": 61440 },
+    "expect": {
+      "admit_result": true,
+      "reserved_after_admit": 61440,
+      "granted_after_admit": 0,
+      "grant_ordinary_cap_result": true,
+      "granted_after_ordinary_grant": 4132864,
+      "grant_one_more_result": false,
+      "granted_after_refused_grant": 4132864,
+      "reserved_after_refused_grant": 61440
+    }
+  },
+  {
+    "name": "corrupt_ledger_entry_charged_full_per_activity_cap",
+    "scenario": "corrupt_ledger_charged_full_cap",
+    "description": "A malformed ledger entry (unparseable JSON) is charged the FULL 4 MiB PER_ACTIVITY_CAP liability, never 0 and never a partial/estimated amount -- counters are never rebuilt from a corrupt file.",
+    "params": { "per_activity_cap": 4194304 },
+    "expect": { "charge_equals": 4194304 }
+  },
+  {
+    "name": "refuse_while_corrupt_at_real_ceiling",
+    "scenario": "refuse_while_corrupt_at_real_ceiling",
+    "description": "A corrupt entry that STANDS (its owner.lock held, so it cannot evidence-clear) makes admit AND grant refuse UNCONDITIONALLY -- not merely 'until capacity runs out'. Uses the REAL 64 MiB ceiling (never lowered): total charge here is far below it, so refusal can only be explained by the corrupt-entry gate, not capacity exhaustion.",
+    "params": { "grant_nbytes": 100 },
+    "expect": {
+      "live_admit_result": true,
+      "fresh_admit_result": false,
+      "live_grant_result": false
+    }
+  },
+  {
+    "name": "terminal_durability_failure_preserves_reservation",
+    "scenario": "terminal_durability_failure_preserves_reservation",
+    "description": "B1: a synthesized terminal must be fsync'd durable BEFORE it is considered settled. When the segment fsync fails, synthesize-terminal returns false (not durable) and the ledger reservation is preserved for a future retry -- never lost.",
+    "params": {},
+    "expect": {
+      "admit_result": true,
+      "synthesize_result": false,
+      "ledger_entry_survives": true
+    }
+  }
+]

@@ -1,0 +1,639 @@
+[
+  {
+    "name": "plain-settled-single-activity-no-ledger",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 1000000,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 1000000,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "plain-settled-multiple-activities-no-ledger",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 100,
+          "uncertain": false
+        },
+        {
+          "aid": "00000000-0000-4000-8000-000000000002",
+          "on_disk": 200,
+          "uncertain": false
+        },
+        {
+          "aid": "00000000-0000-4000-8000-000000000003",
+          "on_disk": 300,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 600,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "live-entry-on-disk-under-reserved-plus-granted",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 2000,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "reserved": 61440,
+          "granted": 5000
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 66440,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "live-entry-on-disk-at-or-above-reserved-plus-granted",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 100000,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "reserved": 61440,
+          "granted": 1000
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 100000,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "uncertain-activity-with-live-entry-no-double-count",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 0,
+          "uncertain": true
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "reserved": 61440,
+          "granted": 2000000
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "rejected-root-id-with-live-entry-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000002",
+          "reserved": 61440,
+          "granted": 100
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "corrupt-ledger-entry-flat-cap-no-activity-dir",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000003",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": false,
+      "corrupt": true
+    }
+  },
+  {
+    "name": "root-unlistable-flattens-to-ceiling",
+    "inputs": {
+      "root_listable": false,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "ledger-unlistable-flattens-to-ceiling",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": false,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 12345,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "sixteen-uncertain-activities-sum-to-ceiling",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        { "aid": "00000000-0000-4000-8000-000000000064", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000065", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000066", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000067", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000068", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000069", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006a", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006b", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006c", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006d", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006e", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-00000000006f", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000070", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000071", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000072", "on_disk": 0, "uncertain": true },
+        { "aid": "00000000-0000-4000-8000-000000000073", "on_disk": 0, "uncertain": true }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "uncertain-activity-with-10mib-measured-exceeds-cap-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000004",
+          "on_disk": 10485760,
+          "uncertain": true
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 10485760,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "uncertain-activity-with-1mib-measured-stays-at-cap-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000005",
+          "on_disk": 1048576,
+          "uncertain": true
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "corrupt-entry-with-10mib-measured-adds-cap-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000006",
+          "on_disk": 10485760,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000006",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 14680064,
+      "uncertain": false,
+      "corrupt": true
+    }
+  },
+  {
+    "name": "unlistable-ledger-with-80mib-measured-exceeds-ceiling-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": false,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000007",
+          "on_disk": 83886080,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 83886080,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "unlistable-ledger-with-10mib-measured-stays-at-ceiling-codex-case",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": false,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000008",
+          "on_disk": 10485760,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": []
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "unlistable-root-with-a-live-entry-codex-case",
+    "inputs": {
+      "root_listable": false,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000009",
+          "reserved": 61440,
+          "granted": 100
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "corrupt-plus-uncertain-activity",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000a",
+          "on_disk": 1024,
+          "uncertain": true
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000a",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4195328,
+      "uncertain": true,
+      "corrupt": true
+    }
+  },
+  {
+    "name": "corrupt-plus-rejected-root",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [
+        "00000000-0000-4000-8000-00000000000b"
+      ],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-00000000000b",
+          "corrupt": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 4194304,
+      "uncertain": true,
+      "corrupt": true
+    }
+  },
+  {
+    "name": "foreign-only-64mib-file-is-charged-certain-ruling-71",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 67108864,
+          "uncertain": false
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-1000-plus-live-activity-2000-reserved-2000-ruling-71",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "on_disk": 2000,
+          "uncertain": false
+        }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        {
+          "aid": "00000000-0000-4000-8000-000000000001",
+          "reserved": 2000,
+          "granted": 0
+        }
+      ],
+      "foreign": [
+        {
+          "name": "stray.bin",
+          "on_disk": 1000,
+          "uncertain": false
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 3000,
+      "uncertain": false,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-uncertain-10-bytes-alone-takes-the-ceiling-ruling-74",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [],
+      "rejected_root_ids": [],
+      "ledger": [],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 10,
+          "uncertain": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  },
+  {
+    "name": "foreign-uncertain-with-certain-activity-and-ledger-floors-at-ceiling-ruling-74",
+    "inputs": {
+      "root_listable": true,
+      "ledger_listable": true,
+      "activities": [
+        { "aid": "00000000-0000-4000-8000-000000000001", "on_disk": 2000, "uncertain": false }
+      ],
+      "rejected_root_ids": [],
+      "ledger": [
+        { "aid": "00000000-0000-4000-8000-000000000001", "reserved": 61440, "granted": 0 }
+      ],
+      "foreign": [
+        {
+          "name": "junk",
+          "on_disk": 1000,
+          "uncertain": true
+        }
+      ]
+    },
+    "constants": {
+      "CEILING": 67108864,
+      "PER_ACTIVITY_CAP": 4194304,
+      "RESERVE": 61440
+    },
+    "expected": {
+      "charge": 67108864,
+      "uncertain": true,
+      "corrupt": false
+    }
+  }
+]
