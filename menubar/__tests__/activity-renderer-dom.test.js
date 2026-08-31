@@ -140,6 +140,46 @@ test('sanitizeText strips ANSI sequences and control characters, keeping newline
   assert.strictEqual(R.sanitizeText(XSS), XSS, 'markup characters are ordinary text, never removed');
 });
 
+// A repo name or a log line carrying U+202E reorders everything that follows it on the row, so a
+// chip can be made to read as a different repo, branch or outcome than the one it describes -- the
+// same trick that disguises executable filenames. These are not control characters in the C0/C1
+// sense, so the sweep above does not reach them; they are stripped by name.
+test('sanitizeText strips bidi overrides and isolates', () => {
+  assert.strictEqual(R.sanitizeText('safe\u202egnp.exe'), 'safegnp.exe');
+  for (const cp of ['\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+    '\u2066', '\u2067', '\u2068', '\u2069']) {
+    assert.strictEqual(R.sanitizeText(`a${cp}b`), 'ab', `U+${cp.codePointAt(0).toString(16)} must go`);
+  }
+  assert.strictEqual(R.sanitizeText('\u200e ok'), '\u200e ok',
+    'the plain LTR/RTL MARKS are not overrides and are left alone');
+});
+
+test('the System renderer strips bidi overrides too -- one scrubber, two files', () => {
+  const node = S.renderSystem(makeDoc(), systemPayload({
+    streams: [{ name: 'sync.error.log', path: '~/Library/Logs/repo-radar/sync.error.log',
+      present: true, onDemand: false, bytes: 8, truncated: false, redactedTail: 'boom\u202egnp.exe\n' }],
+  }));
+  const text = node.textContent;
+  assert.ok(text.includes('boomgnp.exe'), `the tail arrives scrubbed, got ${JSON.stringify(text)}`);
+  assert.strictEqual(text.includes('\u202e'), false, 'no bidi override may survive into the DOM');
+});
+
+test('the two renderer files carry the SAME control sweep', () => {
+  // They are separate files with no way to share code (a sandboxed renderer cannot `require`), so
+  // the only thing keeping them honest is this: the four regex sources must match, character for
+  // character. Editing one and not the other is the failure mode.
+  const a = fs.readFileSync(ACTIVITY_JS, 'utf8');
+  const b = fs.readFileSync(ACTIVITY_SYSTEM_JS, 'utf8');
+  for (const name of ['ANSI_OSC_RE', 'ANSI_CSI_RE', 'ANSI_ESC_RE', 'CONTROL_RE']) {
+    const of = (src) => {
+      const line = src.split('\n').find((l) => l.startsWith(`const ${name} = `));
+      assert.ok(line, `${name} must be defined`);
+      return line.slice(`const ${name} = `.length).split(';')[0];
+    };
+    assert.strictEqual(of(a), of(b), `${name} must be identical in both renderer files`);
+  }
+});
+
 test('sanitizeText coerces non-strings and never returns null or undefined', () => {
   assert.strictEqual(R.sanitizeText(null), '');
   assert.strictEqual(R.sanitizeText(undefined), '');
@@ -1416,4 +1456,31 @@ test('a deep link to an activity outside the listed page still selects it (P4-8)
   assert.deepStrictEqual(calls, [['list', {}], ['get', OTHER_ID]], 'the deep link is honoured');
   assert.strictEqual(byId['btn-reveal'].disabled, false,
     'the pending-focus path must not be second-guessed by the pruned-selection sweep');
+});
+
+// -------------------------------------------------------------------------------------------
+// start(): the browser entry point. A packaging or preload failure -- a renamed preload, or one
+// that threw before it exposed the bridge -- is the ONE condition boot() cannot report, because
+// it is never reached. Without a notice the window paints nothing at all, which during manual
+// acceptance is indistinguishable from an empty history.
+// -------------------------------------------------------------------------------------------
+test('the entry point reports a missing bridge instead of leaving a blank page', async () => {
+  const { doc, byId } = livePage();
+  const win = fakeWindow('');
+  const { api, calls } = fakeApi();
+  win.activityApi = undefined; // the preload never ran, or exposed nothing
+
+  assert.strictEqual(R.start(win, doc), null, 'nothing boots without the bridge');
+  assert.deepStrictEqual(calls, [], 'no bridge call is attempted');
+  assert.ok(byId.list.textContent.includes('Activity bridge unavailable'),
+    `#list must carry the fixed notice, got ${JSON.stringify(byId.list.textContent)}`);
+  assert.strictEqual(byId.list.children.length, 1, 'the notice is the whole pane');
+
+  // Positive control: the same entry point boots normally when the bridge IS there, so the
+  // assertions above are about the guard and not about an inert `start`.
+  const live = livePage();
+  const bridged = fakeWindow('');
+  bridged.activityApi = api;
+  await R.start(bridged, live.doc);
+  assert.deepStrictEqual(calls, [['list', {}]], 'with a bridge, the entry point loads the list');
 });

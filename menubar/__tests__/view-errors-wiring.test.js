@@ -133,11 +133,12 @@ test('P4-14 (a): a menu build never calls the reader', () => {
   assert.strictEqual(/_refreshViewErrorsTarget/.test(click), false, 'a tray click must not walk the store');
 
   // triggerSync rebuilds the menu BEFORE the child is spawned (currentSyncProcess is still null,
-  // so the idle branch runs). Its four refreshes are the two guard blocks, the child's `close`
-  // and the runSync rejection -- the pre-spawn rebuild is not one of them.
+  // so the idle branch runs). Its six refreshes are the two guard blocks, the child's `close`,
+  // the spawn-`error` handler, the hand-off wait and the runSync rejection -- the pre-spawn
+  // rebuild is not one of them.
   const trigger = between('function triggerSync(', 'function showLogWindow(');
-  assert.strictEqual((trigger.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 4,
-    'exactly the four failure/completion refreshes inside triggerSync, none on the pre-spawn path');
+  assert.strictEqual((trigger.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 6,
+    'exactly the six failure/completion refreshes inside triggerSync, none on the pre-spawn path');
 });
 
 test('P4-14 (b): the cache is refreshed at startup and on the 30s tick, in that order', () => {
@@ -171,6 +172,22 @@ test('P4-14 (b): each pre-attempt failure writes its terminal, THEN refreshes, T
   inOrder(between("console.error('runSync failed to start sync:', e);", '});'),
     ["activity.writer.terminal('failed')", '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
     'runSync rejection');
+});
+
+test('P4-14 (b): the hand-off wait and the spawn-failure handler refresh before they rebuild', () => {
+  // handOff can WRITE this attempt's outcome -- `failed` when the adopter rejected the lease, or
+  // a terminal synthesized by the single-activity reconciler -- so the cached target can be stale
+  // the moment it returns, and the tray was rebuilt from the pre-hand-off value.
+  const handoff = between('activityGlue.handOff(', '}).catch((e) => {');
+  inOrder(handoff, ['_refreshViewErrorsTarget()', 'updateTrayMenu()'], 'activity hand-off');
+
+  // The spawn-failure handler writes no terminal of its own yet, but it DOES rebuild the menu, and
+  // every path that rebuilds refreshes first -- one pairing, no exceptions to reason about.
+  const spawnError = between("currentSyncProcess.on('error'", 'activityGlue.handOff(');
+  assert.strictEqual((spawnError.match(/_refreshViewErrorsTarget\(\)/g) || []).length, 1,
+    'one refresh in the spawn-failure handler');
+  inOrder(spawnError, ['showErrorIcon()', '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'spawn failure', { unique: false });
 });
 
 test('showErrorWindow routes to the Activity window and creates no window of its own', () => {

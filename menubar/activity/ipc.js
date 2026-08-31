@@ -152,6 +152,7 @@ function _exportFileName() {
 //   shell                 Electron's shell (activity:reveal only)
 //   dialog                Electron's dialog (activity:export only)
 //   writeFile             fs.writeFileSync by default (activity:export only)
+//   chmod                 fs.chmodSync by default (activity:export only; see the handler)
 //   log                   main-side sink for the ORIGINAL error behind an `internal` rejection;
 //                         console.error by default, matching main.js's own logging
 function createHandlers({
@@ -160,6 +161,7 @@ function createHandlers({
   shell,
   dialog,
   writeFile = fs.writeFileSync,
+  chmod = fs.chmodSync,
   log = console.error,
 } = {}) {
   if (typeof home !== 'string' || home.length === 0) {
@@ -200,16 +202,28 @@ function createHandlers({
     // filter -> the saved path, or null if the user cancelled. The export TEXT is built here in
     // main (already redacted and byte-capped by read.buildExport); the renderer never sees it,
     // and never supplies the destination -- that comes from the OS save dialog.
+    //
+    // Order matters: validate, ASK, then build. buildExport walks the WHOLE store and holds the
+    // rendered document in memory; doing that before the dialog paid that cost in full for a user
+    // who then presses Cancel, and kept every redacted line of it alive across an open-ended modal
+    // wait for nothing. The filter is still validated before anything at all happens, so a
+    // rejected request never reaches the dialog either.
     'activity:export': guard('activity:export', async (filter) => {
       _validateFilter(filter);
-      const text = read.buildExport(home, filter, { configuredSecrets: secrets() });
       const result = await dialog.showSaveDialog({
         title: 'Export Activity History',
         defaultPath: _exportFileName(),
         filters: [{ name: 'Text', extensions: ['txt'] }],
       });
       if (!result || result.canceled || !result.filePath) return null;
+      const text = read.buildExport(home, filter, { configuredSecrets: secrets() });
       writeFile(result.filePath, text, { encoding: 'utf8', mode: 0o600 });
+      // `mode` is honoured only when the file is CREATED. Exporting over a path that already
+      // exists -- a second export to the same name, or any file the user picks in the dialog --
+      // would otherwise keep whatever mode it already had, leaving a history dump 0644. The chmod
+      // is deliberately NOT swallowed: if the mode cannot be set, the export did not deliver what
+      // it promises, and saying so beats reporting success over a world-readable file.
+      chmod(result.filePath, 0o600);
       return result.filePath;
     }),
 

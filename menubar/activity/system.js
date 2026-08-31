@@ -423,11 +423,16 @@ function systemDiagnostics(home, { configuredSecrets = [] } = {}) {
       statusDiagnostics: _readStatus(home, redactor),
     };
   } catch (e) {
+    // A FIXED string, never the thrown message. Node's fs and path errors quote absolute paths
+    // (`ENOENT: ... open '/Users/<name>/Library/Logs/...'`), and the Redactor masks configured
+    // secrets -- it has no notion of a path -- so echoing the message here would put the user's
+    // home directory and username on screen and, worse, into a saved export. Nothing above this
+    // catch was established anyway, so there is nothing specific to truthfully report.
     return {
       uncorrelated: true,
       streams: [],
       statusDiagnostics: _emptyStatus(null),
-      error: _safeStr((e && e.message) || String(e), redactor, 512) || 'diagnostics unavailable',
+      error: 'diagnostics-failed',
     };
   }
 }

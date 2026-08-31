@@ -65,9 +65,10 @@ function seedOne(home, aid = AID, over = {}) {
   return aid;
 }
 
-// Handlers wired to recording fakes for the three injected Electron/fs seams.
+// Handlers wired to recording fakes for the injected Electron/fs seams. `chmod` records like
+// `writeFile` does: with the write faked, nothing is actually on disk for a real chmod to touch.
 function makeHandlers(home, over = {}) {
-  const calls = { revealed: [], dialogs: [], writes: [], logs: [] };
+  const calls = { revealed: [], dialogs: [], writes: [], chmods: [], logs: [] };
   const chosen = path.join(home, 'activity-export.txt');
   const handlers = ipc.createHandlers({
     home,
@@ -76,6 +77,7 @@ function makeHandlers(home, over = {}) {
       showSaveDialog: async (opts) => { calls.dialogs.push(opts); return { canceled: false, filePath: chosen }; },
     },
     writeFile: (p, data, opts) => { calls.writes.push({ path: p, data, opts }); },
+    chmod: (p, mode) => { calls.chmods.push({ path: p, mode }); },
     log: (line) => { calls.logs.push(line); },
     ...over,
   });
@@ -380,13 +382,27 @@ test('activity:reveal rejects an unsafe id and never builds a path or calls the 
 // -----------------------------------------------------------------------------------------------
 // 5. activity:export -- build in main, save dialog, 0600 write, path back (null on cancel).
 // -----------------------------------------------------------------------------------------------
-test('activity:export builds the text in main, writes it 0600 to the chosen path, returns the path', async () => {
+test('activity:export asks FIRST, then builds the text in main, writes it 0600, returns the path', async () => {
   const home = tmpHome();
+  const realBuildExport = read.buildExport;
   try {
     seedOne(home);
-    const { handlers, calls, chosen } = makeHandlers(home);
+    // The whole store walk is the expensive half, so it must happen only once there is somewhere
+    // to put the result: dialog, THEN build.
+    const order = [];
+    read.buildExport = (...args) => { order.push('build'); return realBuildExport(...args); };
+    const { handlers, calls, chosen } = makeHandlers(home, {
+      dialog: {
+        showSaveDialog: async (opts) => {
+          order.push('dialog');
+          calls.dialogs.push(opts);
+          return { canceled: false, filePath: chosen };
+        },
+      },
+    });
     const result = await handlers['activity:export']({});
 
+    assert.deepStrictEqual(order, ['dialog', 'build'], 'the save dialog precedes the export build');
     assert.strictEqual(result, chosen);
     assert.strictEqual(calls.dialogs.length, 1, 'the save dialog is shown exactly once');
     assert.strictEqual(typeof calls.dialogs[0].defaultPath, 'string');
@@ -395,22 +411,49 @@ test('activity:export builds the text in main, writes it 0600 to the chosen path
     assert.strictEqual(calls.writes[0].opts.mode, 0o600, 'the export must be written 0600');
     assert.ok(calls.writes[0].data.startsWith('Repo Radar Activity Export'), 'the built export text');
     assert.ok(calls.writes[0].data.includes(AID));
+    assert.deepStrictEqual(calls.chmods, [{ path: chosen, mode: 0o600 }],
+      'the mode is re-asserted after the write, for the overwrite case');
   } finally {
+    read.buildExport = realBuildExport;
     cleanup(home);
   }
 });
 
-test('activity:export returns null and writes nothing when the user cancels', async () => {
+test('activity:export returns null, writes nothing AND builds nothing when the user cancels', async () => {
   const home = tmpHome();
+  const realBuildExport = read.buildExport;
   try {
     seedOne(home);
     for (const outcome of [{ canceled: true, filePath: undefined }, { canceled: false, filePath: '' }]) {
+      let built = 0;
+      read.buildExport = (...args) => { built += 1; return realBuildExport(...args); };
       const { handlers, calls } = makeHandlers(home, {
         dialog: { showSaveDialog: async () => outcome },
       });
       assert.strictEqual(await handlers['activity:export']({}), null);
       assert.deepStrictEqual(calls.writes, []);
+      assert.strictEqual(built, 0, 'a cancelled export never walks the store');
     }
+  } finally {
+    read.buildExport = realBuildExport;
+    cleanup(home);
+  }
+});
+
+// `mode` on writeFileSync is honoured only when the file is CREATED, so a second export to the
+// same name would otherwise keep whatever mode was already there. This one runs against the REAL
+// fs seams (no recording fake) because the assertion is about the mode bits on disk.
+test('activity:export leaves an OVERWRITTEN file 0600, not the mode it already had', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const { handlers, chosen } = makeHandlers(home, { writeFile: fs.writeFileSync, chmod: fs.chmodSync });
+    fs.writeFileSync(chosen, 'a stale export from some other tool\n');
+    fs.chmodSync(chosen, 0o644);
+
+    assert.strictEqual(await handlers['activity:export']({}), chosen);
+    assert.strictEqual(fs.statSync(chosen).mode & 0o777, 0o600, 'the export ends up 0600 regardless');
+    assert.ok(fs.readFileSync(chosen, 'utf8').startsWith('Repo Radar Activity Export'));
   } finally {
     cleanup(home);
   }

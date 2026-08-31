@@ -44,7 +44,11 @@ const TEXT = {
 const ANSI_OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g; // OSC ... BEL | ST
 const ANSI_CSI_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;                   // CSI ... final byte
 const ANSI_ESC_RE = /\u001b[@-Z\\-_]/g;                             // remaining two-byte escapes
-const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;    // C0/C1 except \n and \t
+// The control sweep below also strips the BIDI overrides and isolates (U+202A-U+202E and
+// U+2066-U+2069): they are not C0/C1 controls, but a single U+202E in a repo name or a log line
+// reverses everything after it on the row, so a row can be made to read as a different repo or
+// outcome than the one it describes. Nothing this app displays needs them.
+const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g; // C0/C1 (bar \n, \t) + bidi
 
 function sanitizeText(value) {
   if (value === null || value === undefined) return '';

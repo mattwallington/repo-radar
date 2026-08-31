@@ -624,11 +624,15 @@ test('redaction expansion can never push a tail past the bound', () => {
 // -------------------------------------------------------------------------------------------
 // Containment
 // -------------------------------------------------------------------------------------------
-test('systemDiagnostics never throws -- an unexpected failure is reported as data', () => {
+test('systemDiagnostics never throws -- an unexpected failure is a FIXED string, not its message', () => {
   const diag = system.systemDiagnostics(42, {});
   assert.strictEqual(diag.uncorrelated, true);
   assert.deepStrictEqual(diag.streams, []);
-  assert.strictEqual(typeof diag.error, 'string');
+  // Node's fs and path errors routinely quote ABSOLUTE PATHS, and the Redactor masks configured
+  // secrets -- not paths. Since this string reaches the renderer and, worse, a saved export, it
+  // may only ever be a constant this module chose.
+  assert.strictEqual(diag.error, 'diagnostics-failed');
+  assert.ok(!/paths\[0\]|\//.test(diag.error), 'no fragment of the underlying message survives');
   assert.strictEqual(diag.statusDiagnostics.present, false);
 });
 

@@ -1038,7 +1038,11 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   lines.push(`incomplete: ${incomplete}`);
   lines.push(`items: ${items.length}`);
   if (problems.length > 0) {
-    lines.push('-- System --');
+    // STORE problems -- an unreadable segment, a directory that is not an activity -- not the
+    // shared-log "System (uncorrelated diagnostics)" section at the bottom of the export. Two
+    // sections both called "System" read as one thing split in half, which is what this label
+    // existed to say and did not.
+    lines.push('-- Store problems --');
     for (const p of problems) lines.push(`  ${_describeProblem(p)}`);
   }
   lines.push('');

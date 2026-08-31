@@ -1574,6 +1574,11 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           saveStatus(status);
 
           showErrorIcon();
+          // Activity History (Task 4.4 / Ruling P4-14): this path writes no terminal of its own
+          // today, but it rebuilds the tray -- and every rebuild reads the cached target, so the
+          // refresh comes first here too rather than leaving one rebuild in the file that does not
+          // pair with one.
+          _refreshViewErrorsTarget();
           updateTrayMenu();
         } catch (e) {
           console.error('Error in error handler:', e);
@@ -1594,6 +1599,14 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       } catch (e) {
         console.error('activity hand-off failed:', e);
       }
+      // Activity History (Task 4.4 / Ruling P4-14): the hand-off is one of the places this
+      // attempt's outcome becomes durable -- it writes `failed` when the adopter rejected the
+      // lease, and otherwise lets the reconciler synthesize a terminal -- so the target cached
+      // before the spawn can be stale the moment it returns. Refresh, then rebuild, the same
+      // ordering the guard blocks and the child's `close` use. Outside the try because a hand-off
+      // that THREW is exactly when a terminal is most likely to have been written by someone else.
+      _refreshViewErrorsTarget();
+      updateTrayMenu();
     },
   }).catch((e) => {
     if (e && e.code === 75) {

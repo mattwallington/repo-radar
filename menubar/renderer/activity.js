@@ -48,6 +48,10 @@ const OUTCOMES = new Set([
 // branches on an error's code or message; every failure shows this one fixed line plus Retry.
 const TEXT = {
   loadError: 'Activity history couldn’t be loaded.',
+  // The one failure that is NOT a bridge rejection: the bridge is not there at all. A renamed
+  // or throwing preload leaves this page with no `activityApi`, and without a line to show for
+  // it the window paints nothing -- indistinguishable, on screen, from an empty history.
+  bridgeMissing: 'Activity bridge unavailable — the window’s preload did not load.',
   loading: 'Loading…',
   empty: 'No activity recorded yet.',
   emptyHint: 'The next sync will record its first activity here.',
@@ -81,7 +85,11 @@ const TEXT = {
 const ANSI_OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g; // OSC ... BEL | ST
 const ANSI_CSI_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;                   // CSI ... final byte
 const ANSI_ESC_RE = /\u001b[@-Z\\-_]/g;                             // remaining two-byte escapes
-const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;    // C0/C1 except \n and \t
+// The control sweep below also strips the BIDI overrides and isolates (U+202A-U+202E and
+// U+2066-U+2069): they are not C0/C1 controls, but a single U+202E in a repo name or a log line
+// reverses everything after it on the row, so a row can be made to read as a different repo or
+// outcome than the one it describes. Nothing this app displays needs them.
+const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g; // C0/C1 (bar \n, \t) + bidi
 
 function sanitizeText(value) {
   if (value === null || value === undefined) return '';
@@ -749,8 +757,23 @@ function boot(win, doc, api) {
   return loadList();
 }
 
-if (typeof window !== 'undefined' && typeof document !== 'undefined' && window.activityApi) {
-  boot(window, document, window.activityApi);
+// The browser entry point. `boot` requires the bridge; this decides whether there is one, and
+// says so in the list pane when there is not -- the alternative is a silent blank page, which is
+// exactly what a packaging or preload regression looks like during manual acceptance. Exported so
+// the tests can drive both halves; the call below runs only in a real window.
+function start(win, doc) {
+  if (!win || !doc) return null;
+  if (win.activityApi) return boot(win, doc, win.activityApi);
+  const listEl = doc.getElementById('list');
+  if (listEl) {
+    listEl.textContent = '';
+    listEl.appendChild(el(doc, 'div', 'state state-error', TEXT.bridgeMissing));
+  }
+  return null;
+}
+
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  start(window, document);
 }
 
 // Exported for the plain-Node unit tests; absent in the browser, where nothing defines this.
@@ -760,6 +783,6 @@ if (typeof module !== 'undefined') {
     renderChip, renderEventRow, renderProblemRow, renderStoreState, renderList,
     renderEvents, renderProblems, renderDetail, describeProblem,
     normalizeFilter, matchesEventFilter, focusIdFromHash,
-    boot,
+    boot, start,
   };
 }
