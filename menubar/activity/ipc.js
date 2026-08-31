@@ -283,7 +283,7 @@ function createHandlers({
     //
     // The directory is confirmed to BE one before the shell is asked. Two reasons:
     //   1. Retention can prune the activity between the list render and the click, and
-    //      `shell.showItemInFinder` on a path that is not there is a silent no-op on macOS -- the
+    //      `shell.showItemInFolder` on a path that is not there is a silent no-op on macOS -- the
     //      user would press Reveal, get no Finder window and no message, and have no way to tell
     //      whether the app was broken or the activity was gone. `not-found` gives the renderer
     //      something to say (it shows its own fixed line; it never reads this code -- P4-7).
@@ -303,7 +303,7 @@ function createHandlers({
       if (!stat || !stat.isDirectory()) {
         throw new ActivityIpcError(NOT_FOUND, 'that activity is no longer on disk');
       }
-      shell.showItemInFinder(dir);
+      shell.showItemInFolder(dir);
       return true;
     }),
   };

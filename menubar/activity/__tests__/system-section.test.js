@@ -738,7 +738,7 @@ function handlersFor(home) {
   return ipc.createHandlers({
     home,
     loadConfiguredSecrets: () => [SECRET],
-    shell: { showItemInFinder: () => {} },
+    shell: { showItemInFolder: () => {} },
     dialog: { showSaveDialog: async () => ({ canceled: true }) },
     writeSecure: () => {},
     log: () => {},

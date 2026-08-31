@@ -75,7 +75,7 @@ function makeHandlers(home, over = {}) {
   const chosen = path.join(home, 'activity-export.txt');
   const handlers = ipc.createHandlers({
     home,
-    shell: { showItemInFinder: (p) => { calls.revealed.push(p); } },
+    shell: { showItemInFolder: (p) => { calls.revealed.push(p); } },
     dialog: {
       showSaveDialog: async (opts) => { calls.dialogs.push(opts); return { canceled: false, filePath: chosen }; },
     },
@@ -309,7 +309,7 @@ test('activity:reveal reveals exactly the validated activity directory', async (
 
 // Fix round 1 (Task 4.5 review, Important): Reveal used to be a SILENT no-op once the activity
 // was gone. `paths.activityDir` is a pure `path.join` -- it never touches the disk -- and
-// `shell.showItemInFinder` on a nonexistent path does nothing at all on macOS, so the handler
+// `shell.showItemInFolder` on a nonexistent path does nothing at all on macOS, so the handler
 // returned `true` and the window had nothing to report. Retention pruning the selected activity
 // between the list render and the click is the ordinary way to reach that.
 test('activity:reveal refuses a pruned activity instead of silently revealing nothing', async () => {
@@ -743,4 +743,18 @@ test('configured secrets from config.json are wired into list, get and export re
   } finally {
     cleanup(home);
   }
+});
+
+// -----------------------------------------------------------------------------------------------
+// 9. Source-level guard: `shell.showItemInFolder` is the real Electron API. There is no
+//    `shell.showItemInFinder` -- that name only ever existed because the plan that specified
+//    ipc.js's Reveal handler named the wrong API, and every test's fake `shell` object copied the
+//    same wrong name, so the mocks never caught it: the suite passed while the real button threw
+//    `TypeError: shell.showItemInFinder is not a function` in the packaged app. Reading the
+//    source text (not calling through a mock) is what pins this.
+// -----------------------------------------------------------------------------------------------
+test('ipc.js calls the real Electron API shell.showItemInFolder, not the nonexistent showItemInFinder', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'ipc.js'), 'utf8');
+  assert.ok(src.includes('showItemInFolder'), 'ipc.js must call shell.showItemInFolder');
+  assert.ok(!src.includes('showItemInFinder'), 'ipc.js must not reference the nonexistent shell.showItemInFinder');
 });
