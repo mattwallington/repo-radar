@@ -39,7 +39,10 @@
 //      `size - SYSTEM_TAIL_MAX_BYTES`. The window starts mid-line, so a truncated tail is
 //      advanced past its first newline (fix round 1): a credential split by the cut would
 //      otherwise survive as a partial that matches neither a configured secret nor a redact.js
-//      pattern. `status.json` cannot be tailed (it must parse), so it is refused outright above
+//      pattern. When there is NO newline to advance to, the body is EMPTY -- only the truncation
+//      marker is returned (fix round 2, Ruling P4-18): the whole window is then one unverifiable
+//      partial line, and keeping it leaked precisely the secret suffix the newline rule exists to
+//      remove. `status.json` cannot be tailed (it must parse), so it is refused outright above
 //      `limits.STATUS_MAX_BYTES`.
 //   3. REDACTION IS DEFENSE-IN-DEPTH. Every string returned -- tails, errorLog, and every
 //      errorList field INCLUDING `stackTrace` -- goes through one `redact.Redactor` built from
@@ -82,6 +85,11 @@ const STATUS_BASENAME = STATUS_SUBPATH[STATUS_SUBPATH.length - 1];
 // Drop a partial leading code point. Slicing at an arbitrary offset can land inside a multi-byte
 // sequence, leaving continuation bytes (10xxxxxx) with no lead byte -- which decode to U+FFFD.
 // A UTF-8 sequence is at most 4 bytes, so at most 3 continuation bytes can be stranded.
+//
+// Kept as belt-and-braces: since fix round 2 every caller pairs this with `_dropPartialLine`,
+// which discards everything up to the first newline (or the whole window when there is none) and
+// so already removes any stranded bytes. It stays because it guards the SLICE, not the line rule --
+// if the line rule is ever relaxed again, this is what keeps the tail decodable.
 function _utf8SafeLeadingCut(buf) {
   let start = 0;
   while (start < buf.length && start < 3 && (buf[start] & 0xc0) === 0x80) start += 1;
@@ -103,11 +111,20 @@ function _truncationMarker(maxBytes) {
 // configured secret (a literal substring the fragment is only part of) nor any redact.js pattern
 // (they are anchored on a complete prefix like `ghp_`), so it would reach the payload in the
 // clear. Advancing past the first newline is also just what `tail` does: a partial line is not a
-// log line. Edge case, documented rather than worked around: a window with NO newline in it is a
-// single >=64 KiB line, and is kept as-is -- dropping it would return nothing at all.
+// log line.
+//
+// Fix round 2 (Ruling P4-18) -- the no-newline case. It used to be documented as an accepted edge
+// case and the whole window returned as-is, on the reasoning that "dropping it would return
+// nothing at all". That was the leak, not an edge case: a window with NO newline is ENTIRELY an
+// unverifiable partial line, so a >64 KiB single line whose cut lands inside a configured secret
+// left exactly the secret's suffix at the front of the tail -- unmatchable by either redaction
+// pass -- and it crossed IPC and landed in a saved export in the clear. Returning nothing is the
+// correct answer: `_scrubTail` still emits the truncation marker, so the reader is told the tail
+// was cut rather than being shown a line no pass could vouch for. Both callers of this helper --
+// a shared stream tail and status.json's `errorLog` -- get the same treatment.
 function _dropPartialLine(buf) {
   const nl = buf.indexOf(0x0a);
-  return nl === -1 ? buf : buf.subarray(nl + 1);
+  return nl === -1 ? buf.subarray(0, 0) : buf.subarray(nl + 1);
 }
 
 // The last `maxBytes` of `buf`, WITHOUT a marker (the marker is applied once, at the end, by

@@ -10,7 +10,9 @@
 //   * a symlink is REFUSED, never followed -- on ANY component: a symlinked log FILE, and (fix
 //     round 1) a symlinked PARENT DIRECTORY, which O_NOFOLLOW on the file alone did not catch;
 //   * a truncated tail starts at a LINE boundary, so a credential straddling the byte cut cannot
-//     survive as an unmatchable fragment (fix round 1);
+//     survive as an unmatchable fragment (fix round 1) -- and when the window holds no newline at
+//     all it is returned EMPTY, marker only, on both surfaces that share the helper: a shared
+//     stream tail and status.json's `errorLog` (fix round 2, Ruling P4-18);
 //   * a malformed-but-present status.json field is reported, never folded into "nothing here"
 //     (fix round 1);
 //   * the legacy status surface is bounded on BOTH axes (50 newest entries, 64 KiB of errorLog)
@@ -159,15 +161,22 @@ test('a stream larger than SYSTEM_TAIL_MAX_BYTES yields only the LAST 64 KiB, ma
 test('a truncated tail never begins with a broken UTF-8 code point', () => {
   const home = tmpHome();
   try {
-    // 30720 x '\u20ac' = 92160 bytes of 3-byte sequences. The cut at `size - 64 KiB` lands
-    // 92160 - 65536 = 26624 bytes in, and 26624 % 3 == 2 -- i.e. INSIDE a sequence. An unguarded
-    // slice would strand a continuation byte at the front and decode it as U+FFFD.
-    seedStream(home, 'sync.log', '\u20ac'.repeat(30 * 1024));
+    // A multi-byte stream whose byte cut lands INSIDE a sequence: 31 lines of 1000 x '\u20ac'
+    // (3001 bytes each) plus a 1-byte final line = 93032 bytes, so the cut at `size - 64 KiB`
+    // lands 27496 bytes in -- 1 byte into a 3-byte sequence, stranding two continuation bytes at
+    // the front of the window, which an unguarded slice would decode as U+FFFD.
+    //
+    // Fix round 2 note: the leading code-point trim is now belt-and-braces behind the partial-LINE
+    // drop, which discards everything up to the first newline (and, with no newline at all, the
+    // whole window). What this pins is the invariant the trim exists for and the line drop must
+    // not be allowed to lose: the returned tail is valid UTF-8 that resumes at a whole line, never
+    // a replacement character standing in for a sequence the cut broke.
+    seedStream(home, 'sync.log', `${`${'\u20ac'.repeat(1000)}\n`.repeat(31)}x`);
     const s = streamsByName(system.systemDiagnostics(home, {}))['sync.log'];
     assert.strictEqual(s.truncated, true);
     const afterMarker = s.redactedTail.slice(s.redactedTail.indexOf('\n') + 1);
     assert.ok(!afterMarker.includes('\ufffd'), 'a partial leading code point is dropped, not decoded');
-    assert.ok(afterMarker.startsWith('\u20ac'));
+    assert.ok(afterMarker.startsWith('\u20ac'), 'the tail resumes at a whole line, on a whole code point');
   } finally {
     cleanup(home);
   }
@@ -212,14 +221,96 @@ test('a secret straddling the 64 KiB cut cannot survive as an unmatchable fragme
   }
 });
 
-test('a truncated window with no newline at all is kept as the single long line it is', () => {
+// Fix round 2 (Ruling P4-18). This test used to pin the OPPOSITE behaviour -- "a window with no
+// newline is kept as the single long line it is" -- which is exactly the leak below: the whole
+// window is then an unverifiable PARTIAL line, and a credential the byte cut landed inside
+// survives in it as a suffix that matches neither a configured secret nor a redact.js pattern.
+// A truncated window with no newline yields the MARKER AND NOTHING ELSE.
+test('a truncated window with no newline at all yields the marker and an EMPTY body', () => {
   const home = tmpHome();
   try {
     seedStream(home, 'sync.error.log', 'y'.repeat(70 * 1024)); // one 70 KiB line, no newline
     const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
     assert.strictEqual(s.truncated, true);
-    assert.ok(s.redactedTail.endsWith('y'.repeat(64)), 'dropping it entirely would return nothing');
-    assert.ok(Buffer.byteLength(s.redactedTail, 'utf8') <= limits.SYSTEM_TAIL_MAX_BYTES + 64);
+    assert.strictEqual(s.redactedTail, `--- tail truncated at 64 KiB ---\n`,
+      'no partial line may be returned -- only the marker that says why there is nothing');
+    assert.ok(!s.redactedTail.includes('y'), 'not one byte of the unverifiable partial line');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Ruling P4-18 (fix round 2): the no-newline case is a SECRET LEAK, on both surfaces that share
+// `_dropPartialLine` -- a shared stream tail and status.json's `errorLog`.
+//
+// Shape of the leak in both: one line longer than the 64 KiB bound, with a configured secret
+// straddling the byte cut. Advancing to the first newline cannot help (there isn't one), so the
+// old code returned the whole window -- beginning mid-secret. The surviving fragment is only PART
+// of the configured value (so the literal-substring pass never matches it) and carries no
+// credential prefix like `ghp_` (so no redact.js pattern matches it either), and it crossed IPC
+// and landed in a saved export in the clear.
+// -------------------------------------------------------------------------------------------
+
+// A single line, no newline anywhere, sized so the tail window opens 8 bytes INTO the secret:
+// 92 + 16 + 65528 = 65636 bytes, cut at 65636 - 65536 = 100 = head(92) + 8.
+const NO_NEWLINE_HEAD = 'A'.repeat(92);
+const NO_NEWLINE_LINE = `${NO_NEWLINE_HEAD}${SECRET}${'B'.repeat(65528)}`;
+const TAIL_MARKER = '--- tail truncated at 64 KiB ---\n';
+
+// Every proper suffix of the secret that is long enough to be unambiguous. The 1-3 character
+// tails ('9', 'k9', 'Rk9') are excluded ONLY for the whole-export assertions, where a lone digit
+// would collide with a timestamp or a byte count; the fragment the cut actually produces here is
+// 8 characters long, so the leak this pins is well inside the checked range.
+function assertNoSecretSuffix(text, label) {
+  for (let cut = 1; cut <= SECRET.length - 4; cut++) {
+    assert.ok(!text.includes(SECRET.slice(cut)),
+      `${label}: a ${SECRET.length - cut}-character tail of the secret leaked: ${JSON.stringify(SECRET.slice(cut))}`);
+  }
+}
+
+test('a secret straddling the cut of a NEWLINE-FREE stream tail never reaches the payload or the export', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', NO_NEWLINE_LINE);
+
+    const s = streamsByName(system.systemDiagnostics(home, { configuredSecrets: [SECRET] }))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    assert.strictEqual(s.redactedTail, TAIL_MARKER, 'marker only -- the partial line is dropped whole');
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!s.redactedTail.includes(SECRET.slice(cut)),
+        `redactedTail: a ${SECRET.length - cut}-character tail of the secret leaked`);
+    }
+
+    // The same tail is rendered into the export document, so the leak has to be gone there too.
+    const text = read.buildExport(home, {}, { configuredSecrets: [SECRET] });
+    assert.ok(text.includes('sync.error.log'), 'the stream is still reported');
+    assert.ok(!text.includes(SECRET), 'the whole secret certainly never appears');
+    assertNoSecretSuffix(text, 'export text');
+    assert.ok(!text.includes('BBBB'), 'no byte of the unverifiable partial line reaches the export');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a secret straddling the cut of a NEWLINE-FREE status.json errorLog never reaches the payload or the export', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: NO_NEWLINE_LINE, errorList: [] });
+
+    const st = system.systemDiagnostics(home, { configuredSecrets: [SECRET] }).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.errorLog.truncated, true);
+    assert.strictEqual(st.errorLog.text, TAIL_MARKER, 'marker only -- the partial line is dropped whole');
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!st.errorLog.text.includes(SECRET.slice(cut)),
+        `errorLog: a ${SECRET.length - cut}-character tail of the secret leaked`);
+    }
+
+    const text = read.buildExport(home, {}, { configuredSecrets: [SECRET] });
+    assert.ok(!text.includes(SECRET));
+    assertNoSecretSuffix(text, 'export text');
+    assert.ok(!text.includes('BBBB'), 'no byte of the unverifiable partial line reaches the export');
   } finally {
     cleanup(home);
   }
@@ -649,7 +740,7 @@ function handlersFor(home) {
     loadConfiguredSecrets: () => [SECRET],
     shell: { showItemInFinder: () => {} },
     dialog: { showSaveDialog: async () => ({ canceled: true }) },
-    writeFile: () => {},
+    writeSecure: () => {},
     log: () => {},
   });
 }

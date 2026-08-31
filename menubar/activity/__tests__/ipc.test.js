@@ -1,8 +1,10 @@
 'use strict';
 // Task 4.1: the main-side Activity IPC surface (`activity/ipc.js`). These tests run under plain
 // `node --test` with NO Electron present -- that is the point of Ruling P4-2: `ipc.js` must be
-// Electron-free at module load and take `shell`/`dialog`/`writeFile` by injection, so the whole
-// boundary is testable here rather than only inside a packaged app.
+// Electron-free at module load and take `shell`/`dialog`/`writeSecure` by injection, so the whole
+// boundary is testable here rather than only inside a packaged app. (Fix round 2, Ruling P4-19:
+// the export's two fs seams -- `writeFile` + `chmod` -- are now the single `writeSecure(path,
+// text)`, whose default `ipc.writeSecureFile` secures the descriptor BEFORE any content lands.)
 //
 // Seeding style mirrors read.test.js (raw JSONL written straight onto segment paths via paths.js,
 // bypassing writer.js/records.buildRecord) since these tests exercise the READ side only. Every
@@ -65,10 +67,11 @@ function seedOne(home, aid = AID, over = {}) {
   return aid;
 }
 
-// Handlers wired to recording fakes for the injected Electron/fs seams. `chmod` records like
-// `writeFile` does: with the write faked, nothing is actually on disk for a real chmod to touch.
+// Handlers wired to recording fakes for the injected Electron/fs seams. The export write is ONE
+// seam (`writeSecure`): securing the destination and putting content in it cannot be separate
+// injections, because the whole point of Ruling P4-19 is that they are not separate steps.
 function makeHandlers(home, over = {}) {
-  const calls = { revealed: [], dialogs: [], writes: [], chmods: [], logs: [] };
+  const calls = { revealed: [], dialogs: [], writes: [], logs: [] };
   const chosen = path.join(home, 'activity-export.txt');
   const handlers = ipc.createHandlers({
     home,
@@ -76,8 +79,7 @@ function makeHandlers(home, over = {}) {
     dialog: {
       showSaveDialog: async (opts) => { calls.dialogs.push(opts); return { canceled: false, filePath: chosen }; },
     },
-    writeFile: (p, data, opts) => { calls.writes.push({ path: p, data, opts }); },
-    chmod: (p, mode) => { calls.chmods.push({ path: p, mode }); },
+    writeSecure: (p, text) => { calls.writes.push({ path: p, text }); },
     log: (line) => { calls.logs.push(line); },
     ...over,
   });
@@ -212,7 +214,7 @@ test('search is a literal substring match, never compiled as a regex', async () 
     const exportWith = async (search) => {
       const { handlers, calls } = makeHandlers(home);
       await handlers['activity:export'](search === undefined ? {} : { search });
-      return calls.writes[0].data;
+      return calls.writes[0].text;
     };
 
     const literal = await exportWith('repo.synced');
@@ -408,11 +410,8 @@ test('activity:export asks FIRST, then builds the text in main, writes it 0600, 
     assert.strictEqual(typeof calls.dialogs[0].defaultPath, 'string');
     assert.strictEqual(calls.writes.length, 1, 'exactly one write');
     assert.strictEqual(calls.writes[0].path, chosen);
-    assert.strictEqual(calls.writes[0].opts.mode, 0o600, 'the export must be written 0600');
-    assert.ok(calls.writes[0].data.startsWith('Repo Radar Activity Export'), 'the built export text');
-    assert.ok(calls.writes[0].data.includes(AID));
-    assert.deepStrictEqual(calls.chmods, [{ path: chosen, mode: 0o600 }],
-      'the mode is re-asserted after the write, for the overwrite case');
+    assert.ok(calls.writes[0].text.startsWith('Repo Radar Activity Export'), 'the built export text');
+    assert.ok(calls.writes[0].text.includes(AID));
   } finally {
     read.buildExport = realBuildExport;
     cleanup(home);
@@ -440,20 +439,118 @@ test('activity:export returns null, writes nothing AND builds nothing when the u
   }
 });
 
-// `mode` on writeFileSync is honoured only when the file is CREATED, so a second export to the
-// same name would otherwise keep whatever mode was already there. This one runs against the REAL
-// fs seams (no recording fake) because the assertion is about the mode bits on disk.
+// -----------------------------------------------------------------------------------------------
+// 5b. activity:export -- the DESTINATION is secured before any content lands (Ruling P4-19).
+//
+// The old shape was `writeFileSync(path, text, {mode: 0o600})` then `chmodSync(path, 0o600)`.
+// `mode` is honoured only when a file is CREATED, so over a pre-existing 0644 file the content
+// went in FIRST and was world-readable until the chmod landed -- and if the chmod failed, the
+// handler rejected but LEFT the whole export behind, 0644, on disk. `writeSecureFile` opens the
+// destination O_WRONLY|O_CREAT|O_NOFOLLOW 0600, fchmods the DESCRIPTOR, truncates, and only then
+// writes: there is no instant at which new content sits under an old mode.
+//
+// These run against the REAL writer -- the assertions are about bits and bytes on disk.
+// -----------------------------------------------------------------------------------------------
+function realWriter(over) {
+  // `ops` is the syscall-level seam: the injected `writeSecure` is the whole function, which
+  // cannot express "the fchmod failed halfway through". Everything else stays the real thing, so
+  // the ORDER under test is the shipped order.
+  const ops = Object.assign(Object.create(fs), over);
+  return { writeSecure: (p, text) => ipc.writeSecureFile(p, text, ops) };
+}
+
 test('activity:export leaves an OVERWRITTEN file 0600, not the mode it already had', async () => {
   const home = tmpHome();
   try {
     seedOne(home);
-    const { handlers, chosen } = makeHandlers(home, { writeFile: fs.writeFileSync, chmod: fs.chmodSync });
+    const { handlers, chosen } = makeHandlers(home, realWriter());
     fs.writeFileSync(chosen, 'a stale export from some other tool\n');
     fs.chmodSync(chosen, 0o644);
 
     assert.strictEqual(await handlers['activity:export']({}), chosen);
     assert.strictEqual(fs.statSync(chosen).mode & 0o777, 0o600, 'the export ends up 0600 regardless');
-    assert.ok(fs.readFileSync(chosen, 'utf8').startsWith('Repo Radar Activity Export'));
+    const written = fs.readFileSync(chosen, 'utf8');
+    assert.ok(written.startsWith('Repo Radar Activity Export'));
+    assert.ok(!written.includes('a stale export'), 'the previous contents are truncated away, not appended to');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('activity:export creates a FRESH destination 0600 with the export in it', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const { handlers, chosen } = makeHandlers(home, realWriter());
+    assert.strictEqual(fs.existsSync(chosen), false, 'nothing there to begin with');
+
+    assert.strictEqual(await handlers['activity:export']({}), chosen);
+    assert.strictEqual(fs.statSync(chosen).mode & 0o777, 0o600);
+    assert.ok(fs.readFileSync(chosen, 'utf8').includes(AID));
+  } finally {
+    cleanup(home);
+  }
+});
+
+// The reviewer's repro: a 0644 destination plus a failing chmod. The old order wrote the export
+// first, so this rejection left a complete activity history dump on disk, world-readable. The new
+// order fails BEFORE the truncate, so the old file is bit-for-bit what it was.
+test('activity:export whose fchmod fails leaves the OLD file untouched -- no new content at the old mode', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const stale = 'a stale export from some other tool\n';
+    const { handlers, calls, chosen } = makeHandlers(home, realWriter({
+      fchmodSync: () => { const e = new Error('EPERM: operation not permitted, fchmod'); e.code = 'EPERM'; throw e; },
+    }));
+    fs.writeFileSync(chosen, stale);
+    fs.chmodSync(chosen, 0o644);
+
+    await rejects(() => handlers['activity:export']({}), 'internal', 'fchmod failure');
+    assert.strictEqual(fs.readFileSync(chosen, 'utf8'), stale,
+      'the destination still holds exactly what it held before -- no export content landed');
+    assert.ok(!fs.readFileSync(chosen, 'utf8').includes('Repo Radar Activity Export'));
+    assert.strictEqual(fs.statSync(chosen).mode & 0o777, 0o644,
+      'the mode is the old one because nothing was written under it');
+    assert.strictEqual(calls.logs.length, 1, 'the real cause is recorded on the main side only');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('activity:export refuses a SYMLINK at the destination and never touches its target', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const { handlers, chosen } = makeHandlers(home, realWriter());
+    const target = path.join(home, 'someone-elses-file.txt');
+    fs.writeFileSync(target, 'PRECIOUS\n');
+    fs.chmodSync(target, 0o644);
+    fs.symlinkSync(target, chosen);
+
+    await rejects(() => handlers['activity:export']({}), 'internal', 'symlinked destination');
+    assert.strictEqual(fs.readFileSync(target, 'utf8'), 'PRECIOUS\n', 'O_NOFOLLOW: the target is not written');
+    assert.strictEqual(fs.statSync(target).mode & 0o777, 0o644, 'nor re-moded');
+    assert.ok(fs.lstatSync(chosen).isSymbolicLink(), 'the symlink itself is left alone, not replaced');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('createHandlers defaults the export writer to the secure fd-based one', async () => {
+  const home = tmpHome();
+  try {
+    seedOne(home);
+    const chosen = path.join(home, 'defaulted-export.txt');
+    const handlers = ipc.createHandlers({
+      home,
+      shell: {},
+      dialog: { showSaveDialog: async () => ({ canceled: false, filePath: chosen }) },
+      log: () => {},
+    });
+    assert.strictEqual(await handlers['activity:export']({}), chosen);
+    assert.strictEqual(fs.statSync(chosen).mode & 0o777, 0o600, 'no injected seam: still 0600');
+    assert.ok(fs.readFileSync(chosen, 'utf8').includes(AID));
   } finally {
     cleanup(home);
   }
@@ -556,7 +653,7 @@ test('an unlogged handler defaults to console.error and survives a failing logge
 
     // Default sink: console.error (captured here so the test output stays pristine).
     console.error = (...args) => { captured.push(args.join(' ')); };
-    const defaulted = ipc.createHandlers({ home, shell: {}, dialog: {}, writeFile: () => {} });
+    const defaulted = ipc.createHandlers({ home, shell: {}, dialog: {}, writeSecure: () => {} });
     await rejects(() => defaulted['activity:list']({}), 'internal', 'default logger');
     console.error = origConsoleError;
     assert.strictEqual(captured.length, 1);
@@ -564,7 +661,7 @@ test('an unlogged handler defaults to console.error and survives a failing logge
 
     // A logger that itself throws must not change what the renderer sees.
     const hostile = ipc.createHandlers({
-      home, shell: {}, dialog: {}, writeFile: () => {}, log: () => { throw new Error('logger down'); },
+      home, shell: {}, dialog: {}, writeSecure: () => {}, log: () => { throw new Error('logger down'); },
     });
     const err = await rejects(() => hostile['activity:list']({}), 'internal', 'failing logger');
     assert.ok(!err.message.includes('logger down'));
@@ -640,7 +737,7 @@ test('configured secrets from config.json are wired into list, get and export re
     assert.ok(detailJson.includes('[REDACTED]'), 'the detail item is masked');
 
     await handlers['activity:export']({});
-    const text = calls.writes[0].data;
+    const text = calls.writes[0].text;
     assert.ok(!text.includes(secret), 'the export text must not leak a configured secret');
     assert.ok(text.includes('[REDACTED]'), 'the export text is masked');
   } finally {

@@ -6,9 +6,10 @@
 //
 // Ruling P4-2: this module is Electron-free at module load (no `require('electron')` anywhere --
 // under plain `node --test` that require resolves to the Electron BINARY PATH STRING, or fails
-// outright when devDependencies aren't installed). `shell`, `dialog` and `writeFile` therefore
-// arrive by injection from main.js, which is the only file that touches Electron. That keeps the
-// whole boundary unit-testable in plain Node (activity/__tests__/ipc.test.js).
+// outright when devDependencies aren't installed). `shell` and `dialog` therefore arrive by
+// injection from main.js, which is the only file that touches Electron (the export's file write
+// is injectable for the same reason: so the boundary is testable). That keeps the whole boundary
+// unit-testable in plain Node (activity/__tests__/ipc.test.js).
 //
 // Four invariants this file exists to hold:
 //   1. REJECT, never clamp. A filter or activity id that violates limits.js is a caller bug; it
@@ -132,6 +133,57 @@ function _guard(channel, log, fn) {
   };
 }
 
+// -------------------------------------------------------------------------------------------
+// The export write (Ruling P4-19): SECURE THE DESCRIPTOR BEFORE ANY CONTENT LANDS.
+//
+// What this replaces, and why it was wrong: `writeFileSync(p, text, {mode: 0o600})` followed by
+// `chmodSync(p, 0o600)`. `mode` is honoured only when a file is CREATED, so exporting over a path
+// that already existed -- a second export to the same name, or any file the user picks in the save
+// dialog -- kept the mode it already had. The content therefore went in FIRST and sat readable
+// under the old (possibly 0644) mode until the chmod landed, and if the chmod FAILED the handler
+// rejected while leaving the entire activity history dump on disk, world-readable. A rejection
+// that still publishes the secret is worse than either outcome it was choosing between.
+//
+// The fd shape below has no such window: the file is opened (or created 0600), the DESCRIPTOR is
+// fchmod'ed, and only then is the old content truncated away and the new content written. Every
+// step addresses the descriptor, so nothing can be swapped underneath between the check and the
+// write -- which a path-based chmod could not promise either.
+//
+// Why not "write a fresh 0600 temp file and rename over the destination"? It is also safe, and it
+// buys atomicity, but it changes what the user asked for: the rename would replace the file the
+// save dialog handed us (breaking a hard link, discarding the target of a symlinked path, needing
+// a temp name in the user's chosen directory and cleanup for every failure path). Securing the
+// destination the user actually picked is the smaller, more predictable promise.
+//
+// O_NOFOLLOW: a symlink sitting at the destination is REFUSED (ELOOP), never followed. The export
+// is a full, redacted history dump; if the picked path is a link to somewhere else, the honest
+// answer is to fail rather than to write it there and chmod someone else's file.
+//
+// `ops` exists only so a test can fail ONE syscall inside the real sequence: the seam
+// `createHandlers` takes is this whole function, which by construction cannot express "the chmod
+// failed halfway". Nothing is unlinked on failure -- the destination may be a pre-existing file
+// this export had no business deleting, and by then it has either been left untouched (the
+// fchmod-failed case) or already opened as the user's chosen target.
+function writeSecureFile(filePath, text, ops = fs) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW;
+  const fd = ops.openSync(filePath, flags, 0o600);
+  try {
+    ops.fchmodSync(fd, 0o600); // before a single byte of content exists at this path
+    ops.ftruncateSync(fd, 0); // only now is the previous content discarded
+    const buf = Buffer.from(text, 'utf8');
+    let written = 0;
+    // writeSync is not guaranteed to consume the whole buffer in one call, and a SHORT export is
+    // a silent lie about the history it contains -- so a stalled write is an error, not a return.
+    while (written < buf.length) {
+      const n = ops.writeSync(fd, buf, written, buf.length - written, written);
+      if (n <= 0) throw new Error('export write made no progress');
+      written += n;
+    }
+  } finally {
+    try { ops.closeSync(fd); } catch (_) { /* a failing close changes nothing already written */ }
+  }
+}
+
 function _exportFileName() {
   // A bare filename, not a path: the save dialog resolves it against its own default directory,
   // and the only path this module ever writes to is the one the USER picks there.
@@ -151,8 +203,9 @@ function _exportFileName() {
 //                         a token saved in Settings starts being masked immediately
 //   shell                 Electron's shell (activity:reveal only)
 //   dialog                Electron's dialog (activity:export only)
-//   writeFile             fs.writeFileSync by default (activity:export only)
-//   chmod                 fs.chmodSync by default (activity:export only; see the handler)
+//   writeSecure           (path, text) -> void; `writeSecureFile` by default (activity:export
+//                         only). ONE seam, not the former write+chmod pair: securing the
+//                         destination and filling it are a single indivisible step (P4-19).
 //   log                   main-side sink for the ORIGINAL error behind an `internal` rejection;
 //                         console.error by default, matching main.js's own logging
 function createHandlers({
@@ -160,8 +213,7 @@ function createHandlers({
   loadConfiguredSecrets = triggerGlue.loadConfiguredSecrets,
   shell,
   dialog,
-  writeFile = fs.writeFileSync,
-  chmod = fs.chmodSync,
+  writeSecure = writeSecureFile,
   log = console.error,
 } = {}) {
   if (typeof home !== 'string' || home.length === 0) {
@@ -217,13 +269,11 @@ function createHandlers({
       });
       if (!result || result.canceled || !result.filePath) return null;
       const text = read.buildExport(home, filter, { configuredSecrets: secrets() });
-      writeFile(result.filePath, text, { encoding: 'utf8', mode: 0o600 });
-      // `mode` is honoured only when the file is CREATED. Exporting over a path that already
-      // exists -- a second export to the same name, or any file the user picks in the dialog --
-      // would otherwise keep whatever mode it already had, leaving a history dump 0644. The chmod
-      // is deliberately NOT swallowed: if the mode cannot be set, the export did not deliver what
-      // it promises, and saying so beats reporting success over a world-readable file.
-      chmod(result.filePath, 0o600);
+      // 0600 is established on the DESCRIPTOR before any content exists at this path, and a
+      // failure anywhere in there is deliberately NOT swallowed: an export that could not be
+      // secured did not deliver what it promises, and saying so beats reporting success over a
+      // world-readable history dump. See `writeSecureFile`.
+      writeSecure(result.filePath, text);
       return result.filePath;
     }),
 
@@ -273,4 +323,4 @@ function register(ipcMain, handlers) {
   }
 }
 
-module.exports = { CHANNELS, ActivityIpcError, createHandlers, register };
+module.exports = { CHANNELS, ActivityIpcError, createHandlers, register, writeSecureFile };
