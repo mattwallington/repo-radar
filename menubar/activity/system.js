@@ -270,15 +270,23 @@ function _absentStream(spec, reason) {
   return out;
 }
 
-function _readStream(dir, spec, redactor) {
-  const opened = _openRegular(path.join(dir, spec.name));
-  if (opened.fd === -1) return _absentStream(spec, opened.reason);
+// The bounded tail of ONE regular file under an already-validated directory: safe-open, read at
+// most `maxBytes` from the END, drop the partial first line, scrub, re-bound. Returns
+// `{ present:false, reason }` for every refusal/absence and `{ present:true, bytes, text,
+// truncated }` otherwise -- NEVER throws, and never reads more than `maxBytes`.
+//
+// Factored out of `_readStream` (which is now a thin stream-shaped wrapper) so Task 5.1's legacy
+// `sync-*.log` adapter can read out of this SAME shared directory under the SAME posture without a
+// second copy of the O_NOFOLLOW open, the tail window loop and the partial-line rule. A second
+// copy of any of those is exactly the drift that reintroduced the leak fix rounds 1 and 2 closed.
+function readTailFile(filePath, maxBytes, redactor) {
+  const opened = _openRegular(filePath);
+  if (opened.fd === -1) return { present: false, reason: opened.reason };
 
   try {
-    const max = limits.SYSTEM_TAIL_MAX_BYTES;
     const size = opened.size;
-    const start = Math.max(0, size - max);
-    const want = Math.max(0, Math.min(size, max));
+    const start = Math.max(0, size - maxBytes);
+    const want = Math.max(0, Math.min(size, maxBytes));
     const buf = Buffer.alloc(want);
     let filled = 0;
     // Loop: one readSync is not guaranteed to return the full request. `position` is explicit on
@@ -288,21 +296,27 @@ function _readStream(dir, spec, redactor) {
       if (n <= 0) break;
       filled += n;
     }
-    const tail = _scrubTail(buf.subarray(0, filled), max, redactor, start > 0);
-    return {
-      name: spec.name,
-      path: `${STREAM_DISPLAY_DIR}/${spec.name}`,
-      present: true,
-      onDemand: spec.onDemand,
-      bytes: size, // the file's size on disk, which the tail may be a small slice of
-      truncated: tail.truncated,
-      redactedTail: tail.text,
-    };
+    const tail = _scrubTail(buf.subarray(0, filled), maxBytes, redactor, start > 0);
+    return { present: true, bytes: size, text: tail.text, truncated: tail.truncated };
   } catch (e) {
-    return _absentStream(spec, e && e.code === 'ENOENT' ? 'gone' : 'read-failed');
+    return { present: false, reason: e && e.code === 'ENOENT' ? 'gone' : 'read-failed' };
   } finally {
     try { fs.closeSync(opened.fd); } catch (_) { /* a failing close changes nothing we reported */ }
   }
+}
+
+function _readStream(dir, spec, redactor) {
+  const tail = readTailFile(path.join(dir, spec.name), limits.SYSTEM_TAIL_MAX_BYTES, redactor);
+  if (!tail.present) return _absentStream(spec, tail.reason);
+  return {
+    name: spec.name,
+    path: `${STREAM_DISPLAY_DIR}/${spec.name}`,
+    present: true,
+    onDemand: spec.onDemand,
+    bytes: tail.bytes, // the file's size on disk, which the tail may be a small slice of
+    truncated: tail.truncated,
+    redactedTail: tail.text,
+  };
 }
 
 // -------------------------------------------------------------------------------------------
@@ -455,5 +469,18 @@ function systemDiagnostics(home, { configuredSecrets = [] } = {}) {
 }
 
 // `STATUS_DISPLAY_PATH` is exported because read.js's export section names the file; the stream
-// list and its display prefix are internal.
-module.exports = { systemDiagnostics, STATUS_DISPLAY_PATH };
+// list is internal.
+//
+// The last four are shared with Task 5.1's legacy `sync-*.log` adapter (activity/legacy.js), which
+// reads out of the SAME `~/Library/Logs/repo-radar` directory these streams come from and must do
+// it under exactly the same posture: the component-by-component O_NOFOLLOW directory walk, the
+// bounded tail read, and the display-only path prefix. They are shared rather than copied because
+// a second copy of a symlink refusal or of the partial-line rule is how a fixed leak comes back.
+module.exports = {
+  systemDiagnostics,
+  STATUS_DISPLAY_PATH,
+  LOG_SUBPATH,
+  STREAM_DISPLAY_DIR,
+  validateDir: _validateDir,
+  readTailFile,
+};

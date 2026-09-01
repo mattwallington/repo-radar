@@ -178,6 +178,31 @@
       background: #2a1d1d;
     }
     .state-unavailable .state-hint { color: #e0a08d; }
+
+    /* ---- Task 5.1: opaque legacy sync-log items. Dimmer and amber-badged, so a pre-contract log
+       never reads as a recorded activity: the chip is muted, the badge names it, and the detail
+       pane leads with the fixed "not correlated to any activity" note. ---- */
+    .chip.legacy { border-left: 2px solid #5a4a1d; }
+    .chip.legacy .chip-time, .chip.legacy .chip-outcome { color: #9d9d9d; }
+    .chip-legacy { background: #5a4a1d; color: #e2c08d; }
+    .legacy-note {
+      color: #e2c08d;
+      font-size: 11px;
+      line-height: 1.4;
+      margin-bottom: 8px;
+    }
+    .legacy-excerpt {
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 11px;
+      color: #b5b5b5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      margin: 0;
+      padding: 8px;
+      background: #232323;
+      border-radius: 4px;
+    }
+
     /* ---- Task 4.3: the System section (shared, uncorrelated diagnostics) ---- */
     .pane-list { display: flex; flex-direction: column; }
     #list { flex: 1 0 auto; }

@@ -77,6 +77,22 @@ const STATUS_ERROR_LOG_MAX_BYTES = 64 * 1024;
 // exhaust memory.
 const STATUS_MAX_BYTES = 8 * 1024 * 1024;
 
+// Task 5.1 (legacy `sync-*.log` adapter) bounds. These govern the PRE-CONTRACT per-run text logs
+// in the same shared `~/Library/Logs/repo-radar` directory -- not Activity data either, and read
+// only as opaque, clearly-marked legacy items.
+
+// Per-log excerpt: only the LAST this-many bytes of a `sync-*.log` are ever read (a bounded
+// `readSync` from `size - LEGACY_EXCERPT_MAX_BYTES`, never a whole-file read), and the returned
+// excerpt is re-bounded to the same number AFTER scrubbing. A cut excerpt carries a visible
+// leading marker line, exactly like a System stream tail.
+const LEGACY_EXCERPT_MAX_BYTES = 16 * 1024;
+
+// How many `sync-*.log` files are adapted per call, newest first by filename (which is a sortable
+// timestamp). repo_radar/modes/sync.py rotates to the newest 10, so this is generous for a real
+// installation while keeping a directory full of old logs -- from a larger historical retention,
+// or planted -- from inflating a list response (at most LEGACY_MAX_FILES * LEGACY_EXCERPT_MAX_BYTES).
+const LEGACY_MAX_FILES = 25;
+
 // Valid `event.level` values, also the valid `filter.level` values.
 const LEVELS = new Set(['info', 'warn', 'error']);
 
@@ -90,5 +106,6 @@ module.exports = {
   SEARCH_MAX,
   EXPORT_MAX_BYTES,
   SYSTEM_TAIL_MAX_BYTES, STATUS_ERROR_LIST_MAX, STATUS_ERROR_LOG_MAX_BYTES, STATUS_MAX_BYTES,
+  LEGACY_EXCERPT_MAX_BYTES, LEGACY_MAX_FILES,
   LEVELS,
 };

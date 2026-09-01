@@ -42,6 +42,9 @@ const reconcileMod = require('./reconcile'); // referenced as `reconcileMod.reco
 // time (never destructured) so a test can inject a failing reconcile by monkeypatching the
 // module export -- the I3 failure-injection seam.
 const idsMod = require('./ids');
+const legacyMod = require('./legacy'); // Task 5.1: the OPAQUE pre-contract `sync-*.log` adapter --
+// self-contained legacy summary DTOs, merged into the item list below but never treated as
+// activities (see `_collectItems`). Re-exported at the bottom, same pattern as system.js.
 const systemMod = require('./system'); // Task 4.3: the SHARED, uncorrelated diagnostic surfaces
 // (log-stream tails + the legacy status.json error surface). Split into its own module -- they
 // are not Activity data and share none of this file's assembly -- and re-exported here so the
@@ -728,10 +731,34 @@ function _sortKey(entry) {
 // diagnostic in `problems` (bounded to ROOT_PROBLEMS_MAX plus one `truncated` marker) and marks
 // the response incomplete, so "clean empty history" is never reported over a root someone has
 // tampered with. `getActivity(id)` on such an entry keeps returning `item:null`/`unreadable`.
-function _collectItems(home, filter, redactor) {
+//
+// Task 5.1 / Ruling P5-2: `opts.legacy` additionally merges the OPAQUE legacy `sync-*.log` items
+// (activity/legacy.js) into the SAME list, ordered by their reconstructed timestamps -- so the
+// window shows one history in one order -- but they are activities in no other sense:
+//   * they are merged AFTER the loop that derives the response-level `incomplete`, and contribute
+//     to neither it nor `available`, nor to `problems`: those are statements about the durable
+//     store, and a legacy log lives outside it (and outside quota/accounting with it);
+//   * they are still merged when the store is MISSING -- that is precisely the user who has never
+//     synced under the new contract and whose whole history is these files -- but NOT when it is
+//     unreadable, where the reader refuses to draw any history at all;
+//   * `viewErrorsTarget`/`_scanActivity` never see them (they are not incidents to open), and
+//     `buildExport` does not pass this flag either: an export item is the durable
+//     Events/Problems-lens document, which a legacy log has neither of.
+function _collectItems(home, filter, redactor, opts = {}) {
+  // Built first so the store-state early returns below can still carry them. Each is already a
+  // complete summary DTO (redacted and bounded by legacy.js), so it is wrapped as an entry with
+  // `mtime: 0` -- `_sortKey` reads its `startedAt`, which a legacy item always has.
+  const legacyEntries = opts.legacy
+    ? legacyMod.legacyItems(home, { configuredSecrets: opts.configuredSecrets || [] })
+      .map((item) => ({ item, mtime: 0 }))
+    : [];
+  const sorted = (entries) => entries.slice().sort((a, b) => _sortKey(b) - _sortKey(a)).map((e) => e.item);
+
   const base = _activityRoot(home);
   const state = _probeRoot(base);
-  if (state === 'missing') return { items: [], available: true, incomplete: false, problems: [] };
+  if (state === 'missing') {
+    return { items: sorted(legacyEntries), available: true, incomplete: false, problems: [] };
+  }
   if (state === 'unreadable') return { items: [], available: false, incomplete: false, problems: [] };
 
   const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(base);
@@ -758,8 +785,14 @@ function _collectItems(home, filter, redactor) {
     entries.push(built);
     if (built.item.incomplete) incomplete = true;
   }
-  entries.sort((a, b) => _sortKey(b) - _sortKey(a));
-  return { items: entries.map((e) => e.item), available: true, incomplete, problems };
+  // AFTER the `incomplete` accumulation above, deliberately: a truncated or refused legacy log
+  // marks its OWN item incomplete and must never make the response say the durable store is.
+  return {
+    items: sorted(entries.concat(legacyEntries)),
+    available: true,
+    incomplete,
+    problems,
+  };
 }
 
 // -------------------------------------------------------------------------------------------
@@ -878,7 +911,8 @@ function _safeScanActivity(home, aid) {
 function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   validateFilter(filter);
   const redactor = new redactMod.Redactor(configuredSecrets);
-  const { items, available, incomplete, problems } = _collectItems(home, filter, redactor);
+  const { items, available, incomplete, problems } = _collectItems(home, filter, redactor,
+    { legacy: true, configuredSecrets });
 
   if (!available) {
     return { items: [], truncated: false, available: false, incomplete: false, problems: [] };
@@ -886,7 +920,13 @@ function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
 
   const offset = filter.offset || 0;
   const limit = Math.min(filter.limit !== undefined ? filter.limit : limits.LIST_MAX, limits.LIST_MAX);
-  const sliced = items.slice(offset, offset + limit).map((full) => _boundSummary(_summaryOf(full)));
+  // A legacy item is ALREADY a self-contained summary (Ruling P5-1): it is passed through
+  // untouched rather than re-derived, because `_summaryOf` would drop the very fields that make it
+  // renderable without a bridge call (`excerpt`, `source`, `legacy`) and `_boundSummary`'s
+  // SUMMARY_MAX_BYTES guard describes a durable summary, not a 16 KiB excerpt. Both halves are
+  // bounded: a durable summary by _boundSummary, a legacy one by legacy.js's own excerpt cap.
+  const sliced = items.slice(offset, offset + limit)
+    .map((full) => (full.legacy === true ? full : _boundSummary(_summaryOf(full))));
   const truncated = offset + sliced.length < items.length;
 
   return { items: sliced, truncated, available, incomplete, problems };
@@ -1175,4 +1215,6 @@ module.exports = {
   buildExport,
   // Task 4.3: re-exported (not reimplemented) so `read` stays the reader facade ipc.js talks to.
   systemDiagnostics: systemMod.systemDiagnostics,
+  // Task 5.1: same pattern -- the legacy adapter is its own module, reached through this facade.
+  legacyItems: legacyMod.legacyItems,
 };
