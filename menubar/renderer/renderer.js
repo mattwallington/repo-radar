@@ -508,6 +508,20 @@ ipcRenderer.on('sync-started', (event, data) => {
     }
 });
 
+// Ruling P6-1: this attempt opened the window and then never started -- either another sync held
+// the root exec lock, or runSync failed before it could spawn anything. Without this the window
+// sat on "Starting sync..." with a full grid of "Waiting..." rows forever, because no
+// progress-update would ever arrive. The reason is a bare selector, not text: sync-refused.js
+// maps a closed set of reasons to fixed sentences and falls back for anything it doesn't know, so
+// nothing from the payload is ever rendered. It comes from the <script> tag above this one in
+// index.html.
+ipcRenderer.on('sync-refused', (event, data) => {
+    log('WARNING: sync refused before it started');
+    repoStates.clear();
+    updateStats(0, 0, 0, 0);
+    applySyncRefused(document, data && data.reason);
+});
+
 // Get version info
 ipcRenderer.on('version-info', (event, versionData) => {
     const versionEl = document.getElementById('version-text');
