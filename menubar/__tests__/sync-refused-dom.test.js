@@ -14,10 +14,13 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 
-const { applySyncRefused, SYNC_REFUSED_STATUS_TEXT } =
+const { applySyncRefused, syncRefusedText, SYNC_REFUSED_TEXTS, SYNC_REFUSED_STATUS_TEXT } =
   require(path.join(__dirname, '..', 'renderer', 'sync-refused.js'));
 
-const EXPECTED_TEXT = 'Not started — another sync is already running';
+// The two reasons main.js can send, and the exact sentence each must produce.
+const BUSY_TEXT = 'Not started — another sync is already running';
+const FAILED_TEXT = 'Sync could not start — see ⚠️ View Errors in the menu';
+const EXPECTED_TEXT = BUSY_TEXT;
 
 function makeElement(tagName) {
   const el = {
@@ -102,14 +105,27 @@ function makeStuckDocument({ repoRows = 3 } = {}) {
   };
 }
 
-test('the module exports the one fixed status string', () => {
-  assert.strictEqual(SYNC_REFUSED_STATUS_TEXT, EXPECTED_TEXT);
+test('the reason -> text map is closed, and unknown reasons fall back to failed-to-start', () => {
+  assert.strictEqual(SYNC_REFUSED_TEXTS['already-running'], BUSY_TEXT);
+  assert.strictEqual(SYNC_REFUSED_TEXTS['failed-to-start'], FAILED_TEXT);
+  assert.strictEqual(SYNC_REFUSED_STATUS_TEXT, BUSY_TEXT, 'the legacy export stays the busy sentence');
+
+  assert.strictEqual(syncRefusedText('already-running'), BUSY_TEXT);
+  assert.strictEqual(syncRefusedText('failed-to-start'), FAILED_TEXT);
+  // Anything main.js might grow later, or a garbled payload, must still say something TRUE about
+  // a sync that did not start -- and must never be the text itself.
+  for (const junk of [undefined, null, '', 'root-busy', 'toString', 'constructor', '<b>boom</b>', 42, {}]) {
+    assert.strictEqual(syncRefusedText(junk), FAILED_TEXT, `unknown reason ${String(junk)}`);
+  }
 });
 
 test('the status line stops claiming the sync is starting', () => {
-  const doc = makeStuckDocument();
-  applySyncRefused(doc);
-  assert.strictEqual(doc.getElementById('status-text').textContent, EXPECTED_TEXT);
+  for (const [reason, expected] of [['already-running', BUSY_TEXT], ['failed-to-start', FAILED_TEXT]]) {
+    const doc = makeStuckDocument();
+    assert.strictEqual(doc.getElementById('status-text').textContent, 'Starting sync...', 'guard');
+    applySyncRefused(doc, reason);
+    assert.strictEqual(doc.getElementById('status-text').textContent, expected, reason);
+  }
 });
 
 test('the "Waiting..." repo grid is cleared, and what replaces it is text, not markup', () => {
@@ -117,7 +133,7 @@ test('the "Waiting..." repo grid is cleared, and what replaces it is text, not m
   const reposList = doc.getElementById('repos-list');
   assert.strictEqual(reposList.children.length, 5, 'guard: the grid starts full');
 
-  applySyncRefused(doc);
+  applySyncRefused(doc, 'already-running');
 
   const text = reposList.textContent;
   assert.strictEqual(/Waiting\.\.\./.test(text), false, 'no repo row may still read "Waiting..."');
@@ -129,7 +145,7 @@ test('the "Waiting..." repo grid is cleared, and what replaces it is text, not m
 
 test('the stop button is left disabled and un-animated', () => {
   const doc = makeStuckDocument();
-  applySyncRefused(doc);
+  applySyncRefused(doc, 'failed-to-start');
   const stopBtn = doc.getElementById('stop-sync-btn');
   assert.strictEqual(stopBtn.disabled, true, 'nothing is running -- there is nothing to stop');
   assert.strictEqual(stopBtn.classList.contains('active'), false,
@@ -138,15 +154,16 @@ test('the stop button is left disabled and un-animated', () => {
 
 test('it survives a window whose DOM is missing pieces', () => {
   const empty = { getElementById: () => null, createElement: (t) => makeElement(t) };
-  assert.doesNotThrow(() => applySyncRefused(empty));
-  assert.doesNotThrow(() => applySyncRefused(null));
+  assert.doesNotThrow(() => applySyncRefused(empty, 'already-running'));
+  assert.doesNotThrow(() => applySyncRefused(null, 'failed-to-start'));
 });
 
 test('the text is fixed: nothing from the payload can reach the DOM', () => {
-  // Callers pass no reason at all, but prove it end-to-end anyway -- an "unknown reason" must
-  // produce the SAME sentence, never an echo.
+  // An unrecognised reason must produce the fallback sentence, never an echo of itself.
   const doc = makeStuckDocument();
-  applySyncRefused(doc, { reason: '<img src=x onerror=alert(1)>' });
-  assert.strictEqual(doc.getElementById('status-text').textContent, EXPECTED_TEXT);
-  assert.strictEqual(/img|onerror/.test(doc.getElementById('repos-list').textContent), false);
+  applySyncRefused(doc, '<img src=x onerror=alert(1)>');
+  assert.strictEqual(doc.getElementById('status-text').textContent, FAILED_TEXT);
+  const grid = doc.getElementById('repos-list').textContent;
+  assert.strictEqual(/img|onerror/.test(grid), false, 'the reason never reaches the grid');
+  assert.ok(grid.includes(FAILED_TEXT));
 });

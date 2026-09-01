@@ -46,6 +46,18 @@ function between(startAnchor, endAnchor, text = src) {
   return text.slice(a, b);
 }
 
+// Asserts `markers` appear in the given order inside `slice`, each exactly once.
+function inOrder(slice, markers, label) {
+  let last = -1;
+  markers.forEach((marker, i) => {
+    const at = slice.indexOf(marker);
+    assert.notStrictEqual(at, -1, `${label}: missing ${marker}`);
+    assert.strictEqual(slice.indexOf(marker, at + 1), -1, `${label}: ${marker} appears more than once`);
+    assert.ok(at > last, `${label}: ${marker} must come after ${markers[i - 1]}`);
+    last = at;
+  });
+}
+
 test('main.js still parses', () => {
   execFileSync(process.execPath, ['--check', MAIN_JS], { stdio: 'pipe' });
 });
@@ -58,32 +70,68 @@ test('the LockBusy branch tells the progress window it was refused', () => {
   // The catch's LockBusy arm, from its `e.code === 75` test to its own `return`.
   const branch = between('if (e && e.code === 75) {', "activityGlue.onContention(activity.writer, 'root-busy');");
 
-  assert.ok(/refuseProgressWindow\(\)/.test(branch),
-    'the LockBusy branch must refuse the progress window it already opened');
+  assert.ok(/refuseProgressWindow\('already-running'\)/.test(branch),
+    'the LockBusy branch must refuse the progress window it already opened, with its own reason');
 
   // The two existing effects are untouched -- this fix ADDS a third.
   assert.ok(/Notification\.isSupported\(\)/.test(branch), 'the macOS Notification stays');
   assert.ok(/A sync is already running\./.test(branch), 'the Notification body stays');
-
-  // The refusal happens before the branch returns, i.e. before onContention's `return`.
-  assert.ok(branch.indexOf('refuseProgressWindow()') > -1);
 });
 
-test('the refusal is gated on this attempt having opened the window, and its payload is fixed', () => {
-  const helper = between('const refuseProgressWindow = () => {', 'const shellEnv = { ...process.env };');
+test("runSync's OTHER rejection arm hangs the same window, and refuses it too", () => {
+  // verifyRuntime failed, or venv/python resolution did: no child, no progress event ever, and
+  // the errorLog + tray work in this arm is invisible from inside the progress window.
+  const arm = between("console.error('runSync failed to start sync:', e);", 'function showLogWindow(');
+
+  assert.ok(/refuseProgressWindow\('failed-to-start'\)/.test(arm),
+    "the failure arm must refuse the window it left on 'Starting sync...'");
+  assert.strictEqual(/refuseProgressWindow\([^)]*e\.message/.test(arm), false,
+    'the error text must never cross the bridge -- the reason is a bare selector');
+
+  // UI first is fine; the existing terminal -> refresh -> rebuild ordering must survive intact.
+  inOrder(arm, [
+    "refuseProgressWindow('failed-to-start')",
+    "activity.writer.terminal('failed')",
+    '_refreshViewErrorsTarget()',
+    'updateTrayMenu()',
+  ], 'the failure arm');
+});
+
+test('the refusal is gated on this attempt having opened the window, and its payload is a bare reason', () => {
+  // The slice must END at the sender, or every assertion below can pass from sendSyncStartedWhenReady's
+  // near-identical body next door (round-2 review finding: deleting the helper's own
+  // destroyed-window guard left this test green).
+  // (comment lines are stripped from `src`, so the end anchor is the sender's own declaration)
+  const helper = between('const refuseProgressWindow = (reason) => {', 'const sendSyncStartedWhenReady');
+  assert.strictEqual(/sendSyncStartedWhenReady/.test(helper), false,
+    'guard: the slice must not bleed into the sync-started sender');
 
   assert.ok(/if \(!showWindow\) return;/.test(helper),
     'a scheduled sync (showWindow=false) opened no window -- there is nothing to refuse');
-  assert.ok(/logWindow && !logWindow\.isDestroyed\(\)/.test(helper),
-    'never send into a destroyed window');
-  assert.ok(/logWindow\.webContents\.send\('sync-refused', \{ reason: 'already-running' \}\)/.test(helper),
-    "the payload is fixed: { reason: 'already-running' } -- nothing user-derived crosses the bridge");
-  assert.ok(/isLoading\(\)/.test(helper),
+  assert.ok(/!attemptWindow \|\| logWindow !== attemptWindow/.test(helper),
+    'the refusal is bound to the window THIS attempt opened, not to whatever logWindow is now');
+  assert.ok(/attemptWindow\.isDestroyed\(\)/.test(helper), 'never send into a destroyed window');
+  assert.ok(/attemptWindow\.webContents\.send\('sync-refused', \{ reason \}\)/.test(helper),
+    'the payload carries the caller-chosen reason and nothing else -- no error text, nothing user-derived');
+  assert.ok(/attemptWindow\.webContents\.isLoading\(\)/.test(helper),
     'a window still loading would drop the send -- wait for it, like sendSyncStartedWhenReady does');
   assert.ok(/syncRefusedForThisAttempt = true;/.test(helper),
     'the refusal must latch, so a pending sync-started can be short-circuited');
   assert.ok(/pendingFreshSync = false;/.test(helper),
     'the fresh-sync replay skip no longer applies once the attempt is refused');
+});
+
+test("the attempt's window is captured where it is opened", () => {
+  const opener = between('if (showWindow) {\n    pendingFreshSync = true;', 'let syncRefusedForThisAttempt');
+  assert.ok(/showLogWindow\(\);/.test(opener) && /attemptWindow = logWindow;/.test(opener),
+    'attemptWindow is captured right after showLogWindow(), inside the showWindow branch');
+  assert.ok(opener.indexOf('showLogWindow()') < opener.indexOf('attemptWindow = logWindow;'),
+    'captured AFTER the window exists');
+
+  const trigger = between('function triggerSync(', 'function showLogWindow(');
+  assert.ok(/let attemptWindow = null;/.test(trigger), 'it is a per-attempt local');
+  assert.strictEqual(/^let attemptWindow/m.test(src.slice(0, src.indexOf('function triggerSync('))), false,
+    'the captured window must not be module state');
 });
 
 test('a refused attempt can never have a late sync-started painted over it', () => {
@@ -128,10 +176,10 @@ test('the legacy progress renderer listens for sync-refused, in its existing ipc
     "renderer.js must register an ipcRenderer 'sync-refused' listener");
 
   const handler = between("ipcRenderer.on('sync-refused', (event, data) => {", "ipcRenderer.on('version-info'", rendererSrc);
-  assert.ok(/applySyncRefused\(document\)/.test(handler),
-    'the listener delegates to the pure DOM function (proven by sync-refused-dom.test.js)');
-  assert.strictEqual(/data\.reason/.test(handler.replace(/reason === 'already-running'/g, '')), false,
-    'the reason is never rendered or logged -- unknown reasons get the same fixed text');
+  assert.ok(/applySyncRefused\(document, data && data\.reason\)/.test(handler),
+    'the listener hands the bare reason to the pure DOM function (mapping proven by sync-refused-dom.test.js)');
+  assert.strictEqual(/textContent|log\([^)]*reason/.test(handler), false,
+    'the reason is a selector, never text: the handler neither renders nor logs it');
   assert.strictEqual(/innerHTML|outerHTML|insertAdjacentHTML/.test(handler), false,
     'no markup sink on the refusal path');
 });

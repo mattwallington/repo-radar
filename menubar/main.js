@@ -1311,9 +1311,15 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   // Set pendingFreshSync BEFORE creating the window so showLogWindow's
   // did-finish-load handler skips its mid-sync replay — sendSyncStartedWhenReady
   // below will deliver the fresh sync-started event instead.
+  let attemptWindow = null;
   if (showWindow) {
     pendingFreshSync = true;
     showLogWindow();
+    // Ruling P6-1 (round 2): bind the refusal below to THIS attempt's window. `logWindow` is
+    // module state that a later attempt can replace (the user closes the window and clicks Sync
+    // Now again while this attempt's refusal poll is still ticking); without this the stale poll
+    // would paint a refusal over a window that belongs to a sync which is actually running.
+    attemptWindow = logWindow;
   }
 
   // Ruling P6-1: a manual sync can still be REFUSED after this point -- the root exec lock is
@@ -1323,7 +1329,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   // (its 300ms timer and its 100ms isLoading poll would otherwise repaint the waiting grid right
   // back over the refusal), and the window is handed a fixed 'sync-refused' payload.
   let syncRefusedForThisAttempt = false;
-  const refuseProgressWindow = () => {
+  const refuseProgressWindow = (reason) => {
     syncRefusedForThisAttempt = true;
     // The fresh-sync replay skip no longer applies. Clearing it is safe here: the status reset
     // above emptied status.repos and no child ever ran, so showLogWindow's did-finish-load
@@ -1332,14 +1338,18 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     // A scheduled sync (showWindow=false) opened no window -- there is nothing to refuse.
     if (!showWindow) return;
     const deliver = () => {
-      if (!logWindow || logWindow.isDestroyed() || !logWindow.webContents) return;
+      // Only ever speak to the window THIS attempt opened (see attemptWindow above).
+      if (!attemptWindow || logWindow !== attemptWindow) return;
+      if (attemptWindow.isDestroyed() || !attemptWindow.webContents) return;
       // A send into a still-loading renderer is dropped on the floor; wait, exactly as
       // sendSyncStartedWhenReady does.
-      if (logWindow.webContents.isLoading()) {
+      if (attemptWindow.webContents.isLoading()) {
         setTimeout(deliver, 100);
         return;
       }
-      logWindow.webContents.send('sync-refused', { reason: 'already-running' });
+      // The reason is one of a closed set the renderer maps to fixed text; nothing derived from
+      // the error itself ever crosses the bridge.
+      attemptWindow.webContents.send('sync-refused', { reason });
     };
     deliver();
   };
@@ -1683,7 +1693,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // Ruling P6-1: FIRST tell the progress window this attempt opened, before anything else can
       // return -- it is already showing "Starting sync..." over a grid of "Waiting..." rows that
       // nothing will ever move, and this also latches the pending sync-started send off.
-      refuseProgressWindow();
+      refuseProgressWindow('already-running');
       if (Notification.isSupported()) {
         new Notification({
           title: getAppDisplayName(),
@@ -1705,6 +1715,14 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     logSyncState('runsync-error');
     currentSyncProcess = null;
     stopIconAnimation();
+
+    // Ruling P6-1 (round 2): the SAME hang as the LockBusy branch above, from the other half of
+    // this catch -- the 300ms timer has already painted "Starting sync..." over a Waiting grid
+    // that nothing will ever move, and the errorLog/tray work below is invisible from inside the
+    // progress window. This is UI only, so it goes first; the terminal + refresh + rebuild
+    // ordering below is untouched. `e.message` stays out of the payload: the renderer maps this
+    // fixed reason to a fixed sentence pointing at "View Errors", where the real error lives.
+    refuseProgressWindow('failed-to-start');
 
     const status = loadStatus();
     status.hasErrors = true;
