@@ -1484,3 +1484,185 @@ test('the entry point reports a missing bridge instead of leaving a blank page',
   await R.start(bridged, live.doc);
   assert.deepStrictEqual(calls, [['list', {}]], 'with a bridge, the entry point loads the list');
 });
+
+// -------------------------------------------------------------------------------------------
+// Task 5.1: OPAQUE LEGACY ITEMS.
+//
+// A `sync-*.log` from before Activity History arrives as a SELF-CONTAINED summary DTO
+// (`legacy:true`, id `legacy:sync-<ISO>`, a bounded redacted `excerpt` carried inline). Its id is
+// NOT a UUIDv4, so it can never become the argument of `activity:get` or `activity:reveal` -- the
+// detail for one is rendered LOCALLY from the summary, with no bridge call at all, and Reveal is
+// disabled while one is selected (there is no activity directory to reveal).
+// -------------------------------------------------------------------------------------------
+const LEGACY_DTO = Object.freeze({
+  id: 'legacy:sync-2026-08-14T09:31:05',
+  legacy: true,
+  outcome: 'unknown',
+  startedAt: '2026-08-14T09:31:05',
+  endedAt: '2026-08-14T09:33:10',
+  duration: 125000,
+  channel: 'legacy',
+  trigger: 'unknown',
+  kind: 'sync',
+  errorCount: 1,
+  warnCount: 1,
+  problemCount: 2,
+  hasProblems: true,
+  incomplete: false,
+  synthesized: false,
+  source: 'sync-2026-08-14T09-31-05.log',
+  excerpt: '[09:32:40] clone_failed repo=owner/gamma\n    fatal: could not read from remote\n',
+  excerptTruncated: false,
+});
+
+test('renderChip marks a legacy chip as legacy and carries NO activity id', () => {
+  const chip = R.renderChip(makeDoc(), LEGACY_DTO);
+  assert.ok(chip.className.split(' ').includes('legacy'), 'the chip itself is marked');
+  assert.strictEqual(chip.getAttribute('data-activity-id'), '',
+    'a legacy id must never sit where a bridge argument is read from');
+  assert.strictEqual(chip.getAttribute('data-legacy-id'), LEGACY_DTO.id);
+  const classes = walk(chip).map((el) => el.className).join(' ');
+  assert.ok(classes.includes('dot-unknown'), 'an unknowable outcome is the grey dot');
+  assert.ok(chip.textContent.includes('legacy'), 'and the badge says so in words');
+});
+
+test('renderChip refuses to carry a malformed legacy id into the DOM', () => {
+  for (const bad of ['legacy:sync-../../etc/passwd', 'legacy:', 'sync-2026-08-14T09:31:05', '']) {
+    const chip = R.renderChip(makeDoc(), Object.assign({}, LEGACY_DTO, { id: bad }));
+    assert.strictEqual(chip.getAttribute('data-legacy-id'), '', bad);
+  }
+});
+
+test('renderDetail renders a legacy item locally, with its fixed uncorrelated header', () => {
+  const wrap = R.renderDetail(makeDoc(), { item: LEGACY_DTO, available: true }, { lens: 'events' });
+  const text = wrap.textContent;
+  assert.match(text, /Legacy sync log/);
+  assert.match(text, /not correlated to any activity/);
+  assert.ok(text.includes(LEGACY_DTO.source), 'the file it came from is named');
+  assert.ok(text.includes('clone_failed'), 'the excerpt is shown');
+
+  // The excerpt lands in a <pre>, as text, on a childless element.
+  const pre = walk(wrap).find((el) => el.tagName === 'PRE');
+  assert.ok(pre, 'the excerpt is preformatted');
+  assert.strictEqual(pre.children.length, 0);
+  assert.ok(pre.textContent.includes('fatal: could not read from remote'));
+  // A legacy item has no lenses at all -- the Problems lens must not be invented for it.
+  assert.ok(!text.includes('No problems recorded'));
+});
+
+test('a hostile legacy excerpt lands as inert characters', () => {
+  const wrap = R.renderDetail(makeDoc(), {
+    item: Object.assign({}, LEGACY_DTO, { excerpt: `${ANSI_XSS}\n${ANSI_NOISE}`, source: XSS }),
+    available: true,
+  }, { lens: 'events' });
+  assertInert(wrap, XSS);
+});
+
+test('a truncated or refused legacy excerpt says so rather than reading as empty', () => {
+  const cut = R.renderDetail(makeDoc(), {
+    item: Object.assign({}, LEGACY_DTO, { excerptTruncated: true, incomplete: true }),
+    available: true,
+  }, {});
+  assert.match(cut.textContent, /truncated/i);
+
+  const refused = R.renderDetail(makeDoc(), {
+    item: Object.assign({}, LEGACY_DTO, { excerpt: '', error: 'symlink', incomplete: true }),
+    available: true,
+  }, {});
+  assert.match(refused.textContent, /could not be read/i);
+  assert.ok(refused.textContent.includes('symlink'), 'the refusal reason is shown');
+});
+
+test('clicking a legacy chip makes NO bridge call and leaves Reveal disabled', async () => {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      return { items: [LIVE_ITEM, LEGACY_DTO], truncated: false, available: true, incomplete: false, problems: [] };
+    },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  });
+  await R.boot(fakeWindow(''), doc, api);
+
+  const legacyChip = byId.list.querySelectorAll('.chip')[1];
+  assert.ok(legacyChip.classList.contains('legacy'));
+
+  fire(byId.list, 'click', walk(legacyChip).find((el) => el.className === 'chip-source'));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepStrictEqual(calls, [['list', {}]], 'a legacy item is rendered from the summary alone');
+  assert.ok(legacyChip.classList.contains('selected'), 'it is still a selection');
+  assert.strictEqual(byId['btn-reveal'].disabled, true, 'there is no activity directory to reveal');
+  assert.match(byId.detail.textContent, /Legacy sync log/);
+  assert.ok(byId.detail.textContent.includes('clone_failed'));
+});
+
+test('selecting a legacy chip after a real one disables Reveal again', async () => {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      return { items: [LIVE_ITEM, LEGACY_DTO], truncated: false, available: true, incomplete: false, problems: [] };
+    },
+    get: async (id) => { calls.push(['get', id]); return LIVE_DETAIL; },
+  });
+  await R.boot(fakeWindow(''), doc, api);
+  const chips = byId.list.querySelectorAll('.chip');
+
+  fire(byId.list, 'click', chips[0]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(byId['btn-reveal'].disabled, false);
+  assert.deepStrictEqual(calls[1], ['get', LIVE_ITEM.id]);
+
+  fire(byId.list, 'click', chips[1]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(byId['btn-reveal'].disabled, true);
+  assert.strictEqual(calls.length, 2, 'the legacy selection crossed no bridge');
+  const selected = byId.list.querySelectorAll('.chip').filter((c) => c.classList.contains('selected'));
+  assert.strictEqual(selected.length, 1, 'exactly one chip is selected');
+
+  // Reveal, pressed with a legacy item selected, must not dispatch anything.
+  fire(byId['btn-reveal'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(calls.filter((c) => c[0] === 'reveal').length, 0);
+});
+
+test('Enter activates a focused legacy chip, exactly like a click', async () => {
+  const { doc, byId } = livePage();
+  const { api, calls } = fakeApi({
+    list: async (filter) => {
+      calls.push(['list', filter]);
+      return { items: [LEGACY_DTO], truncated: false, available: true, incomplete: false, problems: [] };
+    },
+  });
+  await R.boot(fakeWindow(''), doc, api);
+
+  const chip = byId.list.querySelectorAll('.chip')[0];
+  let prevented = false;
+  fire(byId.list, 'keydown', chip, { key: 'Enter', preventDefault: () => { prevented = true; } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(prevented, true);
+  assert.deepStrictEqual(calls, [['list', {}]]);
+  assert.match(byId.detail.textContent, /Legacy sync log/);
+});
+
+test('a refresh that no longer lists the selected legacy item drops the selection', async () => {
+  const { doc, byId } = livePage();
+  const state = { items: [LIVE_ITEM, LEGACY_DTO] };
+  const { api } = fakeApi({
+    list: async () => ({ items: state.items, truncated: false, available: true, incomplete: false, problems: [] }),
+  });
+  await R.boot(fakeWindow(''), doc, api);
+
+  fire(byId.list, 'click', byId.list.querySelectorAll('.chip')[1]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(byId.detail.textContent, /Legacy sync log/);
+
+  state.items = [LIVE_ITEM]; // the log was rotated away
+  fire(byId['btn-refresh'], 'click');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(byId.list.querySelectorAll('.chip').filter((c) => c.classList.contains('selected')).length, 0);
+  assert.match(byId.detail.textContent, /Select an activity/);
+});

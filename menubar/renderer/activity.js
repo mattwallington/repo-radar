@@ -45,6 +45,14 @@
 // reused to validate a chip's `data-activity-id` before it is handed back over the bridge.
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+// Task 5.1: a LEGACY item's id (`legacy:sync-<naive local ISO>`, derived by activity/legacy.js
+// from a pre-contract `sync-*.log` filename). It is deliberately NOT a UUIDv4, so it can never
+// pass the gate above and therefore can never become the argument of `activity:get` or
+// `activity:reveal` -- a legacy item is rendered LOCALLY, from the summary the list already
+// returned. This pattern exists only so the id can be carried on a chip and matched back to that
+// summary; it is never used in a path, a bridge call, or a fragment.
+const LEGACY_ID_RE = /^legacy:sync-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+
 // activity/limits.js's LEVELS and SEARCH_MAX. The main side REJECTS an out-of-bounds filter
 // rather than clamping it, so this side must never send one: `normalizeFilter` is the only place
 // a filter is built, and it drops anything it cannot vouch for.
@@ -88,6 +96,14 @@ const TEXT = {
   unreadable: 'That activity could not be read.',
   notStarted: 'That activity hasn’t started yet.',
   pick: 'Select an activity on the left.',
+  // Task 5.1: the legacy `sync-*.log` items. The note is FIXED text shown above every one of them:
+  // the single thing a reader must not get wrong is that these predate the Activity contract and
+  // belong to no activity, so it says so on the item itself rather than in a legend somewhere.
+  legacyBadge: 'legacy',
+  legacyNote: 'Legacy sync log — recorded before Activity History; not correlated to any activity',
+  legacyTruncated: 'Only the end of this log is shown — the excerpt was truncated.',
+  legacyUnreadable: 'This log could not be read:',
+  legacyEmpty: 'This log recorded nothing.',
 };
 
 // -------------------------------------------------------------------------------------------
@@ -184,13 +200,26 @@ function sourceLabel(item) {
   return parts.length === 0 ? '—' : parts.join(' · ');
 }
 
+// Is this DTO one of Task 5.1's opaque legacy items? `legacy === true` exactly -- never a truthy
+// value -- so nothing else can put a durable activity on the local-render path.
+function isLegacy(item) {
+  return Boolean(item) && item.legacy === true;
+}
+
 // One list chip: time · channel/trigger/kind · duration · outcome dot · error/warn counts.
 // The id is carried as a data attribute (never as text) and only when it is a real UUIDv4, so a
 // tampered directory name can never become the argument of a later bridge call.
+//
+// A LEGACY item (Task 5.1) carries its id in a SEPARATE attribute and leaves `data-activity-id`
+// empty: the two are read by different paths, and the bridge path only ever reads the first. It is
+// marked in the class list AND in words, and its outcome is the grey `unknown` dot -- a
+// pre-contract log records no verdict, so the chip claims none.
 function renderChip(doc, dto) {
   const item = dto && typeof dto === 'object' ? dto : {};
-  const chip = el(doc, 'div', 'chip');
-  chip.setAttribute('data-activity-id', UUID_V4_RE.test(item.id) ? item.id : '');
+  const legacy = isLegacy(item);
+  const chip = el(doc, 'div', legacy ? 'chip legacy' : 'chip');
+  chip.setAttribute('data-activity-id', !legacy && UUID_V4_RE.test(item.id) ? item.id : '');
+  chip.setAttribute('data-legacy-id', legacy && LEGACY_ID_RE.test(item.id) ? item.id : '');
   // Reachable without a mouse: a focus stop that announces what it is. The keys that activate it
   // are handled by the same delegated listener as the click, so this stays a pure renderer.
   chip.setAttribute('tabindex', '0');
@@ -200,6 +229,7 @@ function renderChip(doc, dto) {
   head.appendChild(el(doc, 'span', 'chip-time', formatTime(item.startedAt)));
   head.appendChild(el(doc, 'span', `dot dot-${outcomeKey(item.outcome)}`));
   head.appendChild(el(doc, 'span', 'chip-outcome', outcomeKey(item.outcome)));
+  if (legacy) head.appendChild(el(doc, 'span', 'chip-flag chip-legacy', TEXT.legacyBadge));
   chip.appendChild(head);
 
   const meta = el(doc, 'div', 'chip-meta');
@@ -388,6 +418,13 @@ function focusIdFromHash(hash) {
   return UUID_V4_RE.test(raw) ? raw : null;
 }
 
+// The legacy counterpart, and deliberately NOT reachable from the URL fragment: a legacy item has
+// no main-side handler to deep-link into, so this only ever validates a value that came off a chip
+// this renderer itself wrote, before it is used as a lookup key into the last painted list.
+function legacyIdFrom(value) {
+  return typeof value === 'string' && LEGACY_ID_RE.test(value) ? value : null;
+}
+
 // -------------------------------------------------------------------------------------------
 // The two lenses
 // -------------------------------------------------------------------------------------------
@@ -471,11 +508,56 @@ function renderDetailHead(doc, item) {
   return head;
 }
 
+// Task 5.1: a legacy item's whole detail, built from the SUMMARY the list already returned -- no
+// bridge call, because there is nothing to fetch: `activity:get` takes an activity id, and this is
+// not one. What it shows is exactly what the reader could establish from a pre-contract text log:
+// a fixed note that it is legacy and uncorrelated, the file it came from, the reconstructed
+// timestamps, the derived counts, and the bounded, already-redacted excerpt as text in a <pre>.
+//
+// Deliberately NO Events/Problems lens: those are the shape of a durable activity's records, and
+// inventing them over a log file would be claiming a structure the data does not have.
+function renderLegacyDetail(doc, item) {
+  const it = item && typeof item === 'object' ? item : {};
+  const wrap = el(doc, 'div', 'legacy-detail');
+  wrap.appendChild(el(doc, 'div', 'legacy-note', TEXT.legacyNote));
+
+  const head = el(doc, 'div', 'detail-head');
+  const title = el(doc, 'div', 'detail-title');
+  title.appendChild(el(doc, 'span', `dot dot-${outcomeKey(it.outcome)}`));
+  title.appendChild(el(doc, 'span', 'detail-time', formatTime(it.startedAt)));
+  title.appendChild(el(doc, 'span', 'detail-duration', formatDuration(it.duration)));
+  head.appendChild(title);
+
+  const meta = el(doc, 'div', 'detail-meta');
+  meta.appendChild(el(doc, 'span', 'detail-source', it.source));
+  if (it.errorCount > 0) meta.appendChild(el(doc, 'span', 'chip-count count-error', plural(it.errorCount, 'error')));
+  if (it.warnCount > 0) meta.appendChild(el(doc, 'span', 'chip-count count-warn', plural(it.warnCount, 'warning')));
+  head.appendChild(meta);
+  wrap.appendChild(head);
+
+  // A refusal (a symlinked or non-regular file the reader would not follow) and a cut excerpt are
+  // both stated, so a short or empty body is never read as "this run did nothing".
+  if (it.error) {
+    wrap.appendChild(el(doc, 'div', 'state state-error', `${TEXT.legacyUnreadable} ${it.error}`));
+  }
+  if (it.excerptTruncated) {
+    wrap.appendChild(el(doc, 'div', 'state state-truncated', TEXT.legacyTruncated));
+  }
+  const excerpt = typeof it.excerpt === 'string' ? it.excerpt : '';
+  if (excerpt) wrap.appendChild(el(doc, 'pre', 'legacy-excerpt', excerpt));
+  else if (!it.error) wrap.appendChild(el(doc, 'div', 'state state-empty', TEXT.legacyEmpty));
+  return wrap;
+}
+
 function renderDetail(doc, result, view) {
   const res = result && typeof result === 'object' ? result : {};
   const wrap = el(doc, 'div', 'detail-inner');
   if (!res.item) {
     wrap.appendChild(el(doc, 'div', 'state state-empty', DETAIL_REASONS[res.reason] || TEXT.pick));
+    return wrap;
+  }
+  if (isLegacy(res.item)) {
+    wrap.appendChild(renderLegacyDetail(doc, res.item));
     return wrap;
   }
   const lens = view && view.lens === 'problems' ? 'problems' : 'events';
@@ -506,7 +588,12 @@ function boot(win, doc, api) {
   const revealEl = doc.getElementById('btn-reveal');
   const statusEl = doc.getElementById('action-status');
 
-  const view = { lens: 'events', filter: {}, selectedId: null, detail: null };
+  // `selectedId` is an ACTIVITY id (a bridge argument); `selectedLegacyId` is a legacy item's id,
+  // which is never one. At most one of the two is ever set.
+  const view = { lens: 'events', filter: {}, selectedId: null, selectedLegacyId: null, detail: null };
+  // Task 5.1: the legacy summaries from the last painted list, by id. A legacy item is complete on
+  // arrival, so selecting one is a lookup here rather than a call over the bridge.
+  let legacyItems = new Map();
   let pendingFocus = focusIdFromHash(win.location.hash);
   let listReady = false;
   let systemLoaded = false;
@@ -535,19 +622,29 @@ function boot(win, doc, api) {
     if (text) statusEl.appendChild(el(doc, 'span', 'action-status-text', text));
   }
 
+  // A chip is the selected one if it matches whichever selection is live. The comparisons are
+  // guarded on a non-null selection because an unselectable chip carries an EMPTY attribute, and
+  // `'' === ''` would otherwise mark every one of them.
+  function isSelectedChip(chip) {
+    if (view.selectedId && chip.getAttribute('data-activity-id') === view.selectedId) return true;
+    return Boolean(view.selectedLegacyId) && chip.getAttribute('data-legacy-id') === view.selectedLegacyId;
+  }
+
   function markSelected() {
     const chips = listEl.querySelectorAll('.chip');
     for (const chip of chips) {
-      chip.classList.toggle('selected', chip.getAttribute('data-activity-id') === view.selectedId);
+      chip.classList.toggle('selected', isSelectedChip(chip));
     }
-    // Reveal acts on the SELECTED activity, so it is only offered when there is one.
+    // Reveal acts on the SELECTED ACTIVITY's own directory, so it is only offered when there is
+    // one. A legacy item has no directory to reveal -- its file is a shared log outside the store,
+    // and `activity:reveal` takes an activity id -- so selecting one leaves this disabled.
     revealEl.disabled = !view.selectedId;
   }
 
-  // Is the list currently on screen still showing the selected activity?
+  // Is the list currently on screen still showing the selected item (of either kind)?
   function selectedChipPresent() {
     for (const chip of listEl.querySelectorAll('.chip')) {
-      if (chip.getAttribute('data-activity-id') === view.selectedId) return true;
+      if (isSelectedChip(chip)) return true;
     }
     return false;
   }
@@ -567,10 +664,11 @@ function boot(win, doc, api) {
   // was pruned: not being on this page is not proof of deletion, and the reader is the only thing
   // entitled to make that claim.
   function dropPrunedSelection(result) {
-    if (!view.selectedId) return;
+    if (!view.selectedId && !view.selectedLegacyId) return;
     if (result && result.truncated) return;
     if (selectedChipPresent()) return;
     view.selectedId = null;
+    view.selectedLegacyId = null;
     view.detail = null;
     paintDetail();
   }
@@ -587,8 +685,22 @@ function boot(win, doc, api) {
     paintDetail();
   }
 
+  // Task 5.1: a legacy item is selected WITHOUT touching the bridge -- the summary the list
+  // returned is the whole item. An id that is not in the current list selects nothing (the list
+  // was repainted underneath it), rather than painting a stale detail pane.
+  function selectLegacy(legacyId) {
+    const item = legacyItems.get(legacyId);
+    if (!item) return;
+    view.selectedId = null;
+    view.selectedLegacyId = legacyId;
+    view.detail = { item, available: true };
+    markSelected();
+    paintDetail();
+  }
+
   async function select(id) {
     view.selectedId = id;
+    view.selectedLegacyId = null; // the two selections are mutually exclusive
     markSelected();
     put(detailEl, el(doc, 'div', 'state state-loading', TEXT.loading));
     try {
@@ -613,6 +725,12 @@ function boot(win, doc, api) {
       // items; they matter to `activity:export`, whose Events section is filtered by them.)
       const result = await api.list(normalizeFilter(view.filter));
       put(listEl, renderList(doc, result));
+      // Task 5.1: index the legacy summaries this page painted, so a click on one is answered from
+      // here. Rebuilt per load, so an item that has rotated away cannot be selected afterwards.
+      legacyItems = new Map();
+      for (const item of (Array.isArray(result && result.items) ? result.items : [])) {
+        if (isLegacy(item) && legacyIdFrom(item.id)) legacyItems.set(item.id, item);
+      }
       listReady = true;
       if (pendingFocus) {
         // A deep link names an activity by id, which `activity:get` resolves whether or not the
@@ -663,20 +781,36 @@ function boot(win, doc, api) {
   });
 
   // Delegated: the chips themselves are produced by a pure renderer that attaches no listeners.
-  // The id is re-validated on the way out even though `renderChip` only ever writes a UUIDv4 --
-  // it is about to become the argument of a bridge call.
-  function chipIdFrom(target) {
+  function chipFrom(target) {
     let node = target;
     while (node && node !== listEl && !(node.classList && node.classList.contains('chip'))) {
       node = node.parentNode;
     }
-    if (!node || node === listEl) return null;
-    return focusIdFromHash(node.getAttribute('data-activity-id'));
+    return !node || node === listEl ? null : node;
+  }
+
+  // Both ids are re-validated here even though `renderChip` only ever writes a valid one: the
+  // activity id is about to become the argument of a bridge call, and the legacy id is checked by
+  // the same discipline so the two paths cannot be told apart by how carefully they are guarded.
+  // The ACTIVITY id is tried first and, when present, is the only thing that can happen -- a chip
+  // never carries both. Returns true when the chip was activated.
+  function activateChip(chip) {
+    const id = focusIdFromHash(chip.getAttribute('data-activity-id'));
+    if (id) {
+      if (id !== view.selectedId) select(id);
+      return true;
+    }
+    const legacyId = legacyIdFrom(chip.getAttribute('data-legacy-id'));
+    if (legacyId) {
+      if (legacyId !== view.selectedLegacyId) selectLegacy(legacyId);
+      return true;
+    }
+    return false;
   }
 
   listEl.addEventListener('click', (event) => {
-    const id = chipIdFrom(event.target);
-    if (id && id !== view.selectedId) select(id);
+    const chip = chipFrom(event.target);
+    if (chip) activateChip(chip);
   });
 
   // Keyboard activation for the focusable chips, delegated exactly like the click. Enter and
@@ -684,10 +818,10 @@ function boot(win, doc, api) {
   // instead of scrolling the list pane out from under it.
   listEl.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
-    const id = chipIdFrom(event.target);
-    if (!id) return;
+    const chip = chipFrom(event.target);
+    if (!chip) return;
     event.preventDefault();
-    if (id !== view.selectedId) select(id);
+    activateChip(chip);
   });
 
   // Ruling P4-8, second half: main deep-links into an ALREADY OPEN window by re-issuing
@@ -795,8 +929,8 @@ if (typeof module !== 'undefined') {
   module.exports = {
     sanitizeText, formatTime, formatDuration,
     renderChip, renderEventRow, renderProblemRow, renderStoreState, renderList,
-    renderEvents, renderProblems, renderDetail, describeProblem,
-    normalizeFilter, matchesEventFilter, focusIdFromHash,
+    renderEvents, renderProblems, renderDetail, renderLegacyDetail, describeProblem,
+    normalizeFilter, matchesEventFilter, focusIdFromHash, legacyIdFrom,
     boot, start,
   };
 }

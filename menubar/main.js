@@ -1492,9 +1492,20 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
+          // Activity History (Task 5.2 / Ruling P5-4): retention runs FIRST, before the refresh +
+          // rebuild below. `_spawnPythonRetain` is `spawnSync` -- retention has already finished
+          // deleting by the time it returns -- so refreshing first would let the cache name an
+          // activity retention then removed, and the tray would keep offering "View Errors" for a
+          // target the deep link cannot open until the next 30s tick corrected it (an earlier
+          // comment here claimed the opposite order was deliberate "so this tick's menu reflects
+          // pre-retention state"; showing a deleted item is not a state worth preserving).
+          // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+          // deletion of its own (Ruling B).
+          try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
           // Activity History (Task 4.4 / Ruling P4-14): the child wrote its terminal record before
-          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target before
-          // the rebuild below (and the one 500ms later, once status is finalized) reads it.
+          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target, from
+          // the POST-retention store, before the rebuild below (and the one 500ms later, once
+          // status is finalized) reads it.
           _refreshViewErrorsTarget();
           updateTrayMenu();
 
@@ -2658,7 +2669,7 @@ app.whenReady().then(async () => {
   // closed) is offered on the very first menu rather than 30s later.
   _refreshViewErrorsTarget();
   updateTrayMenu();
-  
+
   // Update menu every 30 seconds to keep "Last Sync" time accurate. The View Errors cache is
   // refreshed on the same tick -- it is the only thing that picks up an activity written by
   // ANOTHER process (a scheduled run, a manual `repo-radar` invocation), since this process sees
@@ -2833,6 +2844,25 @@ app.whenReady().then(async () => {
     // synchronous (spawnSync, like every other prune delegation in this subsystem) and never
     // throws; wrapped defensively anyway per this block's own established pattern.
     try { activityQuota._spawnPythonPrune(os.homedir(), 0); } catch (e) { /* best-effort */ }
+
+    // Activity History (Task 5.2): spawn the Python retention entrypoint once at startup. This
+    // MUST run after `activityQuota.configurePythonRunner(...)` above (set only when
+    // `runtimeChannel` resolved) -- same reason the prune call right above it is here and not
+    // any earlier: before that configuration, quota.js falls back to a bare `python3` + a
+    // repo-relative root that does not exist in a packaged app (see the configurePythonRunner
+    // call's own comment), so spawning any earlier silently no-ops in every packaged build.
+    // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+    // deletion of its own (Ruling B). `_spawnPythonRetain` itself never throws, but this call
+    // site guards anyway, matching the prune call's own best-effort style.
+    try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
+
+    // Activity History (Ruling P5-4): rebuild the menu from the POST-retention store. The seed
+    // refresh at tray creation ran ~2s ago, necessarily against the PRE-retention store, so
+    // without this the session's first menu can go on offering a "View Errors" target that the
+    // prune/retain passes above have already deleted -- until the 30s tick happens to correct it.
+    // Same best-effort guards as everything else in this block.
+    try { _refreshViewErrorsTarget(); } catch (e) { /* never break startup */ }
+    try { updateTrayMenu(); } catch (e) { /* never break startup */ }
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes

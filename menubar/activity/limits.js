@@ -31,11 +31,16 @@ const FIELD_MAX_BYTES = 8 * 1024;
 // total.
 const PROBLEMS_MAX_ROWS = 500;
 
-// listActivities returns SUMMARY DTOs only (no lens arrays). Each summary must serialize to at
-// most this many bytes, so a full page is bounded at LIST_MAX * SUMMARY_MAX_BYTES (~800 KiB).
-// The only free-form strings on a summary (channel/trigger/kind) are bounded to
-// SUMMARY_FIELD_MAX_BYTES each so the summary cap is met by construction; SUMMARY_MAX_BYTES is
-// then a guard read.js asserts, not a bound it relies on hitting.
+// listActivities returns SUMMARY DTOs only (no lens arrays). Each DURABLE summary must serialize to
+// at most this many bytes. The only free-form strings on one (channel/trigger/kind) are bounded to
+// SUMMARY_FIELD_MAX_BYTES each so the cap is met by construction; SUMMARY_MAX_BYTES is then a guard
+// read.js asserts, not a bound it relies on hitting.
+//
+// The FULL PAGE bound is the sum of two caps, not one (Task 5.1): a page holds at most LIST_MAX
+// durable summaries at SUMMARY_MAX_BYTES each (~800 KiB) PLUS at most LEGACY_MAX_FILES opaque
+// legacy items, which deliberately bypass this cap -- each carries an inline excerpt bounded
+// instead by LEGACY_EXCERPT_MAX_BYTES (~400 KiB in total). Both halves are bounded; they are
+// bounded by different constants, and neither is a bound on the other.
 const SUMMARY_MAX_BYTES = 4096;
 const SUMMARY_FIELD_MAX_BYTES = 1024;
 
@@ -77,6 +82,22 @@ const STATUS_ERROR_LOG_MAX_BYTES = 64 * 1024;
 // exhaust memory.
 const STATUS_MAX_BYTES = 8 * 1024 * 1024;
 
+// Task 5.1 (legacy `sync-*.log` adapter) bounds. These govern the PRE-CONTRACT per-run text logs
+// in the same shared `~/Library/Logs/repo-radar` directory -- not Activity data either, and read
+// only as opaque, clearly-marked legacy items.
+
+// Per-log excerpt: only the LAST this-many bytes of a `sync-*.log` are ever read (a bounded
+// `readSync` from `size - LEGACY_EXCERPT_MAX_BYTES`, never a whole-file read), and the returned
+// excerpt is re-bounded to the same number AFTER scrubbing. A cut excerpt carries a visible
+// leading marker line, exactly like a System stream tail.
+const LEGACY_EXCERPT_MAX_BYTES = 16 * 1024;
+
+// How many `sync-*.log` files are adapted per call, newest first by filename (which is a sortable
+// timestamp). repo_radar/modes/sync.py rotates to the newest 10, so this is generous for a real
+// installation while keeping a directory full of old logs -- from a larger historical retention,
+// or planted -- from inflating a list response (at most LEGACY_MAX_FILES * LEGACY_EXCERPT_MAX_BYTES).
+const LEGACY_MAX_FILES = 25;
+
 // Valid `event.level` values, also the valid `filter.level` values.
 const LEVELS = new Set(['info', 'warn', 'error']);
 
@@ -90,5 +111,6 @@ module.exports = {
   SEARCH_MAX,
   EXPORT_MAX_BYTES,
   SYSTEM_TAIL_MAX_BYTES, STATUS_ERROR_LIST_MAX, STATUS_ERROR_LOG_MAX_BYTES, STATUS_MAX_BYTES,
+  LEGACY_EXCERPT_MAX_BYTES, LEGACY_MAX_FILES,
   LEVELS,
 };
