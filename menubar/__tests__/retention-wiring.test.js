@@ -1,13 +1,17 @@
 'use strict';
 // Task 5.2: retention wiring landmarks in main.js -- the Python `retain` entrypoint
 // (`activityQuota._spawnPythonRetain`, Task 3.5) is spawned at exactly two points: once at app
-// start (after the tray exists) and once per sync completion (currentSyncProcess's `close`
-// handler), in the latter case AFTER that handler's existing `_refreshViewErrorsTarget()` +
-// `updateTrayMenu()` pair so this tick's menu still reflects pre-retention state (the spawned
-// Python runs async in spirit -- the next 30s tick or the next sync's own refresh sees whatever
-// retention pruned). Node performs NO deletion of its own (Ruling B) and the legacy
-// `_rotate_sync_logs` (repo_radar/sync.py:107-122) is independent and untouched -- this file also
-// asserts main.js never itself calls a delete primitive anywhere near the activity subsystem.
+// start (inside the post-configuration missed-syncs setTimeout, alongside the startup prune
+// delegation -- fix round 1: it must run AFTER `activityQuota.configurePythonRunner(...)`, or it
+// falls back to a `python3` + repo-relative-root default that does not exist in a packaged app,
+// silently no-op-ing behind a bounded console warn) and once per sync completion
+// (currentSyncProcess's `close` handler), in the latter case AFTER that handler's existing
+// `_refreshViewErrorsTarget()` + `updateTrayMenu()` pair so this tick's menu still reflects
+// pre-retention state (the spawned Python runs async in spirit -- the next 30s tick or the next
+// sync's own refresh sees whatever retention pruned). Node performs NO deletion of its own
+// (Ruling B) and the legacy `_rotate_sync_logs` (repo_radar/sync.py:107-122) is independent and
+// untouched -- this file also asserts main.js never itself calls a delete primitive anywhere near
+// the activity subsystem.
 //
 // main.js cannot be require()'d outside a running Electron process (it destructures
 // `{ app, Tray, ... }` off `require('electron')` and calls `app.requestSingleInstanceLock()` at
@@ -71,22 +75,45 @@ test('_spawnPythonRetain is called exactly twice: startup and post-sync close', 
     'exactly two retain spawns in main.js: once at startup, once in the sync close handler');
 });
 
-test('the startup retain spawn sits in the tray-setup region, adjacent to the seed refresh, ' +
-  'and never inside the 30s interval', () => {
-  // Same startup region view-errors-wiring.test.js's P4-14(b) test anchors: tray creation through
-  // the tray click handler -- this also spans the 30s setInterval tick, so a spawn accidentally
-  // placed inside that interval (re-running retain every 30s, not "once at startup") would still
-  // be caught by this same region, which is why the interval is excluded explicitly below too.
-  const startup = between("'Tray creation failed silently, quitting to avoid invisible process'", "tray.on('click'");
-  const count = (startup.match(/activityQuota\._spawnPythonRetain\(/g) || []).length;
-  assert.strictEqual(count, 1, 'one retain spawn in the startup/tray-setup region');
+test('the startup retain spawn is ordered strictly after configurePythonRunner(...)', () => {
+  // Fix round 1 (review): a retain spawn issued BEFORE configurePythonRunner(...) runs falls back
+  // to quota.js's bare `python3` + repo-relative-root default, which does not exist in a packaged
+  // app (see the configurePythonRunner call site's own comment a few lines above it in main.js) --
+  // the spawn then silently fails closed with only a bounded console warn, invisible in practice.
+  // This is the ordering assertion that would have caught that bug; a positional index check
+  // (rather than `between`, which requires both anchors unique -- configurePythonRunner( only
+  // ever appears once, so a plain indexOf pair is simplest here).
+  const configureAt = src.indexOf('activityQuota.configurePythonRunner(');
+  assert.notStrictEqual(configureAt, -1, 'main.js must still call configurePythonRunner');
+  assert.strictEqual(src.indexOf('activityQuota.configurePythonRunner(', configureAt + 1), -1,
+    'configurePythonRunner( must appear exactly once');
+  const startupSpawnAt = src.indexOf('activityQuota._spawnPythonRetain(os.homedir());', configureAt);
+  assert.notStrictEqual(startupSpawnAt, -1,
+    'the startup retain spawn must appear AFTER configurePythonRunner(...) in source order');
+});
 
+test('the startup retain spawn sits in the post-configuration missed-syncs setTimeout, ' +
+  'alongside the startup prune spawn, and never on the 30s tray-refresh interval', () => {
+  // Same block the pre-existing startup prune delegation already uses -- main.js's own comment
+  // there (and now the retain call's own comment) explains why: configurePythonRunner() must
+  // already have run by the time this fires, and this setTimeout is registered after that call.
+  // Anchored on code (not comments, which `src` has already stripped): the setTimeout's own body
+  // opener through its unique `}, 2000);` closer.
+  const missedSyncs = between('setTimeout(() => {\n    reconcileRunReceipt();', '}, 2000);');
+  const count = (missedSyncs.match(/activityQuota\._spawnPythonRetain\(/g) || []).length;
+  assert.strictEqual(count, 1, 'one retain spawn in the post-configuration missed-syncs setTimeout');
+
+  inOrder(missedSyncs, ['activityQuota._spawnPythonPrune(', 'activityQuota._spawnPythonRetain('],
+    'the startup retain spawn follows the startup prune delegation in the same block');
+
+  assert.ok(/try\s*\{\s*activityQuota\._spawnPythonRetain\(os\.homedir\(\)\);?\s*\}\s*catch/.test(missedSyncs),
+    'the startup call site guards the spawn (belt-and-suspenders; _spawnPythonRetain itself never throws)');
+
+  // Guard against a regression that moves it onto the recurring 30s tray-refresh tick instead of
+  // running once at startup.
   const interval = between('setInterval(() => {\n    _refreshViewErrorsTarget();', '}, 30000);');
   assert.strictEqual(/activityQuota\._spawnPythonRetain\(/.test(interval), false,
-    'the retain spawn must not run on the 30s tick -- startup only, per the brief');
-
-  assert.ok(/try\s*\{\s*activityQuota\._spawnPythonRetain\(os\.homedir\(\)\);?\s*\}\s*catch/.test(startup),
-    'the startup call site guards the spawn (belt-and-suspenders; _spawnPythonRetain itself never throws)');
+    'the retain spawn must not run on the 30s tray-refresh tick -- startup only, per the brief');
 });
 
 test('the close-handler retain spawn comes after the refresh + tray rebuild', () => {

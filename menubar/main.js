@@ -2666,14 +2666,6 @@ app.whenReady().then(async () => {
   _refreshViewErrorsTarget();
   updateTrayMenu();
 
-  // Activity History (Task 5.2): spawn the Python retention entrypoint once at startup, now that
-  // the tray exists (surfaceRuntimeError-adjacent failures above need `tray`, so nothing here
-  // runs before this point either). Independent of the legacy `_rotate_sync_logs`
-  // (repo_radar/sync.py) -- Node performs no deletion of its own (Ruling B); `_spawnPythonRetain`
-  // itself never throws, but this call site guards anyway, matching this block's established
-  // best-effort style (e.g. the reconcile/prune calls elsewhere in app.whenReady()).
-  try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
-
   // Update menu every 30 seconds to keep "Last Sync" time accurate. The View Errors cache is
   // refreshed on the same tick -- it is the only thing that picks up an activity written by
   // ANOTHER process (a scheduled run, a manual `repo-radar` invocation), since this process sees
@@ -2848,6 +2840,17 @@ app.whenReady().then(async () => {
     // synchronous (spawnSync, like every other prune delegation in this subsystem) and never
     // throws; wrapped defensively anyway per this block's own established pattern.
     try { activityQuota._spawnPythonPrune(os.homedir(), 0); } catch (e) { /* best-effort */ }
+
+    // Activity History (Task 5.2): spawn the Python retention entrypoint once at startup. This
+    // MUST run after `activityQuota.configurePythonRunner(...)` above (set only when
+    // `runtimeChannel` resolved) -- same reason the prune call right above it is here and not
+    // any earlier: before that configuration, quota.js falls back to a bare `python3` + a
+    // repo-relative root that does not exist in a packaged app (see the configurePythonRunner
+    // call's own comment), so spawning any earlier silently no-ops in every packaged build.
+    // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+    // deletion of its own (Ruling B). `_spawnPythonRetain` itself never throws, but this call
+    // site guards anyway, matching the prune call's own best-effort style.
+    try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes
