@@ -93,17 +93,23 @@ const RECORD_LINE_RE = /^\[(\d{2}):(\d{2}):(\d{2})\]\s+(\S+)/;
 //     `fetch_failed`, `pull_failed`, `metadata_failed`, `repo_exception`) plus `sync_aborted`,
 //     matched loosely enough to catch names that no longer exist in the tree.
 //   * warn names: `metadata_degraded` and the retry/timeout family.
-//   * a line containing `⚠` counts as a warning if it is not already an error -- the marker the
-//     app's own status writer uses for a degraded condition.
-//   * error wins over warn; a line matching neither counts as neither.
+//   * error wins over warn; a name matching neither counts as neither.
+//
+// Fix round 1: an earlier draft ALSO counted any line containing `⚠` as a warning. It was both
+// dead and self-contradicting -- `SyncLogger` never writes `⚠` into a `sync-*.log` (that marker
+// belongs to main.js's `status.json` errorLog, a different surface entirely), and scanning the
+// whole line is exactly what the rule above forbids: `[09:31:05] repo_unchanged note=⚠ odd` was
+// counted as a warning on the strength of a FIELD value. Removed, so the comment and the code say
+// the same thing: the event NAME decides, and nothing else does.
+//
 // Counts are over the EXCERPT (the bounded tail), which is why a truncated excerpt also marks the
 // item `incomplete`: they describe what was read, and the item says so.
 const LEGACY_ERROR_NAME_RE = /error|fail|fatal|exception|abort|denied/i;
 const LEGACY_WARN_NAME_RE = /warn|degrade|retry|timeout|stale/i;
 
-function _deriveLevel(line, name) {
+function _deriveLevel(name) {
   if (LEGACY_ERROR_NAME_RE.test(name)) return 'error';
-  if (LEGACY_WARN_NAME_RE.test(name) || line.includes('⚠')) return 'warn';
+  if (LEGACY_WARN_NAME_RE.test(name)) return 'warn';
   return null;
 }
 
@@ -163,7 +169,7 @@ function _scanExcerpt(text) {
     const m = RECORD_LINE_RE.exec(line);
     if (!m) continue;
     last = { h: Number(m[1]), m: Number(m[2]), s: Number(m[3]) };
-    const level = _deriveLevel(line, m[4]);
+    const level = _deriveLevel(m[4]); // the event NAME only -- never the rest of the line
     if (level === 'error') errorCount += 1;
     else if (level === 'warn') warnCount += 1;
   }
@@ -226,38 +232,29 @@ function _buildItem(name, match, excerpt) {
 }
 
 // -------------------------------------------------------------------------------------------
-// Public API
-// -------------------------------------------------------------------------------------------
-
-// `home` is the user's home directory (main.js/ipc.js pass process.env.HOME); `opts` takes the
-// same `configuredSecrets` as every other reader entry point. Returns newest-first, at most
-// `limits.LEGACY_MAX_FILES` items. NEVER throws.
-function legacyItems(home, { configuredSecrets = [] } = {}) {
-  if (typeof home !== 'string' || home.length === 0) return [];
-
-  let redactor;
-  try {
-    redactor = new redactMod.Redactor(configuredSecrets);
-  } catch (e) {
-    return []; // without a redactor NOTHING may be read -- the same rule system.js states
-  }
-
+// Enumeration -- the ONE place a candidate log file is identified.
+//
+// Opens nothing: it validates the directory (every component, O_NOFOLLOW), reads the names, and
+// keeps those that match LEGACY_FILENAME_RE AND parse as a real date/time. `legacyItems` tails the
+// ones it keeps; `legacyCandidateCount` only counts them. Returns `{ dir, candidates }`, newest
+// first (the filename stamp is fixed-width, so lexical order IS chronological order), or `null`
+// when there is no readable log directory. NEVER throws.
+function _candidates(home) {
+  if (typeof home !== 'string' || home.length === 0) return null;
   try {
     // Every directory component, O_NOFOLLOW: a symlinked `~/Library/Logs/repo-radar` must not hand
-    // us attacker-chosen "history". A refused directory yields NO items -- and is not silently
+    // us attacker-chosen "history". A refused directory yields NO candidates -- and is not silently
     // lost either: the System section reports that same refusal on all four of its streams.
     const logs = systemMod.validateDir(home, systemMod.LOG_SUBPATH);
-    if (!logs.dir) return [];
+    if (!logs.dir) return null;
 
     let names;
     try {
       names = fs.readdirSync(logs.dir);
     } catch (e) {
-      return [];
+      return null;
     }
 
-    // Newest first: the filename stamp is fixed-width, so lexical order IS chronological order.
-    // Sorting BEFORE the cap means the cap drops the oldest logs, never the newest.
     const candidates = [];
     for (const name of names) {
       const m = LEGACY_FILENAME_RE.exec(name);
@@ -266,12 +263,37 @@ function legacyItems(home, { configuredSecrets = [] } = {}) {
       candidates.push({ name, m });
     }
     candidates.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
-    const kept = candidates.slice(0, Math.max(0, limits.LEGACY_MAX_FILES));
+    return { dir: logs.dir, candidates };
+  } catch (e) {
+    return null;
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Public API
+// -------------------------------------------------------------------------------------------
+
+// `home` is the user's home directory (main.js/ipc.js pass process.env.HOME); `opts` takes the
+// same `configuredSecrets` as every other reader entry point. Returns newest-first, at most
+// `limits.LEGACY_MAX_FILES` items. NEVER throws.
+function legacyItems(home, { configuredSecrets = [] } = {}) {
+  let redactor;
+  try {
+    redactor = new redactMod.Redactor(configuredSecrets);
+  } catch (e) {
+    return []; // without a redactor NOTHING may be read -- the same rule system.js states
+  }
+
+  try {
+    const found = _candidates(home);
+    if (found === null) return [];
+    // Sorted BEFORE the cap, so the cap drops the OLDEST logs, never the newest.
+    const kept = found.candidates.slice(0, Math.max(0, limits.LEGACY_MAX_FILES));
 
     const items = [];
     for (const { name, m } of kept) {
-      // The name is validated ABOVE; this is the only place a path is built from it.
-      const tail = systemMod.readTailFile(path.join(logs.dir, name),
+      // The name was validated by `_candidates`; this is the only place a path is built from it.
+      const tail = systemMod.readTailFile(path.join(found.dir, name),
         limits.LEGACY_EXCERPT_MAX_BYTES, redactor);
       const excerpt = tail.present
         ? { text: tail.text, truncated: tail.truncated, reason: null }
@@ -291,4 +313,14 @@ function legacyItems(home, { configuredSecrets = [] } = {}) {
   }
 }
 
-module.exports = { legacyItems, LEGACY_FILENAME_RE };
+// How many per-run logs are PRESENT, for the one line the export owes its reader (Ruling P5-3).
+// Deliberately the cheap half of the work above: a directory walk, a readdir and the same
+// filename+date check -- no file is opened, no tail is read, no Redactor is built. It counts every
+// candidate, NOT just the `LEGACY_MAX_FILES` the window would show, because the sentence it feeds
+// is about what exists on disk and is missing from the export. 0 on any failure. NEVER throws.
+function legacyCandidateCount(home) {
+  const found = _candidates(home);
+  return found === null ? 0 : found.candidates.length;
+}
+
+module.exports = { legacyItems, legacyCandidateCount, LEGACY_FILENAME_RE };

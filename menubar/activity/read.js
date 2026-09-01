@@ -743,7 +743,10 @@ function _sortKey(entry) {
 //     unreadable, where the reader refuses to draw any history at all;
 //   * `viewErrorsTarget`/`_scanActivity` never see them (they are not incidents to open), and
 //     `buildExport` does not pass this flag either: an export item is the durable
-//     Events/Problems-lens document, which a legacy log has neither of.
+//     Events/Problems-lens document, which a legacy log has neither of. The export does not stay
+//     SILENT about them, though -- Ruling P5-3 has its System section declare how many are present
+//     and not included (see `_appendSystemSection`), so the two views can never be compared and
+//     read as "the logs are gone".
 function _collectItems(home, filter, redactor, opts = {}) {
   // Built first so the store-state early returns below can still carry them. Each is already a
   // complete summary DTO (redacted and bounded by legacy.js), so it is wrapped as an entry with
@@ -1005,13 +1008,25 @@ function _indent(text, pad) {
 
 // The trailing System section of an export. Takes the diagnostics object systemDiagnostics
 // returned (never re-reads anything itself) and appends its lines to `lines`.
-function _appendSystemSection(lines, diag) {
+//
+// `legacyCount` (Ruling P5-3) is the number of pre-contract `sync-*.log` files PRESENT on disk. The
+// Activity window shows them as opaque legacy items; this export deliberately does not carry them
+// (an export item is the durable Events/Problems-lens document, which a text log has neither of) --
+// so it says so, in one fixed line, rather than letting a reader compare the two views and conclude
+// the logs are gone. 0 omits the line entirely: there is then nothing missing to declare.
+function _appendSystemSection(lines, diag, legacyCount = 0) {
   // One blank line before the header, however the items section ended (each item already ends
   // with one; the "no activity recorded" case does not).
   if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
   lines.push('--- System (uncorrelated diagnostics) ---');
   lines.push('Shared app log streams and the legacy status file. These are NOT tied to any');
   lines.push('activity above and are not time-correlated with them.');
+  // Stated ABOVE the diagnostics-failure branch below: whether the streams could be collected has
+  // no bearing on how many per-run logs are sitting in the directory, and this line is the whole
+  // of what the export promises about them.
+  if (legacyCount > 0) {
+    lines.push(`${legacyCount} legacy sync log(s) present; not included in this export`);
+  }
   if (diag.error) {
     // A diagnostics-level failure means nothing below was established -- so nothing below is
     // printed. "(not present)" under a failed collection would be a claim this payload cannot
@@ -1137,7 +1152,13 @@ function buildExport(home, filter = {}, { configuredSecrets = [] } = {}) {
   // that the two views agree. Rendered LAST and counted toward EXPORT_MAX_BYTES like everything
   // else. The header says "uncorrelated" because that is the one thing a reader must not get
   // wrong: none of this belongs to the activities above.
-  _appendSystemSection(lines, systemMod.systemDiagnostics(home, { configuredSecrets }));
+  //
+  // Ruling P5-3: the section also declares how many legacy `sync-*.log` files are present but NOT
+  // included here (the window shows them; this document does not). The count is the CHEAP half of
+  // the legacy adapter -- one readdir plus the same filename+date check, no file opened and no tail
+  // read -- so an export pays nothing like the cost of the items it is declining to include.
+  _appendSystemSection(lines, systemMod.systemDiagnostics(home, { configuredSecrets }),
+    legacyMod.legacyCandidateCount(home));
 
   let text = lines.join('\n');
   const buf = Buffer.from(text, 'utf8');
@@ -1217,4 +1238,5 @@ module.exports = {
   systemDiagnostics: systemMod.systemDiagnostics,
   // Task 5.1: same pattern -- the legacy adapter is its own module, reached through this facade.
   legacyItems: legacyMod.legacyItems,
+  legacyCandidateCount: legacyMod.legacyCandidateCount,
 };

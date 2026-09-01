@@ -31,11 +31,16 @@ const FIELD_MAX_BYTES = 8 * 1024;
 // total.
 const PROBLEMS_MAX_ROWS = 500;
 
-// listActivities returns SUMMARY DTOs only (no lens arrays). Each summary must serialize to at
-// most this many bytes, so a full page is bounded at LIST_MAX * SUMMARY_MAX_BYTES (~800 KiB).
-// The only free-form strings on a summary (channel/trigger/kind) are bounded to
-// SUMMARY_FIELD_MAX_BYTES each so the summary cap is met by construction; SUMMARY_MAX_BYTES is
-// then a guard read.js asserts, not a bound it relies on hitting.
+// listActivities returns SUMMARY DTOs only (no lens arrays). Each DURABLE summary must serialize to
+// at most this many bytes. The only free-form strings on one (channel/trigger/kind) are bounded to
+// SUMMARY_FIELD_MAX_BYTES each so the cap is met by construction; SUMMARY_MAX_BYTES is then a guard
+// read.js asserts, not a bound it relies on hitting.
+//
+// The FULL PAGE bound is the sum of two caps, not one (Task 5.1): a page holds at most LIST_MAX
+// durable summaries at SUMMARY_MAX_BYTES each (~800 KiB) PLUS at most LEGACY_MAX_FILES opaque
+// legacy items, which deliberately bypass this cap -- each carries an inline excerpt bounded
+// instead by LEGACY_EXCERPT_MAX_BYTES (~400 KiB in total). Both halves are bounded; they are
+// bounded by different constants, and neither is a bound on the other.
 const SUMMARY_MAX_BYTES = 4096;
 const SUMMARY_FIELD_MAX_BYTES = 1024;
 

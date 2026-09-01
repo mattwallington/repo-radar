@@ -135,6 +135,27 @@ test('levels are derived from the record line NAME, never from a continuation li
   }
 });
 
+// Fix round 1 (review, promoted minor): an earlier draft also counted any line containing `⚠` as a
+// warning -- dead against the real producer (SyncLogger never writes it into a sync-*.log) and a
+// direct contradiction of the "event NAME only" rule, since a FIELD VALUE could trip it.
+test('a field value can never set the level -- only the event name can', () => {
+  const home = tmpHome();
+  try {
+    seedLog(home, 'sync-2026-08-14T09-31-05.log', [
+      '[09:31:05] repo_unchanged repo=owner/a note=⚠ odd',
+      '[09:31:06] repos_loaded count=1 last_error=clone_failed',
+      '[09:31:07] sync_complete total=1 errors=0 warnings=0',
+      '',
+    ].join('\n'));
+    const it = legacy.legacyItems(home)[0];
+    assert.strictEqual(it.warnCount, 0, 'a ⚠ in a field is not a warning record');
+    assert.strictEqual(it.errorCount, 0, 'nor is an error name quoted in a field an error record');
+    assert.strictEqual(it.hasProblems, false);
+  } finally {
+    cleanup(home);
+  }
+});
+
 test('a log with nothing problem-shaped reports zero counts and no problems', () => {
   const home = tmpHome();
   try {
@@ -523,6 +544,87 @@ test('a legacy id is refused by getActivity -- it is not, and can never be, an a
     const id = read.listActivities(home).items[0].id;
     assert.strictEqual(id, 'legacy:sync-2026-08-14T09:31:05');
     assert.throws(() => read.getActivity(home, id), read.InvalidActivityId);
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// 8b. The export declares what it is NOT carrying (Ruling P5-3, fix round 1)
+// -------------------------------------------------------------------------------------------
+test('the export names how many legacy logs are present but not included', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-00000000000b';
+    seedActivity(home, aid, [
+      startRec(aid, 0, '2026-08-16T00:00:00-07:00'),
+      terminalRec(aid, 1, '2026-08-16T00:05:00-07:00', 'succeeded'),
+    ]);
+    seedLog(home, 'sync-2026-08-14T09-31-05.log', SAMPLE);
+    seedLog(home, 'sync-2026-08-10T09-31-05.log', '[09:31:05] repos_loaded count=1\n');
+    seedLog(home, 'sync.log', 'a shared stream, not a per-run log\n'); // must not be counted
+
+    const text = read.buildExport(home);
+    assert.ok(text.includes('2 legacy sync log(s) present; not included in this export'),
+      `the export must declare the omission, got:\n${text}`);
+    // ...and it really is an omission: no legacy item is rendered into the document.
+    assert.ok(!text.includes('legacy:sync-'), 'a legacy item is never an export item');
+    assert.ok(!text.includes('clone_failed'), 'nor is its excerpt');
+    assert.ok(text.includes(`Activity ${aid}`), 'the durable activity is still there');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an export with no legacy logs omits the line entirely', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-00000000000b';
+    seedActivity(home, aid, [
+      startRec(aid, 0, '2026-08-16T00:00:00-07:00'),
+      terminalRec(aid, 1, '2026-08-16T00:05:00-07:00', 'succeeded'),
+    ]);
+    const text = read.buildExport(home);
+    assert.ok(!text.includes('not included in this export'),
+      'with nothing missing there is nothing to declare');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('the count is the cheap enumeration: every candidate, no file opened', () => {
+  const home = tmpHome();
+  const saved = limits.LEGACY_MAX_FILES;
+  try {
+    limits.LEGACY_MAX_FILES = 1; // the window would show ONE...
+    for (let i = 0; i < 4; i += 1) {
+      seedLog(home, `sync-2026-08-1${i}T09-31-05.log`, `[09:31:05] repos_loaded count=${i}\n`);
+    }
+    // ...but the export's line is about what is on DISK, so it counts all four.
+    assert.strictEqual(legacy.legacyCandidateCount(home), 4);
+    assert.strictEqual(read.listActivities(home).items.length, 1);
+    assert.ok(read.buildExport(home).includes('4 legacy sync log(s) present; not included in this export'));
+  } finally {
+    limits.LEGACY_MAX_FILES = saved;
+    cleanup(home);
+  }
+});
+
+test('legacyCandidateCount never throws and refuses the same things legacyItems does', () => {
+  assert.strictEqual(legacy.legacyCandidateCount(null), 0);
+  assert.strictEqual(legacy.legacyCandidateCount(42), 0);
+  assert.strictEqual(legacy.legacyCandidateCount(path.join(os.tmpdir(), 'rr-legacy-nope')), 0);
+  const home = tmpHome();
+  try {
+    assert.strictEqual(legacy.legacyCandidateCount(home), 0, 'no log directory yet');
+    // A symlinked log directory is refused here exactly as it is for the items.
+    const evil = path.join(home, 'evil-logs');
+    fs.mkdirSync(evil, { recursive: true });
+    fs.writeFileSync(path.join(evil, 'sync-2026-08-14T09-31-05.log'), '[09:31:05] planted\n');
+    fs.mkdirSync(path.join(home, 'Library', 'Logs'), { recursive: true });
+    fs.symlinkSync(evil, logDir(home));
+    assert.strictEqual(legacy.legacyCandidateCount(home), 0);
+    assert.ok(!read.buildExport(home).includes('not included in this export'));
   } finally {
     cleanup(home);
   }
