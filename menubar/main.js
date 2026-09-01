@@ -1497,6 +1497,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           // the rebuild below (and the one 500ms later, once status is finalized) reads it.
           _refreshViewErrorsTarget();
           updateTrayMenu();
+          // Activity History (Task 5.2): retain runs AFTER the refresh + rebuild above, on
+          // purpose -- retention deletes settled activities that the refresh just read, so
+          // ordering it last means THIS tick's menu still reflects pre-retention state; the next
+          // refresh (the 30s tick, or the next sync's own close) picks up whatever retention
+          // pruned. Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node
+          // performs no deletion of its own (Ruling B).
+          try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
 
           // If user cancelled, stay on idle icon — don't show error
           if (wasCancelled) {
@@ -2658,7 +2665,15 @@ app.whenReady().then(async () => {
   // closed) is offered on the very first menu rather than 30s later.
   _refreshViewErrorsTarget();
   updateTrayMenu();
-  
+
+  // Activity History (Task 5.2): spawn the Python retention entrypoint once at startup, now that
+  // the tray exists (surfaceRuntimeError-adjacent failures above need `tray`, so nothing here
+  // runs before this point either). Independent of the legacy `_rotate_sync_logs`
+  // (repo_radar/sync.py) -- Node performs no deletion of its own (Ruling B); `_spawnPythonRetain`
+  // itself never throws, but this call site guards anyway, matching this block's established
+  // best-effort style (e.g. the reconcile/prune calls elsewhere in app.whenReady()).
+  try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
+
   // Update menu every 30 seconds to keep "Last Sync" time accurate. The View Errors cache is
   // refreshed on the same tick -- it is the only thing that picks up an activity written by
   // ANOTHER process (a scheduled run, a manual `repo-radar` invocation), since this process sees
