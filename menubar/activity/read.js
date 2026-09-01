@@ -751,18 +751,23 @@ function _collectItems(home, filter, redactor, opts = {}) {
   // Built first so the store-state early returns below can still carry them. Each is already a
   // complete summary DTO (redacted and bounded by legacy.js), so it is wrapped as an entry with
   // `mtime: 0` -- `_sortKey` reads its `startedAt`, which a legacy item always has.
-  const legacyEntries = opts.legacy
-    ? legacyMod.legacyItems(home, { configuredSecrets: opts.configuredSecrets || [] })
-      .map((item) => ({ item, mtime: 0 }))
-    : [];
+  // Ruling P5-5: the DETAILED form, so `legacyOmitted` can carry what legacy.js's own
+  // LEGACY_MAX_FILES cap dropped. Without it the cap is invisible: `truncated` below is derived
+  // from the merged array, which the cap has already shortened, so 26 valid logs reported
+  // `{ items: 25, truncated: false }`.
+  const legacyDetailed = opts.legacy
+    ? legacyMod.legacyItemsDetailed(home, { configuredSecrets: opts.configuredSecrets || [] })
+    : { items: [], omitted: 0 };
+  const legacyOmitted = legacyDetailed.omitted;
+  const legacyEntries = legacyDetailed.items.map((item) => ({ item, mtime: 0 }));
   const sorted = (entries) => entries.slice().sort((a, b) => _sortKey(b) - _sortKey(a)).map((e) => e.item);
 
   const base = _activityRoot(home);
   const state = _probeRoot(base);
   if (state === 'missing') {
-    return { items: sorted(legacyEntries), available: true, incomplete: false, problems: [] };
+    return { items: sorted(legacyEntries), available: true, incomplete: false, problems: [], legacyOmitted };
   }
-  if (state === 'unreadable') return { items: [], available: false, incomplete: false, problems: [] };
+  if (state === 'unreadable') return { items: [], available: false, incomplete: false, problems: [], legacyOmitted: 0 };
 
   const { subdirs, rejected } = paths.listOwnedSubdirsDetailed(base);
   const aids = subdirs.filter((name) => name !== 'quota' && idsMod.validActivityId(name));
@@ -795,6 +800,7 @@ function _collectItems(home, filter, redactor, opts = {}) {
     available: true,
     incomplete,
     problems,
+    legacyOmitted,
   };
 }
 
@@ -914,7 +920,7 @@ function _safeScanActivity(home, aid) {
 function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   validateFilter(filter);
   const redactor = new redactMod.Redactor(configuredSecrets);
-  const { items, available, incomplete, problems } = _collectItems(home, filter, redactor,
+  const { items, available, incomplete, problems, legacyOmitted } = _collectItems(home, filter, redactor,
     { legacy: true, configuredSecrets });
 
   if (!available) {
@@ -930,7 +936,12 @@ function listActivities(home, filter = {}, { configuredSecrets = [] } = {}) {
   // bounded: a durable summary by _boundSummary, a legacy one by legacy.js's own excerpt cap.
   const sliced = items.slice(offset, offset + limit)
     .map((full) => (full.legacy === true ? full : _boundSummary(_summaryOf(full))));
-  const truncated = offset + sliced.length < items.length;
+  // Two independent ways this page can be short of the truth, and BOTH must set the flag
+  // (Ruling P5-5): the merged list was sliced here, or legacy.js's own LEGACY_MAX_FILES cap
+  // already dropped candidates before the merge ever saw them. The second is invisible to the
+  // slice arithmetic -- `items` is post-cap -- which is exactly how 26 valid logs used to come
+  // back as `{ items: 25, truncated: false }`.
+  const truncated = offset + sliced.length < items.length || legacyOmitted > 0;
 
   return { items: sliced, truncated, available, incomplete, problems };
 }
@@ -1238,5 +1249,6 @@ module.exports = {
   systemDiagnostics: systemMod.systemDiagnostics,
   // Task 5.1: same pattern -- the legacy adapter is its own module, reached through this facade.
   legacyItems: legacyMod.legacyItems,
+  legacyItemsDetailed: legacyMod.legacyItemsDetailed,
   legacyCandidateCount: legacyMod.legacyCandidateCount,
 };

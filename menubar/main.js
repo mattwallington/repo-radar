@@ -1492,18 +1492,22 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
+          // Activity History (Task 5.2 / Ruling P5-4): retention runs FIRST, before the refresh +
+          // rebuild below. `_spawnPythonRetain` is `spawnSync` -- retention has already finished
+          // deleting by the time it returns -- so refreshing first would let the cache name an
+          // activity retention then removed, and the tray would keep offering "View Errors" for a
+          // target the deep link cannot open until the next 30s tick corrected it (an earlier
+          // comment here claimed the opposite order was deliberate "so this tick's menu reflects
+          // pre-retention state"; showing a deleted item is not a state worth preserving).
+          // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+          // deletion of its own (Ruling B).
+          try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
           // Activity History (Task 4.4 / Ruling P4-14): the child wrote its terminal record before
-          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target before
-          // the rebuild below (and the one 500ms later, once status is finalized) reads it.
+          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target, from
+          // the POST-retention store, before the rebuild below (and the one 500ms later, once
+          // status is finalized) reads it.
           _refreshViewErrorsTarget();
           updateTrayMenu();
-          // Activity History (Task 5.2): retain runs AFTER the refresh + rebuild above, on
-          // purpose -- retention deletes settled activities that the refresh just read, so
-          // ordering it last means THIS tick's menu still reflects pre-retention state; the next
-          // refresh (the 30s tick, or the next sync's own close) picks up whatever retention
-          // pruned. Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node
-          // performs no deletion of its own (Ruling B).
-          try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
 
           // If user cancelled, stay on idle icon — don't show error
           if (wasCancelled) {
@@ -2851,6 +2855,14 @@ app.whenReady().then(async () => {
     // deletion of its own (Ruling B). `_spawnPythonRetain` itself never throws, but this call
     // site guards anyway, matching the prune call's own best-effort style.
     try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
+
+    // Activity History (Ruling P5-4): rebuild the menu from the POST-retention store. The seed
+    // refresh at tray creation ran ~2s ago, necessarily against the PRE-retention store, so
+    // without this the session's first menu can go on offering a "View Errors" target that the
+    // prune/retain passes above have already deleted -- until the 30s tick happens to correct it.
+    // Same best-effort guards as everything else in this block.
+    try { _refreshViewErrorsTarget(); } catch (e) { /* never break startup */ }
+    try { updateTrayMenu(); } catch (e) { /* never break startup */ }
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes

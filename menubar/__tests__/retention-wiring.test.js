@@ -5,10 +5,11 @@
 // delegation -- fix round 1: it must run AFTER `activityQuota.configurePythonRunner(...)`, or it
 // falls back to a `python3` + repo-relative-root default that does not exist in a packaged app,
 // silently no-op-ing behind a bounded console warn) and once per sync completion
-// (currentSyncProcess's `close` handler), in the latter case AFTER that handler's existing
-// `_refreshViewErrorsTarget()` + `updateTrayMenu()` pair so this tick's menu still reflects
-// pre-retention state (the spawned Python runs async in spirit -- the next 30s tick or the next
-// sync's own refresh sees whatever retention pruned). Node performs NO deletion of its own
+// (currentSyncProcess's `close` handler), in BOTH cases BEFORE the `_refreshViewErrorsTarget()` +
+// `updateTrayMenu()` pair that follows it (Ruling P5-4, fix round 2: `_spawnPythonRetain` is
+// `spawnSync`, so retention has already deleted by the time it returns -- refreshing FIRST could
+// cache an activity retention then removed, leaving the tray offering a dead "View Errors" deep
+// link until the next 30s tick). Node performs NO deletion of its own
 // (Ruling B) and the legacy `_rotate_sync_logs` (repo_radar/sync.py:107-122) is independent and
 // untouched -- this file also asserts main.js never itself calls a delete primitive anywhere near
 // the activity subsystem.
@@ -109,6 +110,14 @@ test('the startup retain spawn sits in the post-configuration missed-syncs setTi
   assert.ok(/try\s*\{\s*activityQuota\._spawnPythonRetain\(os\.homedir\(\)\);?\s*\}\s*catch/.test(missedSyncs),
     'the startup call site guards the spawn (belt-and-suspenders; _spawnPythonRetain itself never throws)');
 
+  // Ruling P5-4, startup half: the seed refresh near tray creation runs ~2s BEFORE this block, so
+  // it necessarily reads the PRE-retention store. Without a second refresh + rebuild after the
+  // retain call here, the first menu of the session can keep offering a "View Errors" target that
+  // startup retention has already deleted -- until the 30s tick happens to correct it.
+  inOrder(missedSyncs,
+    ['activityQuota._spawnPythonRetain(', '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'startup: the menu is rebuilt from the POST-retention store, after the retain spawn');
+
   // Guard against a regression that moves it onto the recurring 30s tray-refresh tick instead of
   // running once at startup.
   const interval = between('setInterval(() => {\n    _refreshViewErrorsTarget();', '}, 30000);');
@@ -116,12 +125,20 @@ test('the startup retain spawn sits in the post-configuration missed-syncs setTi
     'the retain spawn must not run on the 30s tray-refresh tick -- startup only, per the brief');
 });
 
-test('the close-handler retain spawn comes after the refresh + tray rebuild', () => {
+test('the close-handler retain spawn comes BEFORE the refresh + tray rebuild', () => {
+  // Ruling P5-4 (Codex final verdict, BLOCKER): the original ordering here was refresh -> rebuild
+  // -> retain, justified by "this tick's menu reflects pre-retention state". That justification was
+  // wrong. `_spawnPythonRetain` is `spawnSync` -- retention has ALREADY finished deleting by the
+  // time it returns -- so a refresh performed before it could cache an activity that retention then
+  // deleted, and the tray kept offering "View Errors" for a target the deep link could no longer
+  // open (reviewer repro: one 90-day-expired `failed` activity + 50 recent `succeeded` -- the old
+  // one is selected, retention deletes it, a fresh lookup returns null). The cache must therefore be
+  // recomputed from the POST-retention store: retain first, THEN refresh, THEN rebuild.
   const close = between("currentSyncProcess.on('close'", "currentSyncProcess.on('error'");
   const count = (close.match(/activityQuota\._spawnPythonRetain\(/g) || []).length;
   assert.strictEqual(count, 1, 'one retain spawn in the close handler');
-  inOrder(close, ['_refreshViewErrorsTarget()', 'updateTrayMenu()', 'activityQuota._spawnPythonRetain('],
-    'sync close: refresh, then rebuild, then retain (so this tick\'s menu reflects pre-retention state)');
+  inOrder(close, ['activityQuota._spawnPythonRetain(', '_refreshViewErrorsTarget()', 'updateTrayMenu()'],
+    'sync close: retain, then refresh, then rebuild (the cache must never name a just-deleted activity)');
 });
 
 test('main.js never itself deletes anything near the activity subsystem (Ruling B)', () => {

@@ -275,20 +275,34 @@ function _candidates(home) {
 
 // `home` is the user's home directory (main.js/ipc.js pass process.env.HOME); `opts` takes the
 // same `configuredSecrets` as every other reader entry point. Returns newest-first, at most
-// `limits.LEGACY_MAX_FILES` items. NEVER throws.
-function legacyItems(home, { configuredSecrets = [] } = {}) {
+// `limits.LEGACY_MAX_FILES` items, PLUS the number of candidates the cap dropped. NEVER throws.
+//
+// Ruling P5-5 (Codex final verdict): the cap used to be silent. `read.listActivities` derives its
+// `truncated` flag from the already-capped merged array, so 26 valid logs came back as
+// `{ items: 25, truncated: false }` -- a complete-looking history that was quietly missing a log.
+// `omitted` is what the cap dropped (candidates beyond `LEGACY_MAX_FILES`), so the reader can say
+// so. It counts CANDIDATES, not successfully-read items: a candidate inside the cap that turns out
+// to have vanished between the readdir and the open is an ordinary absence, not something hidden
+// from the reader, and is skipped below without inflating this number.
+//
+// `legacyItems` (below) stays the thin, unchanged wrapper every existing caller already uses.
+function legacyItemsDetailed(home, { configuredSecrets = [] } = {}) {
   let redactor;
   try {
     redactor = new redactMod.Redactor(configuredSecrets);
   } catch (e) {
-    return []; // without a redactor NOTHING may be read -- the same rule system.js states
+    // without a redactor NOTHING may be read -- the same rule system.js states. Nothing was read,
+    // so nothing is being HIDDEN by the cap either: `omitted` is 0, not the candidate count.
+    return { items: [], omitted: 0 };
   }
 
   try {
     const found = _candidates(home);
-    if (found === null) return [];
+    if (found === null) return { items: [], omitted: 0 };
     // Sorted BEFORE the cap, so the cap drops the OLDEST logs, never the newest.
-    const kept = found.candidates.slice(0, Math.max(0, limits.LEGACY_MAX_FILES));
+    const cap = Math.max(0, limits.LEGACY_MAX_FILES);
+    const kept = found.candidates.slice(0, cap);
+    const omitted = found.candidates.length - kept.length;
 
     const items = [];
     for (const { name, m } of kept) {
@@ -305,12 +319,18 @@ function legacyItems(home, { configuredSecrets = [] } = {}) {
       if (!tail.present && excerpt.reason === null) continue;
       items.push(_buildItem(name, m, excerpt));
     }
-    return items;
+    return { items, omitted };
   } catch (e) {
     // Containment, and a FIXED answer: an unexpected failure above cannot be described without
     // quoting an error message that routinely carries the user's absolute home path.
-    return [];
+    return { items: [], omitted: 0 };
   }
+}
+
+// The historical signature: items only, newest-first, at most `limits.LEGACY_MAX_FILES`. NEVER
+// throws. Callers that need to know whether the cap hid anything use `legacyItemsDetailed`.
+function legacyItems(home, opts) {
+  return legacyItemsDetailed(home, opts).items;
 }
 
 // How many per-run logs are PRESENT, for the one line the export owes its reader (Ruling P5-3).
@@ -323,4 +343,4 @@ function legacyCandidateCount(home) {
   return found === null ? 0 : found.candidates.length;
 }
 
-module.exports = { legacyItems, legacyCandidateCount, LEGACY_FILENAME_RE };
+module.exports = { legacyItems, legacyItemsDetailed, legacyCandidateCount, LEGACY_FILENAME_RE };

@@ -610,6 +610,80 @@ test('the count is the cheap enumeration: every candidate, no file opened', () =
   }
 });
 
+// -------------------------------------------------------------------------------------------
+// Ruling P5-5 (Codex final verdict): the LEGACY_MAX_FILES cap must be REPORTED, not silent.
+//
+// `legacyItems` drops the oldest candidates beyond the cap; `listActivities` used to compute
+// `truncated` purely from the already-capped merged array, so 26 valid logs produced
+// `{ items: 25, truncated: false }` -- the window drew a complete-looking history that was
+// silently missing a log. `legacyItemsDetailed` now reports how many candidates the cap omitted,
+// and `listActivities` folds that into `truncated`.
+// -------------------------------------------------------------------------------------------
+
+// Distinct, sortable per-run log names: sync-2026-08-14T09-<MM>-05.log.
+function seedNumberedLogs(home, n) {
+  for (let i = 0; i < n; i += 1) {
+    const mm = String(i).padStart(2, '0');
+    seedLog(home, `sync-2026-08-14T09-${mm}-05.log`, `[09:${mm}:05] repos_loaded count=${i}\n`);
+  }
+}
+
+test('legacyItemsDetailed reports the candidates the cap omitted', () => {
+  const home = tmpHome();
+  try {
+    seedNumberedLogs(home, limits.LEGACY_MAX_FILES + 1);
+    const detailed = legacy.legacyItemsDetailed(home);
+    assert.strictEqual(detailed.items.length, limits.LEGACY_MAX_FILES);
+    assert.strictEqual(detailed.omitted, 1, 'one candidate beyond the cap was dropped');
+    // The thin wrapper is unchanged for every existing caller.
+    assert.deepStrictEqual(legacy.legacyItems(home).map((i) => i.id),
+      detailed.items.map((i) => i.id));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('legacyItemsDetailed reports omitted:0 when nothing was dropped', () => {
+  const home = tmpHome();
+  try {
+    seedNumberedLogs(home, limits.LEGACY_MAX_FILES);
+    const detailed = legacy.legacyItemsDetailed(home);
+    assert.strictEqual(detailed.items.length, limits.LEGACY_MAX_FILES);
+    assert.strictEqual(detailed.omitted, 0);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('26 legacy logs: listActivities reports truncated:true (the cap is no longer silent)', () => {
+  const home = tmpHome();
+  try {
+    seedNumberedLogs(home, 26);                       // one more than LEGACY_MAX_FILES (25)
+    const result = read.listActivities(home);
+    assert.strictEqual(result.items.length, 25, 'the cap still bounds the page');
+    assert.strictEqual(result.truncated, true,
+      'the 26th log exists and is not shown -- the response must say so');
+    // The export's own count is about what is on DISK and is unaffected by the cap.
+    assert.strictEqual(legacy.legacyCandidateCount(home), 26);
+    assert.ok(read.buildExport(home).includes('26 legacy sync log(s) present'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('25 legacy logs: listActivities reports truncated:false (nothing was hidden)', () => {
+  const home = tmpHome();
+  try {
+    seedNumberedLogs(home, 25);
+    const result = read.listActivities(home);
+    assert.strictEqual(result.items.length, 25);
+    assert.strictEqual(result.truncated, false, 'every candidate is on the page');
+    assert.strictEqual(legacy.legacyCandidateCount(home), 25);
+  } finally {
+    cleanup(home);
+  }
+});
+
 test('legacyCandidateCount never throws and refuses the same things legacyItems does', () => {
   assert.strictEqual(legacy.legacyCandidateCount(null), 0);
   assert.strictEqual(legacy.legacyCandidateCount(42), 0);
