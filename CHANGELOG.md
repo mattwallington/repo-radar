@@ -4,18 +4,20 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.0.31] - 2026-09-01
 
-On the **dev channel** (Repo Radar Dev) for testing before the next stable release.
+### Added
+- **Activity History (Phases 1–5).** Durable per-attempt sync history, with a context-isolated Activity window (tray → 🗒 Activity), Events / Problems lenses, a System diagnostics section, redacted export, and a never-empty View Errors deep link. It replaces the Sync Errors window: Clear Errors is gone, and the error icon now clears on the next successful sync. Pre-existing `sync-*.log` files now show up as opaque "legacy" items, never correlated to durable activities, and exports note when legacy logs are omitted. Automatic retention now runs at app start and after every sync: routine activities older than 14 days and problem activities older than 90 days are deleted, with the newest 50 activities protected from that age-based deletion. The 64 MiB history ceiling overrides that protection — if history is over the ceiling it prunes within the newest 50 as well, always keeping the newest problem activity.
 
 ### Fixed
 - **GPT-5.6 Sol / Terra / Luna input limits.** The catalog recorded the models' 1,050,000-token *total* context as their *input* window; corrected to the real 922,000 (total minus the 128,000 output reservation), caught by the release-time model-window gate.
+
+## [1.0.30] - 2026-08-12
 
 ### Changed
 - **Authoritative token counting for Claude.** Metadata generation now preflights each prompt through Anthropic's Count-Tokens endpoint and accepts, splits, or (for a single oversized item) trims it against the model's *real* window — replacing the conservative multiplier added in 1.0.29. When an authoritative count isn't available (non-Anthropic models, provider errors, or transient failures) it falls back to the existing safe behaviour, so it is never less safe than before, and a batch that still can't fit is only ever split further — never silently merged past what fits. A repository that genuinely cannot be summarised is recorded as a visible `degraded` entry instead of failing quietly.
 
 ### Added
-- **Activity History (Phases 1–5).** Durable per-attempt sync history, with a context-isolated Activity window (tray → 🗒 Activity), Events / Problems lenses, a System diagnostics section, redacted export, and a never-empty View Errors deep link. It replaces the Sync Errors window: Clear Errors is gone, and the error icon now clears on the next successful sync. Pre-existing `sync-*.log` files now show up as opaque "legacy" items, never correlated to durable activities, and exports note when legacy logs are omitted. Automatic retention now runs at app start and after every sync: routine activities older than 14 days and problem activities older than 90 days are deleted, with the newest 50 activities protected from that age-based deletion. The 64 MiB history ceiling overrides that protection — if history is over the ceiling it prunes within the newest 50 as well, always keeping the newest problem activity.
 - **Model capability catalog.** Every model's context / input / output window and token-counting strategy now live in one explicit place, with a 1% acceptance-budget headroom, so budget decisions no longer depend on scattered constants.
 - **Release-time model-window gate.** `release.sh` now fails the release closed if a catalog window value drifts above what litellm reports, unless a vendor-verified, freshness-bounded override justifies the difference — so a stale or wrong window cannot ship.
 
