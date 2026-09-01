@@ -1,0 +1,50 @@
+[
+  {
+    "name": "valid-entry",
+    "bytes_b64": "eyJyZXNlcnZlZCI6IDYxNDQwLCAiZ3JhbnRlZCI6IDB9",
+    "expected": {
+      "reserved": 61440,
+      "granted": 0
+    }
+  },
+  {
+    "name": "utf8-bom-prefixed",
+    "bytes_b64": "77u/eyJyZXNlcnZlZCI6IDYxNDQwLCAiZ3JhbnRlZCI6IDB9",
+    "expected": "corrupt"
+  },
+  {
+    "name": "utf16le-encoded",
+    "bytes_b64": "ewAiAHIAZQBzAGUAcgB2AGUAZAAiADoAIAA2ADEANAA0ADAALAAgACIAZwByAGEAbgB0AGUAZAAiADoAIAAwAH0A",
+    "expected": "corrupt"
+  },
+  {
+    "name": "extra-field-invalid-utf8-byte",
+    "bytes_b64": "eyJyZXNlcnZlZCI6IDYxNDQwLCAiZ3JhbnRlZCI6IDAsICJub3RlIjogIv8ifQ==",
+    "expected": "corrupt"
+  },
+  {
+    "name": "truncated-json",
+    "bytes_b64": "eyJyZXNlcnZlZCI6NjE0",
+    "expected": "corrupt"
+  },
+  {
+    "name": "json-array-not-object",
+    "bytes_b64": "WzEsIDIsIDNd",
+    "expected": "corrupt"
+  },
+  {
+    "name": "reserved-mismatch",
+    "bytes_b64": "eyJyZXNlcnZlZCI6IDEsICJncmFudGVkIjogMH0=",
+    "expected": "corrupt"
+  },
+  {
+    "name": "negative-granted",
+    "bytes_b64": "eyJyZXNlcnZlZCI6IDYxNDQwLCAiZ3JhbnRlZCI6IC0xfQ==",
+    "expected": "corrupt"
+  },
+  {
+    "name": "float-granted",
+    "bytes_b64": "eyJyZXNlcnZlZCI6IDYxNDQwLCAiZ3JhbnRlZCI6IDEuMH0=",
+    "expected": "corrupt"
+  }
+]

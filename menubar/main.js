@@ -1,4 +1,4 @@
-const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog, Notification } = require('electron');
+const { app, Tray, Menu, BrowserWindow, ipcMain, nativeImage, clipboard, dialog, shell, Notification } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const os = require('os');
@@ -17,6 +17,19 @@ const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig } = require('./model-notice');
+// Activity History (Task 2.3): Electron-free trigger-glue wired into triggerSync()/stop-sync
+// below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
+const activityGlue = require('./activity/trigger-glue');
+const activityQuota = require('./activity/quota');
+// Activity History (Task 4.1): the narrow, allowlisted IPC surface the Activity window talks to.
+// activity/ipc.js is deliberately Electron-free, so the real `shell`/`dialog` are injected here.
+const activityIpc = require('./activity/ipc');
+// Activity History (Task 4.2 / Ruling P4-5): the Activity window's hardened webPreferences, kept
+// as one frozen constant so they can be asserted by a test main.js itself can never be loaded in.
+const { ACTIVITY_WEB_PREFERENCES } = require('./activity/window-options');
+// Activity History (Task 4.4 / Ruling P4-12): the reader, for the ONE question the tray asks it --
+// `viewErrorsTarget`. Every richer read still goes through activity/ipc.js on behalf of the window.
+const activityRead = require('./activity/read');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -148,7 +161,7 @@ if (!fs.existsSync(CONFIG_DIR) && fs.existsSync(OLD_CONFIG_DIR)) {
 let tray = null;
 let logWindow = null;
 let settingsWindow = null;
-let errorWindow = null;
+let activityWindow = null; // Activity History (Task 4.2) -- the one context-isolated content window
 let statusServer = null;
 let currentSyncProcess = null;
 let syncCancelledByUser = false;
@@ -479,6 +492,44 @@ Note: Read-only reference. Current working directory may differ.
   }
 }
 
+// Activity History (Task 4.4 / Ruling P4-14): the tray's "⚠️ View Errors" target, as a CACHE.
+//
+// `updateTrayMenu()` is called from ~24 sites -- several per progress event during a sync, once
+// per tray click, once every 30s -- and it is also on the sync path itself (triggerSync rebuilds
+// the menu before the child is spawned). The reader answer costs a walk of the activity store, so
+// the menu build must never compute it: it reads this variable and nothing else.
+//
+// The cache is instead recomputed at the EVENTS that can change the answer, each of which already
+// rebuilds the menu right afterwards: startup, a sync child exiting, and each of the three
+// pre-attempt failures that write a `blocked`/`failed` terminal without ever spawning a child.
+// The 30s menu tick refreshes it too, so a change made by anything outside this process (a
+// scheduled run's activity, a manual `repo-radar` invocation) is picked up within one tick.
+//
+// `null` means "no affordance" and is the correct answer whenever the reader cannot say otherwise.
+let viewErrorsTargetId = null;
+
+// Recompute the cache. Never throws -- the callers are icon/menu paths and a sync's exit handler.
+// `viewErrorsTarget` is itself never-throws, so the catch is the second line of defence; it leaves
+// one bounded breadcrumb rather than failing silently, because a persistently unreadable store is
+// something a user reporting "the tray never offers View Errors" would need explained.
+function _refreshViewErrorsTarget() {
+  try {
+    // Same HOME the Activity IPC handlers are registered with, so the tray and the window it
+    // opens always read the same store. `configuredSecrets` is passed for parity with every other
+    // reader call site (Ruling P4-3); this particular path returns only a validated id, so it has
+    // nothing to redact -- see read.js.
+    const home = process.env.HOME;
+    viewErrorsTargetId = activityRead.viewErrorsTarget(home, {
+      configuredSecrets: activityGlue.loadConfiguredSecrets(home),
+    });
+  } catch (e) {
+    viewErrorsTargetId = null;
+    console.warn('View Errors target refresh failed:',
+      String((e && e.message) || e).slice(0, 200));
+  }
+  return viewErrorsTargetId;
+}
+
 // Update tray menu
 function updateTrayMenu() {
   const status = loadStatus();
@@ -550,18 +601,41 @@ function updateTrayMenu() {
       label: '📊 View Progress',
       click: () => showLogWindow()
     });
+    // Task 4.5: Activity History, available in BOTH branches. "📊 View Progress" is the live tail
+    // of the run in flight; this is the durable record of every past attempt, and it is the only
+    // unconditional way into the window -- "⚠️ View Errors" below appears only when the cache
+    // holds a problem item, so a user with a clean history would otherwise have no entry point.
+    // No focus id: the window opens on the list, not deep-linked at anything.
+    menuItems.push({
+      label: '🗒 Activity',
+      click: () => showActivityWindow()
+    });
   } else {
     // Sync not running - show Sync Now
     menuItems.push({
       label: '▶ Sync Now',
       click: () => triggerSync()
     });
-    
-    // Optionally show View Errors if there are errors
-    if (status.hasErrors) {
+
+    // The same unconditional entry as the syncing branch above -- see the note there for why it
+    // appears in both and why it carries no focus id.
+    menuItems.push({
+      label: '🗒 Activity',
+      click: () => showActivityWindow()
+    });
+
+    // View Errors (Task 4.4 / Rulings P4-6, P4-14): the same window as the entry above, but
+    // GATED -- it exists only when the cache holds an actual item to open, and it deep-links
+    // straight to that item.
+    // `status.hasErrors` no longer gates it -- that flag was set by pre-attempt failures which
+    // produce no `errorList`, so it could offer "View Errors" for a window that had nothing to
+    // render. It still drives the tray icon above, unchanged. This is a plain READ: the reader is
+    // never called from a menu build (P4-14 (a)).
+    const viewErrorsId = viewErrorsTargetId;
+    if (viewErrorsId) {
       menuItems.push({
         label: '⚠️  View Errors',
-        click: () => showErrorWindow()
+        click: () => showActivityWindow(viewErrorsId)
       });
     }
   }
@@ -1077,7 +1151,23 @@ function startStatusServer() {
 // Trigger sync
 function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {}) {
   const options = { showWindow, trigger, notBefore };
+
+  // Activity History (Task 2.3): establish activity identity + lease + `start` FIRST, before any
+  // gate below (identity-before-first-gate) -- so a contention/guard-block rejection still
+  // produces a real Activity History item (skipped/blocked) rather than vanishing silently.
+  // beginManualActivity() never throws; a refused/failed mint just yields an inactive writer
+  // whose methods are safe no-ops, so this can never change whether the sync itself proceeds.
+  // `trigger || 'manual'` mirrors the SAME fallback already used a few lines below for
+  // shellEnv.REPO_RADAR_TRIGGER -- the ordinary "Sync Now" tray click calls triggerSync() with no
+  // args at all, so the destructured `trigger` is `null` there; the `start` record's `trigger`
+  // field is schema-required to be a string, so passing the raw `null` through would silently
+  // fail to record a start (and therefore never record activity history) for that primary path.
+  const activity = activityGlue.beginManualActivity(os.homedir(), {
+    channel: runtimeChannel, trigger: trigger || 'manual',
+  });
+
   if (currentSyncProcess) {
+    activityGlue.onContention(activity.writer, 'already-syncing');
     return; // Already syncing
   }
 
@@ -1099,12 +1189,56 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       blockedStatus.errorLog = (blockedStatus.errorLog || '') + `\n⚠️ ${reason}\n`;
       saveStatus(blockedStatus);
       showErrorIcon();
-      updateTrayMenu();
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('terminal-output', `\n⚠️ ${reason}\n`);
       }
+      // Activity History (Task 4.4 / Ruling P4-14): write the `blocked` terminal FIRST (onGuardBlock
+      // is synchronous), then refresh, then rebuild -- so the menu this produces already offers the
+      // incident. This is the exact failure the feature exists to surface; the old order rebuilt
+      // the menu before the terminal existed and left it missing until the next 30s tick.
+      activityGlue.onGuardBlock(activity.writer, reason);
+      _refreshViewErrorsTarget();
+      updateTrayMenu();
+      // Ruling P4-21: same silent-refusal problem as the runtime-disabled guard below -- a manual
+      // click got a tray icon change and nothing else. Deep-link the Activity window at the
+      // `blocked` item; scheduled syncs stay headless.
+      if (showWindow) showActivityWindow(activity.writer.activityId);
       return;
     }
+  }
+
+  // Sync disabled: either the build channel couldn't be resolved, or
+  // ensureRuntime() failed during startup (see app.whenReady()). Surface the
+  // same way a failed spawn would have, rather than silently doing nothing.
+  //
+  // Ruling P4-21: this sits ABOVE the status reset and showLogWindow() deliberately. It depends
+  // only on module state and `activity.writer`, both settled by now, and when it fires nothing
+  // about the previous sync may be disturbed: the reset never runs (the prior errorLog/errorList
+  // survive for the Activity window to explain), no progress window is created, and no
+  // `sync-started` is scheduled. Below the reset -- where this used to live -- a refusal opened
+  // the progress window, handed it the full repo grid, and hung it at "Starting sync..." forever,
+  // because the ⚠️ terminal-output line below goes to a stream the repos grid never renders.
+  if (runtimeDisabled || !runtimeChannel) {
+    const reason = runtimeDisabledReason || 'runtime channel unresolved';
+    console.error('Sync disabled:', reason);
+    const status = loadStatus();
+    status.hasErrors = true;
+    status.errorLog = (status.errorLog || '') + `\n⚠️ Sync unavailable: ${reason}\n`;
+    saveStatus(status);
+    showErrorIcon();
+    if (logWindow && !logWindow.isDestroyed()) {
+      logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
+    }
+    // Activity History (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild.
+    activityGlue.onGuardBlock(activity.writer, reason);
+    _refreshViewErrorsTarget();
+    updateTrayMenu();
+    // Ruling P4-21: a MANUAL "Sync Now" that is refused must land the user on the incident. The
+    // id is the `blocked` item onGuardBlock just wrote; a refused/inactive writer has none, and
+    // showActivityWindow() simply opens the list unfocused then. Scheduled syncs
+    // (showWindow=false, from checkMissedSync) stay headless -- no window of any kind.
+    if (showWindow) showActivityWindow(activity.writer.activityId);
+    return;
   }
 
   syncCancelledByUser = false;
@@ -1278,23 +1412,12 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   if (options && options.notBefore) shellEnv.REPO_RADAR_CATCHUP_NOT_BEFORE = options.notBefore;
   shellEnv.REPO_RADAR_CHANNEL = runtimeChannel;
 
-  // Sync disabled: either the build channel couldn't be resolved, or
-  // ensureRuntime() failed during startup (see app.whenReady()). Surface the
-  // same way a failed spawn would have, rather than silently doing nothing.
-  if (runtimeDisabled || !runtimeChannel) {
-    const reason = runtimeDisabledReason || 'runtime channel unresolved';
-    console.error('Sync disabled:', reason);
-    const status = loadStatus();
-    status.hasErrors = true;
-    status.errorLog = (status.errorLog || '') + `\n⚠️ Sync unavailable: ${reason}\n`;
-    saveStatus(status);
-    showErrorIcon();
-    updateTrayMenu();
-    if (logWindow && !logWindow.isDestroyed()) {
-      logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
-    }
-    return;
-  }
+  // Activity History (Task 2.3): hand the activity's identity/owner-token/lease-fd-number to the
+  // child via env (handOffEnv() is empty for an inactive/refused writer, so this is a no-op
+  // then). The lock FD ITSELF is passed separately below via `lockFd` for fd-inheritance --
+  // runtime.runSync() (Task 2.4) maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD
+  // to that child-side fd number.
+  Object.assign(shellEnv, activity.writer.handOffEnv());
 
   console.log('Starting sync via runtime.runSync (channel:', runtimeChannel, ')', ['sync', '--status-server']);
   console.log('Environment - GEMINI_API_KEY:', !!shellEnv.GEMINI_API_KEY);
@@ -1319,8 +1442,16 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     channel: runtimeChannel,
     env: shellEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
-    onChild: (child) => {
+    // Activity History (Task 2.3/2.4): forward the held lease fd for fd-inheritance. runSync()
+    // maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD to that child-side number.
+    lockFd: activity.lockFd,
+    onChild: async (child) => {
       currentSyncProcess = child;
+      // Activity History (Task 2.3): tag the child with its activity writer so the separate
+      // `stop-sync` IPC handler (a persistent top-level listener with no access to this
+      // invocation's local `activity`) can find it later. Rides along with currentSyncProcess's
+      // own existing lifecycle -- no new module-level state to keep in sync with it.
+      currentSyncProcess._activityWriter = activity.writer;
       logSyncState('process-spawned');
 
       // Capture output for the UI + in-memory status
@@ -1361,6 +1492,21 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
+          // Activity History (Task 5.2 / Ruling P5-4): retention runs FIRST, before the refresh +
+          // rebuild below. `_spawnPythonRetain` is `spawnSync` -- retention has already finished
+          // deleting by the time it returns -- so refreshing first would let the cache name an
+          // activity retention then removed, and the tray would keep offering "View Errors" for a
+          // target the deep link cannot open until the next 30s tick corrected it (an earlier
+          // comment here claimed the opposite order was deliberate "so this tick's menu reflects
+          // pre-retention state"; showing a deleted item is not a state worth preserving).
+          // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+          // deletion of its own (Ruling B).
+          try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
+          // Activity History (Task 4.4 / Ruling P4-14): the child wrote its terminal record before
+          // exiting, so this attempt's outcome is durable NOW -- recompute the cached target, from
+          // the POST-retention store, before the rebuild below (and the one 500ms later, once
+          // status is finalized) reads it.
+          _refreshViewErrorsTarget();
           updateTrayMenu();
 
           // If user cancelled, stay on idle icon — don't show error
@@ -1456,6 +1602,11 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           saveStatus(status);
 
           showErrorIcon();
+          // Activity History (Task 4.4 / Ruling P4-14): this path writes no terminal of its own
+          // today, but it rebuilds the tray -- and every rebuild reads the cached target, so the
+          // refresh comes first here too rather than leaving one rebuild in the file that does not
+          // pair with one.
+          _refreshViewErrorsTarget();
           updateTrayMenu();
         } catch (e) {
           console.error('Error in error handler:', e);
@@ -1465,6 +1616,25 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           updateTrayMenu();
         }
       });
+
+      // Activity History (Task 2.3): best-effort, bounded (<=5s) wait for the child's ack or
+      // exit. Deliberately AFTER all the listener wiring above, so the existing close/error/data
+      // handling is registered synchronously exactly as before -- this hand-off wait runs
+      // CONCURRENTLY with (not instead of) the sync actually happening, never kills a healthy
+      // child, and never blocks/alters the sync itself.
+      try {
+        await activityGlue.handOff({ writer: activity.writer, child, home: os.homedir() });
+      } catch (e) {
+        console.error('activity hand-off failed:', e);
+      }
+      // Activity History (Task 4.4 / Ruling P4-14): the hand-off is one of the places this
+      // attempt's outcome becomes durable -- it writes `failed` when the adopter rejected the
+      // lease, and otherwise lets the reconciler synthesize a terminal -- so the target cached
+      // before the spawn can be stale the moment it returns. Refresh, then rebuild, the same
+      // ordering the guard blocks and the child's `close` use. Outside the try because a hand-off
+      // that THREW is exactly when a terminal is most likely to have been written by someone else.
+      _refreshViewErrorsTarget();
+      updateTrayMenu();
     },
   }).catch((e) => {
     if (e && e.code === 75) {
@@ -1478,6 +1648,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           body: 'A sync is already running.'
         }).show();
       }
+      // Activity History (Task 2.3): the child never spawned, so Electron is the sole holder --
+      // same "manual contention is Electron's alone" authority as the already-syncing guard
+      // above, just discovered later (after the root exec lock rejected us).
+      activityGlue.onContention(activity.writer, 'root-busy');
       return;
     }
 
@@ -1496,6 +1670,11 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     saveStatus(status);
 
     showErrorIcon();
+    // Activity History (Task 2.3): no child ever ran -- Electron finalizes this attempt itself.
+    // (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild -- same ordering as the
+    // two guard blocks above, for the same reason.
+    activity.writer.terminal('failed');
+    _refreshViewErrorsTarget();
     updateTrayMenu();
   });
 }
@@ -1661,46 +1840,65 @@ function showSettingsWindow() {
   });
 }
 
-// Show error window
-function sendErrorData(win) {
-  const status = loadStatus();
-  win.webContents.send('error-log-loaded', {
-    errors: status.errorList || [],
-    errorLog: status.errorLog || ''
-  });
+// Activity History (Task 4.4): the legacy "Sync Errors" window is subsumed by the Activity
+// window. It rendered `status.json`'s `errorList`/`errorLog` and nothing else, so a failure that
+// produced no per-repo errors -- a dev-guard block, an unresolved runtime channel, a sync that
+// never spawned -- opened it completely empty. Both of those legacy surfaces are now the Activity
+// window's System section (Task 4.3), alongside the durable per-attempt history that actually
+// explains such a failure.
+//
+// This is kept as the ONE named entry point the remaining legacy caller uses (the progress
+// window's error-stat click, via `open-error-window` below). A null target simply opens the
+// Activity window unfocused -- the user still lands somewhere with content, never on a blank page.
+function showErrorWindow() {
+  return showActivityWindow(viewErrorsTargetId);
 }
 
-function showErrorWindow() {
-  if (errorWindow && !errorWindow.isDestroyed()) {
-    errorWindow.show();
-    errorWindow.focus();
-    // Re-send error data to refresh the display
-    sendErrorData(errorWindow);
-    return;
+// Activity History (Task 4.2). The ONE context-isolated content window in this app: its renderer
+// displays text produced by external tooling, so it runs sandboxed, with no Node integration, and
+// reaches main only through the four allowlisted channels of renderer/activity-preload.js. Every
+// other window above deliberately keeps its legacy nodeIntegration:true preferences -- do not copy
+// them here, and do not add a preload literal: ACTIVITY_WEB_PREFERENCES is the single source of
+// that posture (activity/window-options.js), asserted by __tests__/activity-window-security.test.js.
+//
+// `focusId` (optional, Ruling P4-8) selects one activity once the list loads. It travels as the
+// loaded URL's FRAGMENT rather than over a channel, so the preload's four-method allowlist stays
+// exact; the renderer accepts it only if it is a UUIDv4, so a malformed one simply selects nothing.
+// Task 4.4 wires the caller.
+function showActivityWindow(focusId) {
+  const page = path.join(__dirname, 'renderer', 'activity.html');
+  const loadOptions = focusId ? { hash: String(focusId) } : null;
+
+  if (activityWindow && !activityWindow.isDestroyed()) {
+    // Re-issue the load ONLY for a deep link. The URL differs from the open one by its FRAGMENT
+    // alone, so Chromium treats it as a same-document navigation: the page is not reloaded and
+    // the renderer keeps its state -- it learns the new id from the `hashchange` event it listens
+    // for (renderer/activity.js), and selects that activity. An ordinary reopen re-issues nothing,
+    // so whatever the user had selected simply stays on screen.
+    if (loadOptions) activityWindow.loadFile(page, loadOptions);
+    activityWindow.show();
+    activityWindow.focus();
+    return activityWindow;
   }
 
-  errorWindow = new BrowserWindow({
-    width: 800,
-    height: 600,
-    title: 'Sync Errors',
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    },
-    show: false
+  activityWindow = new BrowserWindow({
+    width: 1000,
+    height: 680,
+    minWidth: 720,
+    minHeight: 460,
+    title: `${getAppDisplayName()} - Activity`,
+    backgroundColor: '#1e1e1e',
+    show: false,
+    center: true,
+    webPreferences: Object.assign({}, ACTIVITY_WEB_PREFERENCES)
   });
 
-  errorWindow.loadFile(path.join(__dirname, 'renderer', 'error.html'));
+  if (loadOptions) activityWindow.loadFile(page, loadOptions);
+  else activityWindow.loadFile(page);
 
-  errorWindow.once('ready-to-show', () => {
-    errorWindow.show();
-    // Push error data after window is ready (don't rely solely on renderer requesting it)
-    setTimeout(() => sendErrorData(errorWindow), 100);
-  });
-
-  errorWindow.on('closed', () => {
-    errorWindow = null;
-  });
+  activityWindow.once('ready-to-show', () => activityWindow.show());
+  activityWindow.on('closed', () => { activityWindow = null; });
+  return activityWindow;
 }
 
 // Load config and send to settings window
@@ -2051,33 +2249,12 @@ ipcMain.on('load-config', (event) => {
   event.reply('config-loaded', config);
 });
 
-ipcMain.on('load-error-log', (event) => {
-  const status = loadStatus();
-  event.reply('error-log-loaded', {
-    errors: status.errorList || [],
-    errorLog: status.errorLog || ''
-  });
-});
-
+// Activity History (Task 4.4): the progress window's error-stat click. The channel keeps its name
+// -- renderer/renderer.js still sends it -- but it now opens the Activity window at the newest
+// item worth showing. The channels the deleted error page owned (`load-error-log`,
+// `error-log-loaded`, `clear-errors`) went with it: renderer/error.html was their only sender.
 ipcMain.on('open-error-window', (event) => {
   showErrorWindow();
-});
-
-ipcMain.on('clear-errors', (event) => {
-  const status = loadStatus();
-  status.errorList = [];
-  status.errorLog = '';
-  status.hasErrors = false;
-  saveStatus(status);
-  updateTrayMenu();
-  
-  // Notify error window if open
-  if (errorWindow && !errorWindow.isDestroyed()) {
-    errorWindow.webContents.send('error-log-loaded', {
-      errors: [],
-      errorLog: ''
-    });
-  }
 });
 
 ipcMain.on('save-config', (event, config) => {
@@ -2133,8 +2310,10 @@ ipcMain.on('stop-sync', (event) => {
   });
   
   try {
-    // Try graceful SIGTERM first
-    currentSyncProcess.kill('SIGTERM');
+    // Activity History (Task 2.3): record cancel-intent BEFORE the graceful SIGTERM below, then
+    // send that SAME first SIGTERM through onCancel (not a second, separate kill call) so the
+    // existing SIGKILL/system-kill escalation timers further down are completely unchanged.
+    activityGlue.onCancel({ writer: currentSyncProcess._activityWriter, child: currentSyncProcess, home: os.homedir() });
     console.log('Sent SIGTERM to sync process');
     
     // Check if process responded after 1 second
@@ -2196,6 +2375,14 @@ ipcMain.on('stop-sync', (event) => {
 
 ipcMain.handle('model-notice:get', (event) => modelNoticeController ? modelNoticeController.getView(event.sender) : null);
 ipcMain.on('model-notice:action', (event, action) => { if (modelNoticeController) modelNoticeController.onAction(event.sender, action); });
+
+// Activity History (Task 4.1): exactly four allowlisted channels, registered once at startup.
+// Every handler validates its own input and returns only bounded, already-redacted DTOs.
+activityIpc.register(ipcMain, activityIpc.createHandlers({
+  home: process.env.HOME,
+  shell,
+  dialog,
+}));
 
 // Check if we need to catch up on a missed sync
 // Adopt a completion receipt written by a sync that ran while this app was closed.
@@ -2477,11 +2664,19 @@ app.whenReady().then(async () => {
     return;
   }
 
-  // Update menu initially
+  // Update menu initially. Activity History (Task 4.4 / Ruling P4-14): seed the View Errors cache
+  // first, so a failure from a previous session (or from a scheduled run made while the app was
+  // closed) is offered on the very first menu rather than 30s later.
+  _refreshViewErrorsTarget();
   updateTrayMenu();
-  
-  // Update menu every 30 seconds to keep "Last Sync" time accurate
+
+  // Update menu every 30 seconds to keep "Last Sync" time accurate. The View Errors cache is
+  // refreshed on the same tick -- it is the only thing that picks up an activity written by
+  // ANOTHER process (a scheduled run, a manual `repo-radar` invocation), since this process sees
+  // no event for those. Deliberately NOT done in the tray-click handler below: a click must not
+  // pay for a store walk.
   setInterval(() => {
+    _refreshViewErrorsTarget();
     updateTrayMenu();
   }, 30000);
   
@@ -2598,6 +2793,29 @@ app.whenReady().then(async () => {
       // unexpected throw here take down app.whenReady().
       surfaceRuntimeError(`unexpected ensureRuntime error: ${e.message}`);
     }
+
+    // Activity History (Codex B3a): point quota.js's delegated Python-prune spawn at the SAME
+    // managed venv interpreter + repo_radar package location the runtime block above just
+    // ensured/verified for this channel, instead of the hardcoded dev-only `python3` +
+    // source-checkout REPO_ROOT default quota.js falls back to (see quota.js's header comment on
+    // Ruling B delegation) -- that default does not exist in a packaged app. `layout(...).current`
+    // is the exact `<channelDir>/current` symlink runtime/index.js's _fastCandidate/
+    // _fullVerifyCurrent and runtime/activation.js's verifyRuntime/flipCurrent all resolve
+    // against; its target directory contains BOTH `venv/bin/python` and `repo_radar/` (see
+    // runtime/provision.js's staging layout), exactly mirroring quota.js's dev-fallback shape (a
+    // root containing `repo_radar/`, with a python binary alongside it). Configured
+    // unconditionally whenever the channel resolved -- independent of ensureRuntime's outcome
+    // above -- because activity/writer.js still records `blocked` terminals (trigger-glue.js's
+    // onGuardBlock) even when the runtime failed to provision, and quota.js's spawnSync-based
+    // delegation already fails closed + now warns (Codex B3b) on a missing/broken interpreter, so
+    // pointing it at the channel's `current` unconditionally is never worse than the previous
+    // hardcoded default.
+    const activityRuntimeLayout = layout(os.homedir(), runtimeChannel);
+    activityQuota.configurePythonRunner({
+      python: path.join(activityRuntimeLayout.current, 'venv', 'bin', 'python'),
+      cwd: activityRuntimeLayout.current,
+      env: { PYTHONPATH: activityRuntimeLayout.current },
+    });
   }
 
   buildModelNoticeController();
@@ -2613,6 +2831,38 @@ app.whenReady().then(async () => {
     // stable's schedule and stable's lastSync and launch a paid dev catch-up for an occurrence it
     // does not own — after which the stable app may still run the real one.
     if (runtimeChannel === SCHEDULING_CHANNEL) checkMissedSync();
+
+    // Activity History (Task 2.3): reconcile once at startup, so an activity left `start`-only
+    // by a prior crash (of Electron itself, or of a handed-off worker while we were closed) gets
+    // settled instead of sitting "running" forever. Node's activity subsystem deliberately never
+    // does this full-sweep reconciliation itself (Ruling B: Node only ever appends, via the
+    // single-activity reconcile.synthesizeTerminal path trigger-glue.js's handOff() uses) --
+    // ALL multi-activity reconcile-then-clear passes are delegated to the same Python
+    // `prune.py` entrypoint admit() already spawns on demand, which reconciles-all under one
+    // held quota.lock BEFORE it ever prunes. Headroom 0 asks it to reconcile without requesting
+    // any extra room, so it prunes only if something is already over the ceiling. Best-effort,
+    // synchronous (spawnSync, like every other prune delegation in this subsystem) and never
+    // throws; wrapped defensively anyway per this block's own established pattern.
+    try { activityQuota._spawnPythonPrune(os.homedir(), 0); } catch (e) { /* best-effort */ }
+
+    // Activity History (Task 5.2): spawn the Python retention entrypoint once at startup. This
+    // MUST run after `activityQuota.configurePythonRunner(...)` above (set only when
+    // `runtimeChannel` resolved) -- same reason the prune call right above it is here and not
+    // any earlier: before that configuration, quota.js falls back to a bare `python3` + a
+    // repo-relative root that does not exist in a packaged app (see the configurePythonRunner
+    // call's own comment), so spawning any earlier silently no-ops in every packaged build.
+    // Independent of the legacy `_rotate_sync_logs` (repo_radar/sync.py) -- Node performs no
+    // deletion of its own (Ruling B). `_spawnPythonRetain` itself never throws, but this call
+    // site guards anyway, matching the prune call's own best-effort style.
+    try { activityQuota._spawnPythonRetain(os.homedir()); } catch (e) { /* best-effort */ }
+
+    // Activity History (Ruling P5-4): rebuild the menu from the POST-retention store. The seed
+    // refresh at tray creation ran ~2s ago, necessarily against the PRE-retention store, so
+    // without this the session's first menu can go on offering a "View Errors" target that the
+    // prune/retain passes above have already deleted -- until the 30s tick happens to correct it.
+    // Same best-effort guards as everything else in this block.
+    try { _refreshViewErrorsTarget(); } catch (e) { /* never break startup */ }
+    try { updateTrayMenu(); } catch (e) { /* never break startup */ }
   }, 2000);
   
   // Periodically check for missed syncs every 30 minutes

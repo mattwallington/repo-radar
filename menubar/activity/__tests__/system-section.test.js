@@ -1,0 +1,843 @@
+'use strict';
+// Task 4.3: the System section -- bounded, redacted, explicitly UNCORRELATED tails of the app's
+// shared log streams plus the legacy `~/.config/repo-radar/status.json` error surface.
+//
+// What these tests pin, beyond "it returns something":
+//   * the four streams are always reported, in a fixed order, with `menubar.log` (which has no
+//     in-tree writer) honestly reported ABSENT rather than invented;
+//   * a stream is never read whole -- only the last SYSTEM_TAIL_MAX_BYTES, with a visible leading
+//     marker and a UTF-8-safe leading cut;
+//   * a symlink is REFUSED, never followed -- on ANY component: a symlinked log FILE, and (fix
+//     round 1) a symlinked PARENT DIRECTORY, which O_NOFOLLOW on the file alone did not catch;
+//   * a truncated tail starts at a LINE boundary, so a credential straddling the byte cut cannot
+//     survive as an unmatchable fragment (fix round 1) -- and when the window holds no newline at
+//     all it is returned EMPTY, marker only, on both surfaces that share the helper: a shared
+//     stream tail and status.json's `errorLog` (fix round 2, Ruling P4-18);
+//   * a malformed-but-present status.json field is reported, never folded into "nothing here"
+//     (fix round 1);
+//   * the legacy status surface is bounded on BOTH axes (50 newest entries, 64 KiB of errorLog)
+//     and every string on it -- `stackTrace` included -- is redacted;
+//   * redaction is WIRED, not merely available: a configured secret that matches none of
+//     redact.js's built-in patterns is masked in the diagnostics object, in the `activity:list`
+//     `system` payload, and in the export text;
+//   * nothing ever throws out of `systemDiagnostics` -- an unexpected failure is reported as data.
+//
+// Every tmp dir is prefixed `rr-sys-` and removed in a `finally`, per the repo's tmp-dir policy.
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const read = require('../read');
+const system = require('../system');
+const limits = require('../limits');
+const ipc = require('../ipc');
+
+// A secret matching NONE of redact.js's built-in credential forms: proof the CONFIGURED-secret
+// wiring reaches every string, not just the pattern sweep.
+const SECRET = 'qz8Vt3nLp0Xw2Rk9';
+
+function tmpHome() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'rr-sys-'));
+}
+
+function cleanup(home) {
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+function logDir(home) {
+  return path.join(home, 'Library', 'Logs', 'repo-radar');
+}
+
+function seedStream(home, name, text) {
+  const dir = logDir(home);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, name), text);
+  return path.join(dir, name);
+}
+
+function seedStatus(home, status) {
+  const dir = path.join(home, '.config', 'repo-radar');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'status.json'), typeof status === 'string' ? status : JSON.stringify(status));
+  return path.join(dir, 'status.json');
+}
+
+function streamsByName(diag) {
+  const out = {};
+  for (const s of diag.streams) out[s.name] = s;
+  return out;
+}
+
+function errorEntry(over = {}) {
+  return {
+    timestamp: '2026-08-14T10:00:00.000Z',
+    repo: 'acme/widgets',
+    message: 'clone failed',
+    fullError: 'fatal: could not read from remote repository',
+    stackTrace: null,
+    ...over,
+  };
+}
+
+// -------------------------------------------------------------------------------------------
+// Shape and stream enumeration
+// -------------------------------------------------------------------------------------------
+test('systemDiagnostics reports the four shared streams in a fixed order, marked uncorrelated', () => {
+  const home = tmpHome();
+  try {
+    const diag = system.systemDiagnostics(home, { configuredSecrets: [] });
+    assert.strictEqual(diag.uncorrelated, true, 'the payload says, in data, that it is uncorrelated');
+    assert.deepStrictEqual(diag.streams.map((s) => s.name),
+      ['sync.error.log', 'menubar.log', 'sync.log', 'renderer.log']);
+    assert.deepStrictEqual(diag.streams.map((s) => s.onDemand), [false, false, true, true]);
+    for (const s of diag.streams) {
+      assert.strictEqual(s.present, false, 'nothing on disk yet');
+      assert.strictEqual(s.redactedTail, '');
+      assert.strictEqual(s.bytes, 0);
+      assert.strictEqual(s.truncated, false);
+      assert.strictEqual(s.error, undefined, 'a merely-absent stream is not an error');
+    }
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('menubar.log is reported absent rather than invented (no in-tree writer)', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', 'boom\n');
+    const s = streamsByName(system.systemDiagnostics(home, {}));
+    assert.strictEqual(s['sync.error.log'].present, true);
+    assert.strictEqual(s['menubar.log'].present, false);
+    assert.strictEqual(s['menubar.log'].redactedTail, '');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a present stream carries its tail, its size and a home-free display path', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', 'first\nsecond\n');
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+    assert.strictEqual(s.present, true);
+    assert.strictEqual(s.redactedTail, 'first\nsecond\n');
+    assert.strictEqual(s.bytes, 13);
+    assert.strictEqual(s.truncated, false);
+    assert.strictEqual(s.path, '~/Library/Logs/repo-radar/sync.error.log');
+    assert.ok(!s.path.includes(home), 'the real home directory never crosses the bridge');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Bounding
+// -------------------------------------------------------------------------------------------
+test('a stream larger than SYSTEM_TAIL_MAX_BYTES yields only the LAST 64 KiB, marked', () => {
+  const home = tmpHome();
+  try {
+    const filler = 'x'.repeat(70 * 1024);
+    const seeded = `HEAD-MARKER\n${filler}\nTAIL-MARKER\n`;
+    seedStream(home, 'sync.error.log', seeded);
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+
+    assert.strictEqual(s.truncated, true);
+    assert.ok(s.redactedTail.startsWith('--- tail truncated at 64 KiB ---\n'),
+      `expected a leading truncation marker, got: ${JSON.stringify(s.redactedTail.slice(0, 60))}`);
+    assert.ok(s.redactedTail.includes('TAIL-MARKER'), 'the NEWEST bytes are what survive');
+    assert.ok(!s.redactedTail.includes('HEAD-MARKER'), 'the oldest bytes are dropped');
+    assert.strictEqual(s.bytes, Buffer.byteLength(seeded, 'utf8'),
+      '`bytes` is the file size on disk, not the tail size');
+    const tailBytes = Buffer.byteLength(s.redactedTail, 'utf8');
+    assert.ok(tailBytes <= limits.SYSTEM_TAIL_MAX_BYTES + 64,
+      `tail must stay within the bound (+marker), got ${tailBytes}`);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a truncated tail never begins with a broken UTF-8 code point', () => {
+  const home = tmpHome();
+  try {
+    // A multi-byte stream whose byte cut lands INSIDE a sequence: 31 lines of 1000 x '\u20ac'
+    // (3001 bytes each) plus a 1-byte final line = 93032 bytes, so the cut at `size - 64 KiB`
+    // lands 27496 bytes in -- 1 byte into a 3-byte sequence, stranding two continuation bytes at
+    // the front of the window, which an unguarded slice would decode as U+FFFD.
+    //
+    // Fix round 2 note: the leading code-point trim is now belt-and-braces behind the partial-LINE
+    // drop, which discards everything up to the first newline (and, with no newline at all, the
+    // whole window). What this pins is the invariant the trim exists for and the line drop must
+    // not be allowed to lose: the returned tail is valid UTF-8 that resumes at a whole line, never
+    // a replacement character standing in for a sequence the cut broke.
+    seedStream(home, 'sync.log', `${`${'\u20ac'.repeat(1000)}\n`.repeat(31)}x`);
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.log'];
+    assert.strictEqual(s.truncated, true);
+    const afterMarker = s.redactedTail.slice(s.redactedTail.indexOf('\n') + 1);
+    assert.ok(!afterMarker.includes('\ufffd'), 'a partial leading code point is dropped, not decoded');
+    assert.ok(afterMarker.startsWith('\u20ac'), 'the tail resumes at a whole line, on a whole code point');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('the truncation marker names whatever bound is in force', () => {
+  const home = tmpHome();
+  const original = limits.SYSTEM_TAIL_MAX_BYTES;
+  try {
+    limits.SYSTEM_TAIL_MAX_BYTES = 128; // read through the module object at call time
+    seedStream(home, 'sync.error.log', 'y'.repeat(300));
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    assert.ok(s.redactedTail.startsWith('--- tail truncated at 128 bytes ---\n'),
+      `got: ${JSON.stringify(s.redactedTail.slice(0, 60))}`);
+  } finally {
+    limits.SYSTEM_TAIL_MAX_BYTES = original;
+    cleanup(home);
+  }
+});
+
+test('a secret straddling the 64 KiB cut cannot survive as an unmatchable fragment', () => {
+  const home = tmpHome();
+  try {
+    // Sized so the window opens 8 bytes INTO the secret: head(100) + SECRET(16) + '\n' +
+    // 65526 x 'B' + '\n' = 65645 bytes, so the cut at 65645 - 65536 = 109 lands at head+9.
+    // The surviving fragment matches no redact.js pattern and is only PART of the configured
+    // secret, so nothing would mask it -- only dropping the partial LINE removes it.
+    const head = 'A'.repeat(100);
+    seedStream(home, 'sync.error.log', `${head}${SECRET}\n${'B'.repeat(65526)}\n`);
+
+    const s = streamsByName(system.systemDiagnostics(home, { configuredSecrets: [SECRET] }))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!s.redactedTail.includes(SECRET.slice(cut)),
+        `a ${SECRET.length - cut}-character tail of the secret leaked: ${JSON.stringify(SECRET.slice(cut))}`);
+    }
+    assert.ok(s.redactedTail.startsWith('--- tail truncated at 64 KiB ---\nBBB'),
+      'the tail resumes at the first whole line');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// Fix round 2 (Ruling P4-18). This test used to pin the OPPOSITE behaviour -- "a window with no
+// newline is kept as the single long line it is" -- which is exactly the leak below: the whole
+// window is then an unverifiable PARTIAL line, and a credential the byte cut landed inside
+// survives in it as a suffix that matches neither a configured secret nor a redact.js pattern.
+// A truncated window with no newline yields the MARKER AND NOTHING ELSE.
+test('a truncated window with no newline at all yields the marker and an EMPTY body', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', 'y'.repeat(70 * 1024)); // one 70 KiB line, no newline
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    assert.strictEqual(s.redactedTail, `--- tail truncated at 64 KiB ---\n`,
+      'no partial line may be returned -- only the marker that says why there is nothing');
+    assert.ok(!s.redactedTail.includes('y'), 'not one byte of the unverifiable partial line');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Ruling P4-18 (fix round 2): the no-newline case is a SECRET LEAK, on both surfaces that share
+// `_dropPartialLine` -- a shared stream tail and status.json's `errorLog`.
+//
+// Shape of the leak in both: one line longer than the 64 KiB bound, with a configured secret
+// straddling the byte cut. Advancing to the first newline cannot help (there isn't one), so the
+// old code returned the whole window -- beginning mid-secret. The surviving fragment is only PART
+// of the configured value (so the literal-substring pass never matches it) and carries no
+// credential prefix like `ghp_` (so no redact.js pattern matches it either), and it crossed IPC
+// and landed in a saved export in the clear.
+// -------------------------------------------------------------------------------------------
+
+// A single line, no newline anywhere, sized so the tail window opens 8 bytes INTO the secret:
+// 92 + 16 + 65528 = 65636 bytes, cut at 65636 - 65536 = 100 = head(92) + 8.
+const NO_NEWLINE_HEAD = 'A'.repeat(92);
+const NO_NEWLINE_LINE = `${NO_NEWLINE_HEAD}${SECRET}${'B'.repeat(65528)}`;
+const TAIL_MARKER = '--- tail truncated at 64 KiB ---\n';
+
+// Every proper suffix of the secret that is long enough to be unambiguous. The 1-3 character
+// tails ('9', 'k9', 'Rk9') are excluded ONLY for the whole-export assertions, where a lone digit
+// would collide with a timestamp or a byte count; the fragment the cut actually produces here is
+// 8 characters long, so the leak this pins is well inside the checked range.
+function assertNoSecretSuffix(text, label) {
+  for (let cut = 1; cut <= SECRET.length - 4; cut++) {
+    assert.ok(!text.includes(SECRET.slice(cut)),
+      `${label}: a ${SECRET.length - cut}-character tail of the secret leaked: ${JSON.stringify(SECRET.slice(cut))}`);
+  }
+}
+
+test('a secret straddling the cut of a NEWLINE-FREE stream tail never reaches the payload or the export', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', NO_NEWLINE_LINE);
+
+    const s = streamsByName(system.systemDiagnostics(home, { configuredSecrets: [SECRET] }))['sync.error.log'];
+    assert.strictEqual(s.truncated, true);
+    assert.strictEqual(s.redactedTail, TAIL_MARKER, 'marker only -- the partial line is dropped whole');
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!s.redactedTail.includes(SECRET.slice(cut)),
+        `redactedTail: a ${SECRET.length - cut}-character tail of the secret leaked`);
+    }
+
+    // The same tail is rendered into the export document, so the leak has to be gone there too.
+    const text = read.buildExport(home, {}, { configuredSecrets: [SECRET] });
+    assert.ok(text.includes('sync.error.log'), 'the stream is still reported');
+    assert.ok(!text.includes(SECRET), 'the whole secret certainly never appears');
+    assertNoSecretSuffix(text, 'export text');
+    assert.ok(!text.includes('BBBB'), 'no byte of the unverifiable partial line reaches the export');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a secret straddling the cut of a NEWLINE-FREE status.json errorLog never reaches the payload or the export', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: NO_NEWLINE_LINE, errorList: [] });
+
+    const st = system.systemDiagnostics(home, { configuredSecrets: [SECRET] }).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.errorLog.truncated, true);
+    assert.strictEqual(st.errorLog.text, TAIL_MARKER, 'marker only -- the partial line is dropped whole');
+    for (let cut = 1; cut < SECRET.length; cut++) {
+      assert.ok(!st.errorLog.text.includes(SECRET.slice(cut)),
+        `errorLog: a ${SECRET.length - cut}-character tail of the secret leaked`);
+    }
+
+    const text = read.buildExport(home, {}, { configuredSecrets: [SECRET] });
+    assert.ok(!text.includes(SECRET));
+    assertNoSecretSuffix(text, 'export text');
+    assert.ok(!text.includes('BBBB'), 'no byte of the unverifiable partial line reaches the export');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Refusals -- never follow a symlink, never mistake a refusal for absence
+// -------------------------------------------------------------------------------------------
+test('a symlink where a log should be is refused, never followed', () => {
+  const home = tmpHome();
+  try {
+    const target = path.join(home, 'elsewhere.txt');
+    fs.writeFileSync(target, 'CONTENT-BEHIND-THE-SYMLINK\n');
+    fs.mkdirSync(logDir(home), { recursive: true });
+    fs.symlinkSync(target, path.join(logDir(home), 'sync.error.log'));
+
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.error.log'];
+    assert.strictEqual(s.present, false);
+    assert.strictEqual(s.error, 'symlink');
+    assert.strictEqual(s.redactedTail, '');
+    assert.ok(!JSON.stringify(s).includes('CONTENT-BEHIND-THE-SYMLINK'),
+      'the symlink target must never be read');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a non-regular entry (a directory) where a log should be is refused', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(logDir(home), 'renderer.log'), { recursive: true });
+    const s = streamsByName(system.systemDiagnostics(home, {}))['renderer.log'];
+    assert.strictEqual(s.present, false);
+    assert.strictEqual(s.error, 'not-regular');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a SYMLINKED LOG DIRECTORY is refused for every stream, never followed', () => {
+  const home = tmpHome();
+  try {
+    // The attacker-chosen directory the symlink points at holds a real, readable sync.error.log.
+    // O_NOFOLLOW on the FILE alone accepted this: the final component was not a symlink.
+    const elsewhere = path.join(home, 'attacker');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'sync.error.log'), 'CONTENT-FROM-THE-WRONG-DIRECTORY\n');
+    fs.mkdirSync(path.join(home, 'Library', 'Logs'), { recursive: true });
+    fs.symlinkSync(elsewhere, logDir(home));
+
+    const diag = system.systemDiagnostics(home, {});
+    for (const s of diag.streams) {
+      assert.strictEqual(s.present, false, `${s.name} must be refused under a symlinked parent`);
+      assert.strictEqual(s.error, 'symlink');
+      assert.strictEqual(s.redactedTail, '');
+    }
+    assert.ok(!JSON.stringify(diag).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'),
+      'nothing under the symlinked directory may be read');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a symlinked INTERMEDIATE directory component is refused too', () => {
+  const home = tmpHome();
+  try {
+    const elsewhere = path.join(home, 'attacker');
+    fs.mkdirSync(path.join(elsewhere, 'repo-radar'), { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'repo-radar', 'sync.log'), 'CONTENT-FROM-THE-WRONG-DIRECTORY\n');
+    fs.mkdirSync(path.join(home, 'Library'), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, 'Library', 'Logs')); // one level ABOVE repo-radar
+
+    const diag = system.systemDiagnostics(home, {});
+    for (const s of diag.streams) assert.strictEqual(s.error, 'symlink', `${s.name}`);
+    assert.ok(!JSON.stringify(diag).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a non-directory standing in for the log directory is refused', () => {
+  const home = tmpHome();
+  try {
+    fs.mkdirSync(path.join(home, 'Library', 'Logs'), { recursive: true });
+    fs.writeFileSync(logDir(home), 'not a directory');
+    for (const s of system.systemDiagnostics(home, {}).streams) {
+      assert.strictEqual(s.present, false);
+      assert.strictEqual(s.error, 'not-regular');
+    }
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a SYMLINKED .config/repo-radar is refused, never followed to a status.json', () => {
+  const home = tmpHome();
+  try {
+    const elsewhere = path.join(home, 'attacker-config');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'status.json'),
+      JSON.stringify({ errorLog: 'CONTENT-FROM-THE-WRONG-DIRECTORY', errorList: [] }));
+    fs.mkdirSync(path.join(home, '.config'), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, '.config', 'repo-radar'));
+
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(st.error, 'symlink');
+    assert.ok(!JSON.stringify(st).includes('CONTENT-FROM-THE-WRONG-DIRECTORY'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an unreadable stream is reported denied, not absent', { skip: process.getuid && process.getuid() === 0 ? 'root reads everything' : false }, () => {
+  const home = tmpHome();
+  try {
+    const p = seedStream(home, 'sync.log', 'secret ops\n');
+    fs.chmodSync(p, 0o000);
+    const s = streamsByName(system.systemDiagnostics(home, {}))['sync.log'];
+    assert.strictEqual(s.present, false);
+    assert.strictEqual(s.error, 'denied');
+  } finally {
+    try { fs.chmodSync(path.join(logDir(home), 'sync.log'), 0o600); } catch (e) { /* best effort */ }
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// The legacy status.json surface
+// -------------------------------------------------------------------------------------------
+test('status.json errorList is capped at the 50 NEWEST entries with an honest total', () => {
+  const home = tmpHome();
+  try {
+    const errorList = [];
+    for (let i = 0; i < 120; i++) errorList.push(errorEntry({ message: `failure-${i}` }));
+    seedStatus(home, { errorLog: 'log text', errorList });
+
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.errorList.total, 120);
+    assert.strictEqual(st.errorList.truncated, true);
+    assert.strictEqual(st.errorList.entries.length, limits.STATUS_ERROR_LIST_MAX);
+    assert.strictEqual(st.errorList.entries[0].message, 'failure-0', 'the array is already newest-first');
+    assert.strictEqual(st.errorList.entries[49].message, 'failure-49');
+    assert.deepStrictEqual(Object.keys(st.errorList.entries[0]).sort(),
+      ['fullError', 'message', 'repo', 'stackTrace', 'timestamp']);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a short errorList is returned whole, untruncated', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorList: [errorEntry({ message: 'only one' })] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.errorList.total, 1);
+    assert.strictEqual(st.errorList.truncated, false);
+    assert.strictEqual(st.errorList.entries[0].message, 'only one');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('status.json errorLog is bounded to its LAST 64 KiB with a leading marker', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: `OLDEST\n${'z'.repeat(70 * 1024)}\nNEWEST\n`, errorList: [] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.errorLog.truncated, true);
+    assert.ok(st.errorLog.text.startsWith('--- tail truncated at 64 KiB ---\n'));
+    assert.ok(st.errorLog.text.includes('NEWEST'));
+    assert.ok(!st.errorLog.text.includes('OLDEST'));
+    assert.ok(Buffer.byteLength(st.errorLog.text, 'utf8') <= limits.STATUS_ERROR_LOG_MAX_BYTES + 64);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an errorList entry field is bounded to FIELD_MAX_BYTES', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorList: [errorEntry({ fullError: 'w'.repeat(limits.FIELD_MAX_BYTES * 2) })] });
+    const entry = system.systemDiagnostics(home, {}).statusDiagnostics.errorList.entries[0];
+    assert.ok(Buffer.byteLength(entry.fullError, 'utf8') <= limits.FIELD_MAX_BYTES);
+    assert.ok(entry.fullError.endsWith('…[truncated]'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a missing status.json is absent, not an error', () => {
+  const home = tmpHome();
+  try {
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(st.error, undefined);
+    assert.deepStrictEqual(st.errorList, { entries: [], total: 0, truncated: false });
+    assert.deepStrictEqual(st.errorLog, { text: '', truncated: false });
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an unparseable status.json reports a bounded error and echoes no path beyond the basename', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, '{ this is not json');
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(typeof st.error, 'string');
+    assert.ok(st.error.length > 0);
+    assert.ok(!st.error.includes(home), 'no absolute path in the error text');
+    assert.ok(!st.error.includes('/'), 'not even a relative path fragment');
+    assert.deepStrictEqual(st.errorList.entries, []);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a symlinked status.json is refused, never followed', () => {
+  const home = tmpHome();
+  try {
+    const target = path.join(home, 'real-status.json');
+    fs.writeFileSync(target, JSON.stringify({ errorLog: 'CONTENT-BEHIND-THE-SYMLINK' }));
+    const dir = path.join(home, '.config', 'repo-radar');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(target, path.join(dir, 'status.json'));
+
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(st.error, 'symlink');
+    assert.ok(!JSON.stringify(st).includes('CONTENT-BEHIND-THE-SYMLINK'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a status.json whose top level is not an object is refused', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, '[1,2,3]');
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, false);
+    assert.strictEqual(typeof st.error, 'string');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a status.json with neither errorLog nor errorList is present and empty', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { lastSync: '2026-08-14T10:00:00.000Z', repos: [] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.deepStrictEqual(st.errorLog, { text: '', truncated: false });
+    assert.deepStrictEqual(st.errorList, { entries: [], total: 0, truncated: false });
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a malformed-but-present errorList is reported, never folded into "no errors"', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 'real log text', errorList: 'not-an-array' });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true, 'the rest of the file read fine');
+    assert.strictEqual(st.error, 'errorList-not-array');
+    assert.deepStrictEqual(st.errorList.entries, []);
+    assert.ok(st.errorLog.text.includes('real log text'), 'the readable half is still returned');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a malformed-but-present errorLog is reported', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: { not: 'a string' }, errorList: [errorEntry({ message: 'kept' })] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.error, 'errorLog-not-string');
+    assert.strictEqual(st.errorList.entries[0].message, 'kept');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('both fields malformed are reported together, and a null field is absence not damage', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 42, errorList: { nope: true } });
+    assert.strictEqual(system.systemDiagnostics(home, {}).statusDiagnostics.error,
+      'errorLog-not-string, errorList-not-array');
+    cleanup(home);
+  } finally { /* re-seeded below in a fresh home */ }
+
+  const home2 = tmpHome();
+  try {
+    // main.js's own `if (!status.errorList) status.errorList = []` treats a falsy value as
+    // "not written yet", so null/absent is not a malformation.
+    seedStatus(home2, { errorLog: null, errorList: null });
+    const st = system.systemDiagnostics(home2, {}).statusDiagnostics;
+    assert.strictEqual(st.present, true);
+    assert.strictEqual(st.error, undefined);
+  } finally {
+    cleanup(home2);
+  }
+});
+
+test('an export never claims "errors: 0" over an errorList it could not read', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorLog: 'real log text', errorList: 'not-an-array' });
+    const text = read.buildExport(home, {}, { configuredSecrets: [] });
+    assert.ok(text.includes('(partial: errorList-not-array)'));
+    assert.ok(!text.includes('errors: 0'), 'a count is a claim this payload cannot support');
+    assert.ok(text.includes('real log text'), 'the readable half is still exported');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('a hostile errorList (non-objects, missing fields) never throws and never leaks a nested object', () => {
+  const home = tmpHome();
+  try {
+    seedStatus(home, { errorList: [null, 'a string', 42, { repo: { nested: 'object' } }] });
+    const st = system.systemDiagnostics(home, {}).statusDiagnostics;
+    assert.strictEqual(st.errorList.entries.length, 4);
+    for (const e of st.errorList.entries) {
+      for (const k of ['timestamp', 'repo', 'message', 'fullError', 'stackTrace']) {
+        assert.ok(e[k] === null || typeof e[k] === 'string', `${k} must be a string or null`);
+      }
+    }
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Redaction -- wired, not merely available
+// -------------------------------------------------------------------------------------------
+test('a configured secret is masked in a stream tail, in errorLog and in a stackTrace', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', `token=${SECRET} used\n`);
+    seedStream(home, 'sync.log', `also ${SECRET}\n`);
+    seedStatus(home, {
+      errorLog: `\n⚠️ auth failed with ${SECRET}\n`,
+      errorList: [errorEntry({ stackTrace: `at auth (${SECRET})`, fullError: `bad ${SECRET}` })],
+    });
+
+    const diag = system.systemDiagnostics(home, { configuredSecrets: [SECRET] });
+    const blob = JSON.stringify(diag);
+    assert.ok(!blob.includes(SECRET), 'the configured secret must appear nowhere in the payload');
+    assert.ok(blob.includes('[REDACTED]'), 'and it must be visibly masked, not silently dropped');
+
+    const s = streamsByName(diag);
+    assert.strictEqual(s['sync.error.log'].redactedTail, 'token=[REDACTED] used\n');
+    assert.ok(s['sync.log'].redactedTail.includes('[REDACTED]'));
+    assert.ok(diag.statusDiagnostics.errorLog.text.includes('[REDACTED]'));
+    assert.strictEqual(diag.statusDiagnostics.errorList.entries[0].stackTrace, 'at auth ([REDACTED])');
+    assert.ok(diag.statusDiagnostics.errorList.entries[0].fullError.includes('[REDACTED]'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("redact.js's built-in credential forms are masked too", () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', 'remote: ghp_abcdefghijklmnopqrstuvwxyz0123456789\n');
+    seedStatus(home, { errorLog: 'https://user:pw@github.com/acme/widgets.git failed', errorList: [] });
+    const diag = system.systemDiagnostics(home, { configuredSecrets: [] });
+    assert.ok(streamsByName(diag)['sync.error.log'].redactedTail.includes('[REDACTED github token]'));
+    assert.ok(diag.statusDiagnostics.errorLog.text.includes('//<redacted>@'));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('redaction expansion can never push a tail past the bound', () => {
+  const home = tmpHome();
+  const original = limits.SYSTEM_TAIL_MAX_BYTES;
+  try {
+    limits.SYSTEM_TAIL_MAX_BYTES = 256;
+    // 32 x a 4-char secret -> 32 x '[REDACTED]' (10 chars): the scrubbed text is far longer than
+    // the bytes read, so the bound has to be re-applied AFTER scrubbing.
+    seedStream(home, 'sync.error.log', 'abcd'.repeat(64));
+    const s = streamsByName(system.systemDiagnostics(home, { configuredSecrets: ['abcd'] }))['sync.error.log'];
+    assert.ok(Buffer.byteLength(s.redactedTail, 'utf8') <= limits.SYSTEM_TAIL_MAX_BYTES + 64,
+      `scrubbed tail must still be bounded, got ${Buffer.byteLength(s.redactedTail, 'utf8')}`);
+    assert.strictEqual(s.truncated, true);
+  } finally {
+    limits.SYSTEM_TAIL_MAX_BYTES = original;
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Containment
+// -------------------------------------------------------------------------------------------
+test('systemDiagnostics never throws -- an unexpected failure is a FIXED string, not its message', () => {
+  const diag = system.systemDiagnostics(42, {});
+  assert.strictEqual(diag.uncorrelated, true);
+  assert.deepStrictEqual(diag.streams, []);
+  // Node's fs and path errors routinely quote ABSOLUTE PATHS, and the Redactor masks configured
+  // secrets -- not paths. Since this string reaches the renderer and, worse, a saved export, it
+  // may only ever be a constant this module chose.
+  assert.strictEqual(diag.error, 'diagnostics-failed');
+  assert.ok(!/paths\[0\]|\//.test(diag.error), 'no fragment of the underlying message survives');
+  assert.strictEqual(diag.statusDiagnostics.present, false);
+});
+
+test('read.js re-exports systemDiagnostics', () => {
+  assert.strictEqual(read.systemDiagnostics, system.systemDiagnostics);
+});
+
+// -------------------------------------------------------------------------------------------
+// The `activity:list` branch (Ruling P4-1: no fifth channel)
+// -------------------------------------------------------------------------------------------
+function handlersFor(home) {
+  return ipc.createHandlers({
+    home,
+    loadConfiguredSecrets: () => [SECRET],
+    shell: { showItemInFolder: () => {} },
+    dialog: { showSaveDialog: async () => ({ canceled: true }) },
+    writeSecure: () => {},
+    log: () => {},
+  });
+}
+
+test('activity:list attaches `system` ONLY when the filter asks for it', async () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', `boom ${SECRET}\n`);
+    const list = handlersFor(home)['activity:list'];
+
+    const plain = await list({});
+    assert.strictEqual('system' in plain, false, 'absent flag => no diagnostics');
+
+    const off = await list({ system: false });
+    assert.strictEqual('system' in off, false, 'false => no diagnostics');
+
+    const on = await list({ system: true });
+    assert.ok(on.system, 'system:true => the diagnostics ride along on the same response');
+    assert.strictEqual(on.system.uncorrelated, true);
+    assert.ok(Array.isArray(on.items), 'the item list is still there');
+    const blob = JSON.stringify(on.system);
+    assert.ok(blob.includes('[REDACTED]'), 'the app-configured secrets are wired into this path');
+    assert.ok(!blob.includes(SECRET));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('activity:list still rejects a non-boolean system flag', async () => {
+  const home = tmpHome();
+  try {
+    await assert.rejects(() => handlersFor(home)['activity:list']({ system: 'yes' }),
+      (e) => e.code === 'invalid-request');
+  } finally {
+    cleanup(home);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// Export -- self-contained, same bounds
+// -------------------------------------------------------------------------------------------
+test('buildExport ends with the System section, rendered from the same diagnostics', () => {
+  const home = tmpHome();
+  try {
+    seedStream(home, 'sync.error.log', `sh incident: ${SECRET}\n`);
+    seedStatus(home, {
+      errorLog: `\n⚠️ auth failed with ${SECRET}\n`,
+      errorList: [errorEntry({ message: 'clone failed', stackTrace: `at auth (${SECRET})` })],
+    });
+
+    const text = read.buildExport(home, {}, { configuredSecrets: [SECRET] });
+    assert.ok(text.includes('--- System (uncorrelated diagnostics) ---'), 'the section header is present');
+    assert.ok(text.indexOf('--- System (uncorrelated diagnostics) ---') > text.indexOf('Repo Radar Activity Export'),
+      'the section is trailing');
+    assert.ok(text.includes('sync.error.log'));
+    assert.ok(text.includes('sh incident:'));
+    assert.ok(text.includes('menubar.log'), 'an absent stream is still named');
+    assert.ok(text.includes('clone failed'), 'the legacy errorList reaches the export');
+    assert.ok(text.includes('[REDACTED]'));
+    assert.ok(!text.includes(SECRET), 'no configured secret survives into the export text');
+  } finally {
+    cleanup(home);
+  }
+});
+
+test('an export prints nothing below a failed diagnostics collection', () => {
+  const home = tmpHome();
+  const original = system.systemDiagnostics;
+  try {
+    // read.js calls `systemMod.systemDiagnostics` through the shared module object at call time
+    // (the same injection seam reconcile/limits use), so this is observed immediately.
+    system.systemDiagnostics = () => ({
+      uncorrelated: true, streams: [],
+      statusDiagnostics: { present: false, errorLog: { text: '', truncated: false }, errorList: { entries: [], total: 0, truncated: false } },
+      error: 'diagnostics unavailable',
+    });
+    const text = read.buildExport(home, {}, { configuredSecrets: [] });
+    assert.ok(text.includes('(diagnostics unavailable: diagnostics unavailable)'));
+    assert.ok(!text.includes('[status]'), 'no surface is described when none was established');
+    assert.ok(!text.includes('[stream]'));
+  } finally {
+    system.systemDiagnostics = original;
+    cleanup(home);
+  }
+});
+
+test('the System section counts toward EXPORT_MAX_BYTES', () => {
+  const home = tmpHome();
+  const original = limits.EXPORT_MAX_BYTES;
+  try {
+    limits.EXPORT_MAX_BYTES = 2048;
+    seedStream(home, 'sync.error.log', 'q'.repeat(8 * 1024));
+    const text = read.buildExport(home, {}, { configuredSecrets: [] });
+    assert.ok(Buffer.byteLength(text, 'utf8') <= limits.EXPORT_MAX_BYTES + 64);
+    assert.ok(text.includes('--- export truncated at'));
+  } finally {
+    limits.EXPORT_MAX_BYTES = original;
+    cleanup(home);
+  }
+});

@@ -129,12 +129,30 @@ async function ensureRuntime({ home, channel, appVersion, bundle, hooks = {}, _s
 // OWNS the inherited lock fd (Codex C1). `onChild` fires ONLY after the script signals
 // (fd 3) that it acquired the lock (Codex I5) — so a busy contention (exit 75 before the
 // handshake) rejects cleanly without ever being exposed as the active sync.
-function runSync({ home, channel, env = {}, onChild } = {}) {
+//
+// Activity History (Task 2.4): `lockFd` is the Node-side activity writer's held lease fd
+// (menubar/activity/trigger-glue.js's `beginManualActivity()` -> `activity.lockFd`, Task 2.3).
+// When present, it rides the child's stdio at index 4 (Node's spawn interprets a plain integer
+// stdio entry as "inherit this fd, open in THIS process, as the child's fd N" — no pipe/dup
+// needed) so the dispatcher's `exec` into python hands the SAME open-file-description down as
+// child fd 4. `env.REPO_RADAR_ACTIVITY_LOCK_FD` (set by handOffEnv()) carries the PARENT
+// (Electron) process's own fd number, which is meaningless to the child — it is corrected here
+// to the fixed child-side number "4" (matching dispatchers.js's own scheduled-path mint, which
+// also always opens its lease on fd 4), so both paths agree on one fd for the exec'd python to
+// adopt. No `lockFd` (inactive/refused writer) -> stdio stays 4-wide exactly as before, and no
+// env override -- fully inert, matching the pre-Task-2.4 behavior.
+function runSync({ home, channel, env = {}, lockFd, onChild } = {}) {
   const L = layout(home, channel);
   return new Promise((resolve, reject) => {
+    const stdio = ['ignore', 'pipe', 'pipe', 'pipe']; // fd 3 = lock-acquired handshake
+    const spawnEnv = { ...process.env, ...env };
+    if (typeof lockFd === 'number') {
+      stdio[4] = lockFd; // parent fd -> child fd 4
+      spawnEnv.REPO_RADAR_ACTIVITY_LOCK_FD = '4';
+    }
     const child = spawn('/bin/sh', [L.runSync], {
-      env: { ...process.env, ...env },
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'], // fd 3 = lock-acquired handshake
+      env: spawnEnv,
+      stdio,
     });
     let started = false;
     const start = () => { if (!started) { started = true; if (typeof onChild === 'function') onChild(child); } };

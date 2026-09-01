@@ -56,4 +56,12 @@ assert.ok(/com\.user\.repo-radar-dev/.test(src), 'dev channel must use a distinc
 assert.ok(/detectStableManaged\(/.test(src), 'updateLaunchAgent must consult detectStableManaged for the dev hard-block');
 assert.ok(/app\.whenReady\(\)\.then\(async/.test(src), 'the ready handler must be async to await ensureRuntime()');
 
+// 4. Codex B3(a): main.js must supply quota.js's delegated Python prune spawn with the SAME
+// managed venv interpreter + repo_radar location the runtime block resolves, not leave it on the
+// dev-only python3/REPO_ROOT default (which doesn't exist in a packaged app).
+assert.ok(/require\(['"]\.\/activity\/quota['"]\)/.test(src), 'main.js must require(\'./activity/quota\')');
+assert.ok(/activityQuota\.configurePythonRunner\(/.test(src), 'main.js must call activityQuota.configurePythonRunner(...) to supply the packaged Python resolution (Codex B3a)');
+assert.ok(/venv['"],\s*['"]bin['"],\s*['"]python['"]\)/.test(src), 'the configured runner must resolve <current>/venv/bin/python, the same shape runtime/provision.js builds and runtime/activation.js/runtime/index.js verify');
+assert.ok(/layout\(os\.homedir\(\),\s*runtimeChannel\)/.test(src), 'the packaged python resolution must be anchored on layout(home, channel).current, the same symlink the runtime reconcile verifies/flips');
+
 console.log('main-runtime-wiring OK');

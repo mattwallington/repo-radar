@@ -4,6 +4,7 @@
   "description": "Menu bar app for Repo Radar - pristine repository mirrors with AI-powered metadata",
   "main": "main.js",
   "scripts": {
+    "test": "node --test",
     "start": "electron .",
     "dev": "electron . --dev",
     "build": "electron-builder",
