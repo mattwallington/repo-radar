@@ -1168,6 +1168,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
 
   if (currentSyncProcess) {
     activityGlue.onContention(activity.writer, 'already-syncing');
+    // Ruling P6-1: deliberately NO 'sync-refused' here. This returns above the status reset and
+    // above showLogWindow(), so this attempt opened no window -- and any window that IS up is
+    // showing the live sync's real progress. Refusing it would wipe a running sync's grid. The
+    // LockBusy branch in the runSync() catch is the only refusal that has a window to speak to.
     return; // Already syncing
   }
 
@@ -1312,8 +1316,42 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     showLogWindow();
   }
 
+  // Ruling P6-1: a manual sync can still be REFUSED after this point -- the root exec lock is
+  // only attempted inside runSync(), long after the window above exists, so unlike the two guards
+  // higher up this refusal cannot be moved before the window. The window has to be told instead.
+  // Two things must happen when it is: the pending `sync-started` send below is short-circuited
+  // (its 300ms timer and its 100ms isLoading poll would otherwise repaint the waiting grid right
+  // back over the refusal), and the window is handed a fixed 'sync-refused' payload.
+  let syncRefusedForThisAttempt = false;
+  const refuseProgressWindow = () => {
+    syncRefusedForThisAttempt = true;
+    // The fresh-sync replay skip no longer applies. Clearing it is safe here: the status reset
+    // above emptied status.repos and no child ever ran, so showLogWindow's did-finish-load
+    // replay has nothing to replay and is inert.
+    pendingFreshSync = false;
+    // A scheduled sync (showWindow=false) opened no window -- there is nothing to refuse.
+    if (!showWindow) return;
+    const deliver = () => {
+      if (!logWindow || logWindow.isDestroyed() || !logWindow.webContents) return;
+      // A send into a still-loading renderer is dropped on the floor; wait, exactly as
+      // sendSyncStartedWhenReady does.
+      if (logWindow.webContents.isLoading()) {
+        setTimeout(deliver, 100);
+        return;
+      }
+      logWindow.webContents.send('sync-refused', { reason: 'already-running' });
+    };
+    deliver();
+  };
+
   // Wait for window to be fully ready before sending sync-started event
   const sendSyncStartedWhenReady = () => {
+    // Ruling P6-1: the attempt was refused while this was still pending -- the window has been
+    // (or is about to be) told so; do not paint the waiting grid over that.
+    if (syncRefusedForThisAttempt) {
+      pendingFreshSync = false;
+      return;
+    }
     if (logWindow && !logWindow.isDestroyed() && logWindow.webContents) {
       // Check if page has finished loading
       if (logWindow.webContents.isLoading()) {
@@ -1642,6 +1680,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // another sync (manual or scheduled, either channel) — onChild() never
       // ran, so there's no child/process-error path for this.
       console.warn('Sync already running (root lock busy), ignoring Sync Now click');
+      // Ruling P6-1: FIRST tell the progress window this attempt opened, before anything else can
+      // return -- it is already showing "Starting sync..." over a grid of "Waiting..." rows that
+      // nothing will ever move, and this also latches the pending sync-started send off.
+      refuseProgressWindow();
       if (Notification.isSupported()) {
         new Notification({
           title: getAppDisplayName(),
