@@ -157,6 +157,23 @@ export REPO_RADAR_RELEASE_PYTHON="$dir/venv/bin/python"
 
 The script checks that this venv's installed packages exactly match the lock and pass `pip check`, and stops before changing any version if they don't. Keep it to the lock only: install pytest and other test tools in a separate environment.
 
+### Building a signed app locally
+
+Builds are signed with Reperio Health's Developer ID (team `F8UY7565VM`) and notarized through the `reperio-notary` notarytool profile, both in your login keychain. `build-local.sh` builds and checks an app without publishing anything: it makes no commit, tag, push or GitHub release. It runs the same gates as `release.sh`, so set `REPO_RADAR_RELEASE_PYTHON` as above, and it needs a clean checkout of `dev` (Repo Radar Dev) or `main` (Repo Radar) and a version newer than `VERSION`:
+
+```bash
+git checkout dev
+./build-local.sh --version 1.0.33-dev.202610271200 --dry-run   # gates only
+./build-local.sh --version 1.0.33-dev.202610271200
+
+git checkout main
+./build-local.sh --version 1.0.33
+```
+
+It passes electron-builder only the keychain profile, unsetting any `APPLE_ID` or `APPLE_API_*` variables in that one command, and fails if notarization was skipped. It then checks each app's team, bundle ID, signature, Gatekeeper assessment and stapled ticket, and prints the SHA-256 of every DMG, ZIP, blockmap and feed file in `menubar/dist/`. To install, quit the app, open the DMG for your Mac and replace the app in `/Applications`. Builds made this way check for updates at `ReperioHealth/repo-radar-releases`; until that repository has releases, the background check only logs a failure (Check for Updates in the menu shows an error) and syncing is unaffected.
+
+Apps signed by the earlier personal team can't update themselves to a Reperio-signed build, because macOS requires an update to match the installed app's signing team. Replace each installed copy once by hand. Your settings, mirrors and runtime are kept.
+
 ## License
 
 MIT
