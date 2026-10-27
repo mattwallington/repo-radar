@@ -277,7 +277,15 @@ cd "$SCRIPT_DIR/menubar"
 npm install
 
 info "Building for macOS (arm64 + x64)..."
-npx electron-builder --mac --arm64 --x64
+# Notarize with the Reperio keychain profile only, and never publish a build whose notarization
+# electron-builder skipped (it exits 0 when it finds no credential). Same rule as build-local.sh.
+BUILDER_LOG=$(mktemp /tmp/repo-radar-release-builder-XXXXXX)
+env -u APPLE_ID -u APPLE_APP_SPECIFIC_PASSWORD -u APPLE_API_KEY -u APPLE_API_KEY_ID \
+    -u APPLE_API_ISSUER -u APPLE_TEAM_ID -u APPLE_KEYCHAIN APPLE_KEYCHAIN_PROFILE=reperio-notary \
+  npx electron-builder --mac --arm64 --x64 2>&1 | tee "$BUILDER_LOG"
+if grep -qi 'skipped macOS notarization' "$BUILDER_LOG" || ! grep -qi 'notarization successful' "$BUILDER_LOG"; then
+  error "Notarization did not run (log: $BUILDER_LOG). The release commit and tag exist locally only; nothing was pushed."
+fi
 
 cd "$SCRIPT_DIR"
 success "Build complete"
