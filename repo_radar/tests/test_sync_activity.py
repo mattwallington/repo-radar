@@ -249,6 +249,40 @@ def test_network_abort_calls_terminal_failed(monkeypatch, tmp_path):
     assert writer.terminals == [("failed", {"reason": "no_network_connectivity"})]
 
 
+def test_network_abort_reports_each_phase_under_one_attempt_identity(monkeypatch, tmp_path):
+    """The app can only keep a closed-and-reopened window on the right phase if every update
+    names its attempt: starting, the wait, the abort and the terminal outcome all carry the
+    Activity ID and channel, and the terminal comes last."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+
+    def _wait(on_waiting=None, **kw):
+        on_waiting(0)
+        return False
+
+    monkeypatch.setattr(S, "wait_for_network", _wait)
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    writer.activity_id = "a" * 32
+    args = _args(status_server=True)
+    args._activity_writer = writer
+
+    assert S.sync_mode(args) == 1
+
+    lifecycle = [p for p in posted if p["type"] != "output"]
+    assert [p["type"] for p in lifecycle] == [
+        "sync-lifecycle", "waiting-for-network", "network-timeout", "error", "sync-terminal"]
+    assert lifecycle[0]["phase"] == "starting"
+    assert lifecycle[-1]["outcome"] == "failed"
+    assert lifecycle[-1]["reason"] == "no_network_connectivity"
+    assert all(p["attemptId"] == "a" * 32 and p["channel"] == "stable" for p in posted)
+
+
 def test_no_configuration_calls_terminal_blocked(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(S, "load_config", lambda: None)

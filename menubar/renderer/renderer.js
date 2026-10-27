@@ -522,6 +522,16 @@ ipcRenderer.on('sync-refused', (event, data) => {
     applySyncRefused(document, data && data.reason);
 });
 
+// Where the current sync attempt really is: replayed when this window opens on a run already in
+// progress or finished (including a scheduled run the app did not start), and sent when a phase or
+// outcome arrives. Main sends a closed set of phases/outcomes; sync-state.js maps them to fixed
+// text and decides whether Stop is offered.
+const { applySyncState } = require('../sync-state');
+ipcRenderer.on('sync-state', (event, view) => {
+    log('Sync state:', view && view.phase, view && view.outcome);
+    applySyncState(document, view);
+});
+
 // Get version info
 ipcRenderer.on('version-info', (event, versionData) => {
     const versionEl = document.getElementById('version-text');
