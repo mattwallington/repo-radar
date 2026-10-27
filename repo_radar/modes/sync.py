@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import random
+import signal
 import uuid
 import traceback
 import hashlib
@@ -40,7 +41,7 @@ from repo_radar.metadata import (
 )
 from repo_radar.ui import get_short_id, format_id, send_status_update, set_status_attempt
 # Imported by name so callers and tests keep using sync.wait_for_network.
-from repo_radar.network import wait_for_network
+from repo_radar.network import NetworkWaitCancelled, wait_for_network
 
 
 # Keep the most recent N per-run log files; older ones are pruned on each sync.
@@ -1162,7 +1163,19 @@ def sync_mode(args):
         if args.status_server:
             send_status_update('waiting-for-network', {}, args.status_server)
 
-    if not wait_for_network(on_waiting=_notify_waiting):
+    try:
+        network_ready = wait_for_network(on_waiting=_notify_waiting)
+    except NetworkWaitCancelled:
+        # Stop was pressed during the wait. The probe has already been killed and reaped; record
+        # a cancellation, not a connectivity failure.
+        console.print(f"[yellow]Sync cancelled while waiting for network.[/yellow]")
+        if sync_logger:
+            sync_logger.event("sync_aborted", reason="cancelled")
+            sync_logger.close()
+        _terminal('cancelled', reason='cancelled_during_network_wait')
+        return 128 + signal.SIGTERM
+
+    if not network_ready:
         console.print(f"[red]No network connectivity. Aborting sync.[/red]")
         if sync_logger:
             sync_logger.event("sync_aborted",

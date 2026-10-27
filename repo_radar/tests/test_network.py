@@ -4,10 +4,14 @@ The probes here are real child processes running the real probe code; only the r
 stalled case) and the budgets are swapped for small test values.
 """
 import os
+import signal
 import socket
 import subprocess
+import sys
+import textwrap
 import threading
 import time
+from pathlib import Path
 
 from repo_radar import network
 
@@ -52,8 +56,8 @@ def test_stalled_resolver_times_out_within_budget_and_reaps_probe():
 
     assert ok is False
     assert elapsed < 3.0, f"wait overran its 1.5s budget: {elapsed:.2f}s"
-    # Announced while the first probe was still hung, not only after it finally failed.
-    assert len(waits) == 1 and waits[0] < 1.4
+    # Announced before waiting on the first (hung) probe, not only after it finally failed.
+    assert len(waits) == 1 and waits[0] < 0.5
     _assert_reaped(children)
 
 
@@ -99,3 +103,59 @@ def test_requires_consecutive_successes_and_resets_after_a_failure():
     assert len(accepted) == 4
     assert len(waits) == 1
     _assert_reaped(children)
+
+
+def test_sigterm_during_the_wait_reaps_the_probe_and_reports_cancellation():
+    # A real worker process waiting on a stalled probe gets the app's graceful Stop (SIGTERM).
+    # The probe's own alarm is set far beyond this test, so if the probe is gone the moment the
+    # worker exits, the worker killed and reaped it on the way out.
+    repo = Path(__file__).resolve().parents[2]
+    worker = textwrap.dedent(f"""
+        import subprocess, sys
+        sys.path.insert(0, {str(repo)!r})
+        from repo_radar import network
+        stall = "import socket, time\\nsocket.getaddrinfo = lambda *a, **k: time.sleep(3600)\\n"
+        def popen(argv, **kwargs):
+            argv = list(argv)
+            argv[argv.index('-c') + 1] = stall + argv[argv.index('-c') + 1]
+            child = subprocess.Popen(argv, **kwargs)
+            print(child.pid, flush=True)
+            return child
+        try:
+            network.wait_for_network(timeout=60, probe_timeout=30, popen=popen)
+            print('ready', flush=True)
+        except network.NetworkWaitCancelled:
+            print('cancelled', flush=True)
+    """)
+    proc = subprocess.Popen([sys.executable, '-c', worker], stdout=subprocess.PIPE, text=True)
+    probe_pid = int(proc.stdout.readline())
+    time.sleep(0.3)  # let the worker settle into waiting on the probe
+    proc.send_signal(signal.SIGTERM)
+    out, _ = proc.communicate(timeout=10)
+
+    assert out.strip() == 'cancelled'
+    assert proc.returncode == 0
+    try:
+        os.kill(probe_pid, 0)
+    except ProcessLookupError:
+        return
+    os.kill(probe_pid, signal.SIGKILL)
+    raise AssertionError("the probe outlived its cancelled worker")
+
+
+def test_a_probe_that_cannot_start_counts_as_a_failure_until_the_deadline():
+    now = [0.0]
+    waits = []
+
+    def cannot_spawn(argv, **kwargs):
+        raise OSError(35, "Resource temporarily unavailable")
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    ok = network.wait_for_network(timeout=10, interval=2, on_waiting=waits.append,
+                                  clock=lambda: now[0], sleep=sleep, popen=cannot_spawn)
+
+    assert ok is False
+    assert now[0] == 10
+    assert len(waits) == 1

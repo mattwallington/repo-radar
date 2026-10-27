@@ -283,6 +283,32 @@ def test_network_abort_reports_each_phase_under_one_attempt_identity(monkeypatch
     assert all(p["attemptId"] == "a" * 32 and p["channel"] == "stable" for p in posted)
 
 
+def test_stop_during_the_network_wait_is_recorded_as_cancelled(monkeypatch, tmp_path):
+    """Stop (SIGTERM) during the wait surfaces as NetworkWaitCancelled; the run ends cancelled,
+    not as a connectivity failure, and the app is told so."""
+    import requests
+    from repo_radar.network import NetworkWaitCancelled
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+
+    def _cancelled(**kw):
+        raise NetworkWaitCancelled()
+
+    monkeypatch.setattr(S, "wait_for_network", _cancelled)
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    args = _args(status_server=True)
+    args._activity_writer = writer
+
+    assert S.sync_mode(args) == 143
+    assert writer.terminals == [("cancelled", {"reason": "cancelled_during_network_wait"})]
+    assert [p["type"] for p in posted if p["type"] != "output"][-1] == "sync-terminal"
+    assert not any(p["type"] == "network-timeout" for p in posted)
+
+
 def test_no_configuration_calls_terminal_blocked(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(S, "load_config", lambda: None)

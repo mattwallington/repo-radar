@@ -9,10 +9,16 @@ Each probe now runs in a disposable child process that the parent can always kil
 waits only for the time left in the budget, then terminates and reaps the child. The child also
 arms its own alarm, so it cannot outlive its budget even if the parent is killed first. Nothing
 from the sync's configuration or environment (tokens, API keys, repository settings) reaches it.
+
+The app's Stop button sends SIGTERM. During the wait that is turned into NetworkWaitCancelled, so
+the probe is killed and reaped on the way out instead of being left to its alarm.
 """
 
+import contextlib
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -32,10 +38,31 @@ sys.exit(0)
 # Longest a single probe may take, inside whatever remains of the overall budget.
 PROBE_TIMEOUT = 5.0
 
-# How long a probe may run before the caller is told we are waiting. A healthy probe finishes well
-# inside this, so a normal sync never reports a network wait; a stalled resolver is announced
-# within this grace instead of only after it finally fails.
-ANNOUNCE_AFTER = 1.0
+
+class NetworkWaitCancelled(Exception):
+    """SIGTERM (the app's Stop button) arrived while waiting for the network."""
+
+
+@contextlib.contextmanager
+def _cancel_on_sigterm():
+    """For the duration of the wait, turn SIGTERM into NetworkWaitCancelled so cleanup runs.
+
+    Only the main thread can install signal handlers; anywhere else the wait keeps the process's
+    existing SIGTERM behavior. The previous handler is restored afterwards, so SIGTERM later in the
+    sync behaves exactly as before.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise(signum, frame):
+        raise NetworkWaitCancelled()
+
+    previous = signal.signal(signal.SIGTERM, _raise)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
 
 
 def _probe_command(host, port, budget):
@@ -57,27 +84,22 @@ def _reap(child):
         pass
 
 
-def _run_probe(host, port, budget, before_block, popen, clock):
+def _run_probe(host, port, budget, before_block, popen):
     """Run one bounded probe. Returns True on success, False on failure or when out of budget.
 
-    `before_block()` is called once if the probe is still pending after ANNOUNCE_AFTER seconds.
+    `before_block()` runs once the probe has started and before waiting on it, since that wait
+    can last the whole probe budget. A probe that cannot even be started counts as a failure.
     """
-    started = clock()
-    child = popen(_probe_command(host, port, budget),
-                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                  env={}, close_fds=True)
     try:
-        grace = min(ANNOUNCE_AFTER, budget)
-        try:
-            return child.wait(timeout=grace) == 0
-        except subprocess.TimeoutExpired:
-            pass
+        child = popen(_probe_command(host, port, budget),
+                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, env={}, close_fds=True)
+    except OSError:
+        return False
+    try:
         before_block()
-        remaining = budget - (clock() - started)
-        if remaining <= 0:
-            return False
         try:
-            return child.wait(timeout=remaining) == 0
+            return child.wait(timeout=budget) == 0
         except subprocess.TimeoutExpired:
             return False
     finally:
@@ -100,8 +122,16 @@ def wait_for_network(host="github.com", port=443, timeout=300, interval=2, requi
     execution resumes.
 
     Returns True if the network is stable, False if the budget ran out. Calls on_waiting(elapsed)
-    once, the first time a probe fails or stays pending past ANNOUNCE_AFTER seconds.
+    once, before the first wait on a probe. Raises NetworkWaitCancelled if SIGTERM arrives, after
+    the probe in flight has been killed and reaped.
     """
+    with _cancel_on_sigterm():
+        return _wait(host, port, timeout, interval, required_successes, on_waiting,
+                     probe_timeout, clock, sleep, popen)
+
+
+def _wait(host, port, timeout, interval, required_successes, on_waiting, probe_timeout,
+          clock, sleep, popen):
     start = clock()
     deadline = start + timeout
     notified = False
@@ -117,7 +147,7 @@ def wait_for_network(host="github.com", port=443, timeout=300, interval=2, requi
         remaining = deadline - clock()
         if remaining <= 0:
             return False
-        if _run_probe(host, port, min(probe_timeout, remaining), _announce, popen, clock):
+        if _run_probe(host, port, min(probe_timeout, remaining), _announce, popen):
             successes += 1
             if successes >= required_successes:
                 return True
