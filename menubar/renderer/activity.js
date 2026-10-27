@@ -590,7 +590,12 @@ function boot(win, doc, api) {
 
   // `selectedId` is an ACTIVITY id (a bridge argument); `selectedLegacyId` is a legacy item's id,
   // which is never one. At most one of the two is ever set.
-  const view = { lens: 'events', filter: {}, selectedId: null, selectedLegacyId: null, detail: null };
+  // `lensDecidedFor` is the activity whose arrival last chose the lens; `lensAuto` says that choice
+  // was ours rather than a tab click. See `lensOnArrival`.
+  const view = {
+    lens: 'events', filter: {}, selectedId: null, selectedLegacyId: null, detail: null,
+    lensDecidedFor: null, lensAuto: false,
+  };
   // Task 5.1: the legacy summaries from the last painted list, by id. A legacy item is complete on
   // arrival, so selecting one is a lookup here rather than a call over the bridge.
   let legacyItems = new Map();
@@ -685,6 +690,28 @@ function boot(win, doc, api) {
     paintDetail();
   }
 
+  // A blocked attempt that recorded no events (the runtime refused to start, say) keeps its reason
+  // only in its terminal summary, which the reader puts in Problems -- so it opens there instead of
+  // on an empty Events pane. Decided once per selected activity: re-selecting the same one (a deep
+  // link, a Retry) keeps whatever is showing, so the user's own tab choice is never undone. The
+  // next activity that does not need it goes back to Events only if we, not the user, left it.
+  function lensOnArrival(id, item) {
+    if (id === view.lensDecidedFor) return view.lens;
+    view.lensDecidedFor = id;
+    const it = item && typeof item === 'object' ? item : null;
+    const silentBlock = it && !isLegacy(it) && it.outcome === 'blocked'
+      && !(Array.isArray(it.events) && it.events.length > 0);
+    if (silentBlock) {
+      view.lensAuto = true;
+      return 'problems';
+    }
+    if (view.lensAuto) {
+      view.lensAuto = false;
+      return 'events';
+    }
+    return view.lens;
+  }
+
   // Task 5.1: a legacy item is selected WITHOUT touching the bridge -- the summary the list
   // returned is the whole item. An id that is not in the current list selects nothing (the list
   // was repainted underneath it), rather than painting a stale detail pane.
@@ -693,6 +720,7 @@ function boot(win, doc, api) {
     if (!item) return;
     view.selectedId = null;
     view.selectedLegacyId = legacyId;
+    view.lensDecidedFor = null;
     view.detail = { item, available: true };
     markSelected();
     paintDetail();
@@ -707,7 +735,9 @@ function boot(win, doc, api) {
       const result = await api.get(id);
       if (view.selectedId !== id) return; // a newer selection won the race
       view.detail = result;
-      paintDetail();
+      const lens = lensOnArrival(id, result && result.item);
+      if (lens !== view.lens) setLens(lens); // paints
+      else paintDetail();
     } catch (e) {
       if (view.selectedId !== id) return;
       view.detail = null;
@@ -843,8 +873,9 @@ function boot(win, doc, api) {
   }
   levelEl.addEventListener('change', onFilterChange);
   searchEl.addEventListener('input', onFilterChange);
-  tabs.events.addEventListener('click', () => setLens('events'));
-  tabs.problems.addEventListener('click', () => setLens('problems'));
+  // A tab click is the user's choice, which the next selection keeps.
+  tabs.events.addEventListener('click', () => { view.lensAuto = false; setLens('events'); });
+  tabs.problems.addEventListener('click', () => { view.lensAuto = false; setLens('problems'); });
 
   // -----------------------------------------------------------------------------------------
   // Task 4.5: the action bar.
