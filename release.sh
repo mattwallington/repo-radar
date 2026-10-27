@@ -63,6 +63,17 @@ for arg in "$@"; do
       echo "  - Must be on main or dev branch"
       echo "  - GitHub CLI (gh) installed and authenticated"
       echo "  - Node.js and npm installed"
+      echo "  - REPO_RADAR_RELEASE_PYTHON set to the absolute path of a release venv's python"
+      echo ""
+      echo -e "${BOLD}Preparing the release Python:${NC}"
+      echo "  The model gates run in a dedicated venv installed from the checked-in lock that"
+      echo "  matches its Python minor and architecture (resources/pydeps/cp3<minor>-<arch>.lock)."
+      echo "  Do not install anything else into it. On an Apple Silicon Mac with Python 3.14:"
+      echo ""
+      echo "    dir=\$(mktemp -d /tmp/repo-radar-release-XXXXXX)"
+      echo "    /opt/homebrew/bin/python3.14 -m venv \"\$dir/venv\""
+      echo "    \"\$dir/venv/bin/python\" -m pip install --require-hashes -r resources/pydeps/cp314-arm64.lock"
+      echo "    export REPO_RADAR_RELEASE_PYTHON=\"\$dir/venv/bin/python\""
       exit 0
       ;;
     *)
@@ -84,7 +95,7 @@ fi
 cd "$SCRIPT_DIR"
 
 # Check for required tools
-for tool in gh node npm git python3; do
+for tool in gh node npm git; do
   if ! command -v "$tool" &>/dev/null; then
     error "$tool is not installed"
   fi
@@ -115,13 +126,24 @@ if ! git diff --cached --quiet; then
 fi
 success "No staged changes"
 
+# The Python gates run in a dedicated, verified release venv, never the ambient python3.
+RELEASE_PY="${REPO_RADAR_RELEASE_PYTHON:-}"
+if [[ -z "$RELEASE_PY" ]]; then
+  error "REPO_RADAR_RELEASE_PYTHON is not set. Point it at a release venv's python installed from the matching resources/pydeps lock (see ./release.sh --help)."
+fi
+node scripts/check_release_python.js "$RELEASE_PY" || {
+  echo "Release blocked: REPO_RADAR_RELEASE_PYTHON is not a usable release venv. Recreate it from the matching resources/pydeps lock (see ./release.sh --help)." >&2
+  exit 1
+}
+success "Release Python verified: $RELEASE_PY"
+
 RELEASE_DATE=$(date +%Y-%m-%d)
-python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
+"$RELEASE_PY" -B scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
   echo "Release blocked: model lifecycle gate failed. Re-verify vendor deprecation pages and amend repo_radar/model_lifecycle.json + the model maps." >&2
   exit 1
 }
 
-python3 scripts/check_model_windows.py --target-date "$RELEASE_DATE" || {
+"$RELEASE_PY" -B scripts/check_model_windows.py --target-date "$RELEASE_DATE" || {
   echo "Release blocked: model window gate failed. Re-verify vendor windows; fix repo_radar/model_catalog.py or add a bound override." >&2
   exit 1; }
 
