@@ -123,6 +123,13 @@ def test_gates_run_in_supplied_venv_and_failures_block_release(checkout):
     assert not [e for e in entries if e.get("ambient")], "ambient python3 must never run"
     _assert_nothing_released(repo, entries)
 
+    # Publishing is paused: a real run whose gates all pass still stops before any change.
+    proc, entries = _run(checkout, venv_python)
+    assert proc.returncode != 0
+    assert "publishing is paused" in proc.stderr
+    assert [e["gate"] for e in entries if "gate" in e] == ["check_model_lifecycle.py", "check_model_windows.py", "matrix"]
+    _assert_nothing_released(repo, entries)
+
     # The base interpreter behind the venv symlink is not a venv: rejected before any gate.
     for bad in (None, os.path.realpath(venv_python)):
         proc, entries = _run(checkout, bad)
