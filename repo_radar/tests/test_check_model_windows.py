@@ -361,7 +361,7 @@ def test_override_cannot_clear_count_strategy_block():
 
 
 def test_real_overrides_file_is_wellformed():
-    # litellm 1.105.2 reports Google's 65,536 Gemini output cap itself, so the eight 65,535
+    # litellm 1.105 reports Google's 65,536 Gemini output cap itself, so the eight 65,535
     # overrides were dropped. Any future row must still be complete and unique.
     import json
     from pathlib import Path

@@ -1,7 +1,7 @@
 {
   "pyMinor": 11,
   "arch": "arm64",
-  "lockSha256": "fcea3bae9ba9228ef8b9cd1e9b3ae22baffd0d6309e749a4a06a706cf01527b4",
+  "lockSha256": "011ff862c475784a069e43c97de94922060784b5de2f1e0b5d30a1d52cd87ea1",
   "bootstrap": {
     "pip": "26.2.2",
     "setuptools": "84.2.1"
@@ -16,7 +16,7 @@
     "blessed": "1.47.0",
     "boto3": "1.43.120",
     "botocore": "1.43.120",
-    "certifi": "2026.7.22",
+    "certifi": "2026.10.23",
     "charset-normalizer": "3.4.9",
     "click": "8.4.2",
     "distro": "1.9.0",
@@ -42,7 +42,7 @@
     "jmespath": "1.1.0",
     "jsonschema": "4.26.0",
     "jsonschema-specifications": "2025.9.1",
-    "litellm": "1.105.2",
+    "litellm": "1.105.6",
     "markdown-it-py": "4.2.0",
     "markupsafe": "3.0.3",
     "mdurl": "0.1.2",
