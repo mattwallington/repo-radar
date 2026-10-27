@@ -217,11 +217,15 @@ def call_llm(model, prompt, max_tokens=8192):
     import litellm
 
     max_tokens = output_budget(model, max_tokens)
+    # Name the provider explicitly: litellm otherwise infers it from its downloaded model map, and
+    # when that fetch fails its bundled map doesn't know newer ids such as gpt-6.1-terra.
+    provider = provider_for_model(model)
     if _needs_responses_api(model):
         response = litellm.responses(
             model=model,
             input=prompt,
             max_output_tokens=max_tokens,
+            custom_llm_provider=provider,
         )
         # Prefer the convenience attribute; fall back to manual extraction.
         text = getattr(response, 'output_text', None)
@@ -235,6 +239,7 @@ def call_llm(model, prompt, max_tokens=8192):
             model=model,
             messages=_completion_messages(prompt),
             max_tokens=max_tokens,
+            custom_llm_provider=provider,
         )
         try:
             text = response.choices[0].message.content or ''

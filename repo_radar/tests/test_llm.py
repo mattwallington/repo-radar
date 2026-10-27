@@ -182,6 +182,9 @@ def test_needs_responses_api_gated_on_openai_provider():
 # ── Real provider adapters, stubbed at the HTTP transport (no network, no keys) ──────────────────
 import importlib.util
 import json
+import os
+import sys
+from pathlib import Path
 
 import httpx
 
@@ -254,3 +257,39 @@ def test_new_claude_models_budget_conservatively_and_send_plain_text(stub_http, 
     [(host, _path, body)] = stub_http
     assert host == 'api.anthropic.com' and body['max_tokens'] == llm.CHUNK_OUTPUT
     assert not {'temperature', 'top_p', 'top_k'} & set(body), 'Claude 5.x rejects sampling params'
+
+
+_OFFLINE_CHILD = r'''
+import json, os, socket, sys
+import httpx
+def blocked(*a, **k): raise OSError("network blocked in test")
+socket.socket.connect = blocked
+sent = []
+def handle(self, request):
+    if request.url.host == "raw.githubusercontent.com":   # litellm's remote model map: offline
+        raise httpx.ConnectError("offline", request=request)
+    sent.append([request.url.host, request.url.path, json.loads(request.content or b"{}").get("model")])
+    return httpx.Response(200, json={"id": "c", "object": "chat.completion", "created": 0, "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "HELLO"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}})
+httpx.HTTPTransport.handle_request = handle
+sys.path.insert(0, sys.argv[1])
+from repo_radar import llm
+text = llm.call_llm(llm.get_ai_model(), "hi", max_tokens=64)[0]
+print(json.dumps({"text": text, "sent": sent, "saved": os.environ["AI_MODEL"]}))
+'''
+
+
+def test_retired_openai_selection_sends_offline_without_litellm_model_map():
+    # litellm infers the provider from its downloaded model map; when that fetch fails, its bundled
+    # map doesn't know gpt-6.1-terra and refuses the call. call_llm names the provider itself.
+    import subprocess
+    root = str(Path(__file__).resolve().parents[2])
+    env = {**os.environ, "OPENAI_API_KEY": "test-not-a-key", "AI_MODEL": "o4-mini"}
+    env.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+    out = subprocess.run([sys.executable, "-I", "-c", _OFFLINE_CHILD, root], env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert result == {"text": "HELLO", "saved": "o4-mini",
+                      "sent": [["api.openai.com", "/v1/chat/completions", "gpt-6.1-terra"]]}
