@@ -159,3 +159,41 @@ def test_a_probe_that_cannot_start_counts_as_a_failure_until_the_deadline():
     assert ok is False
     assert now[0] == 10
     assert len(waits) == 1
+
+
+def test_stop_during_probe_cleanup_still_reaps_the_probe_and_cancels():
+    # The probe ran out its budget; while it is being killed and reaped, Stop arrives. Cleanup must
+    # finish, and the wait must end as cancelled instead of carrying on to its deadline.
+    class Probe:
+        pid = 4242
+        def __init__(self):
+            self.killed = False
+            self.reaped = False
+            self.cleanup_waits = 0
+        def poll(self):
+            return 0 if self.reaped else None
+        def kill(self):
+            self.killed = True
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired('probe', timeout)
+            self.cleanup_waits += 1
+            if self.cleanup_waits == 1:
+                raise network.NetworkWaitCancelled()
+            self.reaped = True
+            return -9
+
+    probe = Probe()
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    try:
+        network.wait_for_network(timeout=10, clock=lambda: now[0], sleep=sleep,
+                                 popen=lambda argv, **kw: probe)
+    except network.NetworkWaitCancelled:
+        pass
+    else:
+        raise AssertionError("the cancellation was swallowed during cleanup")
+    assert probe.killed and probe.reaped

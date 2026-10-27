@@ -72,16 +72,27 @@ def _probe_command(host, port, budget):
 
 
 def _reap(child):
-    """Kill a still-running probe and collect its exit status so no zombie is left behind."""
-    if child.poll() is None:
+    """Kill a still-running probe and collect its exit status so no zombie is left behind.
+
+    Stop can land in the middle of this cleanup too. The probe is still killed and reaped, and the
+    cancellation is raised afterwards rather than swallowed, so the wait ends as cancelled.
+    """
+    cancelled = None
+    for _ in range(3):
         try:
-            child.kill()
-        except OSError:
-            pass
-    try:
-        child.wait()
-    except Exception:
-        pass
+            if child.poll() is None:
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+            child.wait()
+            break
+        except NetworkWaitCancelled as exc:
+            cancelled = exc  # finish reaping first
+        except Exception:
+            break  # an ordinary cleanup error: nothing more to collect
+    if cancelled is not None:
+        raise cancelled
 
 
 def _run_probe(host, port, budget, before_block, popen):
