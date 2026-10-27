@@ -83,7 +83,7 @@ const MODEL_CAPS = {
   'claude-opus-5-5': { max_input: 1000000, max_output: 128000 },
   'claude-sonnet-4-5': { max_input: 200000, max_output: 64000 },
   'claude-sonnet-4-5-20250929': { max_input: 200000, max_output: 64000 },
-  'claude-sonnet-4-6': { max_input: 1000000, max_output: 64000 },
+  'claude-sonnet-4-6': { max_input: 1000000, max_output: 128000 },
   'claude-sonnet-5': { max_input: 1000000, max_output: 128000 },
   'claude-sonnet-5-5': { max_input: 1000000, max_output: 128000 },
   'gemini/gemini-2.5-flash': { max_input: 1048576, max_output: 65536 },
