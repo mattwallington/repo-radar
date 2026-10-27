@@ -145,6 +145,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ### Preparing a release
 
+`release.sh` is paused for now: it still publishes to the old `mattwallington/repo-radar` feed, which personal-team installs can't update from once builds are Reperio-signed. It prints that and exits, except for `--help`. Use `build-local.sh` (below) until the update feed moves to `ReperioHealth/repo-radar-releases`. The release venv set up here is used by both scripts.
+
 `release.sh` runs its model-lifecycle and model-window gates in a dedicated release venv, never the `python3` on your `PATH`. Before running it, even with `--dry-run`, create that venv from the checked-in lock that matches its Python minor and architecture (`resources/pydeps/cp3<minor>-<arch>.lock`) and point `REPO_RADAR_RELEASE_PYTHON` at its `python`. On an Apple Silicon Mac with Python 3.14:
 
 ```bash
