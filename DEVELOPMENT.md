@@ -58,6 +58,8 @@ repo-radar/
 
 Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases. The app includes auto-update — existing users are prompted when a new version is available.
 
+Before any run, including `--dry-run`, set `REPO_RADAR_RELEASE_PYTHON` to a release venv built from the matching dependency lock. See "Preparing a release" in [README.md](README.md#preparing-a-release) or `./release.sh --help`.
+
 ```bash
 # Patch release (default, no args needed)
 ./release.sh
