@@ -316,6 +316,34 @@ def test_the_run_reports_its_repository_roster_under_its_identity(monkeypatch, t
     assert phases == ["starting", "syncing"]
 
 
+def test_app_launched_run_tags_updates_with_the_apps_progress_id(monkeypatch, tmp_path):
+    """When the app's own Activity recording failed, its hand-off carries no Activity ID, but it
+    still names the progress ID it is waiting for; the worker tags every update with that one.
+    An invalid value is ignored in favour of the worker's own Activity ID."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(S, "wait_for_network", lambda **kw: False)
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    app_id = "3f2b8c1e-5d4a-4b6f-9c7e-1a2b3c4d5e6f"
+    monkeypatch.setenv("REPO_RADAR_PROGRESS_ATTEMPT_ID", app_id)
+    writer = _SpyWriter()
+    writer.activity_id = "c" * 32  # the worker's own (unrelated) Activity ID
+    args = _args(status_server=True)
+    args._activity_writer = writer
+    S.sync_mode(args)
+    assert posted and all(p["attemptId"] == app_id for p in posted)
+
+    posted.clear()
+    monkeypatch.setenv("REPO_RADAR_PROGRESS_ATTEMPT_ID", "not-an-id")
+    S.sync_mode(args)
+    assert posted and all(p["attemptId"] == "c" * 32 for p in posted)
+
+
 def test_stop_during_the_network_wait_is_recorded_as_cancelled(monkeypatch, tmp_path):
     """Stop (SIGTERM) during the wait surfaces as NetworkWaitCancelled; the run ends cancelled,
     not as a connectivity failure, and the app is told so."""

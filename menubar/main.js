@@ -5,6 +5,7 @@ const os = require('os');
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { providerForModel, migrateModel, DEFAULT_MODEL } = require('./model-policy');
 // Spec 2A runtime module (menubar/runtime/): per-channel Python runtime
@@ -352,12 +353,13 @@ function sendSyncStateToWindow(win = logWindow) {
 }
 
 // Electron's own worker for `attemptId` exited. Unless the worker already reported its outcome,
-// take it from the attempt's Activity record, then from the exit itself.
-function finishChildAttempt(attemptId, code, wasCancelled) {
+// take it from the attempt's Activity record (only when the ID is one -- `durable`), then from
+// the exit itself.
+function finishChildAttempt(attemptId, code, wasCancelled, durable) {
   const status = loadStatus();
   const entry = syncState.current(status, runtimeChannel);
   if (entry && entry.attemptId === (attemptId || null) && entry.phase !== syncState.FINISHED) {
-    const outcome = (attemptId && attemptReconciledOutcome(attemptId))
+    const outcome = (attemptId && durable && attemptReconciledOutcome(attemptId))
       || (wasCancelled ? 'cancelled'
         : code === EXIT_SKIPPED_NO_WORK ? 'skipped'
           : code === 0 ? 'succeeded' : 'failed');
@@ -1307,8 +1309,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   const activity = activityGlue.beginManualActivity(os.homedir(), {
     channel: runtimeChannel, trigger: trigger || 'manual',
   });
+  // This launch's progress ID: the Activity ID when recording works, so the window and Activity
+  // agree; otherwise a one-off ID that only ties the worker's updates to this child. The latter
+  // is display correlation only -- there is no Activity owner behind it to probe or reconcile.
+  const attemptDurable = !!(activity.writer._active && activity.writer.activityId);
+  const progressAttemptId = attemptDurable ? activity.writer.activityId : crypto.randomUUID();
   // Until it gets the root lock (onChild) or is turned away, this attempt is not a running worker.
-  const pendingId = activity.writer.activityId || null;
+  const pendingId = attemptDurable ? progressAttemptId : null;
   if (pendingId) pendingManualAttempts.add(pendingId);
   const settlePending = () => { if (pendingId) pendingManualAttempts.delete(pendingId); };
 
@@ -1462,7 +1469,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     pendingFreshSync = startToken;
   }
   // The attempt the start sender below speaks for, and whether it has got the root lock yet.
-  const attemptId = activity.writer.activityId || null;
+  const attemptId = progressAttemptId;
   let attemptBegun = false;
   const clearPendingStart = () => {
     if (startToken && pendingFreshSync === startToken) pendingFreshSync = null;
@@ -1635,6 +1642,9 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   // runtime.runSync() (Task 2.4) maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD
   // to that child-side fd number.
   Object.assign(shellEnv, activity.writer.handOffEnv());
+  // The ID the worker tags its status updates with, kept apart from the Activity hand-off above
+  // (whose ID/token/fd must stay a matched set). Always set, so an inherited value can't leak in.
+  shellEnv.REPO_RADAR_PROGRESS_ATTEMPT_ID = progressAttemptId;
 
   console.log('Starting sync via runtime.runSync (channel:', runtimeChannel, ')', ['sync', '--status-server']);
   console.log('Environment - GEMINI_API_KEY:', !!shellEnv.GEMINI_API_KEY);
@@ -1673,7 +1683,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // The attempt this child is, for the progress view. Recorded now, not at triggerSync: only
       // here is the root exec lock known to be ours, so a refused attempt never displaces a
       // running scheduled attempt's view.
-      currentSyncProcess._attemptId = activity.writer.activityId || null;
+      currentSyncProcess._attemptId = progressAttemptId;
+      currentSyncProcess._attemptDurable = attemptDurable;
       try {
         // This attempt now owns the channel's view: a fresh run snapshot (no rows, errors or
         // output yet) with the roster prepared from the config above.
@@ -1724,6 +1735,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           // IMMEDIATE cleanup and UI update - don't wait
           const wasCancelled = syncCancelledByUser;
           const exitedAttemptId = child._attemptId || null;
+          const exitedDurable = !!child._attemptDurable;
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
@@ -1745,7 +1757,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           updateTrayMenu();
           // The window stops loading for this attempt now, with its real outcome -- including a
           // run that ended before sending one (an early block, a crash).
-          try { finishChildAttempt(exitedAttemptId, code, wasCancelled); } catch (e) { /* best-effort */ }
+          try { finishChildAttempt(exitedAttemptId, code, wasCancelled, exitedDurable); } catch (e) { /* best-effort */ }
 
           // If user cancelled, stay on idle icon — don't show error
           if (wasCancelled) {

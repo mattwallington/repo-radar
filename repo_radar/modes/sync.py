@@ -241,6 +241,17 @@ def _mint_activity_writer():
         return None
 
 
+def _progress_attempt_id():
+    """The ID the app chose for this run's status updates, if the app launched it.
+
+    Display correlation only: it never stands in for the Activity hand-off (REPO_RADAR_ACTIVITY_*),
+    whose ID, token and lease descriptor are validated as a set.
+    """
+    from repo_radar.activity import ids
+    value = (os.environ.get('REPO_RADAR_PROGRESS_ATTEMPT_ID') or '').strip()
+    return value if ids.valid_activity_id(value) else None
+
+
 def _activity_start(writer):
     """Best-effort `.start()`. Idempotent and safe to call unconditionally (a no-op on an
     already-started or inactive writer) -- guarded anyway so a writer-side surprise can never
@@ -1032,8 +1043,10 @@ def sync_mode(args):
     # Tag every status update with this attempt so the app can keep its progress view on the
     # right run: a window opened late, a scheduled run the app did not start, or a previous run's
     # last updates arriving after this one began. The Activity ID is the attempt's identity when
-    # recording works; otherwise a one-off ID still keeps attempts apart.
-    attempt_id = getattr(activity_writer, 'activity_id', None)
+    # recording works; otherwise a one-off ID still keeps attempts apart. When the app launched
+    # this run it says which ID to use, so its window follows this worker even if recording
+    # isn't working for this run.
+    attempt_id = _progress_attempt_id() or getattr(activity_writer, 'activity_id', None)
     if not isinstance(attempt_id, str) or not attempt_id:
         attempt_id = uuid.uuid4().hex
     set_status_attempt(attempt_id, resolve_channel())

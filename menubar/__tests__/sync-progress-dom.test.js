@@ -693,3 +693,36 @@ test('a status file from an older build still replays its last run', (t) => {
   assert.deepStrictEqual(Object.keys(win.rows()), ['l/one']);
   assert.strictEqual(win.status(), 'Complete!');
 });
+
+test('the app\'s own run stays tied to its window even when Activity recording is unavailable', (t) => {
+  const h = makeHarness(t);
+  h.writeConfig(['o/one']);
+  // A plain file where the Activity store should be: the app's writer can't record this run.
+  fs.mkdirSync(path.join(h.home, 'Library', 'Logs', 'repo-radar'), { recursive: true });
+  fs.writeFileSync(path.join(h.home, 'Library', 'Logs', 'repo-radar', 'activity'), '');
+
+  h.main.triggerSync({ showWindow: true });
+  h.clock.tick(60);
+  const { child, env } = h.spawn();
+  assert.strictEqual(env.REPO_RADAR_ACTIVITY_ID, undefined, 'no Activity hand-off without recording');
+  const id = env.REPO_RADAR_PROGRESS_ATTEMPT_ID;
+  assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
+  // The worker tags its updates with that ID (repo_radar/modes/sync.py, _progress_attempt_id).
+  const post = (p) => h.post({ ...p, attemptId: id, channel: 'stable' });
+  post({ type: 'sync-lifecycle', phase: 'starting' });
+  post({ type: 'waiting-for-network' });
+  h.clock.tick(500);
+  assert.strictEqual(h.window().status(), 'Waiting for network...');
+  assert.strictEqual(h.window().stopEnabled(), true, 'it is the app\'s own child');
+  post({ type: 'sync-lifecycle', phase: 'syncing' });
+  post({ type: 'progress', repo: 'o/one', status: 'Fetching', percent: 40, color: 'cyan' });
+  assert.deepStrictEqual(h.window().rows(), { 'o/one': 'Fetching' });
+  post({ type: 'sync-terminal', outcome: 'failed' });
+  child.exit(1);
+  h.clock.tick(1000);
+
+  const entry = h.status().syncState.stable;
+  assert.deepStrictEqual([entry.attemptId, entry.outcome], [id, 'failed']);
+  assert.strictEqual(h.window().status(), 'Sync failed — see ⚠️ View Errors in the menu');
+});
