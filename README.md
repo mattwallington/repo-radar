@@ -145,7 +145,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ### Preparing a release
 
-`release.sh` is paused for now: it still publishes to the old `mattwallington/repo-radar` feed, which personal-team installs can't update from once builds are Reperio-signed. It prints that and exits, except for `--help`. Use `build-local.sh` (below) until the update feed moves to `ReperioHealth/repo-radar-releases`. The release venv set up here is used by both scripts.
+Publishing with `release.sh` is paused for now: it still publishes to the old `mattwallington/repo-radar` feed, which personal-team installs can't update from once builds are Reperio-signed. `./release.sh --help` still works, and `./release.sh --dry-run` still runs every gate in the verified release venv described below and exits successfully without changing anything. A run without `--dry-run` runs the same checks, then stops before changing any file, building, tagging, pushing or publishing. Use `build-local.sh` (below) until the update feed moves to `ReperioHealth/repo-radar-releases`.
 
 `release.sh` runs its model-lifecycle and model-window gates in a dedicated release venv, never the `python3` on your `PATH`. Before running it, even with `--dry-run`, create that venv from the checked-in lock that matches its Python minor and architecture (`resources/pydeps/cp3<minor>-<arch>.lock`) and point `REPO_RADAR_RELEASE_PYTHON` at its `python`. On an Apple Silicon Mac with Python 3.14:
 
@@ -161,7 +161,7 @@ The script checks that this venv's installed packages exactly match the lock and
 
 ### Building a signed app locally
 
-Builds are signed with Reperio Health's Developer ID (team `F8UY7565VM`) and notarized through the `reperio-notary` notarytool profile, both in your login keychain. `build-local.sh` builds and checks an app without publishing anything: it makes no commit, tag, push or GitHub release. It runs the same gates as `release.sh`, so set `REPO_RADAR_RELEASE_PYTHON` as above, and it needs a clean checkout of `dev` (Repo Radar Dev) or `main` (Repo Radar) and a version newer than `VERSION`:
+Builds are signed with Reperio Health's Developer ID (team `F8UY7565VM`) and notarized through the `reperio-notary` notarytool profile, both in your login keychain. `build-local.sh` builds and checks an app without publishing anything: it makes no commit, tag, push or GitHub release. It runs the same gates as `release.sh`, so set `REPO_RADAR_RELEASE_PYTHON` as above, and it needs a clean checkout of `dev` (Repo Radar Dev) or `main` (Repo Radar) and a version newer than `VERSION`. A checkout with uncommitted changes or untracked files is refused, because electron-builder would package them. Every build from changed source needs a new version: never reuse a version that has already been distributed. For example:
 
 ```bash
 git checkout dev
@@ -172,7 +172,7 @@ git checkout main
 ./build-local.sh --version 1.0.33
 ```
 
-It passes electron-builder only the keychain profile, unsetting any `APPLE_ID` or `APPLE_API_*` variables in that one command, and fails if notarization was skipped. It then checks each app's team, bundle ID, signature, Gatekeeper assessment and stapled ticket, and prints the SHA-256 of every DMG, ZIP, blockmap and feed file in `menubar/dist/`. To install, quit the app, open the DMG for your Mac and replace the app in `/Applications`. Builds made this way check for updates at `ReperioHealth/repo-radar-releases`; until that repository has releases, the background check only logs a failure (Check for Updates in the menu shows an error) and syncing is unaffected.
+It passes electron-builder only the keychain profile, unsetting any `APPLE_ID` or `APPLE_API_*` variables in that one command, and fails if notarization was skipped. It writes the new version into `VERSION` for the build and restores it when the script exits; if a SIGTERM reaches only the script's shell, that restore can wait until electron-builder exits. After the build it checks each app's team, bundle ID, signature, Gatekeeper assessment and stapled ticket, and prints the SHA-256 of every DMG, ZIP, blockmap and feed file in `menubar/dist/`. To install, quit the app, open the DMG for your Mac and replace the app in `/Applications`. Builds made this way check for updates at `ReperioHealth/repo-radar-releases`; until that repository has releases, the background check only logs a failure (Check for Updates in the menu shows an error) and syncing is unaffected.
 
 Apps signed by the earlier personal team can't update themselves to a Reperio-signed build, because macOS requires an update to match the installed app's signing team. Replace each installed copy once by hand. Your settings, mirrors and runtime are kept.
 
