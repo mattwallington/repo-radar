@@ -583,6 +583,18 @@ test('a blocked attempt with no events opens on Problems; a later Events choice 
   await settle();
   assert.ok(byId['tab-events'].classList.contains('active'), 'a re-selection keeps the user\'s Events choice');
   assert.ok(!byId['tab-problems'].classList.contains('active'));
+
+  // A Problems choice the user made before opening the blocked attempt is theirs, so returning to
+  // an ordinary attempt keeps it rather than reverting to Events.
+  fire(byId.list, 'click', chipFor(LIVE_ITEM.id));
+  await settle();
+  fire(byId['tab-problems'], 'click');
+  fire(byId.list, 'click', chipFor(BLOCKED_ID));
+  await settle();
+  fire(byId.list, 'click', chipFor(LIVE_ITEM.id));
+  await settle();
+  assert.ok(byId['tab-problems'].classList.contains('active'), 'the user\'s own Problems choice survives');
+  assert.ok(!byId['tab-events'].classList.contains('active'));
 });
 
 test('a rejected bridge call shows one generic line plus Retry, never the error itself (P4-7)', async () => {

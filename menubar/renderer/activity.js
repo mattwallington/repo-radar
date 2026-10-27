@@ -702,7 +702,8 @@ function boot(win, doc, api) {
     const silentBlock = it && !isLegacy(it) && it.outcome === 'blocked'
       && !(Array.isArray(it.events) && it.events.length > 0);
     if (silentBlock) {
-      view.lensAuto = true;
+      // Already on Problems: keep whoever chose it (the user, or an earlier automatic switch).
+      if (view.lens !== 'problems') view.lensAuto = true;
       return 'problems';
     }
     if (view.lensAuto) {
