@@ -9,6 +9,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 On the **dev channel** (Repo Radar Dev) for testing before the next stable release.
 
 ### Fixed
+- **Sync blocked after Homebrew's default Python moved to 3.15.** When Homebrew updated its default `python3` past the supported range, the app could no longer find a usable Python to rebuild its runtime, so every sync — manual and scheduled — was blocked. It now also looks for the versioned Homebrew Pythons (3.14 down to 3.10), so relaunching the app rebuilds the runtime from one that is still installed.
+- **Blocked syncs now show why.** Selecting an attempt in Activity History that was blocked before it recorded any events opens it on Problems, where its reason is shown, instead of an empty Events list. You can still switch to Events.
 - **Progress window stuck on "Starting sync…".** When Sync Now was refused because another sync already held the lock (for example right after an auto-update), or the sync failed before its process could start, the progress window opened and then sat on "Starting sync…" forever. It now says "Not started — another sync is already running" or "Sync could not start — see ⚠️ View Errors in the menu", and the attempt is recorded in Activity History either way.
 
 ## [1.0.31] - 2026-09-01
