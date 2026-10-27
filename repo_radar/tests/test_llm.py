@@ -1,3 +1,5 @@
+import pytest
+
 from repo_radar import llm
 from repo_radar.llm import (
     get_model_context_window,
@@ -117,6 +119,33 @@ def test_get_ai_model_migrates(monkeypatch):
     assert llm.get_ai_model() == 'gpt-5.3-codex'
     monkeypatch.delenv('AI_MODEL', raising=False)
     assert llm.get_ai_model() == llm.DEFAULT_MODEL
+
+
+# OpenAI shut these down 2026-10-23. A stored selection must run on its replacement without a
+# config write; Gemini 2.5 is still served (no shutdown date) and must stay selected.
+RETIRED_2026_10_23 = {
+    'gpt-4.1-nano': 'gpt-5.6-luna',
+    'o4-mini': 'gpt-5.6-terra',
+    'o1': 'gpt-5.6-sol',
+    'o3-mini': 'gpt-5.6-sol',
+    'o1-pro': 'gpt-5.6-sol',
+}
+
+
+@pytest.mark.parametrize('old,new', sorted(RETIRED_2026_10_23.items()))
+def test_get_ai_model_runs_october_retirements_on_replacement(monkeypatch, old, new):
+    monkeypatch.setenv('AI_MODEL', old)
+    assert llm.get_ai_model() == new
+    assert not llm.is_known_model(old)
+    assert llm.is_known_model(new)
+
+
+@pytest.mark.parametrize('model', ['gemini/gemini-2.5-pro', 'gemini/gemini-2.5-flash',
+                                   'gemini/gemini-2.5-flash-lite'])
+def test_get_ai_model_keeps_gemini_2_5(monkeypatch, model):
+    monkeypatch.setenv('AI_MODEL', model)
+    assert llm.get_ai_model() == model
+    assert llm.is_known_model(model)
 
 
 def test_needs_responses_api_gated_on_openai_provider():

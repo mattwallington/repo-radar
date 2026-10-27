@@ -143,6 +143,20 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for development setup, architecture, releas
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
+### Preparing a release
+
+`release.sh` runs its model-lifecycle and model-window gates in a dedicated release venv, never the `python3` on your `PATH`. Before running it, even with `--dry-run`, create that venv from the checked-in lock that matches its Python minor and architecture (`resources/pydeps/cp3<minor>-<arch>.lock`) and point `REPO_RADAR_RELEASE_PYTHON` at its `python`. On an Apple Silicon Mac with Python 3.14:
+
+```bash
+dir=$(mktemp -d /tmp/repo-radar-release-XXXXXX)
+/opt/homebrew/bin/python3.14 -m venv "$dir/venv"
+"$dir/venv/bin/python" -m pip install --require-hashes -r resources/pydeps/cp314-arm64.lock
+export REPO_RADAR_RELEASE_PYTHON="$dir/venv/bin/python"
+./release.sh --dry-run
+```
+
+The script checks that this venv's installed packages exactly match the lock and pass `pip check`, and stops before changing any version if they don't. Keep it to the lock only: install pytest and other test tools in a separate environment.
+
 ## License
 
 MIT

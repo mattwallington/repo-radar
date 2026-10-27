@@ -47,6 +47,13 @@ MODEL_MIGRATIONS = {
     "gpt-5.1-codex-max": "gpt-5.3-codex",
     "gpt-5.2-codex": "gpt-5.3-codex",
     "gpt-5.1-codex-mini": "gpt-5.4-mini",
+    # Shut down 2026-10-23. o1-pro's vendor replacement also sets reasoning.mode=pro, which Repo
+    # Radar does not send; these land on ordinary GPT-5.6 Sol.
+    "gpt-4.1-nano": "gpt-5.6-luna",
+    "o4-mini": "gpt-5.6-terra",
+    "o1": "gpt-5.6-sol",
+    "o3-mini": "gpt-5.6-sol",
+    "o1-pro": "gpt-5.6-sol",
     # Google
     "gemini/gemini-2.0-flash": "gemini/gemini-2.5-flash",
     "gemini/gemini-2.0-flash-001": "gemini/gemini-2.5-flash",

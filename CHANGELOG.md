@@ -13,6 +13,12 @@ On the **dev channel** (Repo Radar Dev) for testing before the next stable relea
 - **Blocked syncs now show why.** Selecting an attempt in Activity History that was blocked before it recorded any events opens it on Problems, where its reason is shown, instead of an empty Events list. You can still switch to Events.
 - **Progress window stuck on "Starting sync…".** When Sync Now was refused because another sync already held the lock (for example right after an auto-update), or the sync failed before its process could start, the progress window opened and then sat on "Starting sync…" forever. It now says "Not started — another sync is already running" or "Sync could not start — see ⚠️ View Errors in the menu", and the attempt is recorded in Activity History either way.
 
+### Changed
+- **Retired OpenAI models now run on GPT-5.6.** OpenAI shut down `gpt-4.1-nano`, `o4-mini`, `o1`, `o3-mini` and `o1-pro` on October 23, 2026. A saved selection of one of these now runs on its replacement: GPT-5.6 Luna for `gpt-4.1-nano`, GPT-5.6 Terra for `o4-mini`, and GPT-5.6 Sol for the other three. On the stable channel the app shows a notice naming the replacement, with Review Models to pick something else. OpenAI's own `o1-pro` replacement also turns on its "pro" reasoning mode; Repo Radar doesn't send that option, so `o1-pro` users get ordinary GPT-5.6 Sol.
+- **Gemini 2.5 Pro, Flash and Flash-Lite stay selectable.** Google has not deprecated them or set a shutdown date, so the October 16 dates recorded earlier were wrong and have been removed. Existing selections keep working unchanged.
+- **Upcoming shutdowns recorded.** Claude Sonnet 4.5 retires November 30, 2026, and GPT-5.1, GPT-5.3-codex and GPT-5.4 nano retire April 1, 2027. They stay selectable until then.
+- **Releases run their model gates in a dedicated release environment.** `release.sh` now requires `REPO_RADAR_RELEASE_PYTHON` and checks that venv against the checked-in dependency lock before anything else. See README, "Preparing a release".
+
 ## [1.0.31] - 2026-09-01
 
 ### Added
