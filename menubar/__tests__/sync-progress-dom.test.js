@@ -658,3 +658,38 @@ test('a run with no repositories says so, rather than reporting missing data', (
   assert.strictEqual(emptyNote(reopened), 'No repositories configured');
   assert.strictEqual(reopened.status(), 'Complete!');
 });
+
+test('a channel with no run of its own shows nothing rather than the other channel\'s', (t) => {
+  const stable = makeHarness(t);
+  const dev = makeHarness(t, { channel: 'dev', home: stable.home });
+  const d = dev.scheduledWorker();
+  d.post({ type: 'sync-lifecycle', phase: 'starting' });
+  d.post({ type: 'sync-roster', repos: [{ name: 'd/two', color: 'red' }] });
+  d.post({ type: 'progress', repo: 'd/two', status: 'Done', percent: 100, color: 'red' });
+  d.post({ type: 'output', data: 'dev log line' });
+  d.post({ type: 'complete', stats: { total: 1, errors: 0 }, channel: 'dev', mode: 'full', trigger: 'scheduled' });
+  d.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  d.end();
+  const devBefore = JSON.stringify(dev.status().syncState.dev);
+
+  for (let i = 0; i < 2; i++) {
+    const win = stable.openWindow();
+    assert.deepStrictEqual(win.rows(), {});
+    assert.strictEqual(win.status(), 'Sync status unknown — a sync may still be running');
+    stable.closeWindow();
+  }
+  const st = stable.status();
+  assert.deepStrictEqual([st.repos, st.syncRepos, st.logOutput], [[], null, '']);
+  assert.strictEqual(JSON.stringify(dev.status().syncState.dev), devBefore, 'dev\'s run is untouched');
+});
+
+test('a status file from an older build still replays its last run', (t) => {
+  const h = makeHarness(t);
+  fs.writeFileSync(path.join(h.home, '.config', 'repo-radar', 'status.json'), JSON.stringify({
+    repos: [{ name: 'l/one', status: 'Done', percent: 100, color: 'cyan' }],
+    stats: { total: 1, cloned: 0, updated: 1, errors: 0 },
+  }));
+  const win = h.openWindow();
+  assert.deepStrictEqual(Object.keys(win.rows()), ['l/one']);
+  assert.strictEqual(win.status(), 'Complete!');
+});

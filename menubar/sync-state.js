@@ -119,11 +119,25 @@ function _becomeCurrent(status, ch, entry) {
   return entry;
 }
 
-// Fill the top-level run fields from `channel`'s current attempt (main.js's loadStatus). A
-// status file from an older build has no run snapshot; its shared fields are used as they are.
+// Does this status file keep per-channel run snapshots (written by this build for any channel)?
+function _hasSnapshots(status) {
+  const all = status && status.syncState;
+  return !!all && typeof all === 'object'
+    && Object.values(all).some((e) => e && typeof e === 'object' && e.run && typeof e.run === 'object');
+}
+
+// Fill the top-level run fields from `channel`'s current attempt (main.js's loadStatus). In a
+// file that keeps snapshots, a channel without one of its own starts from empty run fields --
+// the shared top-level copy may well be another channel's run. Only a status file from an older
+// build, with no snapshots at all, has its shared fields used as they are.
 function project(status, channel) {
   const entry = current(status, channel);
-  if (!entry || !entry.run || typeof entry.run !== 'object') return status;
+  if (!entry || !entry.run || typeof entry.run !== 'object') {
+    if (channel && _hasSnapshots(status)) {
+      for (const k of RUN_FIELDS) status[k] = RUN_DEFAULTS[k]();
+    }
+    return status;
+  }
   for (const k of RUN_FIELDS) {
     status[k] = entry.run[k] !== undefined && entry.run[k] !== null ? entry.run[k] : RUN_DEFAULTS[k]();
   }
@@ -383,7 +397,12 @@ function resolve(status, ctx = {}) {
     return { view: _viewOf(adopted, { live: true }), changed: true };
   }
 
-  if (!entry) return { view: null, changed: false };
+  if (!entry) {
+    // Another channel keeps its runs here, but this one has none of its own: nothing to show
+    // yet, rather than the shared fields' (possibly another channel's) completed run. Only a
+    // status file from an older build falls back to the caller's old replay.
+    return { view: _hasSnapshots(status) ? _unknownView(null) : null, changed: false };
+  }
 
   if (!_isFinished(entry)) {
     if (entry.attemptId && entryOwner === 'free') {
