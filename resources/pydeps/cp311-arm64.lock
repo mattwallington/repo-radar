@@ -154,6 +154,16 @@ blessed==1.47.0 \
     --hash=sha256:ea13e06ae40f24710325411c5fa9b689d215cf170276cf1fda41feddaec8d3e0 \
     --hash=sha256:f4df54a32289b6a3eaca49387b4f6823ba7e04ddb5ffa18f5e1fde44e8b79681
     # via inquirer
+boto3==1.43.120 \
+    --hash=sha256:86978245a7b911549a44df3f805ae4ce94a8154f4ebe4a166631b8a6d7af2697 \
+    --hash=sha256:9d85840e721869f8202ab5f6b4ec3e697ac46343116cc8d1d0804ec58f90c503
+    # via litellm
+botocore==1.43.120 \
+    --hash=sha256:7f54674f26f0d9a500bf44a1f858e88b70b03c82b2aca385ddf51f6e968bfd01 \
+    --hash=sha256:f479cbb7273b9c0ea589a91a7abe38badda6353fb7c237a22c7461a06d279ee2
+    # via
+    #   boto3
+    #   s3transfer
 certifi==2026.7.22 \
     --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775 \
     --hash=sha256:741e2c3b351ddf169a738da9f2c048608ff7f2c5cc02f1ebc6b118bb090d5d55
@@ -353,7 +363,9 @@ fastuuid==0.14.0 \
 filelock==3.32.0 \
     --hash=sha256:7be2ad23a14607ccc71808e68fe30848aeace7058ace17852f68e2a68e310402 \
     --hash=sha256:d396bea984af47333ef05e50eae7eff88c84256de6112aea0ec48a233c064fe3
-    # via huggingface-hub
+    # via
+    #   huggingface-hub
+    #   litellm
 frozenlist==1.8.0 \
     --hash=sha256:0325024fe97f94c41c08872db482cf8ac4800d80e79222c6b0b7b162d5b13686 \
     --hash=sha256:032efa2674356903cd0261c4317a561a6850f3ac864a63fc1583147fb05a79b0 \
@@ -496,6 +508,10 @@ h11==0.16.0 \
     --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
     # via httpcore
+h2==4.4.1 \
+    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
+    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
+    # via httpx
 hf-xet==1.5.2 \
     --hash=sha256:045f84440c55cdeb659cf1a1dd48c77bcd0d2e93632e2fea8f2c3bdee79f38ed \
     --hash=sha256:1da28519496eb7c8094c11e4d25509b4a468457a0302d58136099db2fd9a671d \
@@ -515,11 +531,15 @@ hf-xet==1.5.2 \
     --hash=sha256:f922b8f5fb84f1dd3d7ab7a1316354a1bca9b1c73ecfc19c76e51a2a49d29799 \
     --hash=sha256:fd3add255549e8ef58fa35b2e42dc016961c050600444e7d77d030ba6b57120e
     # via huggingface-hub
+hpack==4.2.0 \
+    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0 \
+    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
+    # via h2
 httpcore==1.0.9 \
     --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
     --hash=sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8
     # via httpx
-httpx==0.28.1 \
+httpx[http2]==0.28.1 \
     --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
     --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
     # via
@@ -529,7 +549,13 @@ httpx==0.28.1 \
 huggingface-hub==1.24.0 \
     --hash=sha256:18431ff4daae0749aa9ba102fc952e314c98e1d30ebdec5319d85ca0a83e1ae5 \
     --hash=sha256:6ed4120a84a6beec900640aa7e346bd766a6b7341e41526fef5dc8bd81fb7d59
-    # via tokenizers
+    # via
+    #   litellm
+    #   tokenizers
+hyperframe==6.1.0 \
+    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5 \
+    --hash=sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08
+    # via h2
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
     --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
@@ -661,6 +687,12 @@ jiter==0.16.0 \
     --hash=sha256:f4444a83f946605990c98f625cdd3d2725bfb818158760c5748c653170a20e0e \
     --hash=sha256:fb08c276dd02dac3a284acdd02cacc630d2e3cd6572a4b85519f35cbd133c3de
     # via openai
+jmespath==1.1.0 \
+    --hash=sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d \
+    --hash=sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64
+    # via
+    #   boto3
+    #   botocore
 jsonschema==4.26.0 \
     --hash=sha256:0c26707e2efad8aa1bfc5b7ce170f3fccc2e4918ff85989ba9ffa9facb2be326 \
     --hash=sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce
@@ -669,18 +701,15 @@ jsonschema-specifications==2025.9.1 \
     --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe \
     --hash=sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d
     # via jsonschema
-litellm==1.93.0 \
-    --hash=sha256:0784172435de48f66ef7ad89d421604db1ad0db1321ef7f39dbcfe6b20111417 \
-    --hash=sha256:140bf215e264c71601bca9c06d2436c5451bb59e1e195ea23fc2d3d87b6929ec \
-    --hash=sha256:1a476ebc340c070c982eab15b4673fa63a70f5936935f9f20e4d2acb5f35d23b \
-    --hash=sha256:23b8eea4fb8b3b6ade05e7b6085ec9ca12daffcfb38d033d0bbce9c1d5894da5 \
-    --hash=sha256:3daf5c5aceb07f5d68871071e0ecdc678caccebadca9143cc00bb76f5a8c54e8 \
-    --hash=sha256:460001b7c88c5b6675ad482ae3cecba96e21f890604b4febb1a67807ace1c750 \
-    --hash=sha256:5d84aead083d3d0619b2d293f8006ebbe75611bbdcef470d659c9e2d131d4454 \
-    --hash=sha256:6b49f653e6205cbc725257da8797277f77065c69865fb3489bc5ed0896b66ee0 \
-    --hash=sha256:952029d422c2cec8117b444d66d6de87ac970ecf0b2e1383b02788ef90ba3603 \
-    --hash=sha256:98c15e84d32e922a821c105308bf9ddae8700de9ed396530bee2cbb1cacf4cbb \
-    --hash=sha256:cd70ccd4ba3ef1a395535c287bce72d30c7d937ecca4290c0db37a00738f7ada
+litellm==1.105.2 \
+    --hash=sha256:50d3671d8861774a9be284bb74669e0f79b02f44e37f79c835aef39088fd2ef4 \
+    --hash=sha256:7811b2ed846bed1e756565d2468d3651863faa8754eec429adec187075158d13 \
+    --hash=sha256:92a38a6ef0f818e604a26f2e40313e3bcb23ef66cf8f775b78a77419549f5279 \
+    --hash=sha256:ab3f2339dbc2292f98ebe81407a95f98e9002265cae7ddbd1d8459469be70417 \
+    --hash=sha256:adf2296fef358686f5b2356e063d8a3200b2a1e94b7d0fcc1ca636b586d2f9ff \
+    --hash=sha256:c8a5eaef064ad3d89aef8460aefdfbb90e357d115841266b664f4f6cf19d00d1 \
+    --hash=sha256:d65752c1a1c78f6ca72a8ceeed2127e31657c6b77c5e80aa95dd2bdb11203b91 \
+    --hash=sha256:d86e613d235a1943992430b179e4093a940fe1b9e1662cedf01f34bbe042b251
     # via -r requirements.txt
 markdown-it-py==4.2.0 \
     --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
@@ -938,7 +967,9 @@ openai==2.47.0 \
 packaging==26.2 \
     --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e \
     --hash=sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661
-    # via huggingface-hub
+    # via
+    #   huggingface-hub
+    #   litellm
 propcache==0.5.2 \
     --hash=sha256:01c4fc7480cd0598bb4b57022df55b9ca296da7fc5a8760bd8451a7e63a7d427 \
     --hash=sha256:04dc2390d9edbbaef7461f33322555976ffddf0b650a038649d026358714e6c5 \
@@ -1070,6 +1101,7 @@ pydantic==2.13.4 \
     # via
     #   litellm
     #   openai
+    #   pydantic-settings
 pydantic-core==2.46.4 \
     --hash=sha256:00c603d540afdd6b80eb39f078f33ebd46211f02f33e34a32d9f053bba711de0 \
     --hash=sha256:0186750b482eefa11d7f435892b09c5c606193ef3375bcf94aa00ae6bfb66262 \
@@ -1192,14 +1224,24 @@ pydantic-core==2.46.4 \
     --hash=sha256:fc3e9034a63de20e15e8ade85358bc6efc614008cab72898b4b4952bea0509ff \
     --hash=sha256:fd8b3d9fd264be37976686c7f65cd52a83f5e84f4bfd2adf9c1d469676bbb6ae
     # via pydantic
+pydantic-settings==2.16.1 \
+    --hash=sha256:30f5313340da4e8f1b440d1910b92a5bc3ccbb6b4ba70ec2b8395bc921f418f5 \
+    --hash=sha256:aff602a1886338c2df3d1e958e2193a8dc33cec75b91f202e83fd98484b4b0da
+    # via litellm
 pygments==2.20.0 \
     --hash=sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f \
     --hash=sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176
     # via rich
+python-dateutil==2.9.0.post0 \
+    --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
+    --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+    # via botocore
 python-dotenv==1.2.2 \
     --hash=sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a \
     --hash=sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3
-    # via litellm
+    # via
+    #   litellm
+    #   pydantic-settings
 pyyaml==6.0.3 \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
     --hash=sha256:0150219816b6a1fa26fb4699fb7daa9caf09eb1999f3b70fb6e786805e80375a \
@@ -1274,7 +1316,9 @@ pyyaml==6.0.3 \
     --hash=sha256:f7057c9a337546edc7973c0d3ba84ddcdf0daa14533c2065749c9075001090e6 \
     --hash=sha256:fa160448684b4e94d80416c0fa4aac48967a969efe22931448d853ada8baf926 \
     --hash=sha256:fc09d0aa354569bc501d4e787133afc08552722d3ab34836a80547331bb5d4a0
-    # via huggingface-hub
+    # via
+    #   huggingface-hub
+    #   litellm
 readchar==4.2.2 \
     --hash=sha256:92daf7e42c52b0787e6c75d01ecfb9a94f4ceff3764958b570c1dddedd47b200 \
     --hash=sha256:e3b270fe16fc90c50ac79107700330a133dd4c63d22939f5b03b4f24564d5dd8
@@ -1535,6 +1579,14 @@ runs==1.3.0 \
     --hash=sha256:cca304b631dbefec598c7bfbcfb50d6feace6d3a968734b67fd42d3c728f5a05 \
     --hash=sha256:e71a551cfa8da9ef882cac1d5a108bda78c9edee5b8d87e37c1003da5b6a7bed
     # via editor
+s3transfer==0.19.3 \
+    --hash=sha256:24eb7535804306355e31c952a90022bf5b2f9d760f9a11062c7493a217c08553 \
+    --hash=sha256:8326acc3d056d7f7b8a37110c7d2aea41f67e83f6ae79cd3b5fbcca34c726406
+    # via boto3
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
+    --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
+    # via python-dateutil
 sniffio==1.3.1 \
     --hash=sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2 \
     --hash=sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc
@@ -1634,16 +1686,21 @@ typing-extensions==4.16.0 \
     #   openai
     #   pydantic
     #   pydantic-core
+    #   pydantic-settings
     #   referencing
     #   typing-inspection
 typing-inspection==0.4.2 \
     --hash=sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7 \
     --hash=sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464
-    # via pydantic
+    # via
+    #   pydantic
+    #   pydantic-settings
 urllib3==2.7.0 \
     --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
     --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
-    # via requests
+    # via
+    #   botocore
+    #   requests
 wcwidth==0.8.2 \
     --hash=sha256:91fbef97204b96a3d4d421609b80340b760cf33e26da123ff243d76b1fda8dda \
     --hash=sha256:d63947694a0539a1d51e01eda7caf800c291020e6cdd7e28ad7b14dd33ad4f85

@@ -67,20 +67,21 @@ function provision({ home, channel, identity, bundle, logPath, plan }) {
     // shell/CLI dispatchers can enforce the full predicate standalone (Codex I5).
     fs.copyFileSync(verifyPySrc || path.join(__dirname, 'verify.py'), path.join(staging, 'verify.py'));
     fs.copyFileSync(manifestPath, path.join(staging, 'manifest.json'));
-    // smoke: import + exact-version + installed-set
+    // smoke: import + exact-version + installed-set. The expected litellm version comes from this
+    // env's manifest, so a dependency bump can never leave a stale hard-coded version behind.
     // NOTE: litellm's module uses PEP 562 __getattr__ lazy-loading and does not expose
-    // `__version__` (confirmed against the real litellm==1.93.0 wheel: accessing it raises
-    // AttributeError). Use importlib.metadata, which reflects the installed distribution
-    // version regardless of what the package's own namespace exposes.
+    // `__version__`. Use importlib.metadata, which reflects the installed distribution version
+    // regardless of what the package's own namespace exposes.
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     execFileSync(
       venvPy,
       [
         '-c',
-        'import repo_radar, importlib.metadata as m; assert m.version("litellm").startswith("1.93")',
+        'import sys, repo_radar, importlib.metadata as m; v = m.version("litellm"); assert v == sys.argv[1], v',
+        manifest.dists.litellm,
       ],
       { stdio: 'pipe', env: { ...process.env, PYTHONPATH: staging } }
     );
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const setCheck = verifyInstalledSet(venvPy, manifest);
     if (!setCheck.ok) throw new ProvisionError(`installed set != manifest: ${JSON.stringify(setCheck)}`);
     const marker = {

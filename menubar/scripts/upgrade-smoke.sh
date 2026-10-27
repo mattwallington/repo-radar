@@ -55,10 +55,10 @@ chk "bundle carries repo_radar + repo-radar + verify.py + pydeps + VERSION" \
 echo "== runtime activation =="
 chk "a generation is active (current resolves)" "[ -L \"$GEN\" ]"
 chk "desired.json is ACTIVE" "[ \"\$(node -e \"console.log(require('$HOME_DIR/.repo-radar/$CHANNEL/desired.json').status)\" 2>/dev/null)\" = active ]"
-chk "manual + scheduled runtime = the versioned venv, litellm 1.93.0 (over any seeded 1.83.4)" \
-  "[ \"\$($VENV_PY -c 'import importlib.metadata as m;print(m.version(\"litellm\"))' 2>/dev/null)\" = 1.93.0 ]"
-chk "bundled repo_radar imported from the generation, DEFAULT_MODEL=claude-sonnet-5" \
-  "[ \"\$(PYTHONPATH=$GEN $VENV_PY -c 'import repo_radar.llm as l;print(l.DEFAULT_MODEL)' 2>/dev/null)\" = claude-sonnet-5 ]"
+chk "manual + scheduled runtime = the versioned venv, litellm 1.106.1 (over any seeded 1.83.4)" \
+  "[ \"\$($VENV_PY -c 'import importlib.metadata as m;print(m.version(\"litellm\"))' 2>/dev/null)\" = 1.106.1 ]"
+chk "bundled repo_radar imported from the generation, DEFAULT_MODEL=claude-sonnet-5-5" \
+  "[ \"\$(PYTHONPATH=$GEN $VENV_PY -c 'import repo_radar.llm as l;print(l.DEFAULT_MODEL)' 2>/dev/null)\" = claude-sonnet-5-5 ]"
 chk "migration/fallback/MODEL_CAPS execute from the new package (catalog isn't dead code)" \
   "[ \"\$(PYTHONPATH=$GEN $VENV_PY -c 'import repo_radar.llm as l;from repo_radar import model_catalog as mc;c=mc.get_caps(\"gpt-5.3-codex\");print(l.migrate_model(\"gpt-5.2-codex\"),l.get_fallback_model(\"o3\"),c.max_input,c.max_output)' 2>/dev/null)\" = 'gpt-5.3-codex None 272000 128000' ]"
 chk "$CLI --version reports the app version (not 1.0.0), via the on-PATH dispatcher" \

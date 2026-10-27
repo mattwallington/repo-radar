@@ -72,3 +72,17 @@ test('isCovered reflects checked-in lock+manifest presence', () => {
   assert.strictEqual(isCovered('pypy-3.10.0-arm64'), false);      // non-cpython impl unsupported
   assert.strictEqual(isCovered('garbage'), false);
 });
+
+// provision() checks the installed litellm against the cell manifest's version, so each
+// manifest must carry the version requirements.txt pins. A bump that skips regenerating a cell
+// fails here instead of on a user's machine.
+test('every lock manifest pins the litellm version requirements.txt declares', () => {
+  const req = fs.readFileSync(path.join(PYDEPS_DIR, '..', '..', 'requirements.txt'), 'utf8');
+  const pin = /^litellm==(\S+)$/m.exec(req)[1];
+  const manifests = fs.readdirSync(PYDEPS_DIR).filter((f) => f.endsWith('.manifest.json'));
+  assert.strictEqual(manifests.length, 10);
+  for (const f of manifests) {
+    const m = JSON.parse(fs.readFileSync(path.join(PYDEPS_DIR, f), 'utf8'));
+    assert.strictEqual(m.dists.litellm, pin, f);
+  }
+});

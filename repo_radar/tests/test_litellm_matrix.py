@@ -3,10 +3,13 @@ import litellm                       # mandatory: fail if absent
 from repo_radar import llm
 from repo_radar import model_catalog
 
-def test_litellm_is_exactly_1_93_0():
-    assert md.version("litellm") == "1.93.0", md.version("litellm")
+def test_litellm_is_exactly_the_pinned_version():
+    from pathlib import Path
+    req = (Path(__file__).resolve().parents[2] / "requirements.txt").read_text()
+    pin = next(l.split("==", 1)[1].strip() for l in req.splitlines() if l.startswith("litellm=="))
+    assert md.version("litellm") == pin, (md.version("litellm"), pin)
 
-def test_every_known_model_resolves_on_litellm_1_93():
+def test_every_known_model_resolves_on_pinned_litellm():
     # Collect EVERY mismatch, don't fail on the first. A per-iteration assert stops at the first
     # bad row and hides the rest — that is exactly how gpt-5.4-nano stayed wrong while gpt-5.4-mini
     # (which sorts first) absorbed the only failure. This is a RESOLVABILITY check only — window
@@ -25,4 +28,4 @@ def test_every_known_model_resolves_on_litellm_1_93():
             problems.append(f"{mid}: provider {provider!r} != {llm.provider_for_model(mid)!r}")
         if info.get("mode") not in ("chat", "responses"):
             problems.append(f"{mid}: mode {info.get('mode')!r} not chat/responses")
-    assert not problems, "MODEL_CAPS diverged from litellm 1.93.0:\n  " + "\n  ".join(problems)
+    assert not problems, "MODEL_CAPS diverged from the pinned litellm:\n  " + "\n  ".join(problems)

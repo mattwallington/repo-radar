@@ -34,7 +34,7 @@ Repeat with `--channel dev` on a separate isolated HOME for the coexistence item
 
 ## Interactive assertions (complete these — the script only NOTEs them)
 - **(1) quiescence:** the app must boot out the legacy job, verify its label absent + child exited, before it flips `current`. If it can't quiesce, it must fail closed (no flip).
-- **(3b) scheduled parity:** `launchctl kickstart -k gui/$(id -u)/com.user.repo-radar`; confirm the scheduled sync used `current/venv/bin/python` + `litellm==1.93.0` (its log under `$HOME/Library/Logs/repo-radar/`).
+- **(3b) scheduled parity:** `launchctl kickstart -k gui/$(id -u)/com.user.repo-radar`; confirm the scheduled sync used `current/venv/bin/python` + `litellm==1.106.1` (its log under `$HOME/Library/Logs/repo-radar/`).
 - **(6) crash recovery:** kill the app during provisioning and at each cutover boundary (after publish-desired, after provision, before/after the `current` flip); relaunch; assert it recovers to a consistent state and sync works. Then install an older build (rollback) and confirm it reports+runs the older version.
 - **(7) tamper:** modify `current/repo_radar`, the venv's installed set, or `current/VERSION`; relaunch; assert a **replacement** generation is built + flipped and the old (tampered) one is retained, not mutated pre-flip.
 - **(8) lock:** start a sync, then start another (manual + scheduled) — the second must serialize (exit 75 / wait). `kill -9` the holder and confirm the kernel auto-releases the lock so the next acquires.
