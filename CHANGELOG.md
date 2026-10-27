@@ -23,6 +23,8 @@ On the **dev channel** (Repo Radar Dev) for testing before the next stable relea
 - **Retired models move to the newest model of the same kind.** A retired model now always lands on the newest model of its own provider, family and tier, for example any older Gemini Flash to Gemini 3.8 Flash, or any older Claude Sonnet to Sonnet 5.5. It is never moved to a different tier or provider. This corrects a few earlier routes: `o3-mini` and `o1-mini` now go to GPT-6.1 Terra (not a flagship model), and `o1-pro` goes to GPT-5.5 Pro.
 - **Gemini fallback** under rate limits is now Gemini 3.8 Flash, then Gemini 3.5 Flash-Lite.
 - **Gemini 4 Argon** always reserves at least 32,768 output tokens, as Google recommends, because its thinking shares the output budget.
+- **The new Claude models think at medium effort, with more room to answer.** Claude Sonnet 5.5, Opus 5.5, Haiku 5.5 and Fable 5.1 keep their built-in thinking, but Repo Radar asks for medium effort, and each request reserves at least 16,384 output tokens, since thinking shares that budget. Chunk analyses rise from 8,192; summaries already used 16,384. This raises the maximum output per call, not necessarily what's spent, and it's a conservative starting policy, not a vendor requirement. Other models are unchanged.
+- **A blank or cut-off Claude reply now stops that repository with an error** instead of being saved as its analysis. Nothing is retried automatically.
 
 ### Added
 - **Current models from all three providers.** Claude Sonnet 5.5, Opus 5.5, Haiku 5.5 and Fable 5.1; GPT-6.1 Sol and Terra, GPT-6 Sol, Luna and Astra; Gemini 3.8 Flash, 3.5 Flash-Lite and 4 Argon. Their limits were checked against each vendor's own pages. Settings has a new "Higher capability" group for Fable, Astra and Argon.

@@ -265,15 +265,18 @@ def test_exact_payload_counted_before_send_all_three_shapes(monkeypatch, tmp_pat
     each authoritatively counted before their identical-digest send. Run 2 forces the SINGLE branch and
     proves the 16384 full-repo payload was counted first. Events record (kind, requested_output, digest)
     so all three shapes are proven present."""
-    import hashlib, repo_radar.modes.sync as sync
+    import hashlib, repo_radar.modes.sync as sync, repo_radar.llm as llm
+    # A model with no output floor, so the 8192 chunk and 16384 synthesis shapes stay distinct.
+    monkeypatch.setenv("AI_MODEL", "claude-sonnet-5")
     def dig(p): return hashlib.sha256(p.encode()).hexdigest()
     def harness():
         ev = []
         class _LogSession:
             def count(self, model, prompt, ro): ev.append(("count", ro, dig(prompt))); return PreflightResult(1, True)
         monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+        # Record what call_llm really requests: it applies output_budget to every send.
         monkeypatch.setattr(sync, "call_llm",
-            lambda model, prompt, max_tokens=8192: ev.append(("send", max_tokens, dig(prompt))) or
+            lambda model, prompt, max_tokens=8192: ev.append(("send", llm.output_budget(model, max_tokens), dig(prompt))) or
             ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
         return ev, _LogSession()
     def assert_counted_before_send(ev):

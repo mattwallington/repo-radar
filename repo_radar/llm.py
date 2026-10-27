@@ -189,9 +189,20 @@ def _completion_messages(prompt):
     return [{"role": "user", "content": prompt}]
 
 
-# Per-model output floors. Argon's thinking shares its output budget and Google recommends at
-# least 32,768 output tokens for it; every other model keeps the stage's own budget.
-MIN_OUTPUT_TOKENS = {"gemini/gemini-4-argon": 32768}
+# Claude models that think adaptively by default (Opus 5.5 and Fable 5.1 can't turn it off). We keep
+# thinking on but ask for medium effort, natively via output_config, so thinking doesn't crowd out
+# the analysis. Our conservative starting policy, not a vendor-prescribed setting.
+CLAUDE_MEDIUM_EFFORT_MODELS = frozenset({
+    "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+})
+
+# Per-model output floors, for models whose thinking shares the output budget. Google recommends at
+# least 32,768 for Argon; the medium-effort Claude models get 16,384, so a chunk call rises from
+# 8,192 while synthesis already asks for 16,384. Every other model keeps the stage's own budget.
+MIN_OUTPUT_TOKENS = {
+    "gemini/gemini-4-argon": 32768,
+    **{m: 16384 for m in CLAUDE_MEDIUM_EFFORT_MODELS},
+}
 
 
 def output_budget(model, requested):
@@ -244,11 +255,13 @@ def call_llm(model, prompt, max_tokens=8192):
             except (AttributeError, IndexError, TypeError):
                 text = ''
     else:
+        extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
         response = litellm.completion(
             model=model,
             messages=_completion_messages(prompt),
             max_tokens=max_tokens,
             custom_llm_provider=provider,
+            **extra,
         )
         try:
             text = response.choices[0].message.content or ''

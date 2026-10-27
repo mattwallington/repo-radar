@@ -250,13 +250,33 @@ def test_argon_send_requests_the_output_it_reserved(stub_http):
 
 
 @pytest.mark.parametrize('model', ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-fable-5-1'])
-def test_new_claude_models_budget_conservatively_and_send_plain_text(stub_http, model):
+def test_new_claude_models_budget_conservatively_and_send_plain_text(stub_http, model, monkeypatch):
+    # Policy: adaptive thinking stays on, effort is medium (native output_config), and chunk and
+    # synthesis both request and reserve 16,384 output tokens.
+    from repo_radar.preflight import PreflightResult
     assert llm.count_tokens_for_budget('x' * 4000, model).strategy == 'claude-4.7+-conservative'
     text, _cost, _resp = llm.call_llm(model, 'hi', max_tokens=llm.CHUNK_OUTPUT)
     assert text == 'HELLO', 'thinking blocks must not leak into the answer'
     [(host, _path, body)] = stub_http
-    assert host == 'api.anthropic.com' and body['max_tokens'] == llm.CHUNK_OUTPUT
+    assert host == 'api.anthropic.com' and body['model'] == model
+    assert body['max_tokens'] == 16384
+    assert body['output_config'] == {'effort': 'medium'}
     assert not {'temperature', 'top_p', 'top_k'} & set(body), 'Claude 5.x rejects sampling params'
+    assert body.get('thinking', {}).get('type') != 'enabled', 'no legacy budget_tokens thinking'
+
+    # The real partition and chunk paths reserve the same output the send requests.
+    reserved = []
+
+    class Session:
+        def count(self, m, prompt, requested_output):
+            reserved.append(requested_output)
+            return PreflightResult(100, True)
+
+    monkeypatch.setattr(llm, 'repo_needs_chunking', lambda *a, **k: (False, 1, True))
+    files = [{"path": "a.py", "size": 1, "content": "x"}]
+    assert llm.authoritative_partition(Session(), 'o/r', files, model) == 'single'
+    llm.authoritative_chunks(Session(), 'o/r', files, model)
+    assert reserved and set(reserved) == {16384}, reserved
 
 
 _OFFLINE_CHILD = r'''
