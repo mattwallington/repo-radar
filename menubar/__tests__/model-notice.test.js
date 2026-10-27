@@ -12,6 +12,15 @@ test('computeModelNotice: live model with suggestion -> suggestion', () => {
   assert.deepStrictEqual(computeModelNotice('claude-sonnet-4-6'),
     { kind: 'suggestion', from: 'claude-sonnet-4-6', effective: 'claude-sonnet-4-6', suggested: 'claude-sonnet-5-5' });
 });
+test('Sonnet 4.5, retiring Nov 30, is offered Sonnet 5.5; Keep preserves the selection', () => {
+  const n = computeModelNotice('claude-sonnet-4-5');
+  assert.deepStrictEqual(n, { kind: 'suggestion', from: 'claude-sonnet-4-5', effective: 'claude-sonnet-4-5', suggested: 'claude-sonnet-5-5' });
+  const r = require('../model-notice').planFinalize('keep', { ai_model: 'claude-sonnet-4-5', repositories: [1] }, noticeSignature(n));
+  assert.strictEqual(r.nextConfig.ai_model, 'claude-sonnet-4-5');
+  assert.deepStrictEqual(r.nextConfig.repositories, [1]);
+  assert.strictEqual(r.reconcileSchedule, false);
+  assert.strictEqual(computeModelNotice('gpt-5.3-codex'), null, 'newest of its tier: nothing to suggest');
+});
 test('computeModelNotice: retired model, clean target -> migration', () => {
   assert.deepStrictEqual(computeModelNotice('claude-3-5-sonnet-20241022'),
     { kind: 'migration', from: 'claude-3-5-sonnet-20241022', effective: 'claude-sonnet-5-5' });

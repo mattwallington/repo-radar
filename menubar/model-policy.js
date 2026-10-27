@@ -176,6 +176,22 @@ const MODEL_SUGGESTIONS = {
   'gpt-5.6-sol': 'gpt-6.1-sol',
   'gpt-5.6-terra': 'gpt-6.1-terra',
   'gpt-5.6-luna': 'gpt-6-luna',
+  // Models with an announced shutdown, offered their tier's newest model ahead of it.
+  'claude-sonnet-4-5': 'claude-sonnet-5-5',
+  'claude-sonnet-4-5-20250929': 'claude-sonnet-5-5',
+  'gpt-5': 'gpt-6.1-sol',
+  'gpt-5.1': 'gpt-6.1-sol',
+  'gpt-4.1': 'gpt-6.1-sol',
+  'gpt-4o': 'gpt-6.1-sol',
+  'o3': 'gpt-6.1-sol',
+  'gpt-5-mini': 'gpt-6.1-terra',
+  'gpt-4.1-mini': 'gpt-6.1-terra',
+  'gpt-4o-mini': 'gpt-6.1-terra',
+  'gpt-5-nano': 'gpt-6-luna',
+  'gpt-5.4-nano': 'gpt-6-luna',
+  'o3-pro': 'gpt-5.5-pro',
+  'gemini/gemini-3-flash-preview': 'gemini/gemini-3.8-flash',
+  // gpt-5.3-codex has none: it is already the newest of its tier, and a suggestion never crosses tiers.
 };
 
 function suggestUpgrade(model) { return (model && MODEL_SUGGESTIONS[model]) || null; }
