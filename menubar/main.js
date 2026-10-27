@@ -1190,6 +1190,17 @@ function startStatusServer() {
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('network-timeout', data.message);
       }
+    } else if (data.type === 'complete' && verdict.lateComplete) {
+      // This attempt already reported its outcome. Keep its final numbers for the window and
+      // the tray, and nothing else: no completion time, icon or notification -- a failed or
+      // cancelled run must not pick up a success's side effects.
+      const status = loadStatus();
+      if (data.stats) status.stats = data.stats;
+      saveStatus(status);
+      if (logWindow && !logWindow.isDestroyed() && data.stats) {
+        logWindow.webContents.send('sync-complete', data.stats);
+        sendSyncStateToWindow(); // the outcome stays on top of the stats
+      }
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();

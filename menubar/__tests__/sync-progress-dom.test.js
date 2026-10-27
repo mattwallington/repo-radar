@@ -613,3 +613,30 @@ test('stable and dev each replay only their own run\'s rows, errors and log', (t
   assert.deepStrictEqual(Object.keys(dwin.rows()), ['d/two']);
   assert.strictEqual(dev.status().errorList.length, 1);
 });
+
+test('final stats that arrive after the outcome are kept without turning it into a success', (t) => {
+  const h = makeHarness(t);
+  const a = h.scheduledWorker();
+  a.post({ type: 'sync-lifecycle', phase: 'starting' });
+  a.end('failed');
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+  b.post({ type: 'sync-terminal', outcome: 'failed' });
+  const iconsBefore = h.icons.length;
+  const lastSync = h.status().lastSync;
+
+  b.post({ type: 'complete', stats: { total: 3, errors: 1, updated: 2, cloned: 0 }, channel: 'stable', mode: 'full', trigger: 'scheduled' });
+  // An earlier attempt's numbers can't attach themselves to this run.
+  a.post({ type: 'complete', stats: { total: 99, errors: 0 }, channel: 'stable', mode: 'full', trigger: 'scheduled' });
+
+  const entry = h.status().syncState.stable;
+  assert.deepStrictEqual([entry.attemptId, entry.outcome, entry.stats.total], [b.id, 'failed', 3]);
+  assert.strictEqual(h.status().lastSync, lastSync, 'a failed run gets no completion time');
+  assert.ok(!h.icons.slice(iconsBefore).includes('icon-success.png'), 'and no success icon');
+
+  const win = h.openWindow();
+  assert.strictEqual(win.status(), 'Sync failed — see ⚠️ View Errors in the menu');
+  assert.strictEqual(win.doc.getElementById('repo-count').textContent, '3 repos synced');
+  assert.strictEqual(win.stopEnabled(), false);
+});

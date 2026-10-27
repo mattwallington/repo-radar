@@ -15,7 +15,8 @@
 //     attempts' Activity records (a live owner lease, durable start times, recorded outcomes).
 //     An unfamiliar ID never displaces an attempt that is still running. Retired IDs are only a
 //     shortcut for rejecting the same late updates again.
-//   - An attempt's terminal outcome wins over its own late progress.
+//   - An attempt's terminal outcome wins over its own late progress. Its final `complete` stats
+//     are still kept if they arrive after the terminal, without reopening or changing it.
 //   - Anonymous updates (an older worker build) are dropped while an identified attempt runs,
 //     and otherwise go to a separate compatibility view that never borrows an identified
 //     attempt's outcome or stats.
@@ -260,6 +261,8 @@ function _supersedes(entry, id, ctx) {
 // effect. `accept: false` means the caller must drop it entirely (no window send, no status
 // changes): it is for another channel, from an attempt that is not current, or late progress
 // from a finished one. `started: true` means this update made a new attempt current.
+// `lateComplete: true` means it is the current attempt's `complete` arriving after its terminal:
+// its stats were recorded, and nothing else about the attempt may change.
 function admit(status, payload, ctx = {}) {
   if (!payload || typeof payload !== 'object') return NOT_ACCEPTED;
   const now = ctx.now || new Date().toISOString();
@@ -285,6 +288,10 @@ function admit(status, payload, ctx = {}) {
 
   let target = entry;
   if (entry && entry.attemptId === id) {
+    if (_isFinished(entry) && payload.type === 'complete') {
+      entry.stats = payload.stats && typeof payload.stats === 'object' ? payload.stats : entry.stats;
+      return { accept: true, changed: true, started: false, lateComplete: true };
+    }
     if (_isFinished(entry) && PROGRESS_TYPES.has(payload.type)) return NOT_ACCEPTED;
   } else {
     let opts = { verified: false };
