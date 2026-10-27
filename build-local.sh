@@ -102,9 +102,11 @@ else
   error "Must be on main or dev branch (currently on: $CURRENT_BRANCH)"
 fi
 
-# The build must match a commit: no tracked changes, staged or not.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  error "You have uncommitted changes. Commit or discard them first."
+# The build must match a commit: no changes, staged or not, and no untracked files, which
+# electron-builder would package. Ignored build outputs and dependencies don't count.
+GIT_STATUS=$(git status --porcelain --untracked-files=all) || error "Could not read git status"
+if [[ -n "$GIT_STATUS" ]]; then
+  error "You have uncommitted changes or untracked files. Commit, discard or remove them first."
 fi
 SOURCE_SHA=$(git rev-parse HEAD)
 success "Clean checkout at $SOURCE_SHA"
