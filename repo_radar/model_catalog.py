@@ -53,15 +53,10 @@ MODEL_CAPS = {
     "gpt-5-nano": ModelCaps(400000, 272000, 128000, "local", _OPE, "2026-08-08"),
     "gpt-4.1": ModelCaps(1047576, 1047576, 32768, "local", _OPE, "2026-08-08"),
     "gpt-4.1-mini": ModelCaps(1047576, 1047576, 32768, "local", _OPE, "2026-08-08"),
-    "gpt-4.1-nano": ModelCaps(1047576, 1047576, 32768, "local", _OPE, "2026-08-08"),
     "gpt-4o": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
     "gpt-4o-mini": ModelCaps(128000, 128000, 16384, "local", _OPE, "2026-08-08"),
-    "o4-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
-    "o3-mini": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
     "o3-pro": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
-    "o1": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
-    "o1-pro": ModelCaps(200000, 200000, 100000, "local", _OPE, "2026-08-08"),
 }
 HEADROOM_FRACTION = 0.01
 def get_caps(model): return MODEL_CAPS.get(model)

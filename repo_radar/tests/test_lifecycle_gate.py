@@ -7,8 +7,8 @@ from scripts import check_model_lifecycle as gate
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "repo_radar" / "model_lifecycle.json"
 JUL23 = datetime.date(2026, 7, 23)   # arbitrary reference date for the synthetic fixtures below
-RELEASE = datetime.date(2026, 8, 7)  # the real release target — BUMP each release so the gate is
-                                     # checked against the date the build actually ships
+RELEASE = datetime.date(2026, 10, 27)  # the real release target — BUMP each release so the gate is
+                                       # checked against the date the build actually ships
 OK = "https://example.com/x"
 
 def _tmp(rows):
