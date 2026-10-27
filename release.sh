@@ -39,16 +39,22 @@ for arg in "$@"; do
       echo ""
       echo -e "${BOLD}Usage:${NC} ./release.sh [options]"
       echo ""
-      echo "  With no arguments, bumps the patch version and releases."
+      echo "  With no arguments, bumps the patch version and releases (paused, see below)."
       echo "  e.g. 1.0.4 -> 1.0.5"
       echo ""
       echo -e "${BOLD}Options:${NC}"
       echo "  --minor     Bump minor version (1.0.4 -> 1.1.0)"
       echo "  --major     Bump major version (1.0.4 -> 2.0.0)"
-      echo "  --dry-run   Show what would happen without doing it"
+      echo "  --dry-run   Run every gate and show the next version without changing anything"
       echo "  --help, -h  Show this help message"
       echo ""
-      echo -e "${BOLD}What it does:${NC}"
+      echo -e "${BOLD}Publishing is paused:${NC}"
+      echo "  Builds are now Reperio-signed, but this script still publishes to the old"
+      echo "  mattwallington/repo-radar feed. Until the feed moves to ReperioHealth/repo-radar-releases,"
+      echo "  a run without --dry-run stops after the gates and changes nothing. Use ./build-local.sh"
+      echo "  to build and verify a signed app without publishing."
+      echo ""
+      echo -e "${BOLD}What it will do once publishing resumes:${NC}"
       echo "  1. Bumps the version (VERSION + package.json)"
       echo "  2. Commits the version bump and creates a git tag"
       echo "  3. Builds the Electron app (arm64 + x64)"
@@ -196,19 +202,22 @@ success "New version:     ${BOLD}$NEW_VERSION${NC} ($BUMP_TYPE$DEV_LABEL)"
 
 if $DRY_RUN; then
   step "Dry run summary"
-  dry "Update VERSION file: $CURRENT_VERSION -> $NEW_VERSION"
-  dry "Update menubar/package.json version: $NEW_VERSION"
-  dry "Git commit: release: v$NEW_VERSION"
-  dry "Git tag: v$NEW_VERSION"
-  dry "Build Electron app (arm64 + x64)"
-  dry "Run create-installer script"
-  dry "Create GitHub release: Repo Radar v$NEW_VERSION"
-  dry "Attach arm64 and x64 zip files + latest-mac.yml"
-  dry "Push commit and tag to origin"
+  dry "All gates passed for v$NEW_VERSION"
+  dry "Publishing is paused: a run without --dry-run stops here and changes nothing"
   echo ""
-  info "No changes were made. Remove --dry-run to execute."
+  info "No changes were made. To build a signed app without publishing, use ./build-local.sh."
   exit 0
 fi
+
+# ── Paused until the feed moves ──────────────────────────────────────────────
+
+# Builds are now Reperio-signed, but this script still publishes to mattwallington/repo-radar,
+# the feed that personal-team installs update from, and they can't accept a Reperio-signed update.
+# The org-move work replaces this script; until then build with build-local.sh.
+echo -e "${RED}[error]${NC} release.sh publishing is paused: it would publish a Reperio-signed build to the old mattwallington/repo-radar feed." >&2
+echo "  Use ./build-local.sh to build and verify a signed app without publishing (see README, \"Building a signed app locally\")." >&2
+echo "  Releases resume once the update feed moves to ReperioHealth/repo-radar-releases." >&2
+exit 1
 
 # ── Update version files ─────────────────────────────────────────────────────
 

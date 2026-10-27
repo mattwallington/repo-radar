@@ -34,22 +34,21 @@
   "build": {
     "appId": "com.mattwallington.repo-radar",
     "productName": "Repo Radar",
+    "forceCodeSigning": true,
     "publish": {
       "provider": "github",
-      "owner": "mattwallington",
-      "repo": "repo-radar"
+      "owner": "ReperioHealth",
+      "repo": "repo-radar-releases"
     },
     "artifactName": "${name}-${version}-${arch}-${os}.${ext}",
     "mac": {
       "category": "public.app-category.utilities",
-      "identity": "Matthew Wallington (5S875AN2HU)",
+      "identity": "Reperio Health, Inc. (F8UY7565VM)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "entitlements.plist",
       "entitlementsInherit": "entitlements.plist",
-      "notarize": {
-        "teamId": "5S875AN2HU"
-      },
+      "notarize": true,
       "target": [
         {
           "target": "dir",
