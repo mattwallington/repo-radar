@@ -293,3 +293,23 @@ def test_retired_openai_selection_sends_offline_without_litellm_model_map():
     result = json.loads(out.stdout.strip().splitlines()[-1])
     assert result == {"text": "HELLO", "saved": "o4-mini",
                       "sent": [["api.openai.com", "/v1/chat/completions", "gpt-6.1-terra"]]}
+
+
+@pytest.mark.parametrize('content,stop_reason', [
+    ([{"type": "thinking", "thinking": "", "signature": "s"}], "end_turn"),  # thinking, no text
+    ([{"type": "text", "text": "Partial analys"}], "max_tokens"),           # cut off mid-answer
+])
+def test_incomplete_claude_reply_raises_instead_of_returning_a_stub(monkeypatch, content, stop_reason):
+    sent = []
+
+    def handle(self, request):
+        sent.append(request.url.path)
+        return httpx.Response(200, json={
+            "id": "m", "type": "message", "role": "assistant", "model": "m", "stop_reason": stop_reason,
+            "content": content, "usage": {"input_tokens": 5, "output_tokens": 8192}})
+
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', handle)
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'test-not-a-key')
+    with pytest.raises(llm.IncompleteResponseError, match='claude-sonnet-5-5 returned an incomplete response'):
+        llm.call_llm('claude-sonnet-5-5', 'hi', max_tokens=llm.CHUNK_OUTPUT)
+    assert [p for p in sent if p == '/v1/messages'] == ['/v1/messages'], 'no retry'

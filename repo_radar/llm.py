@@ -203,6 +203,15 @@ def output_budget(model, requested):
     return max(requested, MIN_OUTPUT_TOKENS.get(model, 0))
 
 
+class IncompleteResponseError(Exception):
+    """A provider reply that must not be used as an analysis: no visible text, or cut off."""
+
+
+# finish_reason values that mean the reply was cut off: litellm maps Anthropic's max_tokens stop to
+# "length" and passes the unmapped context-window stop through unchanged.
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "model_context_window_exceeded"})
+
+
 def call_llm(model, prompt, max_tokens=8192):
     """Call an LLM and return (text, api_cost, raw_response).
 
@@ -245,6 +254,14 @@ def call_llm(model, prompt, max_tokens=8192):
             text = response.choices[0].message.content or ''
         except (AttributeError, IndexError):
             text = ''
+        # Claude 5.x thinks by default and its thinking shares max_tokens, so a reply can end with
+        # thinking and no text, or be cut off mid-answer. Fail the repo rather than analyse a stub.
+        if provider == 'anthropic':
+            finish = getattr(response.choices[0], 'finish_reason', None) if response.choices else None
+            if finish in _TRUNCATED_FINISH_REASONS or not text.strip():
+                raise IncompleteResponseError(
+                    f"{model} returned an incomplete response (finish_reason={finish!r}, "
+                    f"{len(text)} characters of text); not using it")
 
     api_cost = 0.0
     hidden = getattr(response, '_hidden_params', None)
