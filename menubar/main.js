@@ -293,21 +293,54 @@ function attemptReconciledOutcome(attemptId) {
   }
 }
 
+// This channel's sync attempts as the Activity store records them, newest first, through the
+// same reader (and its bounds) the Activity window uses. null when the store can't be read.
+// Only an unfinished attempt's owner lease is probed.
+function syncAttemptEvidence() {
+  try {
+    const home = os.homedir();
+    const res = activityRead.listActivities(home, {}, {
+      configuredSecrets: activityGlue.loadConfiguredSecrets(home),
+    });
+    if (!res || !res.available) return null;
+    const attempts = res.items
+      .filter((i) => !i.legacy && i.kind === 'sync' && i.channel === runtimeChannel)
+      .map((i) => ({
+        id: i.id,
+        startedAt: i.startedAt,
+        outcome: i.outcome,
+        owner: (i.outcome === 'running' || i.outcome === 'unknown') ? attemptOwnerState(i.id) : 'free',
+      }));
+    return { attempts };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Manual attempts Electron has minted that don't hold the root lock yet. Each holds an Activity
+// lease while it waits, so the evidence would otherwise show it as a running worker.
+const pendingManualAttempts = new Set();
+
+// What sync-state.js needs to decide which attempt is current (see its header).
+function syncStateContext() {
+  return {
+    channel: runtimeChannel,
+    liveChildAttemptId: isSyncing() ? (currentSyncProcess._attemptId || null) : null,
+    pendingAttemptIds: [...pendingManualAttempts],
+    ownerState: attemptOwnerState,
+    evidence: syncAttemptEvidence,
+    reconciledOutcome: attemptReconciledOutcome,
+  };
+}
+
 // What a progress window should show for this channel's current attempt right now, or null when
-// status.json has no attempt view yet (written by an older build). An attempt found finished by
-// reconciliation is recorded, so later reads don't repeat the work.
+// status.json has no attempt view yet (written by an older build). The current attempt is settled
+// from evidence first -- a worker whose updates were missed, or a finished one -- and recorded, so
+// later reads don't repeat the work. This only reads; it never starts a sync to find out.
 function currentSyncView() {
   const status = loadStatus();
-  const entry = syncState.current(status, runtimeChannel);
-  const view = syncState.replayView(entry, {
-    childRunning: isSyncing() && !!entry && currentSyncProcess._attemptId === entry.attemptId,
-    ownerState: attemptOwnerState,
-    reconciledOutcome: attemptReconciledOutcome,
-  });
-  if (view && view.recovered) {
-    syncState.finish(status, runtimeChannel, entry.attemptId, view.outcome);
-    saveStatus(status);
-  }
+  const { view, changed } = syncState.resolve(status, syncStateContext());
+  if (changed) saveStatus(status);
   return view;
 }
 
@@ -1040,7 +1073,7 @@ function startStatusServer() {
     // Keep the window on the attempt that is actually current: a superseded attempt's late
     // updates, and late progress from a finished one, change nothing.
     const admitted = loadStatus();
-    const verdict = syncState.admit(admitted, data, { channel: runtimeChannel });
+    const verdict = syncState.admit(admitted, data, syncStateContext());
     if (!verdict.accept) {
       console.log('Ignoring status update from a superseded or finished attempt:', data.type);
       res.json({ success: true });
@@ -1253,8 +1286,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   const activity = activityGlue.beginManualActivity(os.homedir(), {
     channel: runtimeChannel, trigger: trigger || 'manual',
   });
+  // Until it gets the root lock (onChild) or is turned away, this attempt is not a running worker.
+  const pendingId = activity.writer.activityId || null;
+  if (pendingId) pendingManualAttempts.add(pendingId);
+  const settlePending = () => { if (pendingId) pendingManualAttempts.delete(pendingId); };
 
   if (currentSyncProcess) {
+    settlePending();
     activityGlue.onContention(activity.writer, 'already-syncing');
     // Ruling P6-1: deliberately NO 'sync-refused' here. This returns above the status reset and
     // above showLogWindow(), so this attempt opened no window -- and any window that IS up is
@@ -1288,6 +1326,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // is synchronous), then refresh, then rebuild -- so the menu this produces already offers the
       // incident. This is the exact failure the feature exists to surface; the old order rebuilt
       // the menu before the terminal existed and left it missing until the next 30s tick.
+      settlePending();
       activityGlue.onGuardBlock(activity.writer, reason);
       _refreshViewErrorsTarget();
       updateTrayMenu();
@@ -1322,6 +1361,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       logWindow.webContents.send('terminal-output', `\n⚠️ Sync unavailable: ${reason}\n`);
     }
     // Activity History (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild.
+    settlePending();
     activityGlue.onGuardBlock(activity.writer, reason);
     _refreshViewErrorsTarget();
     updateTrayMenu();
@@ -1590,6 +1630,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     // maps it to child fd 4 and corrects REPO_RADAR_ACTIVITY_LOCK_FD to that child-side number.
     lockFd: activity.lockFd,
     onChild: async (child) => {
+      settlePending();
       currentSyncProcess = child;
       // Activity History (Task 2.3): tag the child with its activity writer so the separate
       // `stop-sync` IPC handler (a persistent top-level listener with no access to this
@@ -1802,6 +1843,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       updateTrayMenu();
     },
   }).catch((e) => {
+    settlePending();
     if (e && e.code === 75) {
       // LockBusy (runtime/lock.js): the root exec lock is already held by
       // another sync (manual or scheduled, either channel) — onChild() never
