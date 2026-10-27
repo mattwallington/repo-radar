@@ -1,9 +1,8 @@
 """Explicit per-model capability catalog (Branch 2). VENDOR DOCS ARE CANONICAL; litellm is only a
-release-time drift cross-check. Values re-verified against vendor pages 2026-10-27 (claude-opus-4-6-20260205
-is not documented by Anthropic and keeps its older date). total_context == max_input for shared-window
-models; the OpenAI 272K-input split family vendor-documents 400,000 total (llm.py:71). total_context feeds
-acceptance_budget only for anthropic_api models; for local models it is documentation + the
-max_input<=total_context invariant."""
+release-time drift cross-check. Values re-verified against vendor pages 2026-10-27. total_context ==
+max_input for shared-window models; the OpenAI 272K-input split family vendor-documents 400,000 total
+(llm.py:71). total_context feeds acceptance_budget only for anthropic_api models; for local models it
+is documentation + the max_input<=total_context invariant."""
 import math
 from collections import namedtuple
 ModelCaps = namedtuple("ModelCaps", "total_context max_input max_output count_strategy source_url source_date")
@@ -21,7 +20,6 @@ MODEL_CAPS = {
     "claude-opus-4-7": ModelCaps(1000000, 1000000, 128000, "anthropic_api", _ANT, "2026-10-27"),
     "claude-fable-5": ModelCaps(1000000, 1000000, 128000, "anthropic_api", _ANT, "2026-10-27"),
     "claude-opus-4-6": ModelCaps(1000000, 1000000, 128000, "anthropic_api", _ANT, "2026-10-27"),
-    "claude-opus-4-6-20260205": ModelCaps(1000000, 1000000, 128000, "anthropic_api", _ANT, "2026-08-08"),
     "claude-sonnet-4-6": ModelCaps(1000000, 1000000, 64000, "anthropic_api", _ANT, "2026-10-27"),
     "claude-opus-4-5": ModelCaps(200000, 200000, 64000, "anthropic_api", _ANT, "2026-10-27"),
     "claude-opus-4-5-20251101": ModelCaps(200000, 200000, 64000, "anthropic_api", _ANT, "2026-10-27"),

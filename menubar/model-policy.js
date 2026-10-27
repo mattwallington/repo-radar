@@ -77,7 +77,6 @@ const MODEL_CAPS = {
   'claude-opus-4-5': { max_input: 200000, max_output: 64000 },
   'claude-opus-4-5-20251101': { max_input: 200000, max_output: 64000 },
   'claude-opus-4-6': { max_input: 1000000, max_output: 128000 },
-  'claude-opus-4-6-20260205': { max_input: 1000000, max_output: 128000 },
   'claude-opus-4-7': { max_input: 1000000, max_output: 128000 },
   'claude-opus-4-8': { max_input: 1000000, max_output: 128000 },
   'claude-opus-5': { max_input: 1000000, max_output: 128000 },

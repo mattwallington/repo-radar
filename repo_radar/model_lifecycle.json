@@ -121,9 +121,10 @@
   },
   {
     "id": "claude-opus-4-6-20260205",
-    "status": "active",
-    "shutdown_date": null,
-    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+    "status": "retired",
+    "shutdown_date": "2026-10-27",
+    "source_url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+    "note": "Anthropic does not document this id; from the 4.6 generation on, the dateless claude-opus-4-6 is the pinned 4.6 snapshot. Retired here on 2026-10-27, the date that was verified."
   },
   {
     "id": "claude-opus-4-7",
