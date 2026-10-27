@@ -535,6 +535,68 @@ test('boot switches lenses and applies the level/search filter client-side', asy
   assert.strictEqual(calls.length, 2, 'switching lenses never re-crosses the bridge either');
 });
 
+// Regression (2026-10-27 screenshot): a blocked attempt that never got far enough to record an
+// event opened on Events and said only "This activity recorded no events.", while its reason sat
+// in the terminal summary the reader puts in Problems. It must open on Problems, and the user's
+// later Events choice must survive a re-selection of the same attempt.
+const BLOCKED_ID = '33333333-4444-4333-9444-777777777777';
+const BLOCKED_REASON = 'no CPython 3.10-3.14 interpreter found with a checked-in dependency lock';
+const BLOCKED_ITEM = Object.assign({}, LIVE_ITEM, { id: BLOCKED_ID, outcome: 'blocked' });
+const BLOCKED_DETAIL = {
+  item: Object.assign({}, BLOCKED_ITEM, {
+    events: [],
+    truncatedEvents: false,
+    duplicateTerminals: [],
+    problems: [{ kind: 'terminal', outcome: 'blocked', count: 1, ts: '2026-10-27T18:34:41.000Z', by: 'electron', summary: { reason: BLOCKED_REASON } }],
+  }),
+  available: true,
+};
+
+test('a blocked attempt with no events opens on Problems; a later Events choice sticks', async () => {
+  const { doc, byId } = livePage();
+  const { api } = fakeApi({
+    list: async () => ({ items: [BLOCKED_ITEM, LIVE_ITEM], truncated: false, available: true, incomplete: false, problems: [] }),
+    get: async (id) => (id === BLOCKED_ID ? BLOCKED_DETAIL : LIVE_DETAIL),
+  });
+  const win = fakeWindow('');
+  await R.boot(win, doc, api);
+  const chipFor = (id) => byId.list.querySelectorAll('.chip').find((c) => c.getAttribute('data-activity-id') === id);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  fire(byId.list, 'click', chipFor(BLOCKED_ID));
+  await settle();
+  assert.ok(byId['tab-problems'].classList.contains('active'), 'the blocked attempt opens on Problems');
+  assert.ok(byId.detail.textContent.includes(BLOCKED_REASON), 'its recorded reason is shown');
+
+  // An ordinary attempt afterwards goes back to Events: Problems was our choice, not the user's.
+  fire(byId.list, 'click', chipFor(LIVE_ITEM.id));
+  await settle();
+  assert.ok(byId['tab-events'].classList.contains('active'));
+  assert.ok(byId.detail.textContent.includes('rate-limited'));
+
+  fire(byId.list, 'click', chipFor(BLOCKED_ID));
+  await settle();
+  fire(byId['tab-events'], 'click');
+  assert.ok(byId.detail.textContent.includes('This activity recorded no events.'), 'the user can still pick Events');
+
+  win.navigate(`#${BLOCKED_ID}`); // the same attempt selected again
+  await settle();
+  assert.ok(byId['tab-events'].classList.contains('active'), 'a re-selection keeps the user\'s Events choice');
+  assert.ok(!byId['tab-problems'].classList.contains('active'));
+
+  // A Problems choice the user made before opening the blocked attempt is theirs, so returning to
+  // an ordinary attempt keeps it rather than reverting to Events.
+  fire(byId.list, 'click', chipFor(LIVE_ITEM.id));
+  await settle();
+  fire(byId['tab-problems'], 'click');
+  fire(byId.list, 'click', chipFor(BLOCKED_ID));
+  await settle();
+  fire(byId.list, 'click', chipFor(LIVE_ITEM.id));
+  await settle();
+  assert.ok(byId['tab-problems'].classList.contains('active'), 'the user\'s own Problems choice survives');
+  assert.ok(!byId['tab-events'].classList.contains('active'));
+});
+
 test('a rejected bridge call shows one generic line plus Retry, never the error itself (P4-7)', async () => {
   const { doc, byId } = livePage();
   let attempts = 0;

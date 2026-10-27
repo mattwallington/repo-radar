@@ -31,17 +31,31 @@ function _pyenvWhich() {
   }
 }
 
+const SUPPORTED_MINORS = [14, 13, 12, 11, 10]; // newest first
+const HOMEBREW_PREFIXES = ['/opt/homebrew', '/usr/local'];
+
+// The unversioned defaults keep their preference. The versioned Homebrew executables
+// follow, so a supported Python is still found after Homebrew's default python3 moves
+// past 3.14. The opt/ path covers a formula that is installed but not linked into bin.
+function defaultCandidates(pyenvWhich = _pyenvWhich) {
+  const candidates = ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', pyenvWhich(), 'python3'];
+  for (const minor of SUPPORTED_MINORS) {
+    for (const prefix of HOMEBREW_PREFIXES) {
+      candidates.push(
+        `${prefix}/bin/python3.${minor}`,
+        `${prefix}/opt/python@3.${minor}/bin/python3.${minor}`
+      );
+    }
+  }
+  return candidates;
+}
+
+// opts.probe / opts.pyenvWhich are test seams; production uses the real probes.
 function resolveBaseInterpreter(opts = {}) {
-  const candidates = (
-    opts.candidates || [
-      '/opt/homebrew/bin/python3',
-      '/usr/local/bin/python3',
-      _pyenvWhich(),
-      'python3',
-    ]
-  ).filter(Boolean);
+  const probeFn = opts.probe || probe;
+  const candidates = (opts.candidates || defaultCandidates(opts.pyenvWhich)).filter(Boolean);
   for (const exe of candidates) {
-    const info = probe(exe);
+    const info = probeFn(exe);
     if (info && info.version[0] === 3 && info.version[1] >= 10 && info.version[1] < 15) {
       // opts.accept lets a caller further constrain the accepted set — e.g. require a
       // checked-in dependency lock for the interpreter's env (spec §3.6). Skip to the
@@ -55,4 +69,4 @@ function resolveBaseInterpreter(opts = {}) {
   );
 }
 
-module.exports = { NoInterpreterError, probe, resolveBaseInterpreter };
+module.exports = { NoInterpreterError, probe, defaultCandidates, resolveBaseInterpreter };

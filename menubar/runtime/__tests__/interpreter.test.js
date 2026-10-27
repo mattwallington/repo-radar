@@ -31,3 +31,23 @@ test('resolveBaseInterpreter honors opts.accept (coverage gate)', () => {
   assert.match(resolveBaseInterpreter({ candidates: [PY310], accept: () => true }).exe, /python3.10/);
   assert.throws(() => resolveBaseInterpreter({ candidates: [PY310], accept: () => false }), NoInterpreterError);
 });
+
+// Regression (2026-10-26 outage): Homebrew's default python3 moved to 3.15 and the
+// default search never tried the versioned 3.14 still installed. The 3.14 probe shape
+// below is what the real /opt/homebrew/bin/python3.14 reported on Matt's Mac on
+// 2026-10-27 (CPython 3.14.10, arm64, cpython-314-darwin, Cellar real path).
+test('default discovery falls through an unsupported python3 to a versioned Homebrew python', () => {
+  const REAL_314 = '/opt/homebrew/Cellar/python@3.14/3.14.10/Frameworks/Python.framework/Versions/3.14/bin/python3.14';
+  const probes = {
+    '/opt/homebrew/bin/python3': { exe: '/opt/homebrew/Cellar/python@3.15/3.15.1/bin/python3.15', version: [3, 15, 1], impl: 'cpython', arch: 'arm64', abi: 'cpython-315-darwin' },
+    '/opt/homebrew/bin/python3.14': { exe: REAL_314, version: [3, 14, 10], impl: 'cpython', arch: 'arm64', abi: 'cpython-314-darwin' },
+  };
+  const tried = [];
+  const r = resolveBaseInterpreter({
+    probe: (exe) => { tried.push(exe); return probes[exe] || null; },
+    pyenvWhich: () => null, // pyenv unavailable; PATH python3 probes as missing
+    accept: (exe, info) => info.version.join('.') === '3.14.10' && info.arch === 'arm64',
+  });
+  assert.strictEqual(r.exe, REAL_314);
+  assert.deepStrictEqual(tried, ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', 'python3', '/opt/homebrew/bin/python3.14']);
+});
