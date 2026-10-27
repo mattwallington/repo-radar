@@ -214,9 +214,9 @@ function anyStub() {
   });
 }
 
-function makeHarness(t, { channel = 'stable' } = {}) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-progress-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+function makeHarness(t, { channel = 'stable', home: sharedHome = null } = {}) {
+  const home = sharedHome || fs.mkdtempSync(path.join(os.tmpdir(), 'rr-progress-'));
+  if (!sharedHome) t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const prevHome = process.env.HOME;
   process.env.HOME = home;
   t.after(() => { process.env.HOME = prevHome; });
@@ -508,4 +508,108 @@ test('a finished attempt\'s delayed exit handling cannot overwrite the run after
   assert.strictEqual(status.hasErrors, true, 'the failed run still reports its errors');
   assert.strictEqual(status.lastSync, lastSync, 'the old run did not stamp a completion over the failure');
   assert.ok(!h.icons.slice(iconsBefore).includes('icon-success.png'), 'no success icon over the failure');
+});
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test('a scheduled run\'s rows are laid out and kept, whenever the window opens', (t) => {
+  const h = makeHarness(t);
+  const win = h.openWindow(); // already open when the scheduled worker starts
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'waiting-for-network' });
+  assert.strictEqual(win.status(), 'Waiting for network...');
+  assert.strictEqual(win.stopEnabled(), false);
+
+  b.post({ type: 'sync-lifecycle', phase: 'syncing' });
+  b.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }, { name: 'o/two', color: 'red' }] });
+  b.post({ type: 'progress', repo: 'o/one', status: 'Fetching', percent: 40, color: 'cyan' });
+  assert.deepStrictEqual(win.rows(), { 'o/one': 'Fetching', 'o/two': 'Waiting...' });
+
+  h.closeWindow();
+  const reopened = h.openWindow();
+  assert.deepStrictEqual(reopened.rows(), { 'o/one': 'Fetching', 'o/two': 'Waiting...' });
+  assert.strictEqual(reopened.status(), 'Syncing...');
+  assert.strictEqual(reopened.stopEnabled(), false);
+
+  b.post({ type: 'progress', repo: 'o/two', status: 'Cloning', percent: 20, color: 'red' });
+  // A repository the roster didn't list (or a roster that never arrived) still gets a row.
+  b.post({ type: 'progress', repo: 'o/three', status: 'Cloning', percent: 10, color: 'green' });
+  assert.deepStrictEqual(reopened.rows(), { 'o/one': 'Fetching', 'o/two': 'Cloning', 'o/three': 'Cloning' });
+  assert.strictEqual(reopened.stopEnabled(), false);
+  assert.strictEqual(h.status().syncState.stable.phase, 'syncing');
+});
+
+test('a Sync Now refused because the scheduled run holds the lock leaves that run\'s progress alone', async (t) => {
+  const h = makeHarness(t);
+  h.writeConfig(['o/manual']);
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+  b.post({ type: 'progress', repo: 'o/one', status: 'Fetching', percent: 40, color: 'cyan' });
+  b.post({ type: 'error', repo: 'o/one', message: 'retrying fetch' });
+  b.post({ type: 'output', data: 'scheduled log line' });
+  const before = h.status();
+
+  h.main.triggerSync({ showWindow: true });
+  h.clock.tick(60);
+  h.refuse(); // the root lock is the scheduled worker's
+  await flush();
+  h.clock.tick(500);
+
+  const after = h.status();
+  assert.deepStrictEqual(after.repos, before.repos);
+  assert.deepStrictEqual(after.errorList, before.errorList);
+  assert.strictEqual(after.logOutput, before.logOutput);
+  assert.strictEqual(after.syncState.stable.attemptId, b.id);
+  assert.deepStrictEqual(h.window().rows(), { 'o/one': 'Fetching' });
+  assert.strictEqual(h.window().stopEnabled(), false);
+  assert.strictEqual(h.notifications.length, 1, 'the "already running" notification stays');
+
+  // Nothing of the refused attempt is left pending: a reopened window shows the scheduled run,
+  // and the worker's next update still lands.
+  h.closeWindow();
+  const reopened = h.openWindow();
+  b.post({ type: 'progress', repo: 'o/one', status: 'Merging', percent: 80, color: 'cyan' });
+  assert.deepStrictEqual(reopened.rows(), { 'o/one': 'Merging' });
+});
+
+test('stable and dev each replay only their own run\'s rows, errors and log', (t) => {
+  const stable = makeHarness(t);
+  const dev = makeHarness(t, { channel: 'dev', home: stable.home });
+
+  const s = stable.scheduledWorker();
+  s.post({ type: 'sync-lifecycle', phase: 'starting' });
+  s.post({ type: 'sync-roster', repos: [{ name: 's/one', color: 'cyan' }] });
+  s.post({ type: 'progress', repo: 's/one', status: 'Done', percent: 100, color: 'cyan' });
+  s.post({ type: 'output', data: 'stable log line' });
+  s.post({ type: 'complete', stats: { total: 1, errors: 0 }, channel: 'stable', mode: 'full', trigger: 'scheduled' });
+  s.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  s.end();
+  const stableLastSync = stable.status().lastSync;
+  assert.ok(stableLastSync, 'the qualifying stable run recorded its completion');
+
+  const d = dev.scheduledWorker();
+  d.post({ type: 'sync-lifecycle', phase: 'starting' });
+  d.post({ type: 'sync-roster', repos: [{ name: 'd/two', color: 'red' }] });
+  d.post({ type: 'progress', repo: 'd/two', status: 'Fetching', percent: 50, color: 'red' });
+  d.post({ type: 'error', repo: 'd/two', message: 'dev fetch failed' });
+  d.post({ type: 'output', data: 'dev log line' });
+  d.post({ type: 'complete', stats: { total: 1, errors: 1 }, channel: 'dev', mode: 'full', trigger: 'scheduled' });
+  d.post({ type: 'sync-terminal', outcome: 'failed' });
+  d.end('failed');
+
+  const win = stable.openWindow();
+  assert.deepStrictEqual(Object.keys(win.rows()), ['s/one']);
+  assert.strictEqual(win.status(), 'Complete!');
+  const st = stable.status();
+  assert.match(st.logOutput, /stable log line/);
+  assert.doesNotMatch(st.logOutput, /dev log line/);
+  assert.deepStrictEqual(st.errorList, []);
+  assert.deepStrictEqual(st.syncRepos.map((r) => r.name), ['s/one']);
+  assert.strictEqual(st.lastSync, stableLastSync, 'dev did not advance stable\'s completion time');
+
+  const dwin = dev.openWindow();
+  assert.deepStrictEqual(Object.keys(dwin.rows()), ['d/two']);
+  assert.strictEqual(dev.status().errorList.length, 1);
 });

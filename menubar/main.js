@@ -371,7 +371,8 @@ function finishChildAttempt(attemptId, code, wasCancelled) {
 function loadStatus() {
   try {
     if (fs.existsSync(STATUS_FILE)) {
-      lastStatus = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8'));
+      // The run fields (rows, errors, output, stats) are this channel's current attempt's.
+      lastStatus = syncState.project(JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8')), runtimeChannel);
     }
   } catch (e) {
     console.error('Error loading status:', e);
@@ -389,7 +390,10 @@ function loadStatus() {
 function saveStatus(status) {
   lastStatus = status;
   try {
-    fs.writeFileSync(STATUS_FILE, JSON.stringify(status, null, 2));
+    // The other channel's app shares this file: keep its entry as it is on disk now.
+    let onDisk = {};
+    try { onDisk = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8')); } catch (e) { /* none yet */ }
+    fs.writeFileSync(STATUS_FILE, JSON.stringify(syncState.store(onDisk, status, runtimeChannel), null, 2));
   } catch (e) {
     console.error('Error saving status:', e);
   }
@@ -1079,17 +1083,23 @@ function startStatusServer() {
       res.json({ success: true });
       return;
     }
-    if (verdict.started && data.attemptId) {
-      // A run the app didn't start (the scheduled worker): its rows replace the previous run's,
-      // as triggerSync's reset does for runs the app starts.
-      admitted.repos = [];
-      admitted.logOutput = '';
+    if (data.type === 'sync-roster' && Array.isArray(data.repos)) {
+      // The run's repositories, by display name: the rows a window for this run lays out.
+      admitted.syncRepos = data.repos
+        .filter((r) => r && typeof r.name === 'string' && r.name)
+        .map((r) => ({ name: r.name, fullName: r.name, color: typeof r.color === 'string' ? r.color : 'cyan' }));
     }
-    if (verdict.changed) saveStatus(admitted);
+    if (verdict.changed || data.type === 'sync-roster') saveStatus(admitted);
 
-    if (data.type === 'sync-lifecycle' || data.type === 'sync-terminal') {
+    if (verdict.started || data.type === 'sync-roster') {
+      // A new attempt (or its roster) while the window is open: lay out that run's rows and
+      // replay what it has reported so far, then carry on with this update below.
+      if (logWindow) replaySyncToWindow(logWindow);
+    } else if (data.type === 'sync-lifecycle' || data.type === 'sync-terminal') {
       sendSyncStateToWindow();
-    } else if (data.type === 'output') {
+    }
+
+    if (data.type === 'output') {
       // Send terminal output to renderer
       if (logWindow && !logWindow.isDestroyed()) {
         logWindow.webContents.send('terminal-output', data.data);
@@ -1376,16 +1386,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   syncCancelledByUser = false;
   syncShowWindow = showWindow;
 
-  // Reset status for new sync
-  const status = loadStatus();
-  status.logOutput = '';
-  status.errorLog = '';  // Clear previous error log text
-  status.errorList = [];  // Clear previous error array
-  status.repos = [];
-  status.hasErrors = false;  // Reset error flag
-  saveStatus(status);
-  updateTrayMenu();
-  
+  // This attempt's rows, errors and output start empty -- but only once it actually holds the
+  // root lock (onChild below). Until then a scheduled run may be the one running, and a refused
+  // click must leave its progress alone.
+
   // Load config to prepare repos array
   const configFile = path.join(CONFIG_DIR, 'config.json');
   let repoCount = 0;
@@ -1430,10 +1434,6 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   } catch (e) {
     console.error('Error loading config for repo count:', e);
   }
-  
-  // Store repos in status so window can retrieve them
-  status.syncRepos = reposForUI;
-  saveStatus(status);
   
   // Show log window (only for manual syncs; scheduled syncs run in background).
   // pendingFreshSync names this attempt's window so its did-finish-load handler skips its
@@ -1485,6 +1485,25 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       attemptWindow.webContents.send('sync-refused', { reason });
     };
     deliver();
+  };
+
+  // Root lock busy because another run holds it: if that run is one we can show, put it in this
+  // attempt's window rather than clearing the window with a refusal. Returns false otherwise.
+  const showRunningSyncInstead = () => {
+    const view = currentSyncView();
+    if (!view || !view.live || view.attemptId === attemptId) return false;
+    syncRefusedForThisAttempt = true;
+    clearPendingStart();
+    const deliver = () => {
+      if (!attemptWindow || logWindow !== attemptWindow || attemptWindow.isDestroyed()) return;
+      if (attemptWindow.webContents.isLoading()) {
+        setTimeout(deliver, 100);
+        return;
+      }
+      replaySyncToWindow(attemptWindow);
+    };
+    if (showWindow) deliver();
+    return true;
   };
 
   // Fill the window this attempt opened once it has loaded and the attempt holds the root lock.
@@ -1645,9 +1664,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // running scheduled attempt's view.
       currentSyncProcess._attemptId = activity.writer.activityId || null;
       try {
+        // This attempt now owns the channel's view: a fresh run snapshot (no rows, errors or
+        // output yet) with the roster prepared from the config above.
         const st = loadStatus();
         syncState.begin(st, runtimeChannel, currentSyncProcess._attemptId);
+        if (st.syncRepos === null || st.syncRepos === undefined) st.syncRepos = reposForUI;
         saveStatus(st);
+        updateTrayMenu();
       } catch (e) { /* the view is best-effort; never block the sync */ }
       attemptBegun = true;
       // A window already open for another reason (a catch-up run opens none) moves to this run.
@@ -1855,9 +1878,9 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       // ran, so there's no child/process-error path for this.
       console.warn('Sync already running (root lock busy), ignoring Sync Now click');
       // Ruling P6-1: FIRST tell the progress window this attempt opened, before anything else can
-      // return -- it is already showing "Starting sync..." over a grid of "Waiting..." rows that
-      // nothing will ever move, and this also latches the pending sync-started send off.
-      refuseProgressWindow('already-running');
+      // return, and latch the pending sync-started send off. If the run holding the lock is one
+      // this window can show (a scheduled worker), show it instead of a cleared grid.
+      if (!showRunningSyncInstead()) refuseProgressWindow('already-running');
       if (Notification.isSupported()) {
         new Notification({
           title: getAppDisplayName(),
@@ -1912,21 +1935,24 @@ function replaySyncToWindow(win) {
   if (!view) return false;
   const status = loadStatus();
   const finished = view.phase === syncState.FINISHED;
-  const rows = (!finished && status.syncRepos && status.syncRepos.length > 0 && view.canStop)
-    ? status.syncRepos
-    : (status.repos || []).map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' }));
-  if (rows.length > 0) {
-    win.webContents.send('sync-started', { total: rows.length, repos: rows });
-    const done = finished && /^succeeded/.test(view.outcome || '');
-    (status.repos || []).forEach(repo => {
-      win.webContents.send('progress-update', {
-        repo: repo.name,
-        status: repo.status,
-        percent: repo.percent || (done ? 100 : 0),
-        color: repo.color || 'cyan'
-      });
+  // This attempt's roster lays out its rows; if it was missed (null), the window starts with no
+  // rows and each reported repository adds its own, without claiming that is the whole list.
+  const roster = Array.isArray(status.syncRepos) ? status.syncRepos : null;
+  win.webContents.send('sync-started', {
+    total: roster ? roster.length : 0,
+    repos: roster || [],
+    rosterKnown: !!roster,
+    canStop: view.canStop,
+  });
+  const done = finished && /^succeeded/.test(view.outcome || '');
+  (status.repos || []).forEach(repo => {
+    win.webContents.send('progress-update', {
+      repo: repo.name,
+      status: repo.status,
+      percent: repo.percent || (done ? 100 : 0),
+      color: repo.color || 'cyan'
     });
-  }
+  });
   // Only this attempt's own stats, never an older run's.
   if (finished && view.stats) win.webContents.send('sync-complete', view.stats);
   win.webContents.send('sync-state', view);

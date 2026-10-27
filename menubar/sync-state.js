@@ -23,6 +23,14 @@
 //     own `complete` stats are shown, and only alongside that attempt's outcome. A finished owner
 //     with no recorded outcome is shown as unknown, not as interrupted.
 //
+// Each attempt's entry also carries its run snapshot (`run`): the repository roster, per-repo
+// progress, stats, output, error details and error flag. main.js keeps working with these as the
+// familiar top-level status fields; `project()` fills them from this channel's current attempt
+// when status.json is read and `store()` files them back under it when it is written, keeping
+// every other channel's entry as it is on disk. So a reopened window shows this attempt's rows,
+// never the previous run's or another channel's. Receipts and the schedule's completion
+// timestamps stay shared and authoritative.
+//
 // The main-process half (admit/begin/finish/resolve) is pure data over the status object plus
 // the evidence callbacks main.js supplies; the renderer half (applySyncState) takes `doc` and
 // touches nothing else, so both can be tested. Activity records and receipts stay authoritative;
@@ -49,7 +57,20 @@ const UNFINISHED_OUTCOMES = new Set(['running', 'unknown']);
 // Update types that describe progress inside a run. Once the attempt is finished these are late
 // and are dropped; its abort details (`error`) and repeated terminals are still accepted.
 const PROGRESS_TYPES = new Set(['progress', 'output', 'rate-limit', 'waiting-for-network',
-  'sync-lifecycle', 'complete']);
+  'sync-lifecycle', 'sync-roster', 'complete']);
+
+// The run snapshot fields, as main.js names them at the top level of the status object.
+// `syncRepos` is the roster: null until known, [] for a run with no repositories.
+const RUN_DEFAULTS = {
+  repos: () => [],
+  syncRepos: () => null,
+  errorList: () => [],
+  errorLog: () => '',
+  logOutput: () => '',
+  hasErrors: () => false,
+  stats: () => ({ total: 0, cloned: 0, updated: 0, errors: 0 }),
+};
+const RUN_FIELDS = Object.keys(RUN_DEFAULTS);
 
 const NOT_ACCEPTED = Object.freeze({ accept: false, changed: false, started: false });
 
@@ -70,6 +91,11 @@ function _fresh(attemptId, now, previous, { phase = 'starting', verified = false
   if (previous && previous.attemptId && !retired.includes(previous.attemptId)) {
     retired.push(previous.attemptId);
   }
+  // A new attempt starts with no rows, errors or output of its own. The channel's last completed
+  // stats carry over for the tray's summary line only; the window shows `entry.stats`.
+  const run = {};
+  for (const k of RUN_FIELDS) run[k] = RUN_DEFAULTS[k]();
+  if (previous && previous.run && previous.run.stats) run.stats = previous.run.stats;
   return {
     attemptId: attemptId || null,
     verified: !!verified,
@@ -81,7 +107,43 @@ function _fresh(attemptId, now, previous, { phase = 'starting', verified = false
     startedAt: startedAt || null,
     updatedAt: now,
     retired: retired.slice(-RETIRED_LIMIT),
+    run,
   };
+}
+
+// Make `entry` the channel's current attempt, and its run snapshot the status's top-level fields.
+function _becomeCurrent(status, ch, entry) {
+  _entries(status)[ch] = entry;
+  for (const k of RUN_FIELDS) status[k] = entry.run[k];
+  return entry;
+}
+
+// Fill the top-level run fields from `channel`'s current attempt (main.js's loadStatus). A
+// status file from an older build has no run snapshot; its shared fields are used as they are.
+function project(status, channel) {
+  const entry = current(status, channel);
+  if (!entry || !entry.run || typeof entry.run !== 'object') return status;
+  for (const k of RUN_FIELDS) {
+    status[k] = entry.run[k] !== undefined && entry.run[k] !== null ? entry.run[k] : RUN_DEFAULTS[k]();
+  }
+  if (entry.run.syncRepos === null) status.syncRepos = null;
+  return status;
+}
+
+// What to write (main.js's saveStatus): this process's status, with its run fields filed under
+// its channel's current attempt and every other channel's entry taken from `disk` as it is now.
+// The top-level run fields are still written, for an older build reading the same file.
+function store(disk, status, channel) {
+  const out = { ...status };
+  const onDisk = disk && disk.syncState && typeof disk.syncState === 'object' ? disk.syncState : {};
+  out.syncState = { ...onDisk };
+  const mine = channel ? current(status, channel) : null;
+  if (mine) {
+    const run = {};
+    for (const k of RUN_FIELDS) run[k] = status[k] !== undefined ? status[k] : RUN_DEFAULTS[k]();
+    out.syncState[channel] = { ...mine, run };
+  }
+  return out;
 }
 
 function _isFinished(entry) {
@@ -128,6 +190,8 @@ function _apply(entry, payload, now) {
         _setFinished(entry, errors ? 'failed' : 'succeeded', null, now);
       }
       return true;
+    case 'sync-roster':
+      return true; // the roster itself is recorded by main.js as the run's `syncRepos`
     case 'network-timeout':
       return _setFinished(entry, 'failed', 'no_network_connectivity', now);
     case 'sync-terminal':
@@ -202,7 +266,6 @@ function admit(status, payload, ctx = {}) {
   const named = typeof payload.channel === 'string' && payload.channel ? payload.channel : null;
   if (named && ctx.channel && named !== ctx.channel) return NOT_ACCEPTED;
   const ch = ctx.channel || named;
-  const all = _entries(status);
   const entry = current(status, ch);
   const id = typeof payload.attemptId === 'string' && payload.attemptId ? payload.attemptId : null;
 
@@ -212,7 +275,7 @@ function admit(status, payload, ctx = {}) {
     if (entry && entry.attemptId && !_isFinished(entry)) return NOT_ACCEPTED;
     let target = entry && entry.legacy ? entry : null;
     if (!target || (_isFinished(target) && PROGRESS_TYPES.has(payload.type))) {
-      target = all[ch] = _fresh(null, now, entry, { legacy: true });
+      target = _becomeCurrent(status, ch, _fresh(null, now, entry, { legacy: true }));
     }
     const started = target !== entry;
     return { accept: true, changed: _apply(target, payload, now) || started, started };
@@ -233,7 +296,7 @@ function admit(status, payload, ctx = {}) {
       const cand = ev && ev.attempts.find((a) => a.id === id);
       if (cand) opts = { verified: true, startedAt: cand.startedAt };
     }
-    target = all[ch] = _fresh(id, now, entry, opts);
+    target = _becomeCurrent(status, ch, _fresh(id, now, entry, opts));
   }
   const started = target !== entry;
   const changed = _apply(target, payload, now);
@@ -244,14 +307,12 @@ function admit(status, payload, ctx = {}) {
 // really is the current one. A refused attempt never gets here, so it cannot disturb a running
 // scheduled attempt's entry.
 function begin(status, channel, attemptId, { now = new Date().toISOString() } = {}) {
-  const all = _entries(status);
   const entry = current(status, channel);
   if (entry && attemptId && entry.attemptId === attemptId) {
     entry.verified = true;
     return entry; // the worker already said so
   }
-  all[channel] = _fresh(attemptId, now, entry, { verified: true });
-  return all[channel];
+  return _becomeCurrent(status, channel, _fresh(attemptId, now, entry, { verified: true }));
 }
 
 // Record an outcome Electron learned itself (child exit, Activity reconciliation), but only for
@@ -287,7 +348,6 @@ const _unknownView = (entry) => _viewOf(entry, { phase: UNKNOWN, outcome: null, 
 function resolve(status, ctx = {}) {
   const ch = ctx.channel;
   const now = ctx.now || new Date().toISOString();
-  const all = _entries(status);
   const entry = current(status, ch);
 
   // Electron's own worker: it holds the root lock, nothing can outrank it.
@@ -311,9 +371,9 @@ function resolve(status, ctx = {}) {
     // A running worker whose updates the app never saw (it started while the app was closed,
     // or its posts were lost). Its phase is unknown until it reports one.
     const live = liveOthers[0];
-    all[ch] = _fresh(live.id, now, entry, { phase: UNKNOWN, verified: true,
-      startedAt: live.startedAt });
-    return { view: _viewOf(all[ch], { live: true }), changed: true };
+    const adopted = _becomeCurrent(status, ch, _fresh(live.id, now, entry, { phase: UNKNOWN,
+      verified: true, startedAt: live.startedAt }));
+    return { view: _viewOf(adopted, { live: true }), changed: true };
   }
 
   if (!entry) return { view: null, changed: false };
@@ -341,9 +401,10 @@ function resolve(status, ctx = {}) {
     }
     if (later.length > 0) {
       const newest = later[0];
-      all[ch] = _fresh(newest.id, now, entry, { verified: true, startedAt: newest.startedAt });
-      _setFinished(all[ch], newest.outcome, null, now);
-      return { view: _viewOf(all[ch], { recovered: true }), changed: true };
+      const adopted = _becomeCurrent(status, ch, _fresh(newest.id, now, entry, { verified: true,
+        startedAt: newest.startedAt }));
+      _setFinished(adopted, newest.outcome, null, now);
+      return { view: _viewOf(adopted, { recovered: true }), changed: true };
     }
   }
   return { view: _viewOf(entry), changed: false };
@@ -417,5 +478,5 @@ function applySyncState(doc, view) {
 
 module.exports = {
   FINISHED, UNKNOWN, PHASES, PHASE_TEXTS, OUTCOME_TEXTS, NETWORK_ABORT_TEXT,
-  current, admit, begin, finish, resolve, syncStateText, applySyncState,
+  current, admit, begin, finish, resolve, project, store, syncStateText, applySyncState,
 };

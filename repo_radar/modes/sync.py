@@ -1216,6 +1216,14 @@ def sync_mode(args):
         return 1
 
     repos = config.get('repositories', [])
+    # This run's repositories, so the app can lay out its rows even if it opened the window late
+    # or missed the start. Display names and row colors only; nothing else from the config (clone
+    # URLs can carry credentials) goes with it. An empty list means "no repositories", which the
+    # app tells apart from never having heard.
+    send_status_update('sync-roster', {'repos': [
+        {'name': r['full_name'], 'color': PROGRESS_COLORS[i % len(PROGRESS_COLORS)]}
+        for i, r in enumerate(repos) if isinstance(r, dict) and r.get('full_name')
+    ]}, args.status_server)
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
         # A successful no-op is still a completed run; record it or the schedule looks missed.

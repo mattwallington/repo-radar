@@ -283,6 +283,39 @@ def test_network_abort_reports_each_phase_under_one_attempt_identity(monkeypatch
     assert all(p["attemptId"] == "a" * 32 and p["channel"] == "stable" for p in posted)
 
 
+def test_the_run_reports_its_repository_roster_under_its_identity(monkeypatch, tmp_path):
+    """After the network wait the worker names this run's repositories (display name and row
+    color only), tagged with its attempt, so the app can build the right rows for a window opened
+    late. Nothing else from the config -- clone URLs can carry a token -- goes with it."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "PRISTINE_DIR", tmp_path / "pristine")
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(S, "wait_for_network", lambda **kw: True)
+    monkeypatch.setattr(S, "load_config", lambda: {"repositories": [
+        {"full_name": "o/one", "name": "one", "clone_url": "https://secret-token@github.com/o/one.git"},
+        {"full_name": "o/two", "name": "two", "clone_url": "https://secret-token@github.com/o/two.git"},
+    ]})
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    writer.activity_id = "b" * 32
+    args = _args(status_server=True, dry_run=True, skip_metadata=True)
+    args._activity_writer = writer
+    S.sync_mode(args)
+
+    roster = [p for p in posted if p["type"] == "sync-roster"]
+    assert len(roster) == 1
+    assert roster[0]["repos"] == [{"name": "o/one", "color": "cyan"}, {"name": "o/two", "color": "red"}]
+    assert (roster[0]["attemptId"], roster[0]["channel"]) == ("b" * 32, "stable")
+    assert "secret-token" not in json.dumps(roster[0])
+    phases = [p.get("phase") for p in posted if p["type"] == "sync-lifecycle"]
+    assert phases == ["starting", "syncing"]
+
+
 def test_stop_during_the_network_wait_is_recorded_as_cancelled(monkeypatch, tmp_path):
     """Stop (SIGTERM) during the wait surfaces as NetworkWaitCancelled; the run ends cancelled,
     not as a connectivity failure, and the app is told so."""

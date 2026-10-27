@@ -132,11 +132,14 @@ function updateRepoProgress(repoName, status, percent, color, details) {
     let item = document.getElementById(`repo-${repoName}`);
     
     if (!item) {
-        log('ERROR: Element not found for:', repoName);
-        log('Available elements:', 
-            Array.from(document.querySelectorAll('.repo-progress-item')).map(el => el.id));
-        log('repoStates keys:', Array.from(repoStates.keys()));
-        return;
+        // The window opened after this run's roster was sent (or it never arrived): add the
+        // row this repository needs rather than dropping its progress.
+        const reposList = document.getElementById('repos-list');
+        if (!reposList) return;
+        const placeholder = reposList.querySelector('.empty-message');
+        if (placeholder) reposList.removeChild(placeholder);
+        item = createRepoProgressItem({ name: repoName, fullName: repoName, color });
+        reposList.appendChild(item);
     }
     
     log('✓ Found element, updating...');
@@ -478,7 +481,12 @@ ipcRenderer.on('sync-started', (event, data) => {
     repoStates.clear();
     
     // Initialize all repos if provided
-    if (data.repos && data.repos.length > 0) {
+    if (data.rosterKnown === false) {
+        // A run whose repository list we haven't heard: start empty; each repository that
+        // reports progress adds its own row.
+        const reposList = document.getElementById('repos-list');
+        if (reposList) reposList.textContent = '';
+    } else if (data.repos && data.repos.length > 0) {
         log('Initializing repos...');
         initializeAllRepos(data.repos);
     } else {
@@ -496,9 +504,13 @@ ipcRenderer.on('sync-started', (event, data) => {
         statusText.textContent = 'Starting sync...';
     }
     
-    // Enable stop button
+    // Enable stop button -- unless main says this run can't be stopped from here (a scheduled
+    // worker the app didn't start).
     const stopBtn = document.getElementById('stop-sync-btn');
-    if (stopBtn) {
+    if (stopBtn && data.canStop === false) {
+        stopBtn.disabled = true;
+        stopBtn.classList.remove('active');
+    } else if (stopBtn) {
         log('Enabling stop button');
         stopBtn.disabled = false;
         stopBtn.classList.add('active');
