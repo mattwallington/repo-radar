@@ -12,7 +12,7 @@ from repo_radar.model_catalog import acceptance_budget, get_caps, is_known_model
 
 # TODO: refactor sync_mode to use analyze_repo_chunk and combine_chunk_analyses
 
-DEFAULT_MODEL = 'claude-sonnet-5'
+DEFAULT_MODEL = 'claude-sonnet-5-5'
 
 # Maximum input context window for each supported model.
 #
@@ -21,49 +21,88 @@ DEFAULT_MODEL = 'claude-sonnet-5'
 # see that module for source_url/source_date provenance per model.
 KNOWN_LIMITS = {m: c.max_input for m, c in model_catalog.MODEL_CAPS.items()}
 
-# Retired model ids -> their current replacement. Keys must never overlap
-# with KNOWN_LIMITS (a model is either live or migrated, not both).
-MODEL_MIGRATIONS = {
-    # Anthropic
-    "claude-3-7-sonnet-20250219": "claude-sonnet-5",
-    "claude-3-5-sonnet-20241022": "claude-sonnet-5",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-5",
-    "claude-3-sonnet-20240229": "claude-sonnet-5",
-    "claude-3-5-haiku-20241022": "claude-haiku-4-5",
-    "claude-3-haiku-20240307": "claude-haiku-4-5",
-    "claude-3-opus-20240229": "claude-opus-4-8",
-    "claude-opus-4-20250514": "claude-opus-4-8",
-    "claude-4-opus-20250514": "claude-opus-4-8",
-    "claude-opus-4-1": "claude-opus-4-8",
-    "claude-opus-4-1-20250805": "claude-opus-4-8",
-    "claude-sonnet-4-20250514": "claude-sonnet-5",
-    "claude-4-sonnet-20250514": "claude-sonnet-5",
-    # OpenAI
-    "o1-preview": "o3",
-    "o1-mini": "o3",
-    "codex-mini-latest": "gpt-5.4-mini",
-    "gpt-5-codex": "gpt-5.3-codex",
-    "gpt-5.1-codex": "gpt-5.3-codex",
-    "gpt-5.1-codex-max": "gpt-5.3-codex",
-    "gpt-5.2-codex": "gpt-5.3-codex",
-    "gpt-5.1-codex-mini": "gpt-5.4-mini",
-    # Shut down 2026-10-23. o1-pro's vendor replacement also sets reasoning.mode=pro, which Repo
-    # Radar does not send; these land on ordinary GPT-5.6 Sol.
-    "gpt-4.1-nano": "gpt-5.6-luna",
-    "o4-mini": "gpt-5.6-terra",
-    "o1": "gpt-5.6-sol",
-    "o3-mini": "gpt-5.6-sol",
-    "o1-pro": "gpt-5.6-sol",
-    # Google
-    "gemini/gemini-2.0-flash": "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.0-flash-001": "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.0-flash-exp": "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.0-flash-lite": "gemini/gemini-2.5-flash-lite",
-    "gemini/gemini-3-pro-preview": "gemini/gemini-3.1-pro-preview",
-    "gemini/gemini-3.1-flash-lite-preview": "gemini/gemini-3.1-flash-lite",
-    "gemini/gemini-1.5-pro": "gemini/gemini-2.5-pro",
-    "gemini/gemini-1.5-flash": "gemini/gemini-2.5-flash",
+# Model families and tiers, each listed NEWEST FIRST. Every id ever offered belongs to exactly one
+# tier: one provider, one family, one tier (a Flash stays a Flash, a Sonnet a Sonnet, a mini a
+# mini). A retired id migrates directly to the newest member of its tier that is still known, so
+# retiring a model means dropping its MODEL_CAPS row and marking its lifecycle row retired; there
+# is no hand-written migration to add. OpenAI's own replacements set its tiers: mini-tier models
+# move to Terra, nano-tier models to Luna, and the o-series reasoning models to the line their
+# tier continues in.
+MODEL_TIERS = {
+    "claude-sonnet": [
+        "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514", "claude-4-sonnet-20250514",
+        "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20240620",
+        "claude-3-sonnet-20240229",
+    ],
+    "claude-opus": [
+        "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+        "claude-opus-4-6-20260205", "claude-opus-4-5", "claude-opus-4-5-20251101", "claude-opus-4-1",
+        "claude-opus-4-1-20250805", "claude-opus-4-20250514", "claude-4-opus-20250514",
+        "claude-3-opus-20240229",
+    ],
+    "claude-haiku": [
+        "claude-haiku-5-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001",
+        "claude-3-5-haiku-20241022", "claude-3-haiku-20240307",
+    ],
+    "claude-fable": ["claude-fable-5-1", "claude-fable-5"],
+    # Flagship line: bare gpt-5.6 is an alias of gpt-5.6-sol, and OpenAI names Sol as the
+    # replacement for gpt-5 and o3.
+    "openai-sol": [
+        "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5",
+        "gpt-4.1", "gpt-4o", "o3", "o1", "o1-preview",
+    ],
+    "openai-astra": ["gpt-6-astra"],
+    # Mini tier: OpenAI names Terra as gpt-5-mini's replacement.
+    "openai-terra": [
+        "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.4-mini", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini",
+        "o4-mini", "o3-mini", "o1-mini", "gpt-5.1-codex-mini", "codex-mini-latest",
+    ],
+    # Nano tier: OpenAI names Luna as gpt-5-nano's and gpt-5.4-nano's replacement.
+    "openai-luna": ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.4-nano", "gpt-5-nano", "gpt-4.1-nano"],
+    "openai-pro": ["gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.2-pro", "o3-pro", "o1-pro"],
+    "openai-codex": ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.1-codex", "gpt-5-codex"],
+    "gemini-flash": [
+        "gemini/gemini-3.8-flash", "gemini/gemini-3.6-flash", "gemini/gemini-3.5-flash",
+        "gemini/gemini-3-flash-preview", "gemini/gemini-2.5-flash", "gemini/gemini-2.0-flash",
+        "gemini/gemini-2.0-flash-001", "gemini/gemini-2.0-flash-exp", "gemini/gemini-1.5-flash",
+    ],
+    "gemini-flash-lite": [
+        "gemini/gemini-3.5-flash-lite", "gemini/gemini-3.1-flash-lite",
+        "gemini/gemini-3.1-flash-lite-preview", "gemini/gemini-2.5-flash-lite",
+        "gemini/gemini-2.0-flash-lite",
+    ],
+    "gemini-pro": [
+        "gemini/gemini-3.1-pro-preview", "gemini/gemini-3-pro-preview", "gemini/gemini-2.5-pro",
+        "gemini/gemini-1.5-pro",
+    ],
+    "gemini-argon": ["gemini/gemini-4-argon"],
 }
+
+# Floating aliases point at whatever the vendor currently serves, so they are not tier members.
+FLOATING_ALIASES = frozenset({
+    "gemini/gemini-pro-latest", "gemini/gemini-flash-latest", "gemini/gemini-flash-lite-latest",
+})
+
+
+def newest_in_tier(tier):
+    """The newest still-known member of a tier, or None when the whole tier is retired."""
+    return next((m for m in MODEL_TIERS[tier] if m in KNOWN_LIMITS), None)
+
+
+def derive_migrations(tiers, known):
+    """Retired id -> the newest known member of its own tier. Keys never overlap `known` and every
+    value is known, so a migration is always one direct step. A tier with no known member yields
+    nothing; the lifecycle gate then fails on its retired ids until someone decides where they go."""
+    out = {}
+    for members in tiers.values():
+        target = next((m for m in members if m in known), None)
+        if target:
+            out.update({m: target for m in members if m not in known})
+    return out
+
+
+MODEL_MIGRATIONS = derive_migrations(MODEL_TIERS, KNOWN_LIMITS)
 
 
 def migrate_model(model):
@@ -90,13 +129,10 @@ def get_ai_model():
     return migrate_model(os.environ.get('AI_MODEL', DEFAULT_MODEL))
 
 
-# Fallback model chain - each model has separate rate limit quotas
-GEMINI_FALLBACK_CHAIN = [
-    'gemini/gemini-3.5-flash',
-    'gemini/gemini-3.1-flash-lite',
-    'gemini/gemini-2.5-flash',
-    'gemini/gemini-2.5-flash-lite',
-]
+# Fallback model chain - each model has separate rate limit quotas. The newest Flash, then the
+# newest Flash-Lite. Gemini 2.5 is left out (Google only serves it to projects that already used
+# it), and so are deprecated ids Google routes to another chain member's endpoint.
+GEMINI_FALLBACK_CHAIN = [newest_in_tier('gemini-flash'), newest_in_tier('gemini-flash-lite')]
 
 
 def get_fallback_model(current_model):
@@ -153,6 +189,20 @@ def _completion_messages(prompt):
     return [{"role": "user", "content": prompt}]
 
 
+# Per-model output floors. Argon's thinking shares its output budget and Google recommends at
+# least 32,768 output tokens for it; every other model keeps the stage's own budget.
+MIN_OUTPUT_TOKENS = {"gemini/gemini-4-argon": 32768}
+
+
+def output_budget(model, requested):
+    """Output tokens a send to `model` reserves and requests when its stage asks for `requested`.
+
+    call_llm applies this to every send and every budget calculation reserves the same value, so a
+    prompt is always accepted against the output it will actually request.
+    """
+    return max(requested, MIN_OUTPUT_TOKENS.get(model, 0))
+
+
 def call_llm(model, prompt, max_tokens=8192):
     """Call an LLM and return (text, api_cost, raw_response).
 
@@ -166,6 +216,7 @@ def call_llm(model, prompt, max_tokens=8192):
     """
     import litellm
 
+    max_tokens = output_budget(model, max_tokens)
     if _needs_responses_api(model):
         response = litellm.responses(
             model=model,
@@ -244,6 +295,7 @@ def count_tokens_accurate(text, model):
 NEW_TOKENIZER_MODELS = frozenset({
     "claude-opus-4-7", "claude-opus-4-8", "claude-fable-5",
     "claude-sonnet-5", "claude-opus-5",
+    "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1",
 })
 CLAUDE_UNDERCOUNT_FACTOR = 1.7  # covers the 1.617x worst case observed; the 25% window reserve adds
                                 # headroom. Deliberately NOT applied to 4.5/4.6 (accurate tokenizer).
@@ -850,8 +902,8 @@ def _synthesis_budget(full_name, model):
     Gemini is the only provider with a fallback chain at all. A fully generic guarantee would
     re-count each candidate with its own tokenizer and take the worst case.
     """
-    budget = min(get_chunking_threshold(m) for m in _fallback_chain(model)) \
-        - SYNTHESIS_OUTPUT_TOKENS
+    budget = min(get_chunking_threshold(m) - output_budget(m, SYNTHESIS_OUTPUT_TOKENS)
+                 for m in _fallback_chain(model))
     overhead = _budget_tokens(_build_synthesis_prompt(full_name, []), model)
     # Always leave workable room for content beyond the template itself.
     return max(budget, overhead + 1000)
@@ -1216,14 +1268,14 @@ def authoritative_partition(session, full_name, files, model):
     caps = get_caps(model)
     if caps is None or caps.count_strategy != "anthropic_api":
         return "single"
-    r = session.count(model, _build_full_repo_prompt(full_name, files), FULL_REPO_OUTPUT)
+    r = session.count(model, _build_full_repo_prompt(full_name, files), output_budget(model, FULL_REPO_OUTPUT))
     if r.authoritative:
-        return "single" if r.tokens <= acceptance_budget(model, FULL_REPO_OUTPUT) else "chunk"
+        return "single" if r.tokens <= acceptance_budget(model, output_budget(model, FULL_REPO_OUTPUT)) else "chunk"
     return "single"
 
 
 # The output-token budget every chunk analysis call reserves (call_llm(..., max_tokens=8192)).
-# The acceptance budget for a chunk send is acceptance_budget(model, CHUNK_OUTPUT), so this is the
+# The acceptance budget for a chunk send is acceptance_budget(model, output_budget(model, CHUNK_OUTPUT)), so this is the
 # SAME requested_output the send will use — the count we accept a chunk on is the count call_llm
 # will actually pay for.
 CHUNK_OUTPUT = 8192
@@ -1242,7 +1294,7 @@ class _NonAuthoritative(Exception):
 def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num, total_chunks):
     """AUTHORITATIVE analogue of _truncate_file_to_prompt_budget: trim one file so its OWN single-file
     (i/N) analysis prompt — the exact string call_llm would send — counts within
-    acceptance_budget(model, CHUNK_OUTPUT), recounting EVERY candidate through session.count rather
+    acceptance_budget(model, output_budget(model, CHUNK_OUTPUT)), recounting EVERY candidate through session.count rather
     than a local estimate.
 
     Binary-search the largest retained-content length whose finished prompt fits. Returns the
@@ -1251,7 +1303,7 @@ def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num
     ever make the chunk sendable and the WHOLE repo must degrade. Raises _NonAuthoritative if any
     count is non-authoritative (the caller turns that into the Branch 1 fallback).
     """
-    budget = acceptance_budget(model, CHUNK_OUTPUT)
+    budget = acceptance_budget(model, output_budget(model, CHUNK_OUTPUT))
     original = file_info['content']
     raw = count_tokens_accurate(original, model)
     notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
@@ -1263,7 +1315,7 @@ def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num
     def fits(keep):
         cand = candidate_for(keep)
         r = session.count(model, _build_analysis_prompt(full_name, [cand], chunk_num, total_chunks),
-                          CHUNK_OUTPUT)
+                          output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
             raise _NonAuthoritative
         return r.tokens <= budget, cand
@@ -1291,7 +1343,7 @@ def _largest_fitting_prefix(session, full_name, chunk, chunk_num, total_chunks, 
     the next pass). Raises _NonAuthoritative on a non-authoritative count."""
     def fits(length):
         r = session.count(model, _build_analysis_prompt(full_name, chunk[:length], chunk_num, total_chunks),
-                          CHUNK_OUTPUT)
+                          output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
             raise _NonAuthoritative
         return r.tokens <= budget
@@ -1311,7 +1363,7 @@ def authoritative_chunks(session, full_name, files, model):
 
     Starting from Branch 1's conservative candidate set (chunk_repo_files), drive it to a fixpoint
     where EVERY chunk's REAL analysis prompt — `_build_analysis_prompt(full_name, chunk, i, N)` with
-    the ACTUAL 1-based index and current total — counts within acceptance_budget(model, CHUNK_OUTPUT)
+    the ACTUAL 1-based index and current total — counts within acceptance_budget(model, output_budget(model, CHUNK_OUTPUT))
     AND the count is authoritative. A chunk "fits" only if both hold.
 
     Why the whole set is rebuilt and recounted after every split (not just the offending chunk): the
@@ -1330,10 +1382,10 @@ def authoritative_chunks(session, full_name, files, model):
         unchanged Branch 1 partition (degraded_reason is None): the local estimate remains the best
         information available and Branch 1 already fail-closes on it.
     """
-    budget = acceptance_budget(model, CHUNK_OUTPUT)
+    budget = acceptance_budget(model, output_budget(model, CHUNK_OUTPUT))
 
     def fits(chunk, i, n):
-        r = session.count(model, _build_analysis_prompt(full_name, chunk, i, n), CHUNK_OUTPUT)
+        r = session.count(model, _build_analysis_prompt(full_name, chunk, i, n), output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
             raise _NonAuthoritative
         return r.tokens <= budget
@@ -1410,7 +1462,7 @@ def _authoritative_truncate_synthesis(session, full_name, analysis, model):
     overflows — the fixed template plus one framed marker already exceeds the budget, so nothing this
     function can do makes the part sendable. Raises _NonAuthoritative on a non-authoritative count.
     """
-    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    budget = acceptance_budget(model, output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
     raw = count_tokens_accurate(analysis, model)
     notice = (f"\n\n... (truncated: ~{raw:,} tokens exceeded the "
               f"{budget:,}-token synthesis budget)")
@@ -1420,7 +1472,7 @@ def _authoritative_truncate_synthesis(session, full_name, analysis, model):
 
     def fits(keep):
         cand = candidate_for(keep)
-        r = session.count(model, _build_synthesis_prompt(full_name, [cand]), SYNTHESIS_OUTPUT_TOKENS)
+        r = session.count(model, _build_synthesis_prompt(full_name, [cand]), output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
         if not r.authoritative:
             raise _NonAuthoritative
         return r.tokens <= budget, cand
@@ -1466,10 +1518,10 @@ def authoritative_synthesis_level(session, full_name, analyses, model):
     Returns list[list[str]] (the batch plan) or DegradedSynthesis.
     """
     analyses = list(analyses)
-    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    budget = acceptance_budget(model, output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
 
     def fits(batch):
-        r = session.count(model, _build_synthesis_prompt(full_name, batch), SYNTHESIS_OUTPUT_TOKENS)
+        r = session.count(model, _build_synthesis_prompt(full_name, batch), output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
         if not r.authoritative:
             raise _NonAuthoritative
         return r.tokens <= budget
@@ -1511,9 +1563,9 @@ def _authoritative_terminal_batch(session, full_name, parts, model):
     it authoritatively overflows, truncate it to acceptance_budget. Returns [blob] (fitting) or None
     (template floor overflow -> caller degrades). Raises _NonAuthoritative on a non-authoritative
     count. This is the coverage-loss path the call/depth guards fall back to."""
-    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
+    budget = acceptance_budget(model, output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
     blob = parts[0] if len(parts) == 1 else _join_for_terminal(parts)
-    r = session.count(model, _build_synthesis_prompt(full_name, [blob]), SYNTHESIS_OUTPUT_TOKENS)
+    r = session.count(model, _build_synthesis_prompt(full_name, [blob]), output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
     if not r.authoritative:
         raise _NonAuthoritative
     if r.tokens <= budget:
@@ -1532,8 +1584,8 @@ def _preflight_synthesis_batch(session, full_name, batch, model, terminal):
     coverage); it is prevented upstream by the split plan, so the batch is returned unchanged. In
     every case the LAST prompt counted equals the prompt run() then sends, so every send is counted.
     """
-    budget = acceptance_budget(model, SYNTHESIS_OUTPUT_TOKENS)
-    r = session.count(model, _build_synthesis_prompt(full_name, batch), SYNTHESIS_OUTPUT_TOKENS)
+    budget = acceptance_budget(model, output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
+    r = session.count(model, _build_synthesis_prompt(full_name, batch), output_budget(model, SYNTHESIS_OUTPUT_TOKENS))
     if not r.authoritative or r.tokens <= budget:
         return batch
     if terminal or len(batch) == 1:

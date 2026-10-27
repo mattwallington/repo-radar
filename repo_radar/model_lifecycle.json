@@ -60,6 +60,12 @@
     "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
   },
   {
+    "id": "claude-fable-5-1",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  },
+  {
     "id": "claude-haiku-4-5",
     "status": "active",
     "shutdown_date": null,
@@ -67,6 +73,12 @@
   },
   {
     "id": "claude-haiku-4-5-20251001",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  },
+  {
+    "id": "claude-haiku-5-5",
     "status": "active",
     "shutdown_date": null,
     "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
@@ -132,6 +144,12 @@
     "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
   },
   {
+    "id": "claude-opus-5-5",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  },
+  {
     "id": "claude-sonnet-4-20250514",
     "status": "retired",
     "shutdown_date": "2026-06-15",
@@ -157,6 +175,12 @@
   },
   {
     "id": "claude-sonnet-5",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
+  },
+  {
+    "id": "claude-sonnet-5-5",
     "status": "active",
     "shutdown_date": null,
     "source_url": "https://platform.claude.com/docs/en/about-claude/model-deprecations"
@@ -236,7 +260,7 @@
   {
     "id": "gemini/gemini-3.1-flash-lite",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2027-05-07",
     "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
   },
   {
@@ -258,7 +282,25 @@
     "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
   },
   {
+    "id": "gemini/gemini-3.5-flash-lite",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
+  },
+  {
     "id": "gemini/gemini-3.6-flash",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
+  },
+  {
+    "id": "gemini/gemini-3.8-flash",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
+  },
+  {
+    "id": "gemini/gemini-4-argon",
     "status": "active",
     "shutdown_date": null,
     "source_url": "https://ai.google.dev/gemini-api/docs/deprecations"
@@ -284,13 +326,13 @@
   {
     "id": "gpt-4.1",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2027-01-14",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
     "id": "gpt-4.1-mini",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2027-01-14",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
@@ -302,19 +344,19 @@
   {
     "id": "gpt-4o",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2027-01-14",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
     "id": "gpt-4o-mini",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2027-01-14",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
     "id": "gpt-5",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2026-12-11",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
@@ -326,13 +368,13 @@
   {
     "id": "gpt-5-mini",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2026-12-11",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
     "id": "gpt-5-nano",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2026-12-11",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
@@ -438,6 +480,36 @@
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
+    "id": "gpt-6-astra",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://developers.openai.com/api/docs/deprecations"
+  },
+  {
+    "id": "gpt-6-luna",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://developers.openai.com/api/docs/deprecations"
+  },
+  {
+    "id": "gpt-6-sol",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://developers.openai.com/api/docs/deprecations"
+  },
+  {
+    "id": "gpt-6.1-sol",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://developers.openai.com/api/docs/deprecations"
+  },
+  {
+    "id": "gpt-6.1-terra",
+    "status": "active",
+    "shutdown_date": null,
+    "source_url": "https://developers.openai.com/api/docs/deprecations"
+  },
+  {
     "id": "o1",
     "status": "retired",
     "shutdown_date": "2026-10-23",
@@ -464,7 +536,7 @@
   {
     "id": "o3",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2026-12-11",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
@@ -476,7 +548,7 @@
   {
     "id": "o3-pro",
     "status": "active",
-    "shutdown_date": null,
+    "shutdown_date": "2026-12-11",
     "source_url": "https://developers.openai.com/api/docs/deprecations"
   },
   {
