@@ -290,8 +290,9 @@ function makeHarness(t, { channel = 'stable' } = {}) {
       runSync: (opts) => new Promise((resolve, reject) => { h.runs.push({ opts, resolve, reject }); }),
     }, { get: (o, k) => (k in o ? o[k] : anyStub()) }),
     './runtime/paths': { ...realPaths, resolveChannel: () => channel },
-    // The worker's side of the lease hand-off is not part of these cases.
-    './activity/trigger-glue': { ...realGlue, handOff: async () => {} },
+    // The worker's side of the lease hand-off: once the worker has it, Electron drops its own
+    // reference, as the real handOff does after the worker's ack.
+    './activity/trigger-glue': { ...realGlue, handOff: async ({ writer }) => writer.dropLocalReference() },
     // Retention spawns Python; nothing here depends on it.
     './activity/quota': { ...realQuota, _spawnPythonRetain: () => {} },
   };
@@ -458,4 +459,53 @@ test('a worker whose Activity recording failed is shown as unknown, never as int
   const entry = h.status().syncState.stable;
   assert.deepStrictEqual([entry.outcome, entry.stats.total], ['succeeded', 1]);
   assert.strictEqual(h.window().status(), 'Complete!');
+});
+
+test('a finished attempt\'s start timer cannot repaint the window for the run after it', (t) => {
+  const h = makeHarness(t);
+  h.writeConfig(['o/one']);
+  h.main.triggerSync({ showWindow: true });
+  h.clock.tick(60); // the window has loaded; its 300 ms start sender is still pending
+  const { child, env } = h.spawn();
+  h.post({ type: 'sync-terminal', outcome: 'blocked', attemptId: env.REPO_RADAR_ACTIVITY_ID, channel: 'stable' });
+  child.exit(1);
+
+  // The scheduled worker starts before that timer fires, and is waiting for network.
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'waiting-for-network' });
+  // The window is closed and reopened while the timer is still pending.
+  h.closeWindow();
+  const win = h.openWindow();
+  assert.strictEqual(win.status(), 'Waiting for network...');
+
+  h.clock.tick(1000); // the old attempt's start sender fires now
+  assert.strictEqual(h.window().status(), 'Waiting for network...');
+  assert.strictEqual(h.window().stopEnabled(), false, 'Stop is never offered for the scheduled worker');
+  assert.strictEqual(h.status().syncState.stable.attemptId, b.id);
+});
+
+test('a finished attempt\'s delayed exit handling cannot overwrite the run after it', (t) => {
+  const h = makeHarness(t);
+  h.writeConfig(['o/one']);
+  h.main.triggerSync({ showWindow: false });
+  const { child, env } = h.spawn();
+  h.post({ type: 'sync-terminal', outcome: 'succeeded', attemptId: env.REPO_RADAR_ACTIVITY_ID, channel: 'stable' });
+  child.exit(0); // its 500 ms delayed handling is now pending
+  const lastSync = h.status().lastSync;
+
+  // The next run starts and fails inside that window.
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'error', repo: 'o/one', message: 'fetch failed' });
+  b.post({ type: 'sync-terminal', outcome: 'failed' });
+  b.end('failed');
+  const iconsBefore = h.icons.length;
+
+  h.clock.tick(1000);
+  const status = h.status();
+  assert.deepStrictEqual([status.syncState.stable.attemptId, status.syncState.stable.outcome], [b.id, 'failed']);
+  assert.strictEqual(status.hasErrors, true, 'the failed run still reports its errors');
+  assert.strictEqual(status.lastSync, lastSync, 'the old run did not stamp a completion over the failure');
+  assert.ok(!h.icons.slice(iconsBefore).includes('icon-success.png'), 'no success icon over the failure');
 });

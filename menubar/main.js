@@ -171,10 +171,10 @@ let statusServer = null;
 let currentSyncProcess = null;
 let syncCancelledByUser = false;
 let syncShowWindow = true;
-// One-shot flag: triggerSync sets this before creating the progress window so
-// that the window's did-finish-load handler knows a fresh sync-started event
-// is already on its way and should skip the mid-sync replay path.
-let pendingFreshSync = false;
+// One-shot token: triggerSync sets it ({ window }) when it opens the progress window for an
+// attempt, so that window's did-finish-load handler knows that attempt's own start sender will
+// fill it and skips its replay. Only the attempt that set it clears it.
+let pendingFreshSync = null;
 let lastStatus = null;
 let animationInterval = null;
 let animationFrame = 0;
@@ -1436,19 +1436,26 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   saveStatus(status);
   
   // Show log window (only for manual syncs; scheduled syncs run in background).
-  // Set pendingFreshSync BEFORE creating the window so showLogWindow's
-  // did-finish-load handler skips its mid-sync replay — sendSyncStartedWhenReady
-  // below will deliver the fresh sync-started event instead.
+  // pendingFreshSync names this attempt's window so its did-finish-load handler skips its
+  // replay -- sendSyncStartedWhenReady below fills it for this attempt instead.
   let attemptWindow = null;
+  let startToken = null;
   if (showWindow) {
-    pendingFreshSync = true;
     showLogWindow();
     // Ruling P6-1 (round 2): bind the refusal below to THIS attempt's window. `logWindow` is
     // module state that a later attempt can replace (the user closes the window and clicks Sync
     // Now again while this attempt's refusal poll is still ticking); without this the stale poll
     // would paint a refusal over a window that belongs to a sync which is actually running.
     attemptWindow = logWindow;
+    startToken = { window: attemptWindow };
+    pendingFreshSync = startToken;
   }
+  // The attempt the start sender below speaks for, and whether it has got the root lock yet.
+  const attemptId = activity.writer.activityId || null;
+  let attemptBegun = false;
+  const clearPendingStart = () => {
+    if (startToken && pendingFreshSync === startToken) pendingFreshSync = null;
+  };
 
   // Ruling P6-1: a manual sync can still be REFUSED after this point -- the root exec lock is
   // only attempted inside runSync(), long after the window above exists, so unlike the two guards
@@ -1459,10 +1466,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   let syncRefusedForThisAttempt = false;
   const refuseProgressWindow = (reason) => {
     syncRefusedForThisAttempt = true;
-    // The fresh-sync replay skip no longer applies. Clearing it is safe here: the status reset
-    // above emptied status.repos and no child ever ran, so showLogWindow's did-finish-load
-    // replay has nothing to replay and is inert.
-    pendingFreshSync = false;
+    // The fresh-sync replay skip no longer applies to this attempt's window.
+    clearPendingStart();
     // A scheduled sync (showWindow=false) opened no window -- there is nothing to refuse.
     if (!showWindow) return;
     const deliver = () => {
@@ -1482,47 +1487,45 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     deliver();
   };
 
-  // Wait for window to be fully ready before sending sync-started event
+  // Fill the window this attempt opened once it has loaded and the attempt holds the root lock.
+  // Everything is checked against what was captured for THIS attempt -- its window, its ID --
+  // before anything is sent, so a late timer can never repaint a window that has moved on to
+  // another attempt (a scheduled run that started after this one ended, say).
   const sendSyncStartedWhenReady = () => {
+    if (!startToken) return; // no window was opened for this attempt; onChild updates any open one
     // Ruling P6-1: the attempt was refused while this was still pending -- the window has been
     // (or is about to be) told so; do not paint the waiting grid over that.
     if (syncRefusedForThisAttempt) {
-      pendingFreshSync = false;
+      clearPendingStart();
       return;
     }
-    if (logWindow && !logWindow.isDestroyed() && logWindow.webContents) {
-      // Check if page has finished loading
-      if (logWindow.webContents.isLoading()) {
-        console.log('Window still loading, waiting...');
-        setTimeout(sendSyncStartedWhenReady, 100);
-        return;
-      }
-
-      console.log('Window ready, sending sync-started event with', reposForUI.length, 'repos');
-
-      // Show warning if key is missing
-      if (!configValid) {
-        console.warn(validationMessage);
-        logWindow.webContents.send('terminal-output', `\n${validationMessage}\n\n`);
-      }
-
-      // Send event
-      logWindow.webContents.send('sync-started', { total: repoCount, repos: reposForUI });
-      pendingFreshSync = false;
-      // The attempt may already be past "starting" (waiting for network, or even finished: an
-      // early block exits in milliseconds). Show where it really is rather than leaving the
-      // window on "Starting sync...".
-      const entry = syncState.current(loadStatus(), runtimeChannel);
-      if (entry && activity.writer.activityId && entry.attemptId === activity.writer.activityId
-          && entry.phase !== 'starting') {
-        sendSyncStateToWindow(logWindow);
-      }
-    } else {
-      console.warn('Log window not available for sync-started event');
-      pendingFreshSync = false;
+    const win = startToken.window;
+    if (!win || win.isDestroyed() || !win.webContents || logWindow !== win) {
+      clearPendingStart();
+      return;
     }
+    if (win.webContents.isLoading() || !attemptBegun) {
+      setTimeout(sendSyncStartedWhenReady, 100);
+      return;
+    }
+    const entry = syncState.current(loadStatus(), runtimeChannel);
+    if (!entry || entry.attemptId !== attemptId) {
+      console.log('Not filling the window: another sync attempt is current');
+      clearPendingStart();
+      return;
+    }
+
+    // Show warning if key is missing
+    if (!configValid) {
+      console.warn(validationMessage);
+      win.webContents.send('terminal-output', `\n${validationMessage}\n\n`);
+    }
+    clearPendingStart();
+    // The attempt's rows and where it really is -- possibly already waiting for network, or even
+    // finished: an early block exits in milliseconds.
+    replaySyncToWindow(win);
   };
-  
+
   // Start checking after 300ms
   setTimeout(sendSyncStartedWhenReady, 300);
   
@@ -1646,6 +1649,9 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
         syncState.begin(st, runtimeChannel, currentSyncProcess._attemptId);
         saveStatus(st);
       } catch (e) { /* the view is best-effort; never block the sync */ }
+      attemptBegun = true;
+      // A window already open for another reason (a catch-up run opens none) moves to this run.
+      if (!startToken && logWindow) replaySyncToWindow(logWindow);
       logSyncState('process-spawned');
 
       // Capture output for the UI + in-memory status
@@ -1719,12 +1725,11 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           // Then handle status update asynchronously
           setTimeout(() => {
             const status = loadStatus();
-            // A newer attempt started in the meantime: this exit no longer speaks for the icon or
-            // the status.
+            // Another attempt became current in the meantime -- running or already finished: this
+            // exit no longer speaks for the icon, the error flags or the completion time.
             const now = syncState.current(status, runtimeChannel);
-            if (currentSyncProcess || (now && now.attemptId !== exitedAttemptId
-                && now.phase !== syncState.FINISHED)) {
-              console.log('Skipping delayed exit handling: a newer sync attempt is current');
+            if (currentSyncProcess || !now || now.attemptId !== exitedAttemptId) {
+              console.log('Skipping delayed exit handling: another sync attempt is current');
               return;
             }
 
@@ -1898,6 +1903,36 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   });
 }
 
+// Show `win` the current attempt as it really is: still waiting for network, syncing (also a
+// scheduled run the app did not start), or finished with its own outcome. Returns false when
+// there is no attempt view (status.json from an older build), leaving the caller's old replay.
+function replaySyncToWindow(win) {
+  if (!win || win.isDestroyed() || !win.webContents || win.webContents.isLoading()) return false;
+  const view = currentSyncView();
+  if (!view) return false;
+  const status = loadStatus();
+  const finished = view.phase === syncState.FINISHED;
+  const rows = (!finished && status.syncRepos && status.syncRepos.length > 0 && view.canStop)
+    ? status.syncRepos
+    : (status.repos || []).map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' }));
+  if (rows.length > 0) {
+    win.webContents.send('sync-started', { total: rows.length, repos: rows });
+    const done = finished && /^succeeded/.test(view.outcome || '');
+    (status.repos || []).forEach(repo => {
+      win.webContents.send('progress-update', {
+        repo: repo.name,
+        status: repo.status,
+        percent: repo.percent || (done ? 100 : 0),
+        color: repo.color || 'cyan'
+      });
+    });
+  }
+  // Only this attempt's own stats, never an older run's.
+  if (finished && view.stats) win.webContents.send('sync-complete', view.stats);
+  win.webContents.send('sync-state', view);
+  return true;
+}
+
 // Show log window
 function showLogWindow() {
   if (logWindow && !logWindow.isDestroyed()) {
@@ -1948,37 +1983,13 @@ function showLogWindow() {
   logWindow.webContents.once('did-finish-load', () => {
     setTimeout(() => {
       if (logWindow !== replayWindow || replayWindow.isDestroyed()) return;
-      if (pendingFreshSync) {
+      if (pendingFreshSync && pendingFreshSync.window === replayWindow) {
         console.log('Fresh sync pending, skipping replay (sendSyncStartedWhenReady will send sync-started)');
         return;
       }
 
-      // Replay the current attempt as it really is: still waiting for network, syncing (also a
-      // scheduled run the app did not start), or finished with its own outcome.
-      const view = currentSyncView();
+      if (replaySyncToWindow(replayWindow)) return;
       const status = loadStatus();
-      if (view) {
-        const finished = view.phase === syncState.FINISHED;
-        const rows = (!finished && status.syncRepos && status.syncRepos.length > 0 && view.canStop)
-          ? status.syncRepos
-          : (status.repos || []).map(r => ({ name: r.name, fullName: r.name, color: r.color || 'cyan' }));
-        if (rows.length > 0) {
-          logWindow.webContents.send('sync-started', { total: rows.length, repos: rows });
-          const done = finished && /^succeeded/.test(view.outcome || '');
-          (status.repos || []).forEach(repo => {
-            logWindow.webContents.send('progress-update', {
-              repo: repo.name,
-              status: repo.status,
-              percent: repo.percent || (done ? 100 : 0),
-              color: repo.color || 'cyan'
-            });
-          });
-        }
-        // Only this attempt's own stats, never an older run's.
-        if (finished && view.stats) logWindow.webContents.send('sync-complete', view.stats);
-        logWindow.webContents.send('sync-state', view);
-        return;
-      }
 
       // No attempt view yet (status.json from an older build): the previous behavior.
       if (currentSyncProcess) {

@@ -117,12 +117,12 @@ test('the refusal is gated on this attempt having opened the window, and its pay
     'a window still loading would drop the send -- wait for it, like sendSyncStartedWhenReady does');
   assert.ok(/syncRefusedForThisAttempt = true;/.test(helper),
     'the refusal must latch, so a pending sync-started can be short-circuited');
-  assert.ok(/pendingFreshSync = false;/.test(helper),
+  assert.ok(/clearPendingStart\(\);/.test(helper),
     'the fresh-sync replay skip no longer applies once the attempt is refused');
 });
 
 test("the attempt's window is captured where it is opened", () => {
-  const opener = between('if (showWindow) {\n    pendingFreshSync = true;', 'let syncRefusedForThisAttempt');
+  const opener = between('let startToken = null;', 'let syncRefusedForThisAttempt');
   assert.ok(/showLogWindow\(\);/.test(opener) && /attemptWindow = logWindow;/.test(opener),
     'attemptWindow is captured right after showLogWindow(), inside the showWindow branch');
   assert.ok(opener.indexOf('showLogWindow()') < opener.indexOf('attemptWindow = logWindow;'),
@@ -138,9 +138,11 @@ test('a refused attempt can never have a late sync-started painted over it', () 
   const sender = between('const sendSyncStartedWhenReady = () => {', 'setTimeout(sendSyncStartedWhenReady, 300);');
 
   const guardAt = sender.indexOf('if (syncRefusedForThisAttempt)');
+  const fillAt = sender.indexOf('replaySyncToWindow(win)');
   assert.notStrictEqual(guardAt, -1, 'the sender must check the refusal latch');
-  assert.ok(guardAt < sender.indexOf("logWindow.webContents.send('sync-started'"),
-    'the latch is checked BEFORE the sync-started send -- the 300ms timer and the 100ms isLoading ' +
+  assert.notStrictEqual(fillAt, -1, 'the sender fills only the window it captured');
+  assert.ok(guardAt < fillAt,
+    'the latch is checked BEFORE the window is filled -- the 300ms timer and the 100ms isLoading ' +
     'poll both re-enter here, and either could otherwise repaint the waiting grid over the refusal');
 
   // The latch is declared per-attempt (a closure variable of triggerSync), not module state --
