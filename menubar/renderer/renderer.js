@@ -253,7 +253,7 @@ function initializeAllRepos(repos) {
     log('Cleared existing repos list');
     
     if (!repos || repos.length === 0) {
-        log('ERROR: No repos provided to initialize');
+        log('No repositories to initialize');
         reposList.innerHTML = '<div class="empty-message"><p>No repositories configured</p></div>';
         return;
     }
@@ -486,7 +486,8 @@ ipcRenderer.on('sync-started', (event, data) => {
         // reports progress adds its own row.
         const reposList = document.getElementById('repos-list');
         if (reposList) reposList.textContent = '';
-    } else if (data.repos && data.repos.length > 0) {
+    } else if (data.rosterKnown === true || (data.repos && data.repos.length > 0)) {
+        // A known list, possibly empty: an empty one gets the "No repositories configured" note.
         log('Initializing repos...');
         initializeAllRepos(data.repos);
     } else {

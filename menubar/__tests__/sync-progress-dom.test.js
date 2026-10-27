@@ -640,3 +640,21 @@ test('final stats that arrive after the outcome are kept without turning it into
   assert.strictEqual(win.doc.getElementById('repo-count').textContent, '3 repos synced');
   assert.strictEqual(win.stopEnabled(), false);
 });
+
+test('a run with no repositories says so, rather than reporting missing data', (t) => {
+  const h = makeHarness(t);
+  const b = h.scheduledWorker();
+  b.post({ type: 'sync-lifecycle', phase: 'starting' });
+  b.post({ type: 'sync-roster', repos: [] });
+  const emptyNote = (win) => win.doc.getElementById('repos-list').textContent.trim();
+  const win = h.openWindow();
+  assert.strictEqual(emptyNote(win), 'No repositories configured');
+  assert.strictEqual(win.doc.getElementById('repos-total').textContent, '0');
+  assert.strictEqual(win.stopEnabled(), false, 'Stop follows the run\'s owner, not the roster');
+
+  b.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  h.closeWindow();
+  const reopened = h.openWindow();
+  assert.strictEqual(emptyNote(reopened), 'No repositories configured');
+  assert.strictEqual(reopened.status(), 'Complete!');
+});
