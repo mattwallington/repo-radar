@@ -39,13 +39,14 @@ test(
     const clean = verifyInstalledSet(python, manifest);
     assert.deepStrictEqual(clean, { ok: true, extra: [], missing: [], mismatched: [] });
 
-    // Inject an extra (unmanifested) distribution.
-    execFileSync(pip, ['install', '-q', '--no-deps', 'six']);
+    // Inject an extra (unmanifested) distribution. Not `six`: litellm's boto3 deps now lock it.
+    assert.ok(!('toml' in manifest.dists), 'the injected extra must not be a locked distribution');
+    execFileSync(pip, ['install', '-q', '--no-deps', 'toml']);
     const withExtra = verifyInstalledSet(python, manifest);
     assert.strictEqual(withExtra.ok, false);
     assert.deepStrictEqual(withExtra.missing, []);
     assert.deepStrictEqual(withExtra.mismatched, []);
-    assert.ok(withExtra.extra.includes('six'));
+    assert.ok(withExtra.extra.includes('toml'));
 
     // Inject a version mismatch on a real manifest entry.
     assert.ok(manifest.dists.idna, 'expected idna in manifest.dists for this test to be meaningful');
@@ -55,7 +56,7 @@ test(
     assert.ok(withMismatch.mismatched.includes('idna'));
 
     // Remove a required distribution entirely (uninstall without cascading).
-    execFileSync(pip, ['uninstall', '-y', '-q', 'six']);
+    execFileSync(pip, ['uninstall', '-y', '-q', 'toml']);
     execFileSync(pip, ['install', '-q', '--no-deps', '--force-reinstall', `idna==${manifest.dists.idna}`]);
     execFileSync(pip, ['uninstall', '-y', '-q', 'certifi']);
     const withMissing = verifyInstalledSet(python, manifest);
