@@ -164,8 +164,10 @@ class PreflightSession:
         mutation and NO log: for those models the Count Tokens API doesn't apply, so touching it or
         the breaker would be meaningless.
       * Per-model circuit breaker — the first non-authoritative answer for a model opens the breaker,
-        so the rest of the sync skips the (already-known-degraded) provider call for that model and
-        the downgrade is logged exactly once. Other models are unaffected.
+        so the rest of the sync skips the (already-known-unavailable) provider call for that model and
+        logs it exactly once. With no authoritative count, that model's metadata is skipped for the
+        rest of the sync (llm.InputBudgetUnavailable), not sent on the local estimate. Other models
+        are unaffected.
       * Memo — an authoritative count is cached under (model, sha256(canonical_request)) so an
         identical later request (and a concurrent caller that blocked on the lock) reuses it rather
         than making a second, redundant provider call. The model is part of the key because the same
@@ -228,7 +230,8 @@ class PreflightSession:
                 self._downgraded.add(model)
                 if model not in self._logged:
                     self._logged.add(model)
-                    logger.warning("preflight: %s downgraded to Branch 1 for this sync", model)
+                    logger.warning("preflight: authoritative token count unavailable for %s; "
+                                   "its metadata is skipped for the rest of this sync", model)
             return out
 
     def count(self, model, prompt, requested_output):

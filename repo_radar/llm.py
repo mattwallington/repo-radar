@@ -1290,23 +1290,46 @@ def _synthesize_once(full_name, analyses, model=None):
 FULL_REPO_OUTPUT = SYNTHESIS_OUTPUT_TOKENS
 
 
+class InputBudgetUnavailable(Exception):
+    """A Claude prompt's size couldn't be confirmed with Anthropic's token count, so it isn't sent.
+
+    Raised only for count_strategy == "anthropic_api" models, whose local tokenizer estimate is known
+    to undercount. The caller skips the repo's metadata and retries on a later sync. An unavailable
+    count is not evidence that anything is too large; `context` carries any overflow an earlier
+    authoritative count did establish.
+    """
+
+    def __init__(self, model, budget, context=None):
+        self.model, self.budget, self.context = model, budget, context
+        msg = (f"metadata skipped: token count unavailable for {model}, so the prompt can't be "
+               f"confirmed within its {budget:,}-token acceptance budget")
+        super().__init__(f"{msg} ({context})" if context else msg)
+
+
+def _counts_authoritatively(model):
+    caps = get_caps(model)
+    return caps is not None and caps.count_strategy == "anthropic_api"
+
+
 def authoritative_partition(session, full_name, files, model):
     """Decide "single" vs "chunk" for the whole-repo prompt, monotonically tightening Branch 1's
     estimate-based decision with an authoritative provider count when one is available.
 
     session is a PreflightSession (or test stub) exposing count(model, prompt, requested_output).
+    Raises InputBudgetUnavailable when an anthropic_api model's count is unavailable: an unverified
+    whole-repo prompt is never sent.
     """
     threshold = get_chunking_threshold(model)
     needs_chunk, _v, _e = repo_needs_chunking(full_name, files, model, threshold)
     if needs_chunk:
         return "chunk"
-    caps = get_caps(model)
-    if caps is None or caps.count_strategy != "anthropic_api":
+    if not _counts_authoritatively(model):
         return "single"
+    budget = acceptance_budget(model, output_budget(model, FULL_REPO_OUTPUT))
     r = session.count(model, _build_full_repo_prompt(full_name, files), output_budget(model, FULL_REPO_OUTPUT))
-    if r.authoritative:
-        return "single" if r.tokens <= acceptance_budget(model, output_budget(model, FULL_REPO_OUTPUT)) else "chunk"
-    return "single"
+    if not r.authoritative:
+        raise InputBudgetUnavailable(model, budget)
+    return "single" if r.tokens <= budget else "chunk"
 
 
 # The output-token budget every chunk analysis call reserves (call_llm(..., max_tokens=8192)).
@@ -1413,16 +1436,21 @@ def authoritative_chunks(session, full_name, files, model):
       * A SINGLE-file chunk is authoritatively truncated (binary search, recount per candidate). If
         even the template floor overflows, the whole repo degrades: return PartitionResult([], reason)
         immediately — production writes one degraded record and sends nothing.
-      * ANY non-authoritative count abandons the authoritative pass entirely and returns the complete,
-        unchanged Branch 1 partition (degraded_reason is None): the local estimate remains the best
-        information available and Branch 1 already fail-closes on it.
+      * A non-authoritative count abandons the authoritative pass. For an anthropic_api model it
+        raises InputBudgetUnavailable, so nothing unverified is sent: the local partition may be one
+        Anthropic already counted as too large. Local-only providers get the unchanged Branch 1
+        partition (degraded_reason is None), which is the best information they have.
     """
     budget = acceptance_budget(model, output_budget(model, CHUNK_OUTPUT))
+    overflow = []   # the most recent chunk an authoritative count found over budget, for the error
 
     def fits(chunk, i, n):
         r = session.count(model, _build_analysis_prompt(full_name, chunk, i, n), output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
             raise _NonAuthoritative
+        if r.tokens > budget:
+            what = f"file {chunk[0]['path']!r}" if len(chunk) == 1 else f"{len(chunk)} files"
+            overflow[:] = [f"chunk {i}/{n} ({what}) counted {r.tokens:,} tokens, over budget"]
         return r.tokens <= budget
 
     def build():
@@ -1457,6 +1485,8 @@ def authoritative_chunks(session, full_name, files, model):
     try:
         return build()
     except _NonAuthoritative:
+        if _counts_authoritatively(model):
+            raise InputBudgetUnavailable(model, budget, overflow[0] if overflow else None)
         return PartitionResult(chunk_repo_files(files, model, full_name=full_name), None)
 
 

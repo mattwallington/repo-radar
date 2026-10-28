@@ -167,7 +167,7 @@ def test_breaker_per_model_and_logs_downgrade_once(caplog):
         assert s.count("claude-opus-5","b",8192).authoritative is False            # breaker open, no call
         assert s.count("claude-sonnet-5","c",8192).authoritative is True           # different model still tries
     assert seen == ["claude-opus-5", "claude-sonnet-5"]
-    downgrades = [r for r in caplog.records if "downgraded to Branch 1" in r.getMessage() and "claude-opus-5" in r.getMessage()]
+    downgrades = [r for r in caplog.records if "token count unavailable for claude-opus-5" in r.getMessage()]
     assert len(downgrades) == 1                                                    # logged exactly once
 
 

@@ -28,7 +28,11 @@ def test_branch1_single_stays_or_tightens(monkeypatch):
     files = [{"path": "a", "size": 1, "content": "x"}]
     assert llm.authoritative_partition(_StubSession(lambda p: PreflightResult(500, True)), "o/r", files, "claude-opus-5") == "single"
     assert llm.authoritative_partition(_StubSession(lambda p: PreflightResult(10**9, True)), "o/r", files, "claude-opus-5") == "chunk"
-    assert llm.authoritative_partition(_StubSession(lambda p: PreflightResult(None, False)), "o/r", files, "claude-opus-5") == "single"
+    with pytest.raises(llm.InputBudgetUnavailable, match="token count unavailable for claude-opus-5"):
+        llm.authoritative_partition(_StubSession(lambda p: PreflightResult(None, False)), "o/r", files, "claude-opus-5")
+    # A local-only provider has no authoritative count; its estimate-based decision stands.
+    assert llm.authoritative_partition(_StubSession(lambda p: PreflightResult(None, False)), "o/r", files,
+                                       "gemini/gemini-3.8-flash") == "single"
 
 
 def _files(n): return [{"path": f"m{i}.py", "size": 3, "content": f"c{i}"} for i in range(n)]
@@ -71,12 +75,15 @@ def test_template_floor_degrades_whole_repo(monkeypatch):
     assert out.chunks == [] and out.degraded_reason                                        # whole-repo degrade, no sends
 
 
-def test_non_authoritative_falls_back_to_branch1(monkeypatch):
+def test_non_authoritative_falls_back_to_branch1_only_for_local_providers(monkeypatch):
     import repo_radar.llm as llm
     files = _files(4); branch1 = [_files(2), _files(2)]
     monkeypatch.setattr(llm, "chunk_repo_files", lambda *a, **k: branch1)
-    out = llm.authoritative_chunks(_StubSession(lambda p: PreflightResult(None, False)), "o/r", files, "claude-opus-5")
+    unavailable = _StubSession(lambda p: PreflightResult(None, False))
+    out = llm.authoritative_chunks(unavailable, "o/r", files, "gemini/gemini-3.8-flash")
     assert out.chunks == branch1 and out.degraded_reason is None
+    with pytest.raises(llm.InputBudgetUnavailable):
+        llm.authoritative_chunks(unavailable, "o/r", files, "claude-opus-5")
 
 
 # --- Task 10: authoritative synthesis level (split-only, coverage-preserving, cost-preserving) ---
@@ -324,3 +331,46 @@ def test_synthesis_degradation_keeps_chunk_sends_then_persists_degraded(monkeypa
                    synth_level=lambda *a, **k: llm.DegradedSynthesis("floor"), records=records)
     assert 8192 in records and 16384 not in records            # chunk sends happened; no synthesis send
     assert fm["parse_status"] == "degraded" and fm["last_commit"] == "abc1234"
+
+
+@pytest.mark.parametrize("model,effective_output", [("claude-opus-5", 8192), ("claude-sonnet-5-5", 16384)])
+def test_oversized_file_with_count_outage_skips_metadata_and_keeps_previous(monkeypatch, tmp_path,
+                                                                            model, effective_output):
+    """Anthropic counts the oversized file over budget, then the count becomes unavailable. The local
+    partition (the same oversized chunk) must never be sent: the repo's metadata is skipped with a
+    warning, the previous metadata and commit stay, and nothing is counted as an error."""
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    monkeypatch.setenv("AI_MODEL", model)
+    assert llm.output_budget(model, llm.CHUNK_OUTPUT) == effective_output
+    budget = llm.acceptance_budget(model, effective_output)
+    previous = "---\nfull_name: o/r\nlast_commit: oldc0mmit\nparse_status: ok\n---\n\n# previous metadata\n"
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "collect_repo_files",
+                        lambda *a, **k: [{"path": "huge.py", "size": 90_000, "content": "x = 1\n" * 15_000}])
+    monkeypatch.setattr(llm, "repo_needs_chunking", lambda *a, **k: (True, budget * 2, False))
+    monkeypatch.setattr(sync, "repo_needs_chunking", lambda *a, **k: (True, budget * 2, False))
+    sends = []
+    monkeypatch.setattr(sync, "call_llm", lambda *a, **k: sends.append(a) or ("A", 0.0, None))
+    answers = iter([PreflightResult(budget + 200_000, True)])   # then: count unavailable
+    session = _StubSession(lambda p: next(answers, PreflightResult(None, False)))
+    events, statuses = [], []
+
+    class _Logger:
+        def event(self, name, level, **f): events.append((name, level, f))
+        def error(self, name, **f): events.append((name, "error", f))
+
+    class _Progress:
+        def update(self, *a, **k): statuses.append(k.get("status", ""))
+
+    ctx = _fake_ctx()._replace(sync_logger=_Logger(), meta_progress=_Progress())
+    with patch("litellm.acount_tokens", _boom):
+        cost = sync.generate_repo_metadata(_fake_task_data(tmp_path, "newc0mmit"), session, _fake_args(), ctx)
+
+    assert sends == [] and cost == 0.0
+    assert session.calls and all(ro == effective_output for _m, _p, ro in session.calls)
+    assert (tmp_path / "repo.md").read_text() == previous         # previous metadata and commit kept
+    assert ctx.stats["errors"] == 0 and ctx.stats["skipped"] == 1 and ctx.stats["metadata_generated"] == 0
+    [(name, level, fields)] = events
+    assert (name, level) == ("metadata_skipped", "warn")
+    assert "token count unavailable" in fields["reason"] and "'huge.py'" in fields["reason"]
+    assert any("skipped: token count unavailable" in s for s in statuses)

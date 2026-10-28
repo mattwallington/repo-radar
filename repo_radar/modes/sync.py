@@ -26,7 +26,8 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     count_tokens_accurate, chunk_repo_files, repo_needs_chunking, get_fallback_model,
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt,
-    authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult)
+    authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
+    InputBudgetUnavailable)
 from repo_radar.preflight import PreflightSession
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
@@ -913,6 +914,26 @@ parse_status: {parse_status}
             )
 
         return total_api_cost
+
+    except InputBudgetUnavailable as e:
+        # Claude's token count was unavailable, so the prompt's size is unverified. Skip rather than
+        # risk an oversized send. Nothing is written: the previous metadata and its commit stay, so
+        # the next sync retries this repo. Not _finish_degraded, which would stamp this commit.
+        ctx.meta_progress.update(task_id, completed=100, status="[yellow]\u26a0 skipped: token count unavailable[/yellow]")
+        if hasattr(args, 'status_server') and args.status_server:
+            send_status_update('progress', {
+                'repo': full_name, 'short_name': short_id,
+                'status': '\u26a0 metadata skipped: token count unavailable',
+                'percent': 100,
+                'color': 'yellow'
+            }, args.status_server)
+        with ctx.stats_lock:
+            ctx.stats['skipped'] = ctx.stats.get('skipped', 0) + 1
+        if ctx.sync_logger:
+            ctx.sync_logger.event("metadata_skipped",
+                                  level=_activity_level("metadata_skipped", is_degraded=True),
+                                  repo=full_name, reason=str(e))
+        return 0.0
 
     except Exception as e:
         import traceback
