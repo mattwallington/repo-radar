@@ -145,7 +145,7 @@ test('a refused attempt can never have a late sync-started painted over it', () 
   const sender = between('const sendSyncStartedWhenReady = () => {', 'setTimeout(sendSyncStartedWhenReady, 300);');
 
   const guardAt = sender.indexOf('if (syncRefusedForThisAttempt)');
-  const fillAt = sender.indexOf('replaySyncToWindow(win,');
+  const fillAt = sender.indexOf('replaySyncToWindow(win)');
   assert.notStrictEqual(guardAt, -1, 'the sender must check the refusal latch');
   assert.notStrictEqual(fillAt, -1, 'the sender fills only the window it captured');
   assert.ok(guardAt < fillAt,
@@ -184,7 +184,7 @@ test('the legacy progress renderer listens for sync-refused, in its existing ipc
   assert.ok(/ipcRenderer\.on\('sync-refused', \(event, data\) => \{/.test(rendererSrc),
     "renderer.js must register an ipcRenderer 'sync-refused' listener");
 
-  const handler = between("ipcRenderer.on('sync-refused', (event, data) => {", "ipcRenderer.on('version-info'", rendererSrc);
+  const handler = between("ipcRenderer.on('sync-refused', (event, data) => {", "const { applySyncState }", rendererSrc);
   assert.ok(/applySyncRefused\(document, data && data\.reason\)/.test(handler),
     'the listener hands the bare reason to the pure DOM function (mapping proven by sync-refused-dom.test.js)');
   assert.strictEqual(/textContent|log\([^)]*reason/.test(handler), false,

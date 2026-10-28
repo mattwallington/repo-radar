@@ -354,17 +354,19 @@ function currentSyncView() {
 }
 
 // Push the current attempt's phase/outcome to the progress window, if one is open and loaded.
-// `view` defaults to a full resolve; a caller holding the attempt's own news passes its own view.
+// Only syncState.resolve decides what Progress shows: `view`, when given, is a view the caller
+// has just resolved.
 function sendSyncStateToWindow(win = logWindow, view = undefined) {
   if (!win || win.isDestroyed() || !win.webContents || win.webContents.isLoading()) return;
   const shown = view === undefined ? currentSyncView() : view;
   if (shown) win.webContents.send('sync-state', shown);
 }
 
-// The current attempt as its own latest news has it (an update it just sent, or its own child's
-// exit): no Activity discovery, which could only blur what the app has just been told.
-function ownSyncView(status = loadStatus()) {
-  return syncState.ownView(status, syncStateContext());
+// May the window show the current attempt's own run data (rows, stats, phase text) under
+// `view`? Not when the view is unknown with no established current run. A null view is a status
+// file from an older build, which keeps its old behavior.
+function viewShowsRun(view) {
+  return !view || view.snapshot !== false;
 }
 
 // Electron's own worker for `attemptId` exited. Unless the worker already reported its outcome,
@@ -381,10 +383,7 @@ function finishChildAttempt(attemptId, code, wasCancelled, durable) {
     syncState.finish(status, runtimeChannel, attemptId, outcome);
     saveStatus(status);
   }
-  // This child's own exit is news about this attempt; anything else gets the full check.
-  const now = syncState.current(status, runtimeChannel);
-  const own = !!now && now.attemptId === (attemptId || null);
-  sendSyncStateToWindow(logWindow, own ? ownSyncView(status) : undefined);
+  sendSyncStateToWindow();
 }
 
 // Load last status
@@ -1116,12 +1115,18 @@ function startStatusServer() {
     }
     if (verdict.changed || data.type === 'sync-roster') saveStatus(admitted);
 
+    // Admission only stored the update; what the window may show of it is resolved now, once.
+    const windowOpen = !!(logWindow && !logWindow.isDestroyed());
+    const shown = windowOpen ? currentSyncView() : null;
+    const showsRun = viewShowsRun(shown);
+
     if (verdict.started || data.type === 'sync-roster') {
       // A new attempt (or its roster) while the window is open: lay out that run's rows and
       // replay what it has reported so far, then carry on with this update below.
-      if (logWindow) replaySyncToWindow(logWindow);
+      if (windowOpen) replaySyncToWindow(logWindow, shown);
     } else if (data.type === 'sync-lifecycle' || data.type === 'sync-terminal') {
-      sendSyncStateToWindow(logWindow, ownSyncView(admitted));
+      // A terminal settles its own attempt's outcome; it doesn't show that attempt is the latest.
+      sendSyncStateToWindow(logWindow, shown);
     }
 
     if (data.type === 'output') {
@@ -1160,7 +1165,7 @@ function startStatusServer() {
       updateTrayMenu();
       
       // Send to renderer
-      if (logWindow && !logWindow.isDestroyed()) {
+      if (logWindow && !logWindow.isDestroyed() && showsRun) {
         logWindow.webContents.send('progress-update', data);
       }
       
@@ -1207,12 +1212,12 @@ function startStatusServer() {
       }
     } else if (data.type === 'waiting-for-network') {
       console.log('Sync waiting for network connectivity...');
-      if (logWindow && !logWindow.isDestroyed()) {
+      if (logWindow && !logWindow.isDestroyed() && showsRun) {
         logWindow.webContents.send('waiting-for-network');
       }
     } else if (data.type === 'network-timeout') {
       console.log('Network timeout:', data.message);
-      if (logWindow && !logWindow.isDestroyed()) {
+      if (logWindow && !logWindow.isDestroyed() && showsRun) {
         logWindow.webContents.send('network-timeout', data.message);
       }
     } else if (data.type === 'complete' && verdict.lateComplete) {
@@ -1222,10 +1227,13 @@ function startStatusServer() {
       const status = loadStatus();
       if (data.stats) status.stats = data.stats;
       saveStatus(status);
-      if (logWindow && !logWindow.isDestroyed() && data.stats) {
+      // Shown only while the window may show this finished attempt as the latest run.
+      const view = windowOpen ? currentSyncView() : null;
+      if (windowOpen && data.stats && view && view.snapshot !== false
+        && view.phase === syncState.FINISHED) {
         logWindow.webContents.send('sync-complete', data.stats);
-        sendSyncStateToWindow(logWindow, ownSyncView(status)); // the outcome stays on top of the stats
       }
+      if (windowOpen) sendSyncStateToWindow(logWindow, view); // the outcome stays on top of the stats
     } else if (data.type === 'complete') {
       // Sync complete
       const status = loadStatus();
@@ -1272,8 +1280,8 @@ function startStatusServer() {
       saveStatus(status);
       updateTrayMenu();
       
-      // Send to renderer
-      if (logWindow && !logWindow.isDestroyed()) {
+      // Send to renderer -- the completion only while the window may show this run.
+      if (logWindow && !logWindow.isDestroyed() && showsRun) {
         logWindow.webContents.send('sync-complete', data.stats);
         
         // Send warning if present
@@ -1573,8 +1581,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       setTimeout(sendSyncStartedWhenReady, 100);
       return;
     }
-    const st = loadStatus();
-    const entry = syncState.current(st, runtimeChannel);
+    const entry = syncState.current(loadStatus(), runtimeChannel);
     if (!entry || entry.attemptId !== attemptId) {
       console.log('Not filling the window: another sync attempt is current');
       clearPendingStart();
@@ -1588,8 +1595,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     }
     clearPendingStart();
     // The attempt's rows and where it really is -- possibly already waiting for network, or even
-    // finished: an early block exits in milliseconds. This is the app's own attempt.
-    replaySyncToWindow(win, ownSyncView(st));
+    // finished: an early block exits in milliseconds. Resolved now, at delivery.
+    replaySyncToWindow(win);
   };
 
   // Start checking after 300ms
@@ -1975,6 +1982,15 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     // (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild -- same ordering as the
     // two guard blocks above, for the same reason.
     activity.writer.terminal('failed');
+    // That launch never ran a worker, so its truthful `failed` record must not read as a run that
+    // may have happened since the current one: retire its ID on the current entry (which stays
+    // current) before it stops being pending.
+    if (!attemptBegun) {
+      try {
+        const st = loadStatus();
+        if (syncState.retire(st, runtimeChannel, progressAttemptId)) saveStatus(st);
+      } catch (err) { /* the view is best-effort */ }
+    }
     settlePending();
     _refreshViewErrorsTarget();
     updateTrayMenu();
@@ -1984,7 +2000,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
 // Show `win` the current attempt as it really is: still waiting for network, syncing (also a
 // scheduled run the app did not start), or finished with its own outcome. Returns false when
 // there is no attempt view (status.json from an older build), leaving the caller's old replay.
-// `view` defaults to a full resolve; the app's own attempt passes its own view.
+// `view`, when given, is one the caller has just resolved.
 function replaySyncToWindow(win, view = undefined) {
   if (!win || win.isDestroyed() || !win.webContents || win.webContents.isLoading()) return false;
   if (view === undefined) view = currentSyncView();

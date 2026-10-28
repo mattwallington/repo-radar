@@ -798,15 +798,43 @@ test('a channel with no run of its own shows nothing rather than the other chann
   assert.strictEqual(JSON.stringify(dev.status().syncState.dev), devBefore, 'dev\'s run is untouched');
 });
 
+const UNKNOWN = 'Sync status unknown — a sync may still be running';
+const RECORDLESS = '33333333-3333-4333-8333-333333333333'; // an identified ID with no Activity record
+
+// The window shows nothing of any run: unknown heading, no rows, no summary, zero counters, no Stop.
+function assertEmptyUnknown(win, label) {
+  assert.strictEqual(win.status(), UNKNOWN, label);
+  assert.deepStrictEqual(win.rows(), {}, `${label}: no rows`);
+  assert.strictEqual(win.doc.getElementById('repo-count').textContent, '', `${label}: no summary`);
+  for (const id of ['repos-completed', 'repos-running', 'repos-total', 'repos-errors']) {
+    assert.strictEqual(win.doc.getElementById(id).textContent, '0', `${label}: ${id} is zero`);
+  }
+  assert.strictEqual(win.stopEnabled(), false, `${label}: no Stop`);
+}
+
 test('a status file from an older build still replays its last run', (t) => {
   const h = makeHarness(t);
-  fs.writeFileSync(path.join(h.home, '.config', 'repo-radar', 'status.json'), JSON.stringify({
+  const legacy = {
     repos: [{ name: 'l/one', status: 'Done', percent: 100, color: 'cyan' }],
     stats: { total: 1, cloned: 0, updated: 1, errors: 0 },
-  }));
+  };
+  fs.writeFileSync(path.join(h.home, '.config', 'repo-radar', 'status.json'), JSON.stringify(legacy));
   const win = h.openWindow();
   assert.deepStrictEqual(Object.keys(win.rows()), ['l/one']);
   assert.strictEqual(win.status(), 'Complete!');
+  h.closeWindow();
+
+  // A worker nothing can identify starts: that old run is no longer shown as the latest, on
+  // reopen and after the app restarts, while its data stays on disk and the ID is never adopted.
+  h.post({ type: 'sync-lifecycle', phase: 'starting', attemptId: RECORDLESS, channel: 'stable' });
+  assertEmptyUnknown(h.openWindow(), 'reopened');
+  h.closeWindow();
+  const restarted = makeHarness(t, { home: h.home });
+  assertEmptyUnknown(restarted.openWindow(), 'after a restart');
+  const st = JSON.parse(fs.readFileSync(path.join(h.home, '.config', 'repo-radar', 'status.json'), 'utf8'));
+  assert.deepStrictEqual([st.repos, st.stats], [legacy.repos, legacy.stats], 'the old run is still stored');
+  assert.strictEqual(st.syncState === undefined || st.syncState.stable === undefined, true,
+    'no attempt was made up for the rejected ID');
 });
 
 test('the app\'s own run stays tied to its window even when Activity recording is unavailable', (t) => {
@@ -834,10 +862,122 @@ test('the app\'s own run stays tied to its window even when Activity recording i
   post({ type: 'progress', repo: 'o/one', status: 'Fetching', percent: 40, color: 'cyan' });
   assert.deepStrictEqual(h.window().rows(), { 'o/one': 'Fetching' });
   post({ type: 'sync-terminal', outcome: 'failed' });
+  assert.strictEqual(h.window().status(), 'Sync failed — see ⚠️ View Errors in the menu',
+    'its own terminal, while it is still the app\'s live child');
   child.exit(1);
   h.clock.tick(1000);
 
   const entry = h.status().syncState.stable;
   assert.deepStrictEqual([entry.attemptId, entry.outcome], [id, 'failed']);
-  assert.strictEqual(h.window().status(), 'Sync failed — see ⚠️ View Errors in the menu');
+  // Once the child is gone, nothing readable shows this is still the latest run.
+  assert.strictEqual(h.window().status(), 'Sync status unknown — a sync may still be running');
+});
+
+test('late stats and a duplicate terminal leave an unknown window unknown', (t) => {
+  const h = makeHarness(t);
+  const a = h.scheduledWorker();
+  a.post({ type: 'sync-lifecycle', phase: 'starting' });
+  a.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+  a.post({ type: 'progress', repo: 'o/one', status: 'Done', percent: 100, color: 'cyan' });
+  a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  a.end();
+  const b = h.scheduledWorker(); // unseen, holding a real live lease
+  const win = h.openWindow();
+  assertEmptyUnknown(win, 'with B running unseen');
+
+  a.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } });
+  assertEmptyUnknown(win, 'after A\'s late stats');
+  a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  assertEmptyUnknown(win, 'after A\'s duplicate terminal');
+  h.closeWindow();
+  assertEmptyUnknown(h.openWindow(), 'reopened');
+
+  const entry = h.status().syncState.stable;
+  assert.deepStrictEqual([entry.attemptId, entry.outcome, entry.stats.total], [a.id, 'succeeded', 1],
+    'A keeps its own ID and outcome, and its stats are stored');
+  assert.notStrictEqual(entry.attemptId, b.id);
+});
+
+test('a stray update empties an open completed window at once, and reopening matches', (t) => {
+  const h = makeHarness(t);
+  const a = h.scheduledWorker();
+  a.post({ type: 'sync-lifecycle', phase: 'starting' });
+  a.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+  a.post({ type: 'progress', repo: 'o/one', status: 'Done', percent: 100, color: 'cyan' });
+  a.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0, metadata_generated: 2 } });
+  a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  a.end();
+  const win = h.openWindow();
+  assert.strictEqual(win.status(), 'Complete!');
+  assert.deepStrictEqual(Object.keys(win.rows()), ['o/one']);
+  assert.match(win.doc.getElementById('repo-count').textContent, /1 repos synced.*2 metadata files generated/);
+  assert.strictEqual(win.doc.getElementById('repos-completed').textContent, '1');
+
+  h.post({ type: 'sync-lifecycle', phase: 'starting', attemptId: RECORDLESS, channel: 'stable' });
+  assertEmptyUnknown(win, 'live, before any reopen');
+  const entry = h.status().syncState.stable;
+  assert.deepStrictEqual([entry.attemptId, entry.outcome, entry.run.repos.map((r) => r.name), entry.stats.total],
+    [a.id, 'succeeded', ['o/one'], 1], 'A\'s stored snapshot is untouched');
+  h.closeWindow();
+  assertEmptyUnknown(h.openWindow(), 'reopened');
+});
+
+test('a Sync Now that fails before starting leaves the previous run its completion', async (t) => {
+  const h = makeHarness(t);
+  h.writeConfig(['o/manual']);
+  const a = h.scheduledWorker();
+  a.post({ type: 'sync-lifecycle', phase: 'starting' });
+  a.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+  a.post({ type: 'progress', repo: 'o/one', status: 'Done', percent: 100, color: 'cyan' });
+  a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  a.end();
+
+  h.main.triggerSync({ showWindow: true });
+  h.clock.tick(200); // the window has loaded and replayed; the runtime check is still going
+  const failedId = h.runs[h.runs.length - 1].opts.env.REPO_RADAR_ACTIVITY_ID;
+  h.runs[h.runs.length - 1].reject(new Error('runtime could not be verified')); // not LockBusy
+  await flush();
+  h.clock.tick(500);
+  assert.strictEqual(h.window().status(), 'Sync could not start — see ⚠️ View Errors in the menu');
+  h.closeWindow();
+
+  const win = h.openWindow();
+  assert.strictEqual(win.status(), 'Complete!');
+  assert.deepStrictEqual(Object.keys(win.rows()), ['o/one']);
+  const entry = h.status().syncState.stable;
+  assert.deepStrictEqual([entry.attemptId, entry.outcome], [a.id, 'succeeded']);
+  const failed = activityRead.listActivities(h.home).items.find((i) => i.id === failedId);
+  assert.strictEqual(failed.outcome, 'failed', 'the failed launch stays truthfully failed in Activity');
+});
+
+test('a stray update while a run is known to be executing leaves no doubt once it ends', (t) => {
+  for (const kind of ['the app\'s own child', 'an established scheduled worker']) {
+    const h = makeHarness(t);
+    h.writeConfig(['o/one']);
+    let post;
+    let finishRun;
+    if (kind === 'the app\'s own child') {
+      h.main.triggerSync({ showWindow: false });
+      const { child, env } = h.spawn();
+      post = (p) => h.post({ ...p, attemptId: env.REPO_RADAR_ACTIVITY_ID, channel: 'stable' });
+      finishRun = () => { child.exit(0); h.clock.tick(1000); };
+    } else {
+      const b = h.scheduledWorker();
+      post = b.post;
+      finishRun = () => b.end();
+      post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+    }
+    post({ type: 'sync-lifecycle', phase: 'syncing' });
+    post({ type: 'progress', repo: 'o/one', status: 'Done', percent: 100, color: 'cyan' });
+    h.post({ type: 'sync-lifecycle', phase: 'starting', attemptId: RECORDLESS, channel: 'stable' });
+    assert.strictEqual(h.status().syncUnexplained, undefined, `${kind}: no uncertainty mark`);
+    post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } });
+    post({ type: 'sync-terminal', outcome: 'succeeded' });
+    finishRun();
+
+    const win = h.openWindow();
+    assert.strictEqual(win.status(), 'Complete!', kind);
+    assert.deepStrictEqual(Object.keys(win.rows()), ['o/one'], kind);
+    h.closeWindow();
+  }
 });

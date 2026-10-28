@@ -542,6 +542,17 @@ ipcRenderer.on('sync-refused', (event, data) => {
 const { applySyncState } = require('../sync-state');
 ipcRenderer.on('sync-state', (event, view) => {
     log('Sync state:', view && view.phase, view && view.outcome);
+    if (view && view.snapshot === false) {
+        // Unknown, with no run established as current: nothing of an earlier run stays on screen
+        // -- rows, summary or counters -- whether this arrives live or on replay. A known run whose
+        // phase alone is unknown (snapshot true) keeps its own rows.
+        repoStates.clear();
+        const reposList = document.getElementById('repos-list');
+        if (reposList) reposList.textContent = '';
+        const repoCount = document.getElementById('repo-count');
+        if (repoCount) repoCount.textContent = '';
+        updateStats(0, 0, 0, 0);
+    }
     applySyncState(document, view);
 });
 

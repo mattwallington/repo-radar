@@ -120,19 +120,40 @@ function _fresh(attemptId, now, previous, { phase = 'starting', executed = false
     stats: null,
     startedAt: startedAt || null,
     updatedAt: now,
-    // When an identified worker update arrived that no evidence could tie to an attempt; from then
-    // on this attempt's result is not shown as the latest.
-    unexplainedAt: null,
     retired: retired.slice(-RETIRED_LIMIT),
     run,
   };
 }
 
 // Make `entry` the channel's current attempt, and its run snapshot the status's top-level fields.
+// A run seen executing is the latest again, so the channel's uncertainty mark is cleared here --
+// and only here.
 function _becomeCurrent(status, ch, entry) {
   _entries(status)[ch] = entry;
   for (const k of RUN_FIELDS) status[k] = entry.run[k];
+  _setUnexplained(status, ch, null);
   return entry;
+}
+
+// The channel's uncertainty mark: when an identified worker update arrived that no evidence could
+// tie to an attempt. From then on nothing earlier is shown as the latest run on that channel.
+// It is kept per channel in `syncUnexplained`, apart from any attempt entry, so it holds even when
+// the channel has none (a status file from an older build). An entry-level `unexplainedAt` from
+// an earlier build of this one is still read.
+function _unexplained(status, ch) {
+  const marks = status && status.syncUnexplained;
+  if (marks && typeof marks === 'object' && marks[ch]) return marks[ch];
+  const entry = current(status, ch);
+  return entry && entry.unexplainedAt ? entry.unexplainedAt : null;
+}
+
+function _setUnexplained(status, ch, at) {
+  const had = status.syncUnexplained && typeof status.syncUnexplained === 'object';
+  if (!at && !had) return;
+  const marks = had ? { ...status.syncUnexplained } : {};
+  if (at) marks[ch] = at;
+  else delete marks[ch];
+  status.syncUnexplained = marks;
 }
 
 // Does this status file keep per-channel run snapshots (written by this build for any channel)?
@@ -174,6 +195,18 @@ function store(disk, status, channel) {
     for (const k of RUN_FIELDS) run[k] = status[k] !== undefined ? status[k] : RUN_DEFAULTS[k]();
     out.syncState[channel] = { ...mine, run };
   }
+  // Uncertainty marks: this channel's as this process has it, every other channel's as on disk.
+  const diskMarks = disk && disk.syncUnexplained && typeof disk.syncUnexplained === 'object'
+    ? disk.syncUnexplained : {};
+  const marks = { ...diskMarks };
+  const myMark = channel && status.syncUnexplained && typeof status.syncUnexplained === 'object'
+    ? status.syncUnexplained[channel] : null;
+  if (channel) {
+    if (myMark) marks[channel] = myMark;
+    else delete marks[channel];
+  }
+  if (Object.keys(marks).length > 0) out.syncUnexplained = marks;
+  else delete out.syncUnexplained;
   return out;
 }
 
@@ -269,12 +302,23 @@ function _isChild(entry, ctx) {
 }
 
 // The attempts other than `exceptId` that may have run a sync: not Electron's own attempts still
-// waiting for the root lock, and not startups turned away (skipped, blocked) -- those stay true
-// Activity history but never stand for a run.
-function _candidates(ev, ctx, exceptId) {
+// waiting for the root lock, not startups turned away (skipped, blocked) -- those stay true
+// Activity history but never stand for a run -- and not IDs the current entry has retired
+// (earlier current attempts, and the app's own launches that failed before spawning a worker).
+function _candidates(ev, ctx, exceptId, entry) {
   const pending = new Set((ctx && ctx.pendingAttemptIds) || []);
-  return ev.attempts.filter((a) => a.id !== exceptId && !pending.has(a.id)
+  const retired = new Set((entry && entry.retired) || []);
+  return ev.attempts.filter((a) => a.id !== exceptId && !pending.has(a.id) && !retired.has(a.id)
     && !NOT_RUN_OUTCOMES.has(a.outcome));
+}
+
+// Positive evidence that a run is executing right now: Electron's own child (it holds the root
+// lock), or the current attempt, seen executing and unfinished, with a readable live owner lease.
+// While either holds, no other worker can be running, so a stray update proves nothing.
+function _knownLive(entry, ctx) {
+  if (ctx && ctx.liveChildAttemptId) return true;
+  return !!(entry && entry.attemptId && entry.executed === true && !_isFinished(entry)
+    && _owner(ctx, entry.attemptId) === 'busy');
 }
 
 // Could `a` have started after `entry`? Dates can only raise this doubt, never decide who is
@@ -290,15 +334,13 @@ function _maybeNewer(a, entry, ev) {
 // is running (a live owner lease) and that nothing else could be: Electron's own child, a known
 // attempt whose owner is live, or a second running candidate all make it ambiguous.
 function _mayEstablish(entry, id, ctx) {
-  if (ctx.liveChildAttemptId) return false; // Electron's own child holds the root lock
-  if (entry && entry.attemptId && !_isFinished(entry) && _owner(ctx, entry.attemptId) === 'busy') {
-    return false;
-  }
+  if (_knownLive(entry, ctx)) return false;
   const ev = _evidence(ctx);
   if (!ev.sufficient) return false;
-  const cand = _candidates(ev, ctx, null).find((a) => a.id === id);
+  const cand = _candidates(ev, ctx, null, entry).find((a) => a.id === id);
   if (!cand || cand.owner !== 'busy') return false;
-  return !_candidates(ev, ctx, id).some((a) => a.owner === 'busy');
+  // Any other live lease -- including an unobserved current entry's own -- makes it ambiguous.
+  return !_candidates(ev, ctx, id, entry).some((a) => a.owner === 'busy');
 }
 
 // A rejected worker update the evidence doesn't explain as an older or finished attempt's: a run
@@ -313,7 +355,7 @@ function _isUnexplained(id, ctx) {
 // Decide whether a worker update belongs to the current attempt on this channel, and record its
 // effect. `accept: false` means the caller must drop it (no window send); it is for another
 // channel, from an attempt that is not current, or late progress from a finished one. If
-// `changed` is still true the status was marked (see `unexplainedAt`) and should be saved.
+// `changed` is still true the channel was marked uncertain (`syncUnexplained`) and should be saved.
 // `started: true` means this update made a new attempt current. `lateComplete: true` means it is
 // the current attempt's `complete` arriving after its terminal: its stats were recorded, and
 // nothing else about the attempt may change.
@@ -356,9 +398,10 @@ function admit(status, payload, ctx = {}) {
   } else {
     // A terminal, a late `complete` or a start time alone never makes an attempt current.
     if (!ESTABLISHING_TYPES.has(payload.type) || !_mayEstablish(entry, id, ctx)) {
-      if (entry && ESTABLISHING_TYPES.has(payload.type) && !entry.unexplainedAt
-        && _isUnexplained(id, ctx)) {
-        entry.unexplainedAt = now;
+      // While a run is known to be executing, a stray update can't be another run's.
+      if (ESTABLISHING_TYPES.has(payload.type) && !_unexplained(status, ch)
+        && !_knownLive(entry, ctx) && _isUnexplained(id, ctx)) {
+        _setUnexplained(status, ch, now);
         return { ...NOT_ACCEPTED, changed: true };
       }
       return NOT_ACCEPTED;
@@ -394,6 +437,19 @@ function finish(status, channel, attemptId, outcome, reason = null,
   return _setFinished(entry, outcome, reason, now);
 }
 
+// The app minted `attemptId` for a launch that failed before any worker ran: keep it out of
+// discovery and admission by retiring it on the channel's current entry, which stays current.
+// With no current entry there is nothing to protect, and none is made up for it.
+function retire(status, channel, attemptId) {
+  const entry = current(status, channel);
+  if (!entry || !attemptId || entry.attemptId === attemptId) return false;
+  const retired = [...(entry.retired || [])];
+  if (retired.includes(attemptId)) return false;
+  retired.push(attemptId);
+  entry.retired = retired.slice(-RETIRED_LIMIT);
+  return true;
+}
+
 // `snapshot` says whether the entry's run fields (rows, stats) belong with this view. An unknown
 // view with no established current attempt shows none, rather than an older run's relabeled.
 function _viewOf(entry, extra) {
@@ -412,15 +468,6 @@ function _viewOf(entry, extra) {
 
 const _unknownView = (entry) => _viewOf(entry, { phase: UNKNOWN, outcome: null, reason: null,
   stats: null });
-
-// The current attempt as its own latest news has it -- its own update just admitted, or
-// Electron's own child just exited -- with no discovery: what an open window shows right then.
-function ownView(status, ctx = {}) {
-  const entry = current(status, ctx.channel);
-  if (!entry) return null;
-  const child = _isChild(entry, ctx);
-  return _viewOf(entry, { live: child || !_isFinished(entry), canStop: child });
-}
 
 // What a window opening now (or the app starting) should show for this channel. Returns
 // { view, changed }: `changed` means the status object was updated (a known attempt's outcome was
@@ -441,7 +488,9 @@ function resolve(status, ctx = {}) {
   if (!entry) {
     // Another channel keeps its runs here, but this one has none of its own: nothing to show
     // yet, rather than the shared fields' (possibly another channel's) completed run.
-    if (_hasSnapshots(status)) return { view: _unknownView(null), changed: false };
+    if (_hasSnapshots(status) || _unexplained(status, ch)) {
+      return { view: _unknownView(null), changed: false };
+    }
     const ev = _evidence(ctx);
     const quiet = ev.sufficient && !_candidates(ev, ctx, null).some((a) => a.owner === 'busy');
     return { view: quiet ? null : _unknownView(null), changed: false };
@@ -471,9 +520,9 @@ function resolve(status, ctx = {}) {
 
   // Finished. It is still the latest only if complete evidence shows no other run that may be
   // going or may have run since (one the app never heard from is inspected in Activity).
-  if (!established || entry.unexplainedAt) return { view: _unknownView(null), changed };
+  if (!established || _unexplained(status, ch)) return { view: _unknownView(null), changed };
   const ev = _evidence(ctx);
-  const doubt = !ev.sufficient || _candidates(ev, ctx, entry.attemptId)
+  const doubt = !ev.sufficient || _candidates(ev, ctx, entry.attemptId, entry)
     .some((a) => a.owner === 'busy' || _maybeNewer(a, entry, ev));
   return { view: doubt ? _unknownView(null) : _viewOf(entry), changed };
 }
@@ -546,5 +595,5 @@ function applySyncState(doc, view) {
 
 module.exports = {
   FINISHED, UNKNOWN, PHASES, PHASE_TEXTS, OUTCOME_TEXTS, NETWORK_ABORT_TEXT,
-  current, admit, begin, finish, resolve, ownView, project, store, syncStateText, applySyncState,
+  current, admit, begin, finish, retire, resolve, project, store, syncStateText, applySyncState,
 };
