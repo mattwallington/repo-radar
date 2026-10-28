@@ -249,6 +249,127 @@ def test_network_abort_calls_terminal_failed(monkeypatch, tmp_path):
     assert writer.terminals == [("failed", {"reason": "no_network_connectivity"})]
 
 
+def test_network_abort_reports_each_phase_under_one_attempt_identity(monkeypatch, tmp_path):
+    """The app can only keep a closed-and-reopened window on the right phase if every update
+    names its attempt: starting, the wait, the abort and the terminal outcome all carry the
+    Activity ID and channel, and the terminal comes last."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+
+    def _wait(on_waiting=None, **kw):
+        on_waiting(0)
+        return False
+
+    monkeypatch.setattr(S, "wait_for_network", _wait)
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    writer.activity_id = "a" * 32
+    args = _args(status_server=True)
+    args._activity_writer = writer
+
+    assert S.sync_mode(args) == 1
+
+    lifecycle = [p for p in posted if p["type"] != "output"]
+    assert [p["type"] for p in lifecycle] == [
+        "sync-lifecycle", "waiting-for-network", "network-timeout", "error", "sync-terminal"]
+    assert lifecycle[0]["phase"] == "starting"
+    assert lifecycle[-1]["outcome"] == "failed"
+    assert lifecycle[-1]["reason"] == "no_network_connectivity"
+    assert all(p["attemptId"] == "a" * 32 and p["channel"] == "stable" for p in posted)
+
+
+def test_the_run_reports_its_repository_roster_under_its_identity(monkeypatch, tmp_path):
+    """After the network wait the worker names this run's repositories (display name and row
+    color only), tagged with its attempt, so the app can build the right rows for a window opened
+    late. Nothing else from the config -- clone URLs can carry a token -- goes with it."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "PRISTINE_DIR", tmp_path / "pristine")
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(S, "wait_for_network", lambda **kw: True)
+    monkeypatch.setattr(S, "load_config", lambda: {"repositories": [
+        {"full_name": "o/one", "name": "one", "clone_url": "https://secret-token@github.com/o/one.git"},
+        {"full_name": "o/two", "name": "two", "clone_url": "https://secret-token@github.com/o/two.git"},
+    ]})
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    writer.activity_id = "b" * 32
+    args = _args(status_server=True, dry_run=True, skip_metadata=True)
+    args._activity_writer = writer
+    S.sync_mode(args)
+
+    roster = [p for p in posted if p["type"] == "sync-roster"]
+    assert len(roster) == 1
+    assert roster[0]["repos"] == [{"name": "o/one", "color": "cyan"}, {"name": "o/two", "color": "red"}]
+    assert (roster[0]["attemptId"], roster[0]["channel"]) == ("b" * 32, "stable")
+    assert "secret-token" not in json.dumps(roster[0])
+    phases = [p.get("phase") for p in posted if p["type"] == "sync-lifecycle"]
+    assert phases == ["starting", "syncing"]
+
+
+def test_app_launched_run_tags_updates_with_the_apps_progress_id(monkeypatch, tmp_path):
+    """When the app's own Activity recording failed, its hand-off carries no Activity ID, but it
+    still names the progress ID it is waiting for; the worker tags every update with that one.
+    An invalid value is ignored in favour of the worker's own Activity ID."""
+    import requests
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+    monkeypatch.setattr(S, "wait_for_network", lambda **kw: False)
+    monkeypatch.setenv("REPO_RADAR_CHANNEL", "stable")
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    app_id = "3f2b8c1e-5d4a-4b6f-9c7e-1a2b3c4d5e6f"
+    monkeypatch.setenv("REPO_RADAR_PROGRESS_ATTEMPT_ID", app_id)
+    writer = _SpyWriter()
+    writer.activity_id = "c" * 32  # the worker's own (unrelated) Activity ID
+    args = _args(status_server=True)
+    args._activity_writer = writer
+    S.sync_mode(args)
+    assert posted and all(p["attemptId"] == app_id for p in posted)
+
+    posted.clear()
+    monkeypatch.setenv("REPO_RADAR_PROGRESS_ATTEMPT_ID", "not-an-id")
+    S.sync_mode(args)
+    assert posted and all(p["attemptId"] == "c" * 32 for p in posted)
+
+
+def test_stop_during_the_network_wait_is_recorded_as_cancelled(monkeypatch, tmp_path):
+    """Stop (SIGTERM) during the wait surfaces as NetworkWaitCancelled; the run ends cancelled,
+    not as a connectivity failure, and the app is told so."""
+    import requests
+    from repo_radar.network import NetworkWaitCancelled
+
+    monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(S, "_open_sync_logger", lambda: None)
+
+    def _cancelled(**kw):
+        raise NetworkWaitCancelled()
+
+    monkeypatch.setattr(S, "wait_for_network", _cancelled)
+    posted = []
+    monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
+
+    writer = _SpyWriter()
+    args = _args(status_server=True)
+    args._activity_writer = writer
+
+    assert S.sync_mode(args) == 143
+    assert writer.terminals == [("cancelled", {"reason": "cancelled_during_network_wait"})]
+    assert [p["type"] for p in posted if p["type"] != "output"][-1] == "sync-terminal"
+    assert not any(p["type"] == "network-timeout" for p in posted)
+
+
 def test_no_configuration_calls_terminal_blocked(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(S, "load_config", lambda: None)

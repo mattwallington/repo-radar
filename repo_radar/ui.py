@@ -101,6 +101,20 @@ def format_size(bytes_size):
     return f"{bytes_size:.2f} TB"
 
 
+# The sync attempt this process is reporting for. Every status update carries it, so the app can
+# tell this run's updates apart from a previous run's late ones and from another channel's.
+_status_attempt = {}
+
+
+def set_status_attempt(attempt_id, channel):
+    """Tag every later status update from this process with its attempt and channel."""
+    _status_attempt.clear()
+    if attempt_id:
+        _status_attempt['attemptId'] = attempt_id
+    if channel:
+        _status_attempt['channel'] = channel
+
+
 def send_status_update(status_type, data=None, status_server_enabled=False):
     """Send status update to HTTP server if enabled."""
     if not status_server_enabled:
@@ -111,6 +125,7 @@ def send_status_update(status_type, data=None, status_server_enabled=False):
         payload = {'type': status_type}
         if data:
             payload.update(data)
+        payload.update(_status_attempt)
 
         import os
         port = os.environ.get('REPO_RADAR_STATUS_PORT', '3847')

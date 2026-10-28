@@ -5,7 +5,8 @@ import sys
 import json
 import time
 import random
-import socket
+import signal
+import uuid
 import traceback
 import hashlib
 from pathlib import Path
@@ -39,7 +40,9 @@ from repo_radar.metadata import (
     regenerate_index,
     save_degraded_response,
 )
-from repo_radar.ui import get_short_id, format_id, send_status_update
+from repo_radar.ui import get_short_id, format_id, send_status_update, set_status_attempt
+# Imported by name so callers and tests keep using sync.wait_for_network.
+from repo_radar.network import NetworkWaitCancelled, wait_for_network
 
 
 # Keep the most recent N per-run log files; older ones are pruned on each sync.
@@ -239,6 +242,17 @@ def _mint_activity_writer():
         return None
 
 
+def _progress_attempt_id():
+    """The ID the app chose for this run's status updates, if the app launched it.
+
+    Display correlation only: it never stands in for the Activity hand-off (REPO_RADAR_ACTIVITY_*),
+    whose ID, token and lease descriptor are validated as a set.
+    """
+    from repo_radar.activity import ids
+    value = (os.environ.get('REPO_RADAR_PROGRESS_ATTEMPT_ID') or '').strip()
+    return value if ids.valid_activity_id(value) else None
+
+
 def _activity_start(writer):
     """Best-effort `.start()`. Idempotent and safe to call unconditionally (a no-op on an
     already-started or inactive writer) -- guarded anyway so a writer-side surprise can never
@@ -262,38 +276,6 @@ def _activity_terminal(writer, outcome, **summary):
         writer.terminal(outcome, **summary)
     except Exception:
         pass
-
-
-def wait_for_network(host="github.com", port=443, timeout=300, interval=2, required_successes=3, on_waiting=None):
-    """Wait for stable network connectivity before starting sync.
-
-    Requires `required_successes` consecutive successful TCP probes to declare
-    the network stable. A single successful handshake isn't enough — right after
-    the laptop wakes from sleep, one packet may squeak through while DNS, routing,
-    or the VPN are still warming up, causing the sync to start and then fail.
-
-    Returns True if network is stable, False if timed out.
-    Calls on_waiting(elapsed) the first time a probe fails.
-    """
-    start = time.time()
-    deadline = start + timeout
-    notified = False
-    successes = 0
-    while time.time() < deadline:
-        try:
-            sock = socket.create_connection((host, port), timeout=5)
-            sock.close()
-            successes += 1
-            if successes >= required_successes:
-                return True
-            time.sleep(interval)
-        except OSError:
-            successes = 0
-            if on_waiting and not notified:
-                on_waiting(0)
-                notified = True
-            time.sleep(interval)
-    return False
 
 
 SyncContext = namedtuple("SyncContext", "meta_progress meta_tasks stats stats_lock sync_logger console")
@@ -1104,6 +1086,24 @@ def sync_mode(args):
     activity_writer = getattr(args, '_activity_writer', None) or _mint_activity_writer()
     _activity_start(activity_writer)
 
+    # Tag every status update with this attempt so the app can keep its progress view on the
+    # right run: a window opened late, a scheduled run the app did not start, or a previous run's
+    # last updates arriving after this one began. The Activity ID is the attempt's identity when
+    # recording works; otherwise a one-off ID still keeps attempts apart. When the app launched
+    # this run it says which ID to use, so its window follows this worker even if recording
+    # isn't working for this run.
+    attempt_id = _progress_attempt_id() or getattr(activity_writer, 'activity_id', None)
+    if not isinstance(attempt_id, str) or not attempt_id:
+        attempt_id = uuid.uuid4().hex
+    set_status_attempt(attempt_id, resolve_channel())
+    send_status_update('sync-lifecycle', {'phase': 'starting'}, args.status_server)
+
+    def _terminal(outcome, **summary):
+        """Record the run's one authoritative outcome, and tell the app so it can stop loading."""
+        _activity_terminal(activity_writer, outcome, **summary)
+        send_status_update('sync-terminal', {'outcome': outcome, 'reason': summary.get('reason')},
+                           args.status_server)
+
     # Fail-closed: reject an uncatalogued model before any network wait or git work. A
     # metadata-capable run (not skip_metadata, not repos_only) will eventually call the LLM, so an
     # unknown model must be caught here -- at the very top, before the 5-minute network wait and
@@ -1123,7 +1123,7 @@ def sync_mode(args):
             # Pre-attempt early exit, before the old per-run log even exists -- still a durable
             # System incident: `blocked` is the same bucket as a dependency-check failure or a
             # missing/invalid config (spec Sec 3: pre-worker guard/verification block).
-            _activity_terminal(activity_writer, 'blocked', reason='unknown_model', model=model)
+            _terminal('blocked', reason='unknown_model', model=model)
             return 1
 
     console.print(f"[bold]Repository Sync[/bold]")
@@ -1209,7 +1209,7 @@ def sync_mode(args):
                     sync_logger.event("catchup_skipped", reason="already_satisfied",
                                       satisfied_at=existing['finishedAt'])
                     sync_logger.close()
-                _activity_terminal(activity_writer, 'skipped', reason='catchup_already_satisfied')
+                _terminal('skipped', reason='catchup_already_satisfied')
                 # Distinct from 0: nothing was synced, so the caller must not stamp a completion
                 # timestamp for this run.
                 return EXIT_SKIPPED_NO_WORK
@@ -1222,14 +1222,25 @@ def sync_mode(args):
         if args.status_server:
             send_status_update('waiting-for-network', {}, args.status_server)
 
-    if not wait_for_network(on_waiting=_notify_waiting):
+    try:
+        network_ready = wait_for_network(on_waiting=_notify_waiting)
+    except NetworkWaitCancelled:
+        # Stop was pressed during the wait. The probe has already been killed and reaped; record
+        # a cancellation, not a connectivity failure.
+        console.print(f"[yellow]Sync cancelled while waiting for network.[/yellow]")
+        if sync_logger:
+            sync_logger.event("sync_aborted", reason="cancelled")
+            sync_logger.close()
+        _terminal('cancelled', reason='cancelled_during_network_wait')
+        return 128 + signal.SIGTERM
+
+    if not network_ready:
         console.print(f"[red]No network connectivity. Aborting sync.[/red]")
         if sync_logger:
             sync_logger.event("sync_aborted",
                               level=_activity_level("sync_aborted", is_exhausted=True),
                               reason="no_network_connectivity")
             sync_logger.close()
-        _activity_terminal(activity_writer, 'failed', reason='no_network_connectivity')
         if args.status_server:
             send_status_update('network-timeout', {
                 'message': 'No network connectivity'
@@ -1241,7 +1252,11 @@ def sync_mode(args):
                 'message': 'No network connectivity',
                 'fullError': 'Sync aborted: network was unavailable after retrying for 5 minutes.'
             }, args.status_server)
+        # Last, so the app sees the abort details above before this attempt's terminal outcome.
+        _terminal('failed', reason='no_network_connectivity')
         return 1
+
+    send_status_update('sync-lifecycle', {'phase': 'syncing'}, args.status_server)
 
     # Load configuration
     config = load_config()
@@ -1256,10 +1271,18 @@ def sync_mode(args):
                               level=_activity_level("sync_aborted", is_exhausted=True),
                               reason="no_configuration")
             sync_logger.close()
-        _activity_terminal(activity_writer, 'blocked', reason='no_configuration')
+        _terminal('blocked', reason='no_configuration')
         return 1
 
     repos = config.get('repositories', [])
+    # This run's repositories, so the app can lay out its rows even if it opened the window late
+    # or missed the start. Display names and row colors only; nothing else from the config (clone
+    # URLs can carry credentials) goes with it. An empty list means "no repositories", which the
+    # app tells apart from never having heard.
+    send_status_update('sync-roster', {'repos': [
+        {'name': r['full_name'], 'color': PROGRESS_COLORS[i % len(PROGRESS_COLORS)]}
+        for i, r in enumerate(repos) if isinstance(r, dict) and r.get('full_name')
+    ]}, args.status_server)
     if not repos:
         console.print(f"[yellow]No repositories configured[/yellow]")
         # A successful no-op is still a completed run; record it or the schedule looks missed.
@@ -1269,7 +1292,7 @@ def sync_mode(args):
             sync_logger.event("sync_complete", total=0, updated=0, cloned=0, skipped=0,
                               errors=0, metadata=0, cost="$0.0000")
             sync_logger.close()
-        _activity_terminal(activity_writer, 'succeeded', reason='no_repositories_configured')
+        _terminal('succeeded', reason='no_repositories_configured')
         return 0
 
     # Create directories
@@ -1891,7 +1914,7 @@ Stack Trace:
     if sync_logger:
         sync_logger.close()
 
-    _activity_terminal(activity_writer, sync_outcome, errors=stats['errors'],
+    _terminal(sync_outcome, errors=stats['errors'],
                        warnings=sync_warn_count, cloned=stats['cloned'], updated=stats['updated'],
                        metadata_generated=stats['metadata_generated'])
 
