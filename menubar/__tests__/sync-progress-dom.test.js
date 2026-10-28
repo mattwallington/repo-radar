@@ -24,6 +24,7 @@ const MAIN = path.join(MENUBAR, 'main.js');
 const RENDERER = path.join(MENUBAR, 'renderer', 'renderer.js');
 const { ActivityWriter } = require(path.join(MENUBAR, 'activity', 'writer.js'));
 const activityRead = require(path.join(MENUBAR, 'activity', 'read.js'));
+const syncState = require(path.join(MENUBAR, 'sync-state.js'));
 
 // ---- a small DOM -------------------------------------------------------------------------
 
@@ -521,6 +522,36 @@ test('a worker with no Activity record is never adopted, and is shown as unknown
 test('a finished attempt\'s start timer cannot repaint the window for the run after it', (t) => {
   const h = makeHarness(t);
   h.writeConfig(['o/one']);
+  const repoCount = () => h.window().doc.getElementById('repo-count').textContent;
+
+  // A's completion summary is on screen when a manual run B starts in the same window and exits
+  // before it posts anything and before its start sender has run.
+  const a = h.scheduledWorker();
+  a.post({ type: 'sync-lifecycle', phase: 'starting' });
+  a.post({ type: 'sync-roster', repos: [{ name: 'o/a', color: 'cyan' }] });
+  a.post({ type: 'progress', repo: 'o/a', status: 'Done', percent: 100, color: 'cyan' });
+  a.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0, metadata_generated: 2 } });
+  a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+  a.end();
+  h.openWindow();
+  assert.match(repoCount(), /1 repos synced.*2 metadata files generated/);
+  h.main.triggerSync({ showWindow: true });
+  const early = h.spawn();
+  early.child.exit(1);
+  const bView = h.main.currentSyncView();
+  assert.deepStrictEqual([bView.attemptId, bView.phase, bView.stats],
+    [early.env.REPO_RADAR_ACTIVITY_ID, 'finished', null]);
+  const shownB = (label) => {
+    assert.strictEqual(repoCount(), '', `${label}: A's summary is not B's`);
+    assert.strictEqual(h.window().status(), syncState.syncStateText(h.main.currentSyncView()), label);
+    assert.strictEqual(h.window().stopEnabled(), false, `${label}: no Stop`);
+  };
+  shownB('immediately');
+  h.clock.tick(1000); // B's start sender replays
+  shownB('after replay');
+  h.closeWindow();
+
+  // The run after that one: its start timer is still pending when a scheduled worker starts.
   h.main.triggerSync({ showWindow: true });
   h.clock.tick(60); // the window has loaded; its 300 ms start sender is still pending
   const { child, env } = h.spawn();
@@ -1079,5 +1110,47 @@ test('a progress or complete update for a run that already failed never paints S
     assert.deepStrictEqual(win.rows(), { 'o/one': 'Fetching' });
     assert.strictEqual(win.doc.getElementById('repo-count').textContent, '');
     assert.strictEqual(win.stopEnabled(), false);
+  }
+});
+
+test('a scheduled run whose first update is output or rate-limit takes a refused window over', async (t) => {
+  for (const first of ['output', 'rate-limit']) {
+    const h = makeHarness(t);
+    h.writeConfig(['o/manual']);
+    const a = h.scheduledWorker();
+    a.post({ type: 'sync-lifecycle', phase: 'starting' });
+    a.post({ type: 'sync-terminal', outcome: 'succeeded' });
+    a.end();
+
+    // A manual launch fails before spawning, and its refusal is on screen.
+    h.main.triggerSync({ showWindow: true });
+    h.clock.tick(200);
+    h.runs[h.runs.length - 1].reject(new Error('runtime could not be verified'));
+    await flush();
+    h.clock.tick(200);
+    const win = h.window();
+    assert.strictEqual(win.status(), 'Sync could not start — see ⚠️ View Errors in the menu', first);
+
+    // Scheduled B, with a real lease; its lifecycle post is lost, so `first` is the first it sends.
+    const b = h.scheduledWorker();
+    b.post(first === 'output' ? { type: 'output', data: 'b log line\n' } : { type: 'rate-limit', status: 'Requests: 9/10' });
+    assert.strictEqual(h.status().syncState.stable.attemptId, b.id, `${first}: B is current`);
+    assert.strictEqual(win.status(), syncState.syncStateText(h.main.currentSyncView()), `${first}: B's view`);
+    assert.notStrictEqual(win.status(), 'Sync could not start — see ⚠️ View Errors in the menu');
+    assert.strictEqual(win.stopEnabled(), false, `${first}: Stop is never offered for a scheduled run`);
+
+    b.post({ type: 'sync-lifecycle', phase: 'syncing' });
+    b.post({ type: 'sync-roster', repos: [{ name: 'o/b', color: 'red' }] });
+    b.post({ type: 'progress', repo: 'o/b', status: 'Fetching', percent: 50, color: 'red' });
+    assert.deepStrictEqual(win.rows(), { 'o/b': 'Fetching' }, first);
+    b.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } });
+    b.post({ type: 'sync-terminal', outcome: 'succeeded' });
+    assert.strictEqual(h.window(), win, 'the same window, never closed');
+    assert.strictEqual(win.status(), 'Complete!', first);
+    assert.strictEqual(win.doc.getElementById('repo-count').textContent, '1 repos synced', first);
+
+    h.clock.tick(2000); // the refused launch's old timers
+    assert.strictEqual(win.status(), 'Complete!', `${first}: the refusal does not come back`);
+    assert.deepStrictEqual(Object.keys(win.rows()), ['o/b']);
   }
 });

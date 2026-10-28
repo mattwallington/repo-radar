@@ -1305,8 +1305,10 @@ function startStatusServer() {
     }
 
     // Everything this update stores is stored; now resolve, once, what the window shows of it.
-    // Output and rate-limit lines are diagnostics and change nothing there.
-    if (logWindow && !logWindow.isDestroyed() && data.type !== 'output' && data.type !== 'rate-limit') {
+    // Output and rate-limit lines from the run already shown are diagnostics and change nothing
+    // there -- but one that just established a run (its first received update) is a takeover.
+    if (logWindow && !logWindow.isDestroyed()
+      && (verdict.started || (data.type !== 'output' && data.type !== 'rate-limit'))) {
       const shown = currentSyncView();
       if (verdict.started || data.type === 'sync-roster') {
         // A newly established run (or its roster): lay out its rows and replay what it has

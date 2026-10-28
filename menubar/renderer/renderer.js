@@ -471,12 +471,10 @@ ipcRenderer.on('sync-state', (event, view) => {
         if (reposList) reposList.textContent = '';
         updateStats(0, 0, 0, 0);
     }
-    if (!(view && view.phase === 'finished' && view.outcome)) {
-        // No finished outcome to summarize (any more): drop a completion summary shown earlier.
-        // Main re-sends it with each view that permits it.
-        const repoCount = document.getElementById('repo-count');
-        if (repoCount) repoCount.textContent = '';
-    }
+    // Drop any completion summary shown so far: main follows this view with its own summary
+    // ('sync-complete') only when the view permits it, so a summary never outlives its view.
+    const repoCount = document.getElementById('repo-count');
+    if (repoCount) repoCount.textContent = '';
     applySyncState(document, view);
 });
 
