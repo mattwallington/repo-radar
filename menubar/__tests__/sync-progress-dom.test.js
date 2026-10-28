@@ -932,13 +932,27 @@ test('a Sync Now that fails before starting leaves the previous run its completi
   a.post({ type: 'sync-terminal', outcome: 'succeeded' });
   a.end();
 
+  const COULD_NOT_START = 'Sync could not start — see ⚠️ View Errors in the menu';
+  const holdsNotice = (label) => {
+    const win = h.window();
+    assert.strictEqual(win.status(), COULD_NOT_START, label);
+    assert.deepStrictEqual(win.rows(), {}, `${label}: no rows`);
+    assert.strictEqual(win.stopEnabled(), false, `${label}: no Stop`);
+  };
+
+  // The runtime check fails before the window has even loaded.
   h.main.triggerSync({ showWindow: true });
-  h.clock.tick(200); // the window has loaded and replayed; the runtime check is still going
   const failedId = h.runs[h.runs.length - 1].opts.env.REPO_RADAR_ACTIVITY_ID;
   h.runs[h.runs.length - 1].reject(new Error('runtime could not be verified')); // not LockBusy
   await flush();
-  h.clock.tick(500);
-  assert.strictEqual(h.window().status(), 'Sync could not start — see ⚠️ View Errors in the menu');
+  h.clock.tick(110); // loaded at 50 ms; the refusal's poll delivers it at 100 ms
+  holdsNotice('after delivery');
+  h.clock.tick(100); // the window's own post-load replay, at 150 ms
+  holdsNotice('after the load replay');
+  h.clock.tick(500); // the start sender's timer
+  holdsNotice('after the start timer');
+  a.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } }); // A's late stats
+  holdsNotice('after a late update from the previous run');
   h.closeWindow();
 
   const win = h.openWindow();
@@ -948,6 +962,19 @@ test('a Sync Now that fails before starting leaves the previous run its completi
   assert.deepStrictEqual([entry.attemptId, entry.outcome], [a.id, 'succeeded']);
   const failed = activityRead.listActivities(h.home).items.find((i) => i.id === failedId);
   assert.strictEqual(failed.outcome, 'failed', 'the failed launch stays truthfully failed in Activity');
+  h.closeWindow();
+
+  // Another refusal while its window loads, then a genuine start in that same window: the new
+  // launch takes the window, and the old refusal's pending delivery doesn't repaint it.
+  h.main.triggerSync({ showWindow: true });
+  h.runs[h.runs.length - 1].reject(new Error('runtime could not be verified'));
+  await flush();
+  h.main.triggerSync({ showWindow: true });
+  h.clock.tick(60);
+  h.spawn();
+  h.clock.tick(1000);
+  assert.strictEqual(h.window().status(), 'Starting sync...');
+  assert.strictEqual(h.window().stopEnabled(), true, 'the new run is the app\'s own child');
 });
 
 test('a stray update while a run is known to be executing leaves no doubt once it ends', (t) => {
@@ -979,5 +1006,78 @@ test('a stray update while a run is known to be executing leaves no doubt once i
     assert.strictEqual(win.status(), 'Complete!', kind);
     assert.deepStrictEqual(Object.keys(win.rows()), ['o/one'], kind);
     h.closeWindow();
+  }
+});
+
+test('a progress or complete update for a run that already failed never paints Syncing or Complete', (t) => {
+  const failedText = 'Sync failed — see ⚠️ View Errors in the menu';
+  const agrees = (h, win, label) => {
+    const view = h.main.currentSyncView();
+    assert.deepStrictEqual([view.phase, view.outcome], ['finished', 'failed'], label);
+    assert.strictEqual(win.status(), failedText, label);
+    assert.strictEqual(win.stopEnabled(), false, `${label}: no Stop`);
+  };
+  const established = (h) => {
+    const b = h.scheduledWorker();
+    b.post({ type: 'sync-lifecycle', phase: 'syncing' });
+    b.post({ type: 'sync-roster', repos: [{ name: 'o/one', color: 'cyan' }] });
+    b.post({ type: 'progress', repo: 'o/one', status: 'Fetching', percent: 40, color: 'cyan' });
+    return b;
+  };
+
+  for (const first of ['progress', 'complete']) {
+    const h = makeHarness(t);
+    const b = established(h);
+    const win = h.openWindow();
+    assert.strictEqual(win.status(), 'Syncing...');
+    // Its failed terminal is durable in Activity and its lease released, but its terminal post
+    // never arrives: the app hasn't seen it yet when the next ordinary update comes.
+    b.end('failed');
+    if (first === 'progress') {
+      b.post({ type: 'progress', repo: 'o/one', status: 'Merging', percent: 80, color: 'cyan' });
+      agrees(h, win, 'after progress');
+      assert.deepStrictEqual(win.rows(), { 'o/one': 'Merging' }, 'its own row still updates');
+      assert.strictEqual(h.status().repos[0].status, 'Merging');
+    } else {
+      b.post({ type: 'complete', stats: { total: 1, errors: 1, updated: 0, cloned: 0 } });
+      agrees(h, win, 'after complete');
+      assert.strictEqual(h.status().syncState.stable.stats.total, 1, 'its stats are stored');
+      assert.strictEqual(win.doc.getElementById('repo-count').textContent, '1 repos synced',
+        'a failed run shows its own numbers');
+    }
+    h.closeWindow();
+    agrees(h, h.openWindow(), `${first}: reopened`);
+  }
+
+  // Control: still running (live lease). Its stats are stored but nothing is summarized, and the
+  // heading stays its phase, until its actual terminal arrives -- then its numbers appear.
+  {
+    const h = makeHarness(t);
+    const b = established(h);
+    const win = h.openWindow();
+    b.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } });
+    assert.strictEqual(h.status().syncState.stable.stats.total, 1);
+    assert.strictEqual(win.status(), 'Syncing...');
+    assert.strictEqual(win.doc.getElementById('repo-count').textContent, '');
+    b.post({ type: 'sync-terminal', outcome: 'succeeded' });
+    assert.strictEqual(win.status(), 'Complete!');
+    assert.strictEqual(win.doc.getElementById('repo-count').textContent, '1 repos synced');
+  }
+
+  // Control: a known run whose owner can't be read (unknown, but still its own rows). Its stats
+  // are stored, its rows stay, and no completion heading or summary appears.
+  {
+    const h = makeHarness(t);
+    const b = established(h);
+    const win = h.openWindow();
+    fs.rmSync(require(path.join(MENUBAR, 'activity', 'paths.js')).activityDir(h.home, b.id), { recursive: true, force: true });
+    b.post({ type: 'complete', stats: { total: 1, errors: 0, updated: 1, cloned: 0 } });
+    const view = h.main.currentSyncView();
+    assert.deepStrictEqual([view.phase, view.snapshot], ['unknown', true]);
+    assert.strictEqual(h.status().syncState.stable.stats.total, 1);
+    assert.strictEqual(win.status(), 'Sync status unknown — a sync may still be running');
+    assert.deepStrictEqual(win.rows(), { 'o/one': 'Fetching' });
+    assert.strictEqual(win.doc.getElementById('repo-count').textContent, '');
+    assert.strictEqual(win.stopEnabled(), false);
   }
 });

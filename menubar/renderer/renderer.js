@@ -343,13 +343,8 @@ ipcRenderer.on('progress-update', (event, data) => {
     
     if (data.repo && data.status && typeof data.percent !== 'undefined') {
         log('Calling updateRepoProgress for:', data.repo, 'percent:', data.percent);
+        // Row data only: the heading and Stop come from 'sync-state'.
         updateRepoProgress(data.repo, data.status, data.percent, data.color);
-        
-        // Update header status
-        const statusText = document.getElementById('status-text');
-        if (statusText) {
-            statusText.textContent = `Syncing: ${data.repo} - ${data.status}`;
-        }
     } else {
         log('ERROR: Invalid progress update data:', data);
     }
@@ -395,13 +390,10 @@ function updateRateLimitDisplay(rateLimitText) {
     }
 }
 
+// The run's completion summary and counters. Data only: main sends it alongside a 'sync-state'
+// whose outcome permits it, and that view alone sets the heading and Stop.
 ipcRenderer.on('sync-complete', (event, syncStats) => {
     console.log('Sync complete:', syncStats);
-    
-    const statusText = document.getElementById('status-text');
-    if (statusText) {
-        statusText.textContent = `Complete!`;
-    }
     
     const repoCount = document.getElementById('repo-count');
     if (repoCount) {
@@ -413,62 +405,9 @@ ipcRenderer.on('sync-complete', (event, syncStats) => {
         }
     }
     
-    // Disable stop button
-    const stopBtn = document.getElementById('stop-sync-btn');
-    if (stopBtn) {
-        console.log('Disabling stop button (sync complete)');
-        stopBtn.disabled = true;
-        stopBtn.classList.remove('active');
-        stopBtn.textContent = '⏹';
-    }
-    
     // Update total and recalculate everything
     stats.total = syncStats.total;
     recalculateStats();
-});
-
-ipcRenderer.on('waiting-for-network', (event) => {
-    console.log('Waiting for network connectivity...');
-    const statusText = document.getElementById('status-text');
-    if (statusText) {
-        statusText.textContent = 'Waiting for network...';
-        statusText.style.color = '#f0ad4e';
-    }
-});
-
-ipcRenderer.on('network-timeout', (event, message) => {
-    console.log('Network timeout:', message);
-    const statusText = document.getElementById('status-text');
-    if (statusText) {
-        statusText.textContent = 'No network connectivity — sync aborted';
-        statusText.style.color = '#d9534f';
-    }
-
-    // Disable stop button
-    const stopBtn = document.getElementById('stop-sync-btn');
-    if (stopBtn) {
-        stopBtn.disabled = true;
-        stopBtn.classList.remove('active');
-        stopBtn.textContent = '⏹';
-    }
-});
-
-ipcRenderer.on('sync-stopped', (event) => {
-    console.log('Sync was stopped by user');
-    
-    const statusText = document.getElementById('status-text');
-    if (statusText) {
-        statusText.textContent = 'Sync cancelled by user';
-    }
-    
-    // Disable stop button
-    const stopBtn = document.getElementById('stop-sync-btn');
-    if (stopBtn) {
-        console.log('Disabling stop button (sync stopped)');
-        stopBtn.disabled = true;
-        stopBtn.classList.remove('active');
-        stopBtn.textContent = '⏹';
-    }
 });
 
 ipcRenderer.on('sync-started', (event, data) => {
@@ -499,26 +438,7 @@ ipcRenderer.on('sync-started', (event, data) => {
     }
     
     updateStats(0, 0, data.total || 0, 0);
-    
-    const statusText = document.getElementById('status-text');
-    if (statusText) {
-        statusText.textContent = 'Starting sync...';
-    }
-    
-    // Enable stop button -- unless main says this run can't be stopped from here (a scheduled
-    // worker the app didn't start).
-    const stopBtn = document.getElementById('stop-sync-btn');
-    if (stopBtn && data.canStop === false) {
-        stopBtn.disabled = true;
-        stopBtn.classList.remove('active');
-    } else if (stopBtn) {
-        log('Enabling stop button');
-        stopBtn.disabled = false;
-        stopBtn.classList.add('active');
-        stopBtn.textContent = '⏹';
-    } else {
-        log('ERROR: Stop button element not found!');
-    }
+    // Roster data only: main follows this with the resolved 'sync-state' for the heading and Stop.
 });
 
 // Ruling P6-1: this attempt opened the window and then never started -- either another sync held
@@ -549,9 +469,13 @@ ipcRenderer.on('sync-state', (event, view) => {
         repoStates.clear();
         const reposList = document.getElementById('repos-list');
         if (reposList) reposList.textContent = '';
+        updateStats(0, 0, 0, 0);
+    }
+    if (!(view && view.phase === 'finished' && view.outcome)) {
+        // No finished outcome to summarize (any more): drop a completion summary shown earlier.
+        // Main re-sends it with each view that permits it.
         const repoCount = document.getElementById('repo-count');
         if (repoCount) repoCount.textContent = '';
-        updateStats(0, 0, 0, 0);
     }
     applySyncState(document, view);
 });
@@ -580,11 +504,9 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log('Stop button clicked');
             
             // Confirm with user
+            // Intent only: main answers with the resolved view, which no longer offers Stop.
             if (confirm('Are you sure you want to stop the sync?')) {
                 ipcRenderer.send('stop-sync');
-                stopBtn.disabled = true;
-                stopBtn.classList.remove('active');
-                stopBtn.textContent = '⏹';
             }
         });
     }

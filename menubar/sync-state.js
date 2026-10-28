@@ -48,6 +48,7 @@
 //   pendingAttemptIds   Electron's own attempts that have not got the root lock yet (a manual
 //                       click holds an Activity lease while it waits, so it must not count as a
 //                       running worker)
+//   cancellingAttemptId Electron's own live child that Stop has been clicked for, if any
 //   ownerState(id)      'busy' | 'free' | 'uncertain', from the attempt's Activity owner lease
 //   evidence()          { available, truncated, incomplete,
 //                         attempts: [{ id, startedAt, outcome, owner, incomplete }] } for this
@@ -469,20 +470,33 @@ function _viewOf(entry, extra) {
 const _unknownView = (entry) => _viewOf(entry, { phase: UNKNOWN, outcome: null, reason: null,
   stats: null });
 
+// A status file from an older build, with no sign of a running sync: its last run is presented as
+// that build did -- complete, with its stored rows and stats -- or not at all when it has none.
+// Presentation only: no attempt ID, terminal or entry is made up for it.
+function _legacyView(status) {
+  const repos = status && Array.isArray(status.repos) ? status.repos : [];
+  if (repos.length === 0) return null;
+  const stats = status.stats && typeof status.stats === 'object' ? status.stats : null;
+  return _viewOf(null, { phase: FINISHED, outcome: 'succeeded', stats, legacy: true,
+    snapshot: true });
+}
+
 // What a window opening now (or the app starting) should show for this channel. Returns
 // { view, changed }: `changed` means the status object was updated (a known attempt's outcome was
 // recovered) and should be saved. Who is current is never changed here: this only settles the
 // known attempt from its own evidence, and says "unknown" whenever the evidence can't show that
-// it is still the latest. `view` is null only for a status file from an older build with no sign
-// of a running sync, so the caller keeps that file's old replay.
+// it is still the latest. A status file from an older build with no sign of a running sync gets
+// its compatibility presentation (`legacy: true`), or null when it has no run to show.
 function resolve(status, ctx = {}) {
   const ch = ctx.channel;
   const now = ctx.now || new Date().toISOString();
   const entry = current(status, ch);
 
-  // Electron's own worker: it holds the root lock, nothing can outrank it.
+  // Electron's own worker: it holds the root lock, nothing can outrank it. Once Stop has been
+  // clicked for it, Stop is not offered again while it winds down.
   if (_isChild(entry, ctx)) {
-    return { view: _viewOf(entry, { live: true, canStop: true }), changed: false };
+    const cancelling = ctx.cancellingAttemptId === entry.attemptId;
+    return { view: _viewOf(entry, { live: true, canStop: !cancelling }), changed: false };
   }
 
   if (!entry) {
@@ -493,7 +507,8 @@ function resolve(status, ctx = {}) {
     }
     const ev = _evidence(ctx);
     const quiet = ev.sufficient && !_candidates(ev, ctx, null).some((a) => a.owner === 'busy');
-    return { view: quiet ? null : _unknownView(null), changed: false };
+    if (!quiet) return { view: _unknownView(null), changed: false };
+    return { view: _legacyView(status), changed: false };
   }
 
   // Only an attempt seen running (Electron's own spawn, or its own worker updates) is shown as
