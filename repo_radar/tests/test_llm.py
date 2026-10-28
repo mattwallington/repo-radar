@@ -318,8 +318,20 @@ def test_retired_openai_selection_sends_offline_without_litellm_model_map():
 @pytest.mark.parametrize('content,stop_reason', [
     ([{"type": "thinking", "thinking": "", "signature": "s"}], "end_turn"),  # thinking, no text
     ([{"type": "text", "text": "Partial analys"}], "max_tokens"),           # cut off mid-answer
+    # Valid-looking metadata cut off by the context window: litellm maps this raw stop to "stop"
+    # unless call_llm teaches it otherwise, so the raw reason must come from the transport.
+    ([{"type": "text", "text": "QUICK_REFERENCE_START\nType: Service\nQUICK_REFERENCE_END\n"
+                               "ONE_LINE_SUMMARY_START\nAn API.\nONE_LINE_SUMMARY_END\n"
+                               "RELATED_REPOS_START\nRELATED_REPOS_END\n# Overview\nThe service hand"}],
+     "model_context_window_exceeded"),
 ])
 def test_incomplete_claude_reply_raises_instead_of_returning_a_stub(monkeypatch, content, stop_reason):
+    import socket
+
+    def blocked(*a, **k):
+        raise OSError("network blocked in test")
+
+    monkeypatch.setattr(socket.socket, 'connect', blocked)
     sent = []
 
     def handle(self, request):

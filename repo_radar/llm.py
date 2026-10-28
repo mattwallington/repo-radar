@@ -218,9 +218,22 @@ class IncompleteResponseError(Exception):
     """A provider reply that must not be used as an analysis: no visible text, or cut off."""
 
 
-# finish_reason values that mean the reply was cut off: litellm maps Anthropic's max_tokens stop to
-# "length" and passes the unmapped context-window stop through unchanged.
+# finish_reason values that mean the reply was cut off. litellm maps Anthropic's max_tokens stop to
+# "length", but it maps any stop reason it doesn't know to "stop", so the context-window stop would
+# read as a clean finish; _map_context_window_stop_as_truncation() maps that one to "length" too.
 _TRUNCATED_FINISH_REASONS = frozenset({"length", "model_context_window_exceeded"})
+
+
+def _map_context_window_stop_as_truncation():
+    """Make litellm report Anthropic's model_context_window_exceeded stop as "length".
+
+    Depends on litellm's private _FINISH_REASON_MAP (pinned 1.105.6), which lacks this reason.
+    Adding the entry once is idempotent and safe for concurrent workers, unlike swapping the mapper
+    per request. If litellm moves the map this import fails loudly rather than accepting truncated
+    replies. Remove it once the pinned litellm maps this reason itself.
+    """
+    from litellm.litellm_core_utils.core_helpers import _FINISH_REASON_MAP
+    _FINISH_REASON_MAP.setdefault("model_context_window_exceeded", "length")
 
 
 def call_llm(model, prompt, max_tokens=8192):
@@ -256,6 +269,8 @@ def call_llm(model, prompt, max_tokens=8192):
                 text = ''
     else:
         extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
+        if provider == 'anthropic':
+            _map_context_window_stop_as_truncation()
         response = litellm.completion(
             model=model,
             messages=_completion_messages(prompt),
