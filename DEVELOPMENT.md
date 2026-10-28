@@ -56,7 +56,11 @@ repo-radar/
 
 ## Releasing
 
+**Current process:** releases are now built locally with `build-local.sh`, signed and notarized with Reperio Health's Apple team (see https://github.com/mattwallington/repo-radar/pull/4 and README's "Building a signed app locally"). It builds the channel that matches the branch, needs an explicit `--version`, runs the same release checks as `release.sh`, and publishes nothing. Publishing with `release.sh` is paused until the update feed moves to the ReperioHealth org: its `--dry-run` still runs every check, but a real run stops after them. The `release.sh` instructions below describe publishing once it resumes.
+
 Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases. The app includes auto-update — existing users are prompted when a new version is available.
+
+Before any run, including `--dry-run`, set `REPO_RADAR_RELEASE_PYTHON` to a release venv built from the matching dependency lock. See "Preparing a release" in [README.md](README.md#preparing-a-release) or `./release.sh --help`.
 
 ```bash
 # Patch release (default, no args needed)

@@ -47,17 +47,16 @@ See the [Setup Guide](menubar/SETUP.md) for detailed instructions.
 
 ### AI Models
 
-The default model is `claude-sonnet-5` (1M context window). Override in the menubar Settings — the dropdown has 18 models across 5 groups: a pinned "⭐ Recommended" section at the top, an "(other)" section per provider, and an "Advanced — Responses API" section for the higher-cost/latency models.
+The default model is `claude-sonnet-5-5` (Claude Sonnet 5.5, 1M context window). Override it in the menubar Settings. The dropdown has a pinned "⭐ Recommended" group, a "Higher capability" group, an "(older)" group per provider, and an "Advanced — Responses API" group for the higher-cost, higher-latency models.
 
-Pinned recommended models:
+| Group | Models |
+|-------|--------|
+| ⭐ Recommended | **Claude Sonnet 5.5** (default), Claude Opus 5.5, Claude Haiku 5.5; Gemini 3.8 Flash, Gemini 3.5 Flash-Lite; GPT-6.1 Sol, GPT-6.1 Terra, GPT-6 Luna |
+| Higher capability (higher cost) | Claude Fable 5.1, GPT-6 Astra, Gemini 4 Argon |
+| Older, still supported | Earlier Claude, Gemini and GPT models. Gemini 2.5 is available only to Google projects that already used it |
+| Advanced — Responses API | GPT-5.5 Pro, GPT-5.3 Codex |
 
-| Provider | Models | Context |
-|----------|--------|---------|
-| Anthropic | **Claude Sonnet 5** (default), Claude Opus 4.8, Claude Haiku 4.5 | 1M / 1M / 200K |
-| Google | Gemini 3.5 Flash, Gemini 3.1 Flash Lite | 1M |
-| OpenAI | GPT-5.6 Terra, GPT-5.6 Luna | 1M |
-
-Also available: Claude Fable 5, Claude Opus 4.7, Claude Sonnet 4.6 (Anthropic); Gemini 3.1 Pro (Preview), Gemini 2.5 Pro, Gemini 2.5 Flash (Google); GPT-5.6 Sol, GPT-5.5, o3 (OpenAI); GPT-5.3 Codex (400K), GPT-5.5 Pro (Advanced — Responses API, higher cost/latency).
+A saved model that is still supported but no longer listed stays selected. When a vendor retires a model, Repo Radar moves you to the newest model of the same provider, family and tier, for example an older Flash to the newest Flash, or an OpenAI mini to the newest mini-tier model. It never moves you to a different tier or provider.
 
 ### LLM Integration
 

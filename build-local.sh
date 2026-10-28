@@ -138,12 +138,12 @@ node scripts/check_release_python.js "$RELEASE_PY" || {
 success "Release Python verified: $RELEASE_PY"
 
 BUILD_DATE=$(date +%Y-%m-%d)
-"$RELEASE_PY" -B scripts/check_model_lifecycle.py --target-date "$BUILD_DATE" || {
+"$RELEASE_PY" -I -B scripts/check_model_lifecycle.py --target-date "$BUILD_DATE" || {
   echo "Build blocked: model lifecycle gate failed. Re-verify vendor deprecation pages and amend repo_radar/model_lifecycle.json + the model maps." >&2
   exit 1
 }
 
-"$RELEASE_PY" -B scripts/check_model_windows.py --target-date "$BUILD_DATE" || {
+"$RELEASE_PY" -I -B scripts/check_model_windows.py --target-date "$BUILD_DATE" || {
   echo "Build blocked: model window gate failed. Re-verify vendor windows; fix repo_radar/model_catalog.py or add a bound override." >&2
   exit 1
 }

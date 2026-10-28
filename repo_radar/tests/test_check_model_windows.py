@@ -360,22 +360,20 @@ def test_override_cannot_clear_count_strategy_block():
     assert any(f.field == "count_strategy" and f.blocking for f in findings), findings  # NOT cleared
 
 
-def test_real_overrides_file_is_eight_wellformed_dicts():
+def test_real_overrides_file_is_wellformed():
+    # litellm 1.105 reports Google's 65,536 Gemini output cap itself, so the eight 65,535
+    # overrides were dropped. Any future row must still be complete and unique.
     import json
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     data = json.loads((root / "repo_radar" / "model_window_overrides.json").read_text())
-    assert isinstance(data, list) and len(data) == 8, data
+    assert isinstance(data, list), data
     required = {"model", "field", "catalog_value", "litellm_value", "vendor_url", "verified_at", "justification"}
     for ov in data:
         assert isinstance(ov, dict) and required <= set(ov), ov
-        assert ov["field"] == "max_output", ov
-        assert ov["catalog_value"] == 65536 and ov["litellm_value"] == 65535, ov
-        assert ov["vendor_url"] == "https://ai.google.dev/gemini-api/docs/models", ov
-        assert ov["verified_at"] == "2026-08-08", ov
         assert isinstance(ov["justification"], str) and ov["justification"].strip(), ov
-    models = {ov["model"] for ov in data}
-    assert len(models) == 8, "override (model, field) pairs must be unique"
+    pairs = [(ov["model"], ov["field"]) for ov in data]
+    assert len(pairs) == len(set(pairs)), "override (model, field) pairs must be unique"
 
 
 def test_cli_requires_iso_date():

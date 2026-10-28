@@ -2,7 +2,8 @@ const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { MODEL_MIGRATIONS, MODEL_CAPS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel, MODEL_SUGGESTIONS } = require('../model-policy');
+const { MODEL_MIGRATIONS, MODEL_CAPS, KNOWN_MODEL_IDS, DEFAULT_MODEL, providerForModel, MODEL_SUGGESTIONS,
+  MODEL_TIERS, FLOATING_ALIASES } = require('../model-policy');
 const root = path.join(__dirname, '..', '..');
 const py = process.platform === 'win32' ? 'python' : 'python3';
 
@@ -15,6 +16,7 @@ const out = execFileSync(py, ['-c',
   "fx=json.loads(sys.argv[1]);" +
   "ids=sorted(set(llm.KNOWN_LIMITS)|set(llm.MODEL_MIGRATIONS)|set(fx));" +
   "print(json.dumps({'d':llm.DEFAULT_MODEL,'m':llm.MODEL_MIGRATIONS,'k':sorted(llm.KNOWN_LIMITS)," +
+  "'tiers':llm.MODEL_TIERS,'aliases':sorted(llm.FLOATING_ALIASES)," +
   "'caps':{m:{'max_input':c.max_input,'max_output':c.max_output} for m,c in model_catalog.MODEL_CAPS.items()}," +
   "'prov':{i:llm.provider_for_model(i) for i in ids}}))",
   JSON.stringify(FIXTURES)],
@@ -25,6 +27,8 @@ assert.strictEqual(DEFAULT_MODEL, p.d, 'DEFAULT_MODEL drift');
 assert.deepStrictEqual(Object.keys(MODEL_MIGRATIONS).sort(), Object.keys(p.m).sort(), 'migration key drift');
 for (const k of Object.keys(MODEL_MIGRATIONS)) assert.strictEqual(MODEL_MIGRATIONS[k], p.m[k], `migration value drift ${k}`);
 assert.deepStrictEqual([...KNOWN_MODEL_IDS].sort(), p.k, 'KNOWN_MODEL_IDS drift');
+assert.deepStrictEqual(MODEL_TIERS, p.tiers, 'MODEL_TIERS drift (members and newest-first order)');
+assert.deepStrictEqual([...FLOATING_ALIASES].sort(), p.aliases, 'FLOATING_ALIASES drift');
 
 // MODEL_CAPS parity: every known model's {max_input, max_output} must match Python exactly.
 assert.deepStrictEqual(Object.keys(MODEL_CAPS).sort(), Object.keys(p.caps).sort(), 'MODEL_CAPS key drift');
@@ -55,6 +59,10 @@ for (const [from, to] of Object.entries(MODEL_SUGGESTIONS)) {
   assert.ok(!(to in MODEL_MIGRATIONS), `suggestion target must be current (not a migration key): ${to}`);
   assert.strictEqual(providerForModel(from), providerForModel(to), `suggestion crosses provider: ${from} -> ${to}`);
   assert.notStrictEqual(from, to, `suggestion is a self-map: ${from}`);
+  const tier = Object.keys(MODEL_TIERS).find((t) => MODEL_TIERS[t].includes(from));
+  assert.ok(tier, `suggestion key has no tier: ${from}`);
+  assert.strictEqual(to, MODEL_TIERS[tier].find((m) => KNOWN_MODEL_IDS.has(m)),
+    `suggestion must target the newest member of ${from}'s own tier`);
 }
 console.log('MODEL_SUGGESTIONS invariants OK:', Object.keys(MODEL_SUGGESTIONS).length, 'rows');
 

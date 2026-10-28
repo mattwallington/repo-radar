@@ -39,13 +39,14 @@ test(
     const clean = verifyInstalledSet(python, manifest);
     assert.deepStrictEqual(clean, { ok: true, extra: [], missing: [], mismatched: [] });
 
-    // Inject an extra (unmanifested) distribution.
-    execFileSync(pip, ['install', '-q', '--no-deps', 'six']);
+    // Inject an extra (unmanifested) distribution. Not `six`: litellm's boto3 deps now lock it.
+    assert.ok(!('toml' in manifest.dists), 'the injected extra must not be a locked distribution');
+    execFileSync(pip, ['install', '-q', '--no-deps', 'toml']);
     const withExtra = verifyInstalledSet(python, manifest);
     assert.strictEqual(withExtra.ok, false);
     assert.deepStrictEqual(withExtra.missing, []);
     assert.deepStrictEqual(withExtra.mismatched, []);
-    assert.ok(withExtra.extra.includes('six'));
+    assert.ok(withExtra.extra.includes('toml'));
 
     // Inject a version mismatch on a real manifest entry.
     assert.ok(manifest.dists.idna, 'expected idna in manifest.dists for this test to be meaningful');
@@ -55,7 +56,7 @@ test(
     assert.ok(withMismatch.mismatched.includes('idna'));
 
     // Remove a required distribution entirely (uninstall without cascading).
-    execFileSync(pip, ['uninstall', '-y', '-q', 'six']);
+    execFileSync(pip, ['uninstall', '-y', '-q', 'toml']);
     execFileSync(pip, ['install', '-q', '--no-deps', '--force-reinstall', `idna==${manifest.dists.idna}`]);
     execFileSync(pip, ['uninstall', '-y', '-q', 'certifi']);
     const withMissing = verifyInstalledSet(python, manifest);
@@ -71,4 +72,18 @@ test('isCovered reflects checked-in lock+manifest presence', () => {
   assert.strictEqual(isCovered('cpython-3.9.0-arm64'), false);    // 3.9 is below the supported floor -> no lock
   assert.strictEqual(isCovered('pypy-3.10.0-arm64'), false);      // non-cpython impl unsupported
   assert.strictEqual(isCovered('garbage'), false);
+});
+
+// provision() checks the installed litellm against the cell manifest's version, so each
+// manifest must carry the version requirements.txt pins. A bump that skips regenerating a cell
+// fails here instead of on a user's machine.
+test('every lock manifest pins the litellm version requirements.txt declares', () => {
+  const req = fs.readFileSync(path.join(PYDEPS_DIR, '..', '..', 'requirements.txt'), 'utf8');
+  const pin = /^litellm==(\S+)$/m.exec(req)[1];
+  const manifests = fs.readdirSync(PYDEPS_DIR).filter((f) => f.endsWith('.manifest.json'));
+  assert.strictEqual(manifests.length, 10);
+  for (const f of manifests) {
+    const m = JSON.parse(fs.readFileSync(path.join(PYDEPS_DIR, f), 'utf8'));
+    assert.strictEqual(m.dists.litellm, pin, f);
+  }
 });

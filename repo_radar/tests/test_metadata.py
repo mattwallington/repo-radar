@@ -251,6 +251,39 @@ def test_legacy_file_without_parse_status_is_inferred_degraded(tmp_path, monkeyp
     assert "degraded metadata" in index_file.read_text()
 
 
+def test_legacy_files_without_parse_status_are_all_indexed(tmp_path, monkeypatch):
+    """Old files carry no parse_status, so it's inferred. A brief that opens with a leaked fragment
+    is listed as degraded and a normal one as ok; neither is dropped from INDEX.md. (The fragment
+    branch once referenced a deleted constant, so every such file raised and was skipped.)"""
+    import repo_radar.metadata as metadata
+
+    def legacy(name, brief):
+        (tmp_path / f"{name}-bbb2222.md").write_text(
+            "---\n"
+            f"repo_name: {name}\n"
+            f"full_name: org/{name}\n"
+            f"cache_dir: {name}-bbb2222\n"
+            f"brief: {brief}\n"
+            "type: Library\n"
+            "language: Python\n"
+            "related_repos: []\n"
+            f"---\n\n# Repository: org/{name}\n"
+        )
+
+    legacy("leaky", '{"brief": "A summary that leaked through as JSON')
+    legacy("healthy", "A perfectly good summary sentence.")
+    index_file = tmp_path / "INDEX.md"
+    monkeypatch.setattr(metadata, "PRISTINE_DIR", tmp_path)
+    monkeypatch.setattr(metadata, "INDEX_FILE", index_file)
+    monkeypatch.setattr(metadata, "load_cache_index", lambda: {})
+
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    content = index_file.read_text()
+    assert "org/leaky" in content and "org/healthy" in content
+    degraded_line = next(l for l in content.splitlines() if "degraded metadata" in l)
+    assert "org/leaky" in degraded_line and "org/healthy" not in degraded_line
+
+
 # ── saved raw responses are owner-only, redacted, capped, and pruned ─────────────────
 
 

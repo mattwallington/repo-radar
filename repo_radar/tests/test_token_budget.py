@@ -145,7 +145,7 @@ def test_repack_splits_a_component_overshoot_chunk():
     """The exact seam class Codex reproduced. With this config, per-file-component packing yields a
     chunk whose REAL assembled prompt is 1094 tokens against a 1090 budget — the seams add tokens
     the component sum misses. The repack pass must split it so every real prompt fits. Pinned to
-    litellm 1.93.0's tokenizer (a version the suite already asserts). This test FAILS if pass 3 is
+    the locked litellm's tokenizer (a version the suite already asserts). This test FAILS if pass 3 is
     removed, unlike the invariant sweep above."""
     model, budget = "claude-opus-5", 1090
     body = "def f_0(x):\n    return x + compute(x)  # note\n" * 6

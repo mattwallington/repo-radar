@@ -11,9 +11,21 @@ def _parsed(sd):
         return None
 
 
-def check(manifest_path, known_ids, migration_keys, target_date):
-    """Return a list of failure strings (never raises for malformed rows)."""
+def check(manifest_path, known_ids, migration_keys, target_date, tiers=None):
+    """Return a list of failure strings (never raises for malformed rows).
+
+    `tiers` is llm.MODEL_TIERS. Every tier must keep a known (live) member for its retired ids to
+    land on, and every member must be known or a migration key. Checked from the tier table itself,
+    so a fully retired tier fails by name even if its lifecycle rows were deleted to match.
+    """
     failures = []
+    for tier, members in (tiers or {}).items():
+        if not any(m in known_ids for m in members):
+            failures.append(f"tier {tier}: no known member left for its retired ids to move to "
+                            f"(members: {members}); decide where its users go")
+        stray = [m for m in members if m not in known_ids and m not in migration_keys]
+        if stray:
+            failures.append(f"tier {tier}: members neither known nor migrated: {stray}")
     try:
         rows = json.loads(Path(manifest_path).read_text())
     except Exception as e:
@@ -82,7 +94,8 @@ def main():
     from repo_radar import llm
     from repo_radar import model_catalog
     failures = check(str(root / "repo_radar" / "model_lifecycle.json"),
-                     set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), target)
+                     set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), target,
+                     tiers=llm.MODEL_TIERS)
     if failures:
         print("MODEL LIFECYCLE GATE FAILED:", file=sys.stderr)
         for f in failures:

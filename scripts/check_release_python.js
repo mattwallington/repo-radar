@@ -16,7 +16,10 @@ const { execFileSync } = require('child_process');
 const { probe } = require('../menubar/runtime/interpreter');
 const { selectFor, verifyInstalledSet, isCovered } = require('../menubar/runtime/deps');
 
-const ENV = { ...process.env, PYTHONDONTWRITEBYTECODE: '1' };
+// Every interpreter this check starts (the probe, pip list, pip check) inherits this, so verifying
+// the release venv never writes bytecode into it.
+process.env.PYTHONDONTWRITEBYTECODE = '1';
+const ENV = process.env;
 
 function check(exe) {
   if (!exe || !path.isAbsolute(exe)) return [`not an absolute path: ${JSON.stringify(exe || '')}`];

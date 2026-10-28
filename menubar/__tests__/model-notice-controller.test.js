@@ -31,7 +31,7 @@ test('maybe: dev build shows nothing (stable-only)', () => {
 });
 test('maybe: dedup — a matching ack shows nothing', () => {
   const { ctl, state } = harness();
-  state.config.model_notice_ack = 'suggestion:claude-sonnet-4-6>claude-sonnet-5';
+  state.config.model_notice_ack = 'suggestion:claude-sonnet-4-6>claude-sonnet-5-5';
   assert.strictEqual(ctl.maybe(), null);
   assert.strictEqual(state.windows.length, 0);
 });
@@ -51,7 +51,7 @@ test('onAction switch: persists suggested, reconciles, destroys, finalized', () 
   const { ctl, state } = harness();
   const w = ctl.maybe();
   ctl.onAction(w.webContents, 'switch');
-  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5');
+  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5-5');
   assert.strictEqual(state.reconciled, 1);
   assert.strictEqual(w.destroyed, true);
   assert.strictEqual(ctl.isFinalized(), true);
@@ -83,13 +83,12 @@ test('idempotent: a second action after finalize does nothing', () => {
   ctl.onAction(w.webContents, 'switch');
   assert.strictEqual(state.saved.length, 1);
 });
-test('compound Keep: persists effective + acks resulting suggestion; re-run dedups', () => {
+test('retired Flash acknowledge: persists the newest Flash; re-run shows nothing', () => {
   const { ctl, state } = harness({ config: { ai_model: 'gemini/gemini-2.0-flash' } });
   const w = ctl.maybe();
-  ctl.onAction(w.webContents, 'keep');
-  assert.strictEqual(state.saved[0].ai_model, 'gemini/gemini-2.5-flash');
-  assert.strictEqual(state.saved[0].model_notice_ack, 'suggestion:gemini/gemini-2.5-flash>gemini/gemini-3.6-flash');
-  assert.strictEqual(ctl.maybe(), null, 'resulting config dedups the follow-on suggestion');
+  ctl.onAction(w.webContents, 'acknowledge');
+  assert.strictEqual(state.saved[0].ai_model, 'gemini/gemini-3.8-flash');
+  assert.strictEqual(ctl.maybe(), null, 'the newest Flash has no follow-on suggestion');
 });
 test('closeDecision is pure: handle normally, allow when finalized', () => {
   const { ctl } = harness();
@@ -125,6 +124,6 @@ test('migration Review: persists effective (heals retired id) and opens Settings
   const { ctl, state } = harness({ config: { ai_model: 'claude-3-5-sonnet-20241022' } });
   const w = ctl.maybe();
   ctl.onAction(w.webContents, 'review');
-  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5');
+  assert.strictEqual(state.saved[0].ai_model, 'claude-sonnet-5-5');
   assert.strictEqual(state.settingsOpened, 1);
 });
