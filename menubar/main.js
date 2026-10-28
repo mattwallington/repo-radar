@@ -36,6 +36,7 @@ const syncState = require('./sync-state');
 const activityLease = require('./activity/lease');
 const activityPaths = require('./activity/paths');
 const activityReconcile = require('./activity/reconcile');
+const activityLimits = require('./activity/limits');
 let appIsQuitting = false;
 let modelNoticeController = null;
 let modelUpdateWindow = null; // the open notice window, if any (Codex code-review: never coexist with Settings)
@@ -294,27 +295,33 @@ function attemptReconciledOutcome(attemptId) {
   }
 }
 
-// This channel's sync attempts as the Activity store records them, newest first, through the
-// same reader (and its bounds) the Activity window uses. null when the store can't be read.
-// Only an unfinished attempt's owner lease is probed.
+// This channel's sync attempts as the Activity store records them, through the same reader (and
+// its bounds) the Activity window uses, with the reader's own word on how complete that is:
+// unreadable, cut off at its page limit, or holding records it could not fully read. Only an
+// unfinished attempt's owner lease is probed.
 function syncAttemptEvidence() {
+  const unavailable = { available: false, truncated: false, incomplete: false, attempts: [] };
   try {
     const home = os.homedir();
     const res = activityRead.listActivities(home, {}, {
       configuredSecrets: activityGlue.loadConfiguredSecrets(home),
     });
-    if (!res || !res.available) return null;
+    if (!res || !res.available || !Array.isArray(res.items)) return unavailable;
     const attempts = res.items
       .filter((i) => !i.legacy && i.kind === 'sync' && i.channel === runtimeChannel)
       .map((i) => ({
         id: i.id,
         startedAt: i.startedAt,
         outcome: i.outcome,
+        incomplete: !!i.incomplete,
         owner: (i.outcome === 'running' || i.outcome === 'unknown') ? attemptOwnerState(i.id) : 'free',
       }));
-    return { attempts };
+    // The reader also sets `truncated` when it skipped old pre-Activity text logs, which can't
+    // hide an Activity record; only a full page means records may have been left out.
+    const truncated = !!res.truncated && res.items.length >= activityLimits.LIST_MAX;
+    return { available: true, truncated, incomplete: !!res.incomplete, attempts };
   } catch (e) {
-    return null;
+    return unavailable;
   }
 }
 
@@ -335,9 +342,10 @@ function syncStateContext() {
 }
 
 // What a progress window should show for this channel's current attempt right now, or null when
-// status.json has no attempt view yet (written by an older build). The current attempt is settled
-// from evidence first -- a worker whose updates were missed, or a finished one -- and recorded, so
-// later reads don't repeat the work. This only reads; it never starts a sync to find out.
+// status.json has no attempt view yet (written by an older build). A known attempt whose worker
+// has gone is settled from its own Activity record first, and recorded; when the evidence can't
+// show the current attempt is still the latest, the view says unknown. This only reads; it never
+// starts a sync to find out.
 function currentSyncView() {
   const status = loadStatus();
   const { view, changed } = syncState.resolve(status, syncStateContext());
@@ -346,10 +354,17 @@ function currentSyncView() {
 }
 
 // Push the current attempt's phase/outcome to the progress window, if one is open and loaded.
-function sendSyncStateToWindow(win = logWindow) {
+// `view` defaults to a full resolve; a caller holding the attempt's own news passes its own view.
+function sendSyncStateToWindow(win = logWindow, view = undefined) {
   if (!win || win.isDestroyed() || !win.webContents || win.webContents.isLoading()) return;
-  const view = currentSyncView();
-  if (view) win.webContents.send('sync-state', view);
+  const shown = view === undefined ? currentSyncView() : view;
+  if (shown) win.webContents.send('sync-state', shown);
+}
+
+// The current attempt as its own latest news has it (an update it just sent, or its own child's
+// exit): no Activity discovery, which could only blur what the app has just been told.
+function ownSyncView(status = loadStatus()) {
+  return syncState.ownView(status, syncStateContext());
 }
 
 // Electron's own worker for `attemptId` exited. Unless the worker already reported its outcome,
@@ -366,7 +381,10 @@ function finishChildAttempt(attemptId, code, wasCancelled, durable) {
     syncState.finish(status, runtimeChannel, attemptId, outcome);
     saveStatus(status);
   }
-  sendSyncStateToWindow();
+  // This child's own exit is news about this attempt; anything else gets the full check.
+  const now = syncState.current(status, runtimeChannel);
+  const own = !!now && now.attemptId === (attemptId || null);
+  sendSyncStateToWindow(logWindow, own ? ownSyncView(status) : undefined);
 }
 
 // Load last status
@@ -1081,7 +1099,12 @@ function startStatusServer() {
     const admitted = loadStatus();
     const verdict = syncState.admit(admitted, data, syncStateContext());
     if (!verdict.accept) {
-      console.log('Ignoring status update from a superseded or finished attempt:', data.type);
+      console.log('Ignoring status update from an attempt that is not current:', data.type);
+      // A run the evidence can't identify: the current result is no longer shown as the latest.
+      if (verdict.changed) {
+        saveStatus(admitted);
+        sendSyncStateToWindow();
+      }
       res.json({ success: true });
       return;
     }
@@ -1098,7 +1121,7 @@ function startStatusServer() {
       // replay what it has reported so far, then carry on with this update below.
       if (logWindow) replaySyncToWindow(logWindow);
     } else if (data.type === 'sync-lifecycle' || data.type === 'sync-terminal') {
-      sendSyncStateToWindow();
+      sendSyncStateToWindow(logWindow, ownSyncView(admitted));
     }
 
     if (data.type === 'output') {
@@ -1201,7 +1224,7 @@ function startStatusServer() {
       saveStatus(status);
       if (logWindow && !logWindow.isDestroyed() && data.stats) {
         logWindow.webContents.send('sync-complete', data.stats);
-        sendSyncStateToWindow(); // the outcome stays on top of the stats
+        sendSyncStateToWindow(logWindow, ownSyncView(status)); // the outcome stays on top of the stats
       }
     } else if (data.type === 'complete') {
       // Sync complete
@@ -1320,8 +1343,10 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   const settlePending = () => { if (pendingId) pendingManualAttempts.delete(pendingId); };
 
   if (currentSyncProcess) {
-    settlePending();
+    // Turned away: record that first, and only then stop treating it as pending, so nothing
+    // reading the Activity store in between takes its lease for another running worker.
     activityGlue.onContention(activity.writer, 'already-syncing');
+    settlePending();
     // Ruling P6-1: deliberately NO 'sync-refused' here. This returns above the status reset and
     // above showLogWindow(), so this attempt opened no window -- and any window that IS up is
     // showing the live sync's real progress. Refusing it would wipe a running sync's grid. The
@@ -1506,10 +1531,13 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
   };
 
   // Root lock busy because another run holds it: if that run is one we can show, put it in this
-  // attempt's window rather than clearing the window with a refusal. Returns false otherwise.
+  // attempt's window rather than clearing the window with a refusal. If who holds it can't be
+  // established, say unknown -- a refusal would clear a run that may well be going. Returns false
+  // when there is nothing better than the refusal to show.
   const showRunningSyncInstead = () => {
     const view = currentSyncView();
-    if (!view || !view.live || view.attemptId === attemptId) return false;
+    if (!view || view.attemptId === attemptId) return false;
+    if (!view.live && view.phase !== syncState.UNKNOWN) return false;
     syncRefusedForThisAttempt = true;
     clearPendingStart();
     const deliver = () => {
@@ -1545,7 +1573,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       setTimeout(sendSyncStartedWhenReady, 100);
       return;
     }
-    const entry = syncState.current(loadStatus(), runtimeChannel);
+    const st = loadStatus();
+    const entry = syncState.current(st, runtimeChannel);
     if (!entry || entry.attemptId !== attemptId) {
       console.log('Not filling the window: another sync attempt is current');
       clearPendingStart();
@@ -1559,8 +1588,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     }
     clearPendingStart();
     // The attempt's rows and where it really is -- possibly already waiting for network, or even
-    // finished: an early block exits in milliseconds.
-    replaySyncToWindow(win);
+    // finished: an early block exits in milliseconds. This is the app's own attempt.
+    replaySyncToWindow(win, ownSyncView(st));
   };
 
   // Start checking after 300ms
@@ -1894,13 +1923,19 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
       updateTrayMenu();
     },
   }).catch((e) => {
-    settlePending();
     if (e && e.code === 75) {
       // LockBusy (runtime/lock.js): the root exec lock is already held by
       // another sync (manual or scheduled, either channel) — onChild() never
       // ran, so there's no child/process-error path for this.
       console.warn('Sync already running (root lock busy), ignoring Sync Now click');
-      // Ruling P6-1: FIRST tell the progress window this attempt opened, before anything else can
+      // Activity History (Task 2.3): the child never spawned, so Electron is the sole holder --
+      // same "manual contention is Electron's alone" authority as the already-syncing guard
+      // above, just discovered later (after the root exec lock rejected us). Recorded before
+      // this attempt stops being pending, and before the window below is chosen, so its lease is
+      // never mistaken for another running worker. onContention never throws.
+      activityGlue.onContention(activity.writer, 'root-busy');
+      settlePending();
+      // Ruling P6-1: then tell the progress window this attempt opened, before anything else can
       // return, and latch the pending sync-started send off. If the run holding the lock is one
       // this window can show (a scheduled worker), show it instead of a cleared grid.
       if (!showRunningSyncInstead()) refuseProgressWindow('already-running');
@@ -1910,10 +1945,6 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           body: 'A sync is already running.'
         }).show();
       }
-      // Activity History (Task 2.3): the child never spawned, so Electron is the sole holder --
-      // same "manual contention is Electron's alone" authority as the already-syncing guard
-      // above, just discovered later (after the root exec lock rejected us).
-      activityGlue.onContention(activity.writer, 'root-busy');
       return;
     }
 
@@ -1944,6 +1975,7 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
     // (Task 4.4 / Ruling P4-14): terminal first, then refresh, then rebuild -- same ordering as the
     // two guard blocks above, for the same reason.
     activity.writer.terminal('failed');
+    settlePending();
     _refreshViewErrorsTarget();
     updateTrayMenu();
   });
@@ -1952,11 +1984,14 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
 // Show `win` the current attempt as it really is: still waiting for network, syncing (also a
 // scheduled run the app did not start), or finished with its own outcome. Returns false when
 // there is no attempt view (status.json from an older build), leaving the caller's old replay.
-function replaySyncToWindow(win) {
+// `view` defaults to a full resolve; the app's own attempt passes its own view.
+function replaySyncToWindow(win, view = undefined) {
   if (!win || win.isDestroyed() || !win.webContents || win.webContents.isLoading()) return false;
-  const view = currentSyncView();
+  if (view === undefined) view = currentSyncView();
   if (!view) return false;
-  const status = loadStatus();
+  // An unknown view with no established current run lays out no rows: the stored ones are an
+  // earlier run's, kept on disk in case that run turns out to be current after all.
+  const status = view.snapshot === false ? { repos: [], syncRepos: null } : loadStatus();
   const finished = view.phase === syncState.FINISHED;
   // This attempt's roster lays out its rows; if it was missed (null), the window starts with no
   // rows and each reported repository adds its own, without claiming that is the whole list.

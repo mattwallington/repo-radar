@@ -67,11 +67,18 @@ test('renderer.js still parses', () => {
 });
 
 test('the LockBusy branch tells the progress window it was refused', () => {
-  // The catch's LockBusy arm, from its `e.code === 75` test to its own `return`.
-  const branch = between('if (e && e.code === 75) {', "activityGlue.onContention(activity.writer, 'root-busy');");
+  // The catch's LockBusy arm, from its `e.code === 75` test to the start of the other arm.
+  const branch = between('if (e && e.code === 75) {', "console.error('runSync failed to start sync:', e);");
 
   assert.ok(/refuseProgressWindow\('already-running'\)/.test(branch),
     'the LockBusy branch must refuse the progress window it already opened, with its own reason');
+  // The refused attempt is recorded as skipped, and stops being pending, before the window is
+  // chosen: until then its Activity lease must not be read as another running worker.
+  inOrder(branch, [
+    "activityGlue.onContention(activity.writer, 'root-busy')",
+    'settlePending()',
+    'showRunningSyncInstead()',
+  ], 'the LockBusy branch');
 
   // The two existing effects are untouched -- this fix ADDS a third.
   assert.ok(/Notification\.isSupported\(\)/.test(branch), 'the macOS Notification stays');
@@ -138,7 +145,7 @@ test('a refused attempt can never have a late sync-started painted over it', () 
   const sender = between('const sendSyncStartedWhenReady = () => {', 'setTimeout(sendSyncStartedWhenReady, 300);');
 
   const guardAt = sender.indexOf('if (syncRefusedForThisAttempt)');
-  const fillAt = sender.indexOf('replaySyncToWindow(win)');
+  const fillAt = sender.indexOf('replaySyncToWindow(win,');
   assert.notStrictEqual(guardAt, -1, 'the sender must check the refusal latch');
   assert.notStrictEqual(fillAt, -1, 'the sender fills only the window it captured');
   assert.ok(guardAt < fillAt,

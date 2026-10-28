@@ -10,11 +10,16 @@
 // channel; this file decides whether to accept it and what phase the attempt is in.
 //
 // Rules:
-//   - One current attempt per channel. Who is current is decided from evidence, never from the
-//     order HTTP requests arrive in: Electron's own spawn (it holds the root lock by then), or the
-//     attempts' Activity records (a live owner lease, durable start times, recorded outcomes).
-//     An unfamiliar ID never displaces an attempt that is still running. Retired IDs are only a
-//     shortcut for rejecting the same late updates again.
+//   - One current attempt per channel, and only one seen executing: Electron's own spawn (it
+//     holds the root lock by then), or an unfamiliar worker's own progress while complete Activity
+//     evidence shows its owner lease live and nothing else that could be running. A live lease, a
+//     start time, a terminal or a finished history item alone never makes an attempt current, and
+//     the order HTTP requests arrive in never does. Retired IDs are only a shortcut for rejecting
+//     the same late updates again.
+//   - When evidence can't show the current attempt is still the latest (the store is unreadable
+//     or only partly read, another run may be going or may have run since), the window says
+//     "unknown" and nothing about who is current changes. A run the app never saw stays in
+//     Activity; it is not reconstructed here.
 //   - An attempt's terminal outcome wins over its own late progress. Its final `complete` stats
 //     are still kept if they arrive after the terminal, without reopening or changing it.
 //   - Anonymous updates (an older worker build) are dropped while an identified attempt runs,
@@ -44,9 +49,9 @@
 //                       click holds an Activity lease while it waits, so it must not count as a
 //                       running worker)
 //   ownerState(id)      'busy' | 'free' | 'uncertain', from the attempt's Activity owner lease
-//   evidence()          null when the Activity store can't be read, else
-//                       { attempts: [{ id, startedAt, outcome, owner }] } for this channel's sync
-//                       attempts, newest first (owner is probed only for unfinished ones)
+//   evidence()          { available, truncated, incomplete,
+//                         attempts: [{ id, startedAt, outcome, owner, incomplete }] } for this
+//                       channel's sync attempts (owner is probed only for unfinished ones)
 //   reconciledOutcome(id)  the attempt's recorded or reconciled outcome, or null
 
 const PHASES = ['starting', 'waiting-for-network', 'syncing'];
@@ -59,6 +64,12 @@ const UNFINISHED_OUTCOMES = new Set(['running', 'unknown']);
 // and are dropped; its abort details (`error`) and repeated terminals are still accepted.
 const PROGRESS_TYPES = new Set(['progress', 'output', 'rate-limit', 'waiting-for-network',
   'sync-lifecycle', 'sync-roster', 'complete']);
+// Updates only a running worker sends. Only these can show an unfamiliar attempt is executing;
+// a terminal or a final `complete` can arrive long after the run, from any attempt.
+const ESTABLISHING_TYPES = new Set(['progress', 'output', 'rate-limit', 'waiting-for-network',
+  'sync-lifecycle', 'sync-roster']);
+// Activity outcomes for a startup that never ran a sync (turned away by contention or a guard).
+const NOT_RUN_OUTCOMES = new Set(['skipped', 'blocked']);
 
 // The run snapshot fields, as main.js names them at the top level of the status object.
 // `syncRepos` is the roster: null until known, [] for a run with no repositories.
@@ -86,7 +97,7 @@ function current(status, channel) {
   return entry && typeof entry === 'object' ? entry : null;
 }
 
-function _fresh(attemptId, now, previous, { phase = 'starting', verified = false, legacy = false,
+function _fresh(attemptId, now, previous, { phase = 'starting', executed = false, legacy = false,
   startedAt = null } = {}) {
   const retired = previous ? [...(previous.retired || [])] : [];
   if (previous && previous.attemptId && !retired.includes(previous.attemptId)) {
@@ -99,7 +110,9 @@ function _fresh(attemptId, now, previous, { phase = 'starting', verified = false
   if (previous && previous.run && previous.run.stats) run.stats = previous.run.stats;
   return {
     attemptId: attemptId || null,
-    verified: !!verified,
+    // Seen executing: Electron's own spawn after the root lock, or the attempt's own worker
+    // updates. Only such an attempt is ever shown as the current run.
+    executed: !!executed,
     legacy: !!legacy,
     phase,
     outcome: null,
@@ -107,6 +120,9 @@ function _fresh(attemptId, now, previous, { phase = 'starting', verified = false
     stats: null,
     startedAt: startedAt || null,
     updatedAt: now,
+    // When an identified worker update arrived that no evidence could tie to an attempt; from then
+    // on this attempt's result is not shown as the latest.
+    unexplainedAt: null,
     retired: retired.slice(-RETIRED_LIMIT),
     run,
   };
@@ -225,14 +241,22 @@ function _owner(ctx, id) {
   }
 }
 
+// The Activity evidence main.js read, and whether it can say who else might be running:
+// `sufficient` only when the store was readable, the whole list fit in one read and nothing in it
+// was incomplete. Evidence short of that is never treated as an empty or exhaustive list.
 function _evidence(ctx) {
-  if (!ctx || typeof ctx.evidence !== 'function') return null;
+  const none = { sufficient: false, attempts: [] };
+  if (!ctx || typeof ctx.evidence !== 'function') return none;
+  let ev;
   try {
-    const ev = ctx.evidence();
-    return ev && Array.isArray(ev.attempts) ? ev : null;
+    ev = ctx.evidence();
   } catch (e) {
-    return null;
+    return none;
   }
+  if (!ev || !Array.isArray(ev.attempts)) return none;
+  const sufficient = ev.available !== false && !ev.truncated && !ev.incomplete
+    && ev.attempts.every((a) => a && !a.incomplete);
+  return { sufficient, attempts: ev.attempts };
 }
 
 function _time(iso) {
@@ -240,43 +264,59 @@ function _time(iso) {
   return Number.isFinite(t) ? t : null;
 }
 
-// Is `entry`'s attempt still running? Electron's own child, or a busy Activity owner lease.
-function _isLive(entry, ctx) {
-  if (!entry || !entry.attemptId) return false;
-  if (ctx && ctx.liveChildAttemptId && ctx.liveChildAttemptId === entry.attemptId) return true;
-  return _owner(ctx, entry.attemptId) === 'busy';
+function _isChild(entry, ctx) {
+  return !!(entry && entry.attemptId && ctx && ctx.liveChildAttemptId === entry.attemptId);
 }
 
-// May an update from unfamiliar attempt `id` replace identified `entry` as current? Returns the
-// new entry's options, or null to reject the update.
-function _supersedes(entry, id, ctx) {
-  if (_isLive(entry, ctx)) return null; // never displace a running attempt
-  const ev = _evidence(ctx);
-  const cand = ev && ev.attempts.find((a) => a.id === id);
-  const cur = ev && ev.attempts.find((a) => a.id === entry.attemptId);
-  if (cand) {
-    if (cand.owner === 'busy') return { verified: true, startedAt: cand.startedAt };
-    const candAt = _time(cand.startedAt);
-    const curAt = cur ? _time(cur.startedAt) : null;
-    if (candAt !== null && curAt !== null && candAt > curAt) {
-      return { verified: true, startedAt: cand.startedAt };
-    }
-    // The current entry was never backed by a durable record; a durable candidate outranks it.
-    if (!cur && !entry.verified) return { verified: true, startedAt: cand.startedAt };
-    return null;
+// The attempts other than `exceptId` that may have run a sync: not Electron's own attempts still
+// waiting for the root lock, and not startups turned away (skipped, blocked) -- those stay true
+// Activity history but never stand for a run.
+function _candidates(ev, ctx, exceptId) {
+  const pending = new Set((ctx && ctx.pendingAttemptIds) || []);
+  return ev.attempts.filter((a) => a.id !== exceptId && !pending.has(a.id)
+    && !NOT_RUN_OUTCOMES.has(a.outcome));
+}
+
+// Could `a` have started after `entry`? Dates can only raise this doubt, never decide who is
+// current or what happened.
+function _maybeNewer(a, entry, ev) {
+  const own = ev.attempts.find((x) => x.id === entry.attemptId);
+  const since = _time(own && own.startedAt) ?? _time(entry.startedAt);
+  const at = _time(a.startedAt);
+  return since === null || at === null || at > since;
+}
+
+// May an update from unfamiliar attempt `id` make it current? Only with complete evidence that it
+// is running (a live owner lease) and that nothing else could be: Electron's own child, a known
+// attempt whose owner is live, or a second running candidate all make it ambiguous.
+function _mayEstablish(entry, id, ctx) {
+  if (ctx.liveChildAttemptId) return false; // Electron's own child holds the root lock
+  if (entry && entry.attemptId && !_isFinished(entry) && _owner(ctx, entry.attemptId) === 'busy') {
+    return false;
   }
-  // No durable record for the candidate (Activity recording unavailable for it). It may only
-  // supply an unverified display, and only once the current attempt is over.
-  if (_isFinished(entry) || _owner(ctx, entry.attemptId) === 'free') return { verified: false };
-  return null;
+  const ev = _evidence(ctx);
+  if (!ev.sufficient) return false;
+  const cand = _candidates(ev, ctx, null).find((a) => a.id === id);
+  if (!cand || cand.owner !== 'busy') return false;
+  return !_candidates(ev, ctx, id).some((a) => a.owner === 'busy');
+}
+
+// A rejected worker update the evidence doesn't explain as an older or finished attempt's: a run
+// the window can't identify may be going. Nothing about the current attempt changes, but its
+// result may no longer be shown as the latest.
+function _isUnexplained(id, ctx) {
+  const ev = _evidence(ctx);
+  const rec = ev.sufficient ? ev.attempts.find((a) => a.id === id) : null;
+  return !rec || UNFINISHED_OUTCOMES.has(rec.outcome) || rec.owner === 'busy';
 }
 
 // Decide whether a worker update belongs to the current attempt on this channel, and record its
-// effect. `accept: false` means the caller must drop it entirely (no window send, no status
-// changes): it is for another channel, from an attempt that is not current, or late progress
-// from a finished one. `started: true` means this update made a new attempt current.
-// `lateComplete: true` means it is the current attempt's `complete` arriving after its terminal:
-// its stats were recorded, and nothing else about the attempt may change.
+// effect. `accept: false` means the caller must drop it (no window send); it is for another
+// channel, from an attempt that is not current, or late progress from a finished one. If
+// `changed` is still true the status was marked (see `unexplainedAt`) and should be saved.
+// `started: true` means this update made a new attempt current. `lateComplete: true` means it is
+// the current attempt's `complete` arriving after its terminal: its stats were recorded, and
+// nothing else about the attempt may change.
 function admit(status, payload, ctx = {}) {
   if (!payload || typeof payload !== 'object') return NOT_ACCEPTED;
   const now = ctx.now || new Date().toISOString();
@@ -292,7 +332,8 @@ function admit(status, payload, ctx = {}) {
     if (entry && entry.attemptId && !_isFinished(entry)) return NOT_ACCEPTED;
     let target = entry && entry.legacy ? entry : null;
     if (!target || (_isFinished(target) && PROGRESS_TYPES.has(payload.type))) {
-      target = _becomeCurrent(status, ch, _fresh(null, now, entry, { legacy: true }));
+      target = _becomeCurrent(status, ch, _fresh(null, now, entry, { legacy: true, executed: true,
+        startedAt: now }));
     }
     const started = target !== entry;
     return { accept: true, changed: _apply(target, payload, now) || started, started };
@@ -301,39 +342,47 @@ function admit(status, payload, ctx = {}) {
   if (entry && (entry.retired || []).includes(id)) return NOT_ACCEPTED;
 
   let target = entry;
+  let marked = false;
   if (entry && entry.attemptId === id) {
     if (_isFinished(entry) && payload.type === 'complete') {
       entry.stats = payload.stats && typeof payload.stats === 'object' ? payload.stats : entry.stats;
       return { accept: true, changed: true, started: false, lateComplete: true };
     }
     if (_isFinished(entry) && PROGRESS_TYPES.has(payload.type)) return NOT_ACCEPTED;
-  } else {
-    let opts = { verified: false };
-    if (entry && entry.attemptId && !entry.legacy) {
-      opts = _supersedes(entry, id, ctx);
-      if (!opts) return NOT_ACCEPTED;
-    } else {
-      const ev = _evidence(ctx);
-      const cand = ev && ev.attempts.find((a) => a.id === id);
-      if (cand) opts = { verified: true, startedAt: cand.startedAt };
+    if (ESTABLISHING_TYPES.has(payload.type) && !entry.executed) {
+      entry.executed = true; // its own worker is running: this attempt really did start
+      marked = true;
     }
-    target = _becomeCurrent(status, ch, _fresh(id, now, entry, opts));
+  } else {
+    // A terminal, a late `complete` or a start time alone never makes an attempt current.
+    if (!ESTABLISHING_TYPES.has(payload.type) || !_mayEstablish(entry, id, ctx)) {
+      if (entry && ESTABLISHING_TYPES.has(payload.type) && !entry.unexplainedAt
+        && _isUnexplained(id, ctx)) {
+        entry.unexplainedAt = now;
+        return { ...NOT_ACCEPTED, changed: true };
+      }
+      return NOT_ACCEPTED;
+    }
+    const cand = _evidence(ctx).attempts.find((a) => a.id === id);
+    target = _becomeCurrent(status, ch, _fresh(id, now, entry, { executed: true,
+      startedAt: cand.startedAt }));
   }
   const started = target !== entry;
   const changed = _apply(target, payload, now);
-  return { accept: true, changed: changed || started, started };
+  return { accept: true, changed: changed || started || marked, started };
 }
 
 // Electron spawned a worker for `attemptId`: the root exec lock is held by now, so this attempt
-// really is the current one. A refused attempt never gets here, so it cannot disturb a running
-// scheduled attempt's entry.
+// really is running and is the current one. A refused attempt never gets here, so it cannot
+// disturb a running scheduled attempt's entry.
 function begin(status, channel, attemptId, { now = new Date().toISOString() } = {}) {
   const entry = current(status, channel);
   if (entry && attemptId && entry.attemptId === attemptId) {
-    entry.verified = true;
+    entry.executed = true;
     return entry; // the worker already said so
   }
-  return _becomeCurrent(status, channel, _fresh(attemptId, now, entry, { verified: true }));
+  return _becomeCurrent(status, channel, _fresh(attemptId, now, entry, { executed: true,
+    startedAt: now }));
 }
 
 // Record an outcome Electron learned itself (child exit, Activity reconciliation), but only for
@@ -345,6 +394,8 @@ function finish(status, channel, attemptId, outcome, reason = null,
   return _setFinished(entry, outcome, reason, now);
 }
 
+// `snapshot` says whether the entry's run fields (rows, stats) belong with this view. An unknown
+// view with no established current attempt shows none, rather than an older run's relabeled.
 function _viewOf(entry, extra) {
   return {
     attemptId: entry ? entry.attemptId : null,
@@ -354,6 +405,7 @@ function _viewOf(entry, extra) {
     reason: entry && _isFinished(entry) ? entry.reason : null,
     live: false,
     canStop: false,
+    snapshot: !!entry,
     ...extra,
   };
 }
@@ -361,79 +413,69 @@ function _viewOf(entry, extra) {
 const _unknownView = (entry) => _viewOf(entry, { phase: UNKNOWN, outcome: null, reason: null,
   stats: null });
 
-// What a window opening now (or the app starting) should show for this channel, settling the
-// current attempt from evidence first. Returns { view, changed }: `changed` means the status
-// object was updated (an attempt adopted or finished) and should be saved. `view` is null only
-// when there is no attempt view at all and no evidence of one, so the caller keeps its
-// pre-existing behavior for status files from older builds.
+// The current attempt as its own latest news has it -- its own update just admitted, or
+// Electron's own child just exited -- with no discovery: what an open window shows right then.
+function ownView(status, ctx = {}) {
+  const entry = current(status, ctx.channel);
+  if (!entry) return null;
+  const child = _isChild(entry, ctx);
+  return _viewOf(entry, { live: child || !_isFinished(entry), canStop: child });
+}
+
+// What a window opening now (or the app starting) should show for this channel. Returns
+// { view, changed }: `changed` means the status object was updated (a known attempt's outcome was
+// recovered) and should be saved. Who is current is never changed here: this only settles the
+// known attempt from its own evidence, and says "unknown" whenever the evidence can't show that
+// it is still the latest. `view` is null only for a status file from an older build with no sign
+// of a running sync, so the caller keeps that file's old replay.
 function resolve(status, ctx = {}) {
   const ch = ctx.channel;
   const now = ctx.now || new Date().toISOString();
   const entry = current(status, ch);
 
   // Electron's own worker: it holds the root lock, nothing can outrank it.
-  if (entry && entry.attemptId && ctx.liveChildAttemptId === entry.attemptId) {
+  if (_isChild(entry, ctx)) {
     return { view: _viewOf(entry, { live: true, canStop: true }), changed: false };
-  }
-  // A worker the app didn't start, still running. Stop only works on Electron's own child.
-  const entryOwner = entry && entry.attemptId ? _owner(ctx, entry.attemptId) : 'uncertain';
-  if (entry && !_isFinished(entry) && entryOwner === 'busy') {
-    return { view: _viewOf(entry, { live: true }), changed: false };
-  }
-
-  const ev = _evidence(ctx);
-  const pending = new Set(ctx.pendingAttemptIds || []);
-  const others = ev
-    ? ev.attempts.filter((a) => a.id !== (entry && entry.attemptId) && !pending.has(a.id))
-    : [];
-  const liveOthers = others.filter((a) => a.owner === 'busy');
-  if (liveOthers.length > 1) return { view: _unknownView(entry), changed: false };
-  if (liveOthers.length === 1) {
-    // A running worker whose updates the app never saw (it started while the app was closed,
-    // or its posts were lost). Its phase is unknown until it reports one.
-    const live = liveOthers[0];
-    const adopted = _becomeCurrent(status, ch, _fresh(live.id, now, entry, { phase: UNKNOWN,
-      verified: true, startedAt: live.startedAt }));
-    return { view: _viewOf(adopted, { live: true }), changed: true };
   }
 
   if (!entry) {
     // Another channel keeps its runs here, but this one has none of its own: nothing to show
-    // yet, rather than the shared fields' (possibly another channel's) completed run. Only a
-    // status file from an older build falls back to the caller's old replay.
-    return { view: _hasSnapshots(status) ? _unknownView(null) : null, changed: false };
+    // yet, rather than the shared fields' (possibly another channel's) completed run.
+    if (_hasSnapshots(status)) return { view: _unknownView(null), changed: false };
+    const ev = _evidence(ctx);
+    const quiet = ev.sufficient && !_candidates(ev, ctx, null).some((a) => a.owner === 'busy');
+    return { view: quiet ? null : _unknownView(null), changed: false };
   }
 
+  // Only an attempt seen running (Electron's own spawn, or its own worker updates) is shown as
+  // the current run; an entry from an older build without that mark keeps its data, unshown.
+  const established = entry.executed === true;
+  let changed = false;
   if (!_isFinished(entry)) {
-    if (entry.attemptId && entryOwner === 'free') {
-      const outcome = typeof ctx.reconciledOutcome === 'function'
-        ? ctx.reconciledOutcome(entry.attemptId) : null;
+    const owner = entry.attemptId ? _owner(ctx, entry.attemptId) : 'uncertain';
+    // A worker the app didn't start, still running. Stop only works on Electron's own child.
+    if (owner === 'busy') {
+      return { view: established ? _viewOf(entry, { live: true }) : _unknownView(null), changed };
+    }
+    if (owner === 'free' && typeof ctx.reconciledOutcome === 'function') {
+      const outcome = ctx.reconciledOutcome(entry.attemptId);
       if (outcome && !UNFINISHED_OUTCOMES.has(outcome)) {
-        _setFinished(entry, outcome, null, now);
-        return { view: _viewOf(entry, { recovered: true }), changed: true };
+        changed = _setFinished(entry, outcome, null, now);
       }
     }
     // No owner to ask, an owner we can't read, or a gone owner with nothing recorded: say so.
-    return { view: _unknownView(entry), changed: false };
+    if (!_isFinished(entry)) {
+      return { view: _unknownView(established ? entry : null), changed };
+    }
   }
 
-  // Finished. Has a later attempt finished without the app hearing about it?
-  const cur = ev && entry.attemptId ? ev.attempts.find((a) => a.id === entry.attemptId) : null;
-  const curAt = cur ? _time(cur.startedAt) : null;
-  if (curAt !== null) {
-    const later = others.filter((a) => (_time(a.startedAt) || 0) > curAt);
-    if (later.some((a) => UNFINISHED_OUTCOMES.has(a.outcome))) {
-      return { view: _unknownView(entry), changed: false }; // can't tell how that one stands
-    }
-    if (later.length > 0) {
-      const newest = later[0];
-      const adopted = _becomeCurrent(status, ch, _fresh(newest.id, now, entry, { verified: true,
-        startedAt: newest.startedAt }));
-      _setFinished(adopted, newest.outcome, null, now);
-      return { view: _viewOf(adopted, { recovered: true }), changed: true };
-    }
-  }
-  return { view: _viewOf(entry), changed: false };
+  // Finished. It is still the latest only if complete evidence shows no other run that may be
+  // going or may have run since (one the app never heard from is inspected in Activity).
+  if (!established || entry.unexplainedAt) return { view: _unknownView(null), changed };
+  const ev = _evidence(ctx);
+  const doubt = !ev.sufficient || _candidates(ev, ctx, entry.attemptId)
+    .some((a) => a.owner === 'busy' || _maybeNewer(a, entry, ev));
+  return { view: doubt ? _unknownView(null) : _viewOf(entry), changed };
 }
 
 // ---- Renderer half ------------------------------------------------------------------------
@@ -504,5 +546,5 @@ function applySyncState(doc, view) {
 
 module.exports = {
   FINISHED, UNKNOWN, PHASES, PHASE_TEXTS, OUTCOME_TEXTS, NETWORK_ABORT_TEXT,
-  current, admit, begin, finish, resolve, project, store, syncStateText, applySyncState,
+  current, admit, begin, finish, resolve, ownView, project, store, syncStateText, applySyncState,
 };
