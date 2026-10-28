@@ -25,6 +25,13 @@ const MODEL_MIGRATIONS = {
   'gpt-5.1-codex-max': 'gpt-5.3-codex',
   'gpt-5.2-codex': 'gpt-5.3-codex',
   'gpt-5.1-codex-mini': 'gpt-5.4-mini',
+  // Shut down 2026-10-23. o1-pro's vendor replacement also sets reasoning.mode=pro, which Repo
+  // Radar does not send; these land on ordinary GPT-5.6 Sol.
+  'gpt-4.1-nano': 'gpt-5.6-luna',
+  'o4-mini': 'gpt-5.6-terra',
+  'o1': 'gpt-5.6-sol',
+  'o3-mini': 'gpt-5.6-sol',
+  'o1-pro': 'gpt-5.6-sol',
   // Google
   'gemini/gemini-2.0-flash': 'gemini/gemini-2.5-flash',
   'gemini/gemini-2.0-flash-001': 'gemini/gemini-2.5-flash',
@@ -67,7 +74,6 @@ const MODEL_CAPS = {
   'gemini/gemini-pro-latest': { max_input: 1048576, max_output: 65536 },
   'gpt-4.1': { max_input: 1047576, max_output: 32768 },
   'gpt-4.1-mini': { max_input: 1047576, max_output: 32768 },
-  'gpt-4.1-nano': { max_input: 1047576, max_output: 32768 },
   'gpt-4o': { max_input: 128000, max_output: 16384 },
   'gpt-4o-mini': { max_input: 128000, max_output: 16384 },
   'gpt-5': { max_input: 272000, max_output: 128000 },
@@ -83,15 +89,11 @@ const MODEL_CAPS = {
   'gpt-5.4-pro': { max_input: 1050000, max_output: 128000 },
   'gpt-5.5': { max_input: 1050000, max_output: 128000 },
   'gpt-5.5-pro': { max_input: 1050000, max_output: 128000 },
-  'gpt-5.6-luna': { max_input: 1050000, max_output: 128000 },
-  'gpt-5.6-sol': { max_input: 1050000, max_output: 128000 },
-  'gpt-5.6-terra': { max_input: 1050000, max_output: 128000 },
-  'o1': { max_input: 200000, max_output: 100000 },
-  'o1-pro': { max_input: 200000, max_output: 100000 },
+  'gpt-5.6-luna': { max_input: 922000, max_output: 128000 },
+  'gpt-5.6-sol': { max_input: 922000, max_output: 128000 },
+  'gpt-5.6-terra': { max_input: 922000, max_output: 128000 },
   'o3': { max_input: 200000, max_output: 100000 },
-  'o3-mini': { max_input: 200000, max_output: 100000 },
   'o3-pro': { max_input: 200000, max_output: 100000 },
-  'o4-mini': { max_input: 200000, max_output: 100000 },
 };
 
 const KNOWN_MODEL_IDS = new Set(Object.keys(MODEL_CAPS));

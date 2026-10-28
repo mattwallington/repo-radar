@@ -108,3 +108,34 @@ test('persistConfig: ack-only skips reconcile; schedule failure is non-fatal', (
   assert.strictEqual(res.schedule.ok, false);
   assert.strictEqual(res.schedule.error, 'no launchctl');
 });
+
+// OpenAI shut these down 2026-10-23. Each stored selection gets a plain migration notice, and
+// finalizing it persists the replacement without touching the rest of the config.
+const RETIRED_2026_10_23 = {
+  'gpt-4.1-nano': 'gpt-5.6-luna',
+  'o4-mini': 'gpt-5.6-terra',
+  'o1': 'gpt-5.6-sol',
+  'o3-mini': 'gpt-5.6-sol',
+  'o1-pro': 'gpt-5.6-sol',
+};
+for (const [from, effective] of Object.entries(RETIRED_2026_10_23)) {
+  test(`October 2026 retirement ${from} -> ${effective}: migration notice, finalize preserves settings`, () => {
+    const { migrateModel } = require('../model-policy');
+    assert.strictEqual(migrateModel(from), effective, 'launch policy runs the replacement');
+    const notice = computeModelNotice(from);
+    assert.deepStrictEqual(notice, { kind: 'migration', from, effective });
+    const cfg = { ai_model: from, repositories: [1, 2], openai_api_key_set: true };
+    const r = planFinalize('acknowledge', cfg, noticeSignature(notice));
+    assert.strictEqual(r.valid, true);
+    assert.strictEqual(r.nextConfig.ai_model, effective);
+    assert.strictEqual(r.reconcileSchedule, true);
+    assert.deepStrictEqual(r.nextConfig.repositories, [1, 2]);
+    assert.strictEqual(r.nextConfig.openai_api_key_set, true);
+  });
+}
+
+test('Gemini 2.5 Pro is still served: stays selected, no notice', () => {
+  const { migrateModel } = require('../model-policy');
+  assert.strictEqual(migrateModel('gemini/gemini-2.5-pro'), 'gemini/gemini-2.5-pro');
+  assert.strictEqual(computeModelNotice('gemini/gemini-2.5-pro'), null);
+});

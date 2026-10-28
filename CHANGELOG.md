@@ -7,7 +7,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [1.0.32] - 2026-09-01
 
 ### Fixed
+- **Sync blocked after Homebrew's default Python moved to 3.15.** When Homebrew updated its default `python3` past the supported range, the app could no longer find a usable Python to rebuild its runtime, so every sync — manual and scheduled — was blocked. It now also looks for the versioned Homebrew Pythons (3.14 down to 3.10), so relaunching the app rebuilds the runtime from one that is still installed.
+- **Blocked syncs now show why.** Selecting an attempt in Activity History that was blocked before it recorded any events opens it on Problems, where its reason is shown, instead of an empty Events list. You can still switch to Events.
 - **Progress window stuck on "Starting sync…".** When Sync Now was refused because another sync already held the lock (for example right after an auto-update), or the sync failed before its process could start, the progress window opened and then sat on "Starting sync…" forever. It now says "Not started — another sync is already running" or "Sync could not start — see ⚠️ View Errors in the menu", and the attempt is recorded in Activity History either way.
+
+### Changed
+- **Retired OpenAI models now run on GPT-5.6.** OpenAI shut down `gpt-4.1-nano`, `o4-mini`, `o1`, `o3-mini` and `o1-pro` on October 23, 2026. A saved selection of one of these now runs on its replacement: GPT-5.6 Luna for `gpt-4.1-nano`, GPT-5.6 Terra for `o4-mini`, and GPT-5.6 Sol for the other three. On the stable channel the app shows a notice naming the replacement, with Review Models to pick something else. OpenAI's own `o1-pro` replacement also turns on its "pro" reasoning mode; Repo Radar doesn't send that option, so `o1-pro` users get ordinary GPT-5.6 Sol.
+- **Gemini 2.5 Pro, Flash and Flash-Lite stay selectable.** Google has not deprecated them or set a shutdown date, so the October 16 dates recorded earlier were wrong and have been removed. Existing selections keep working unchanged.
+- **Upcoming shutdowns recorded.** Claude Sonnet 4.5 retires November 30, 2026, and GPT-5.1, GPT-5.3-codex and GPT-5.4 nano retire April 1, 2027. They stay selectable until then.
+- **Signed by Reperio Health.** Builds are now signed with Reperio Health's Apple Developer ID (team F8UY7565VM) and notarized through its `reperio-notary` keychain profile, and they check for updates at `ReperioHealth/repo-radar-releases`. Copies signed by the earlier personal team can't update to these builds automatically, so replace each installed app once by hand; settings, mirrors and runtime are kept. The new `build-local.sh` builds and verifies a signed app without publishing it, and stops if notarization was skipped. Publishing with `release.sh` is paused until the update feed moves to `ReperioHealth/repo-radar-releases`, because it would still publish to the old feed; `--dry-run` still runs its gates. See README, "Building a signed app locally".
+- **Releases run their model gates in a dedicated release environment.** `release.sh` now requires `REPO_RADAR_RELEASE_PYTHON` and checks that venv against the checked-in dependency lock before anything else. See README, "Preparing a release".
 
 ## [1.0.31] - 2026-09-01
 

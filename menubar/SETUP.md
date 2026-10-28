@@ -13,11 +13,7 @@ Then:
 2. Drag "Repo Radar.app" to your Applications folder
 3. Open it from Applications (or use Spotlight: Cmd+Space, type "Repo Radar")
 
-**First time opening**: The app is not yet notarized with Apple, so macOS will block it. Run this once in Terminal to allow it:
-```bash
-xattr -cr "/Applications/Repo Radar.app"
-```
-Then open it normally.
+**First time opening**: The app is signed and notarized with Apple, so it opens normally. macOS may ask you to confirm opening an app downloaded from the internet.
 
 ### First Launch: Automatic Python Runtime Setup
 

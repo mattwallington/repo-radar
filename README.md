@@ -68,7 +68,7 @@ To make your AI assistant (Claude Code, etc.) aware of your pristine repos, clic
 Repo Radar self-provisions its own Python runtime — no manual `pip install` required. On first launch, the app builds a private, versioned virtual environment under `~/.repo-radar/<channel>/` (`~/.repo-radar/stable/` for release builds, `~/.repo-radar/dev/` for dev builds) from a checked-in, hash-pinned dependency lock, and runs every sync — manual, scheduled, or CLI — through it.
 
 - **Supported interpreters:** CPython **3.10 through 3.14**. The app auto-selects a compatible interpreter already on your machine; it fails closed (no sync) if none is found.
-- **Known pre-release limitation:** hash-pinned locks are currently checked in for only a subset of the (Python version, architecture) matrix — see [`resources/pydeps/README.md`](resources/pydeps/README.md). A host whose only available Python lands on an uncovered cell (e.g. Python 3.11 or 3.14, or any x86_64/Intel Mac) will fail provisioning closed until that cell is generated or the supported matrix is narrowed.
+- **Dependency locks:** hash-pinned locks are checked in for every supported cell: CPython 3.10–3.14 on both arm64 (Apple Silicon) and x86_64 (Intel) — see [`resources/pydeps/README.md`](resources/pydeps/README.md). You still need one of those Pythons installed. The app tries Homebrew's `python3`, pyenv and `python3` on your `PATH` first, then the versioned Homebrew executables (`python3.14` down to `python3.10`, including installed but unlinked `python@3.x` formulae), so it keeps working when Homebrew's default `python3` moves to a newer, unsupported release.
 - **On-PATH CLI:** once provisioned, the app installs a `repo-radar` (stable) or `repo-radar-dev` (dev builds) command onto your `PATH` (via `~/.local/bin`) so you can run syncs directly from a terminal — see [CLI Usage](#cli-usage).
 - **If runtime setup fails** (e.g. offline on first launch, or no supported Python found), sync is disabled and the app surfaces the reason via the tray icon, a notification, and Settings' error log. Relaunching the app retries setup.
 
@@ -142,6 +142,39 @@ Set `repos_dir` in your `config.json` to change where repos are synced:
 See [DEVELOPMENT.md](DEVELOPMENT.md) for development setup, architecture, release process, and the dev branch workflow.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
+
+### Preparing a release
+
+Publishing with `release.sh` is paused for now: it still publishes to the old `mattwallington/repo-radar` feed, which personal-team installs can't update from once builds are Reperio-signed. `./release.sh --help` still works, and `./release.sh --dry-run` still runs every gate in the verified release venv described below and exits successfully without changing anything. A run without `--dry-run` runs the same checks, then stops before changing any file, building, tagging, pushing or publishing. Use `build-local.sh` (below) until the update feed moves to `ReperioHealth/repo-radar-releases`.
+
+`release.sh` runs its model-lifecycle and model-window gates in a dedicated release venv, never the `python3` on your `PATH`. Before running it, even with `--dry-run`, create that venv from the checked-in lock that matches its Python minor and architecture (`resources/pydeps/cp3<minor>-<arch>.lock`) and point `REPO_RADAR_RELEASE_PYTHON` at its `python`. On an Apple Silicon Mac with Python 3.14:
+
+```bash
+dir=$(mktemp -d /tmp/repo-radar-release-XXXXXX)
+/opt/homebrew/bin/python3.14 -m venv "$dir/venv"
+"$dir/venv/bin/python" -m pip install --require-hashes -r resources/pydeps/cp314-arm64.lock
+export REPO_RADAR_RELEASE_PYTHON="$dir/venv/bin/python"
+./release.sh --dry-run
+```
+
+The script checks that this venv's installed packages exactly match the lock and pass `pip check`, and stops before changing any version if they don't. Keep it to the lock only: install pytest and other test tools in a separate environment.
+
+### Building a signed app locally
+
+Builds are signed with Reperio Health's Developer ID (team `F8UY7565VM`) and notarized through the `reperio-notary` notarytool profile, both in your login keychain. `build-local.sh` builds and checks an app without publishing anything: it makes no commit, tag, push or GitHub release. It runs the same gates as `release.sh`, so set `REPO_RADAR_RELEASE_PYTHON` as above, and it needs a clean checkout of `dev` (Repo Radar Dev) or `main` (Repo Radar) and a version newer than `VERSION`. A checkout with uncommitted changes or untracked files is refused, because electron-builder would package them. Every build from changed source needs a new version: never reuse a version that has already been distributed. For example:
+
+```bash
+git checkout dev
+./build-local.sh --version 1.0.33-dev.202610271200 --dry-run   # gates only
+./build-local.sh --version 1.0.33-dev.202610271200
+
+git checkout main
+./build-local.sh --version 1.0.33
+```
+
+It passes electron-builder only the keychain profile, unsetting any `APPLE_ID` or `APPLE_API_*` variables in that one command, and fails if notarization was skipped. It writes the new version into `VERSION` for the build and restores it when the script exits; if a SIGTERM reaches only the script's shell, that restore can wait until electron-builder exits. After the build it checks each app's team, bundle ID, signature, Gatekeeper assessment and stapled ticket, and prints the SHA-256 of every DMG, ZIP, blockmap and feed file in `menubar/dist/`. To install, quit the app, open the DMG for your Mac and replace the app in `/Applications`. Builds made this way check for updates at `ReperioHealth/repo-radar-releases`; until that repository has releases, the background check only logs a failure (Check for Updates in the menu shows an error) and syncing is unaffected.
+
+Apps signed by the earlier personal team can't update themselves to a Reperio-signed build, because macOS requires an update to match the installed app's signing team. Replace each installed copy once by hand. Your settings, mirrors and runtime are kept.
 
 ## License
 

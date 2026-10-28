@@ -39,16 +39,22 @@ for arg in "$@"; do
       echo ""
       echo -e "${BOLD}Usage:${NC} ./release.sh [options]"
       echo ""
-      echo "  With no arguments, bumps the patch version and releases."
+      echo "  With no arguments, bumps the patch version and releases (paused, see below)."
       echo "  e.g. 1.0.4 -> 1.0.5"
       echo ""
       echo -e "${BOLD}Options:${NC}"
       echo "  --minor     Bump minor version (1.0.4 -> 1.1.0)"
       echo "  --major     Bump major version (1.0.4 -> 2.0.0)"
-      echo "  --dry-run   Show what would happen without doing it"
+      echo "  --dry-run   Run every gate and show the next version without changing anything"
       echo "  --help, -h  Show this help message"
       echo ""
-      echo -e "${BOLD}What it does:${NC}"
+      echo -e "${BOLD}Publishing is paused:${NC}"
+      echo "  Builds are now Reperio-signed, but this script still publishes to the old"
+      echo "  mattwallington/repo-radar feed. Until the feed moves to ReperioHealth/repo-radar-releases,"
+      echo "  a run without --dry-run stops after the gates and changes nothing. Use ./build-local.sh"
+      echo "  to build and verify a signed app without publishing."
+      echo ""
+      echo -e "${BOLD}What it will do once publishing resumes:${NC}"
       echo "  1. Bumps the version (VERSION + package.json)"
       echo "  2. Commits the version bump and creates a git tag"
       echo "  3. Builds the Electron app (arm64 + x64)"
@@ -63,6 +69,17 @@ for arg in "$@"; do
       echo "  - Must be on main or dev branch"
       echo "  - GitHub CLI (gh) installed and authenticated"
       echo "  - Node.js and npm installed"
+      echo "  - REPO_RADAR_RELEASE_PYTHON set to the absolute path of a release venv's python"
+      echo ""
+      echo -e "${BOLD}Preparing the release Python:${NC}"
+      echo "  The model gates run in a dedicated venv installed from the checked-in lock that"
+      echo "  matches its Python minor and architecture (resources/pydeps/cp3<minor>-<arch>.lock)."
+      echo "  Do not install anything else into it. On an Apple Silicon Mac with Python 3.14:"
+      echo ""
+      echo "    dir=\$(mktemp -d /tmp/repo-radar-release-XXXXXX)"
+      echo "    /opt/homebrew/bin/python3.14 -m venv \"\$dir/venv\""
+      echo "    \"\$dir/venv/bin/python\" -m pip install --require-hashes -r resources/pydeps/cp314-arm64.lock"
+      echo "    export REPO_RADAR_RELEASE_PYTHON=\"\$dir/venv/bin/python\""
       exit 0
       ;;
     *)
@@ -84,7 +101,7 @@ fi
 cd "$SCRIPT_DIR"
 
 # Check for required tools
-for tool in gh node npm git python3; do
+for tool in gh node npm git; do
   if ! command -v "$tool" &>/dev/null; then
     error "$tool is not installed"
   fi
@@ -115,13 +132,24 @@ if ! git diff --cached --quiet; then
 fi
 success "No staged changes"
 
+# The Python gates run in a dedicated, verified release venv, never the ambient python3.
+RELEASE_PY="${REPO_RADAR_RELEASE_PYTHON:-}"
+if [[ -z "$RELEASE_PY" ]]; then
+  error "REPO_RADAR_RELEASE_PYTHON is not set. Point it at a release venv's python installed from the matching resources/pydeps lock (see ./release.sh --help)."
+fi
+node scripts/check_release_python.js "$RELEASE_PY" || {
+  echo "Release blocked: REPO_RADAR_RELEASE_PYTHON is not a usable release venv. Recreate it from the matching resources/pydeps lock (see ./release.sh --help)." >&2
+  exit 1
+}
+success "Release Python verified: $RELEASE_PY"
+
 RELEASE_DATE=$(date +%Y-%m-%d)
-python3 scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
+"$RELEASE_PY" -B scripts/check_model_lifecycle.py --target-date "$RELEASE_DATE" || {
   echo "Release blocked: model lifecycle gate failed. Re-verify vendor deprecation pages and amend repo_radar/model_lifecycle.json + the model maps." >&2
   exit 1
 }
 
-python3 scripts/check_model_windows.py --target-date "$RELEASE_DATE" || {
+"$RELEASE_PY" -B scripts/check_model_windows.py --target-date "$RELEASE_DATE" || {
   echo "Release blocked: model window gate failed. Re-verify vendor windows; fix repo_radar/model_catalog.py or add a bound override." >&2
   exit 1; }
 
@@ -174,19 +202,22 @@ success "New version:     ${BOLD}$NEW_VERSION${NC} ($BUMP_TYPE$DEV_LABEL)"
 
 if $DRY_RUN; then
   step "Dry run summary"
-  dry "Update VERSION file: $CURRENT_VERSION -> $NEW_VERSION"
-  dry "Update menubar/package.json version: $NEW_VERSION"
-  dry "Git commit: release: v$NEW_VERSION"
-  dry "Git tag: v$NEW_VERSION"
-  dry "Build Electron app (arm64 + x64)"
-  dry "Run create-installer script"
-  dry "Create GitHub release: Repo Radar v$NEW_VERSION"
-  dry "Attach arm64 and x64 zip files + latest-mac.yml"
-  dry "Push commit and tag to origin"
+  dry "All gates passed for v$NEW_VERSION"
+  dry "Publishing is paused: a run without --dry-run stops here and changes nothing"
   echo ""
-  info "No changes were made. Remove --dry-run to execute."
+  info "No changes were made. To build a signed app without publishing, use ./build-local.sh."
   exit 0
 fi
+
+# ── Paused until the feed moves ──────────────────────────────────────────────
+
+# Builds are now Reperio-signed, but this script still publishes to mattwallington/repo-radar,
+# the feed that personal-team installs update from, and they can't accept a Reperio-signed update.
+# The org-move work replaces this script; until then build with build-local.sh.
+echo -e "${RED}[error]${NC} release.sh publishing is paused: it would publish a Reperio-signed build to the old mattwallington/repo-radar feed." >&2
+echo "  Use ./build-local.sh to build and verify a signed app without publishing (see README, \"Building a signed app locally\")." >&2
+echo "  Releases resume once the update feed moves to ReperioHealth/repo-radar-releases." >&2
+exit 1
 
 # ── Update version files ─────────────────────────────────────────────────────
 
