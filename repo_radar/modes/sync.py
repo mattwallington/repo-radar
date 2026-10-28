@@ -27,7 +27,7 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt,
     authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
-    InputBudgetUnavailable)
+    InputBudgetUnavailable, IncompleteResponseError)
 from repo_radar.preflight import PreflightSession
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
@@ -529,6 +529,8 @@ _Metadata generation degraded before completion: {reason}_
                         # Success! Break out of retry loop
                         break
 
+                    except IncompleteResponseError:
+                        raise  # a rejected reply, not a rate limit: no retry or fallback
                     except Exception as e:
                         import traceback
                         error_str = str(e)
@@ -618,6 +620,8 @@ _Metadata generation degraded before completion: {reason}_
                             )
                             rate_limit_tracker.update_from_response(resp)
                             return text, cost, current_model_combine
+                        except IncompleteResponseError:
+                            raise  # a rejected reply, not a rate limit: no retry or fallback
                         except Exception as exc:
                             err = str(exc)
                             is_rl = (type(exc).__name__ == 'RateLimitError'
@@ -657,6 +661,8 @@ _Metadata generation degraded before completion: {reason}_
                         # Success! Break out of retry loop
                         break
 
+                    except IncompleteResponseError:
+                        raise  # a rejected reply, not a rate limit: no retry or fallback
                     except Exception as e:
                         error_str = str(e)
                         error_type = type(e).__name__
@@ -750,6 +756,8 @@ _Metadata generation degraded before completion: {reason}_
                     # Success! Break out of retry loop
                     break
 
+                except IncompleteResponseError:
+                    raise  # a rejected reply, not a rate limit: no retry or fallback
                 except Exception as e:
                     error_str = str(e)
                     error_type = type(e).__name__
@@ -942,8 +950,25 @@ parse_status: {parse_status}
         error_type = type(e).__name__
         stack_trace = traceback.format_exc()
 
-        # Show more descriptive error for common issues
-        if 'NotFoundError' in full_error:
+        # Show more descriptive error for common issues. The type comes first: a rejected reply's
+        # message can contain "429" (its character count) without being a rate limit.
+        if isinstance(e, IncompleteResponseError):
+            short_msg = "Incomplete response from model"
+            detailed_msg = f"""ERROR: Incomplete Response
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Details:
+{full_error}
+
+This usually means:
+- The model's reply was empty or cut off, so it wasn't used
+- The previous metadata was kept; the next sync tries this repository again
+
+Stack Trace:
+{stack_trace}"""
+        elif 'NotFoundError' in full_error:
             short_msg = f"Model not found: {get_ai_model()}"
             detailed_msg = f"""ERROR: Model Not Found
 Repository: {full_name}

@@ -374,3 +374,51 @@ def test_oversized_file_with_count_outage_skips_metadata_and_keeps_previous(monk
     assert (name, level) == ("metadata_skipped", "warn")
     assert "token count unavailable" in fields["reason"] and "'huge.py'" in fields["reason"]
     assert any("skipped: token count unavailable" in s for s in statuses)
+
+
+@pytest.mark.parametrize("stage", ["single", "chunk", "synthesis"])
+def test_rejected_reply_is_not_retried_as_a_rate_limit(monkeypatch, tmp_path, stage):
+    """call_llm rejects an incomplete reply, and its message ("429 characters of text") contains 429.
+    The real retry loops must not read that as a rate limit: one attempt, no retry sleep or fallback,
+    one incomplete-response error, and the previous metadata and commit stay. For synthesis, the
+    chunk sends succeed first and the rejection passes both nested synthesis catches."""
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    monkeypatch.setenv("AI_MODEL", "claude-sonnet-5-5")
+    previous = "---\nfull_name: o/r\nlast_commit: oldc0mmit\nparse_status: ok\n---\n\n# previous metadata\n"
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "single" if stage == "single" else "chunk")
+    ev = []
+
+    def send(model, prompt, max_tokens=8192):
+        failing = stage != "synthesis" or max_tokens == 16384
+        ev.append(("send", "fail" if failing else "ok"))
+        if failing:
+            raise llm.IncompleteResponseError(f"{model} returned an incomplete response "
+                                              "(finish_reason='length', 429 characters of text); not using it")
+        return "A", 0.0, None
+
+    monkeypatch.setattr(sync, "call_llm", send)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: ev.append(("sleep",)))
+    monkeypatch.setattr(sync, "get_fallback_model", lambda m: ev.append(("fallback",)) or "gemini/gemini-3.8-flash")
+    errors, statuses = [], []
+
+    class _Logger:
+        def event(self, name, level, **f): pass
+        def error(self, name, **f): errors.append((name, f["error_type"]))
+
+    class _Progress:
+        def update(self, *a, **k): statuses.append(k.get("status", ""))
+
+    ctx = _fake_ctx()._replace(sync_logger=_Logger(), meta_progress=_Progress())
+    with patch("litellm.acount_tokens", _boom):
+        cost = sync.generate_repo_metadata(_fake_task_data(tmp_path, "newc0mmit"),
+                                           _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
+
+    failed_at = ev.index(("send", "fail"))
+    assert ev[failed_at:] == [("send", "fail")], ev               # one attempt; no retry sleep or fallback
+    assert (("send", "ok") in ev) == (stage == "synthesis")      # only synthesis follows successful chunks
+    assert errors == [("metadata_failed", "IncompleteResponseError")] and cost == 0.0
+    assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
+    assert any("Incomplete response" in s for s in statuses) and not any("Rate limit" in s for s in statuses)
+    assert (tmp_path / "repo.md").read_text() == previous         # previous metadata and commit kept

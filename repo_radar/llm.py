@@ -712,6 +712,8 @@ def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
             analysis, api_cost, _ = call_llm(get_ai_model(), prompt, max_tokens=8192)
             return analysis, api_cost
 
+        except IncompleteResponseError:
+            raise  # a rejected reply, not a rate limit: no retry
         except Exception as e:
             error_str = str(e)
 
@@ -1265,6 +1267,8 @@ def _synthesize_once(full_name, analyses, model=None):
             )
             return final_analysis, api_cost, model
 
+        except IncompleteResponseError:
+            raise  # a rejected reply, not a rate limit: no retry
         except Exception as e:
             error_str = str(e)
 
