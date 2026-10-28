@@ -422,3 +422,65 @@ def test_rejected_reply_is_not_retried_as_a_rate_limit(monkeypatch, tmp_path, st
     assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
     assert any("Incomplete response" in s for s in statuses) and not any("Rate limit" in s for s in statuses)
     assert (tmp_path / "repo.md").read_text() == previous         # previous metadata and commit kept
+
+
+@pytest.mark.parametrize("case", ["401", "400-credit", "503", "timeout"])
+def test_count_errors_fail_or_skip_through_the_real_preflight(monkeypatch, tmp_path, case):
+    """The real PreflightSession counts each repo through Anthropic's Count Tokens handler, with only
+    the HTTP transport stubbed. A rejected count (401, a 400 credit error) fails each repo as an error
+    with nothing generated. A transient one (503, timeout) skips both repos with the cause in the
+    reason, and the second repo reuses it without another count request. Previous metadata stays."""
+    import asyncio, socket, httpx
+    import repo_radar.modes.sync as sync
+    from repo_radar.preflight import PreflightSession
+    from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
+    monkeypatch.setattr(socket.socket, "connect", lambda *a, **k: (_ for _ in ()).throw(OSError("blocked")))
+    monkeypatch.setenv("AI_MODEL", "claude-sonnet-5-5")
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+    generated, requests = [], []
+    monkeypatch.setattr(sync, "call_llm", lambda *a, **k: generated.append(a) or ("A", 0.0, None))
+    body = {"type": "error", "error": {"type": "x", "message": "raw-provider-body"}}
+    replies = {"401": httpx.Response(401, json=body), "503": httpx.Response(503, json=body),
+               "400-credit": httpx.Response(400, json={"type": "error", "error": {
+                   "type": "invalid_request_error", "message": "Your credit balance is too low (raw-provider-body)"}})}
+
+    async def transport(self, request):
+        requests.append(request.url.path)
+        if case == "timeout":
+            await asyncio.sleep(5)
+        return replies[case]
+
+    monkeypatch.setattr(LiteLLMAiohttpTransport, "handle_async_request", transport)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", transport)
+    events = []
+
+    class _Logger:
+        def event(self, name, level, **f): events.append((name, f["reason"]))
+        def error(self, name, **f): events.append((name, f["error_type"], f["detail"]))
+
+    ctx = _fake_ctx()._replace(sync_logger=_Logger())
+    previous = "---\nfull_name: o/r\nlast_commit: oldc0mmit\nparse_status: ok\n---\n\n# previous metadata\n"
+    with patch("litellm.acount_tokens", _boom), PreflightSession(timeout_s=0.2) as session:
+        for repo in ("a", "b"):
+            (tmp_path / repo).mkdir()
+            (tmp_path / repo / "repo.md").write_text(previous)
+            sync.generate_repo_metadata(_fake_task_data(tmp_path / repo, "newc0mmit"), session, _fake_args(), ctx)
+
+    assert generated == [] and ctx.stats["metadata_generated"] == 0
+    assert all((tmp_path / r / "repo.md").read_text() == previous for r in ("a", "b"))
+    if case in ("401", "400-credit"):
+        status = case[:3]
+        assert requests == ["/v1/messages/count_tokens"] * 2               # an error, not the breaker
+        assert ctx.stats["errors"] == 2 and not ctx.stats.get("skipped")
+        assert sync._finalize_outcome(errors=ctx.stats["errors"], warns=0, degraded=False) == "failed"
+        for name, error_type, detail in events:
+            assert (name, error_type) == ("metadata_failed", "TokenCountRejected")
+            assert f"token count rejected (HTTP {status}) for claude-sonnet-5-5" in detail
+            assert "raw-provider-body" not in detail and "test-key-not-real" not in detail
+        assert len(events) == 2
+    else:
+        reason = "TimeoutError" if case == "timeout" else "AnthropicError (HTTP 503)"
+        assert requests == ["/v1/messages/count_tokens"]                    # the second repo hits the breaker
+        assert ctx.stats["errors"] == 0 and ctx.stats["skipped"] == 2
+        assert [n for n, *_ in events] == ["metadata_skipped"] * 2
+        assert all(f"token count unavailable for claude-sonnet-5-5 ({reason})" in r for _n, r in events)

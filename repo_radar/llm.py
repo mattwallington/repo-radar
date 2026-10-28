@@ -1315,12 +1315,14 @@ class InputBudgetUnavailable(Exception):
     Raised only for count_strategy == "anthropic_api" models, whose local tokenizer estimate is known
     to undercount. The caller skips the repo's metadata and retries on a later sync. An unavailable
     count is not evidence that anything is too large; `context` carries any overflow an earlier
-    authoritative count did establish.
+    authoritative count did establish, and `reason` the safe cause preflight reported, such as
+    "TimeoutError".
     """
 
-    def __init__(self, model, budget, context=None):
-        self.model, self.budget, self.context = model, budget, context
-        msg = (f"metadata skipped: token count unavailable for {model}, so the prompt can't be "
+    def __init__(self, model, budget, context=None, reason=None):
+        self.model, self.budget, self.context, self.reason = model, budget, context, reason
+        cause = f" ({reason})" if reason else ""
+        msg = (f"metadata skipped: token count unavailable for {model}{cause}, so the prompt can't be "
                f"confirmed within its {budget:,}-token acceptance budget")
         super().__init__(f"{msg} ({context})" if context else msg)
 
@@ -1347,7 +1349,7 @@ def authoritative_partition(session, full_name, files, model):
     budget = acceptance_budget(model, output_budget(model, FULL_REPO_OUTPUT))
     r = session.count(model, _build_full_repo_prompt(full_name, files), output_budget(model, FULL_REPO_OUTPUT))
     if not r.authoritative:
-        raise InputBudgetUnavailable(model, budget)
+        raise InputBudgetUnavailable(model, budget, reason=getattr(r, "reason", None))
     return "single" if r.tokens <= budget else "chunk"
 
 
@@ -1365,7 +1367,12 @@ PartitionResult = namedtuple("PartitionResult", "chunks degraded_reason")
 
 class _NonAuthoritative(Exception):
     """Raised at a count site the moment the provider returns a non-authoritative result, to abandon
-    the authoritative pass and fall back to the complete Branch 1 partition (unchanged)."""
+    the authoritative pass and fall back to the complete Branch 1 partition (unchanged). Carries the
+    count's `reason` so InputBudgetUnavailable can report it."""
+
+    def __init__(self, reason=None):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num, total_chunks):
@@ -1394,7 +1401,7 @@ def _authoritative_truncate_file(session, full_name, file_info, model, chunk_num
         r = session.count(model, _build_analysis_prompt(full_name, [cand], chunk_num, total_chunks),
                           output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
-            raise _NonAuthoritative
+            raise _NonAuthoritative(getattr(r, "reason", None))
         return r.tokens <= budget, cand
 
     # Floor first: if not even the notice-only prompt (zero retained content) fits, the template
@@ -1422,7 +1429,7 @@ def _largest_fitting_prefix(session, full_name, chunk, chunk_num, total_chunks, 
         r = session.count(model, _build_analysis_prompt(full_name, chunk[:length], chunk_num, total_chunks),
                           output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
-            raise _NonAuthoritative
+            raise _NonAuthoritative(getattr(r, "reason", None))
         return r.tokens <= budget
 
     lo, hi, best = 1, len(chunk) - 1, 1
@@ -1466,7 +1473,7 @@ def authoritative_chunks(session, full_name, files, model):
     def fits(chunk, i, n):
         r = session.count(model, _build_analysis_prompt(full_name, chunk, i, n), output_budget(model, CHUNK_OUTPUT))
         if not r.authoritative:
-            raise _NonAuthoritative
+            raise _NonAuthoritative(getattr(r, "reason", None))
         if r.tokens > budget:
             what = f"file {chunk[0]['path']!r}" if len(chunk) == 1 else f"{len(chunk)} files"
             overflow[:] = [f"chunk {i}/{n} ({what}) counted {r.tokens:,} tokens, over budget"]
@@ -1503,9 +1510,9 @@ def authoritative_chunks(session, full_name, files, model):
 
     try:
         return build()
-    except _NonAuthoritative:
+    except _NonAuthoritative as e:
         if _counts_authoritatively(model):
-            raise InputBudgetUnavailable(model, budget, overflow[0] if overflow else None)
+            raise InputBudgetUnavailable(model, budget, overflow[0] if overflow else None, e.reason)
         return PartitionResult(chunk_repo_files(files, model, full_name=full_name), None)
 
 

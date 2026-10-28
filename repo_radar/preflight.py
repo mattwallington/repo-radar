@@ -5,7 +5,7 @@ asyncio.Runner (3.11+) is not usable. The loop is managed manually via
 asyncio.new_event_loop() plus a daemon thread running run_forever().
 """
 
-import asyncio, threading, hashlib, json, logging
+import asyncio, threading, hashlib, json, logging, os, types
 from collections import namedtuple
 
 import litellm
@@ -15,8 +15,37 @@ from repo_radar.model_catalog import get_caps
 
 logger = logging.getLogger("repo_radar.preflight")
 
-PreflightResult = namedtuple("PreflightResult", "tokens authoritative")
+# `reason` is a safe diagnostic for an unavailable count, such as "TimeoutError" or
+# "AnthropicError (HTTP 503)": never a key, header, prompt or raw provider body.
+PreflightResult = namedtuple("PreflightResult", "tokens authoritative reason", defaults=(None,))
 _Fatal = namedtuple("_Fatal", "exc")
+
+
+class TokenCountRejected(Exception):
+    """Anthropic refused the token count for a reason a retry won't fix: authentication, permission,
+    billing or credit, or a bad request (any 4xx except 408 and 429), or no API key is set.
+
+    Unlike a transient outage, this is an error for the repo, not a skip: it propagates to sync's
+    metadata-error handler and doesn't open the per-model breaker.
+    """
+
+    def __init__(self, model, status, category):
+        self.model, self.status, self.category = model, status, category
+        super().__init__(f"token count rejected (HTTP {status}) for {model}: {category}")
+
+
+# Safe, actionable categories by HTTP status. Anthropic reports low credit as a 400, so 400 names it.
+_REJECTED_CATEGORIES = {
+    400: "invalid request or insufficient credit; check the model and the account's credit balance",
+    401: "authentication failed; check the Anthropic API key",
+    402: "billing problem; check the Anthropic account's billing",
+    403: "permission denied; check the API key's access to this model",
+    404: "model not found; check the model id",
+}
+
+
+def _is_transient_status(status):
+    return not isinstance(status, int) or status in (408, 429) or not 400 <= status < 500
 
 
 class PreflightLoop:
@@ -120,19 +149,42 @@ def _is_authoritative(resp, model):
             and getattr(resp, "model_used", None) == model)
 
 
+async def _anthropic_count(model, prompt):
+    """Ask Anthropic's Count Tokens API directly, through litellm's own handler.
+
+    litellm.acount_tokens catches a failed count and returns a local estimate instead, so an invalid
+    key looked the same as an outage. Calling its handler keeps the HTTP status (AnthropicError)
+    while reusing its request transformation, async HTTP client and headers. The model and API key
+    are resolved exactly as litellm's Anthropic counter does. Returns a response shaped for
+    _is_authoritative, which still decides whether the count can be trusted.
+    """
+    from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+    from litellm.llms.anthropic.count_tokens.token_counter import anthropic_count_tokens_handler
+
+    resolved, _provider, dynamic_key, _base = get_llm_provider(model=model)
+    api_key = dynamic_key or litellm.anthropic_key or litellm.api_key or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise TokenCountRejected(model, 401, "no Anthropic API key is set")
+    result = await anthropic_count_tokens_handler.handle_count_tokens_request(
+        model=resolved, messages=_completion_messages(prompt), api_key=api_key)
+    return types.SimpleNamespace(total_tokens=result.get("input_tokens"), tokenizer_type="anthropic_api",
+                                 error=False, request_model=model, model_used=resolved)
+
+
 async def _count_once(model, prompt, timeout_s):
-    """One bounded attempt at an authoritative token count via litellm's Count Tokens API.
+    """One bounded attempt at an authoritative token count via Anthropic's Count Tokens API.
 
     Uses _completion_messages so the counted message structure is EXACTLY what call_llm will
     send on the completion path — counting a different shape than what's sent would make the
-    count meaningless. Timeouts and provider/network errors are expected, routine fallback
-    triggers (PreflightResult(None, False) lets the caller fall back to the estimate); only
+    count meaningless. Timeouts, network errors, 408, 429 and 5xx are transient: they return
+    PreflightResult(None, False, reason) with a safe reason naming the failure. A 4xx the provider
+    won't change its mind about raises TokenCountRejected (see _anthropic_count). Only
     KeyboardInterrupt/SystemExit are enveloped rather than swallowed, so an operator-initiated
     interrupt during the background loop's call still propagates as a distinguishable outcome
     instead of silently degrading to "not authoritative."
 
     Timeout scope (narrow, not a hard kill): asyncio.wait_for's `timeout_s` is a HARD bound
-    only for a cancellation-COOPERATIVE awaitable. litellm.acount_tokens runs over HTTPX, which
+    only for a cancellation-COOPERATIVE awaitable. litellm's count handler runs over HTTPX, which
     honors cancellation at its await points, so on timeout wait_for cancels the request and it
     actually unwinds — that is the only path this code runs in production. wait_for cannot
     force-kill a cancellation-RESISTANT coroutine (one that catches CancelledError and refuses
@@ -141,15 +193,24 @@ async def _count_once(model, prompt, timeout_s):
     pathological coroutine is contained: PreflightLoop.close() stays retryable (never a false
     success), it is never destroyed mid-flight, and close() never hangs — see PreflightLoop.close.
     """
+    from litellm.llms.anthropic.common_utils import AnthropicError
     try:
-        resp = await asyncio.wait_for(
-            litellm.acount_tokens(model=model, messages=_completion_messages(prompt)), timeout_s
-        )
+        resp = await asyncio.wait_for(_anthropic_count(model, prompt), timeout_s)
     except (KeyboardInterrupt, SystemExit) as e:
         return _Fatal(e)
-    except Exception:
-        return PreflightResult(None, False)
-    return PreflightResult(resp.total_tokens, True) if _is_authoritative(resp, model) else PreflightResult(None, False)
+    except TokenCountRejected:
+        raise
+    except AnthropicError as e:
+        status = getattr(e, "status_code", None)
+        if not _is_transient_status(status):
+            raise TokenCountRejected(model, status, _REJECTED_CATEGORIES.get(
+                status, "request rejected; check the model and the Anthropic account")) from None
+        return PreflightResult(None, False, f"AnthropicError (HTTP {status})")
+    except Exception as e:
+        return PreflightResult(None, False, type(e).__name__)
+    if _is_authoritative(resp, model):
+        return PreflightResult(resp.total_tokens, True)
+    return PreflightResult(None, False, "invalid token count")
 
 
 class PreflightSession:
@@ -166,8 +227,9 @@ class PreflightSession:
       * Per-model circuit breaker — the first non-authoritative answer for a model opens the breaker,
         so the rest of the sync skips the (already-known-unavailable) provider call for that model and
         logs it exactly once. With no authoritative count, that model's metadata is skipped for the
-        rest of the sync (llm.InputBudgetUnavailable), not sent on the local estimate. Other models
-        are unaffected.
+        rest of the sync (llm.InputBudgetUnavailable), not sent on the local estimate. Later calls get
+        the same result, so its reason survives. Other models are unaffected. A rejected count
+        (TokenCountRejected) is an error, not unavailability: it propagates and opens no breaker.
       * Memo — an authoritative count is cached under (model, sha256(canonical_request)) so an
         identical later request (and a concurrent caller that blocked on the lock) reuses it rather
         than making a second, redundant provider call. The model is part of the key because the same
@@ -181,7 +243,7 @@ class PreflightSession:
         self._loop = PreflightLoop()
         self._timeout = timeout_s
         self._memo = {}
-        self._downgraded = set()
+        self._downgraded = {}   # model -> its unavailable PreflightResult, reason included
         self._logged = set()
         self._lock = None
 
@@ -217,7 +279,7 @@ class PreflightSession:
             if caps is None or caps.count_strategy != "anthropic_api":
                 return PreflightResult(None, False)
             if model in self._downgraded:
-                return PreflightResult(None, False)
+                return self._downgraded[model]
             key = self._key(model, prompt)
             if key in self._memo:
                 return self._memo[key]
@@ -227,11 +289,11 @@ class PreflightSession:
             if out.authoritative:
                 self._memo[key] = out
             else:
-                self._downgraded.add(model)
+                self._downgraded[model] = out
                 if model not in self._logged:
                     self._logged.add(model)
-                    logger.warning("preflight: authoritative token count unavailable for %s; "
-                                   "its metadata is skipped for the rest of this sync", model)
+                    logger.warning("preflight: authoritative token count unavailable for %s (%s); "
+                                   "its metadata is skipped for the rest of this sync", model, out.reason)
             return out
 
     def count(self, model, prompt, requested_output):
