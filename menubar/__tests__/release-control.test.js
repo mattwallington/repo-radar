@@ -49,7 +49,7 @@ function fakeGitHub() {
 
 function context(client, plan) {
   return {
-    client, plan, floor: '1.0.32', changelog: '## [Unreleased]\n\n- Sync fix\n', now: () => NOW, log: () => {},
+    client, plan, floor: '1.0.32', now: () => NOW, log: () => {},
     toolchain: { node: 'test' }, run: { id: '1' }, appleRun: appleTools().run,
   };
 }
@@ -123,6 +123,7 @@ test('publishing uploads and verifies the full set; a published source is a no-o
       [...names.zips, ...names.dmgs, ...names.zipBlockmaps, names.feed, 'release-receipt.json'].sort());
     const receipt = JSON.parse(state.bytes.get(release.assets.find((a) => a.name === 'release-receipt.json').id).toString());
     assert.strictEqual(receipt.finalization.source, sha('c'), 'the receipt carries the verified finalization result');
+    assert.match(release.body, new RegExp(`^Built from \\[ccccccc\\]\\(https://github\\.com/ReperioHealth/repo-radar/commit/${sha('c')}\\)\\. See \\[CHANGELOG\\.md at ccccccc\\]\\(https://github\\.com/ReperioHealth/repo-radar/blob/${sha('c')}/CHANGELOG\\.md\\)`));
 
     // main moves on; rerunning the old run reports the published release instead of building again.
     state.branches.main = sha('d');

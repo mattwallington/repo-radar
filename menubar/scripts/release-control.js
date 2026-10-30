@@ -118,29 +118,36 @@ async function assertCurrent(ctx) {
   }
 }
 
-function notesFor(changelog, version) {
-  const sections = changelog.split(/^(?=## \[)/m);
-  const pick = (title) => sections.find((s) => s.startsWith(`## [${title}]`));
-  const section = (channelOf(version) === 'stable' && pick(version)) || pick('Unreleased');
-  const text = section ? section.replace(/^## \[[^\]]*\][^\n]*\n/, '').trim() : '';
-  return text || 'See CHANGELOG.md in the source repository.';
+// Notes are fixed when the draft is reserved: what changed in the source since the previous published
+// release of this channel, and the changelog as of this commit. The artifact repository's own generated
+// notes would describe only its README commit.
+function notesFor(releases, plan, version, { bootstrap = false } = {}) {
+  const repo = `https://github.com/${plan.sourceRepo}`;
+  const short = (sha) => sha.slice(0, 7);
+  const changelog = `[CHANGELOG.md at ${short(plan.sourceCommit)}](${repo}/blob/${plan.sourceCommit}/CHANGELOG.md)`;
+  const commit = `[${short(plan.sourceCommit)}](${repo}/commit/${plan.sourceCommit})`;
+  if (bootstrap) return `First organization release, built from ${commit}. See ${changelog}.`;
+  const previous = releases.filter((r) => !r.draft).map(recordOf)
+    .filter((r) => r && r.channel === plan.channel && compareVersion(r.version, version) < 0)
+    .sort((a, b) => compareVersion(a.version, b.version)).pop();
+  if (!previous) return `Built from ${commit}. See ${changelog}.`;
+  const range = `${previous.sourceCommit}...${plan.sourceCommit}`;
+  return `Changes since v${previous.version}: [${short(previous.sourceCommit)}...${short(plan.sourceCommit)}](${repo}/compare/${range}). See ${changelog}.`;
 }
 
 function releaseBody(record, notes) {
-  const short = record.sourceCommit.slice(0, 7);
   return [
     notes,
     '',
     '---',
     '',
-    `Built from [${record.sourceRepo}@${short}](https://github.com/${record.sourceRepo}/commit/${record.sourceCommit}). `
-      + `This repository holds release files only: v${record.version} is an artifact tag on its README commit, not a source revision.`,
+    `This repository holds release files only: v${record.version} is an artifact tag on its README commit, not a source revision.`,
     '',
     `<!-- repo-radar-release ${JSON.stringify(record)} -->`,
   ].join('\n');
 }
 
-async function createDraft(ctx, version, extra = {}) {
+async function createDraft(ctx, releases, version, extra = {}) {
   const { plan, client } = ctx;
   const record = {
     schema: SCHEMA, channel: plan.channel, version, sourceRepo: plan.sourceRepo,
@@ -150,7 +157,7 @@ async function createDraft(ctx, version, extra = {}) {
   return client.createRelease({
     tag_name: `v${version}`,
     name: `${dev ? 'Repo Radar Dev' : 'Repo Radar'} v${version}`,
-    body: releaseBody(record, notesFor(ctx.changelog || '', version)),
+    body: releaseBody(record, notesFor(releases, plan, version, { bootstrap: Boolean(extra.bootstrap) })),
     draft: true,
     prerelease: dev,
   });
@@ -241,7 +248,7 @@ async function reserve(ctx) {
   }
   const version = planVersion({ versions: releases.map(versionOf).filter(Boolean), channel: ctx.plan.channel, floor: ctx.floor, now: ctx.now() });
   if (releases.some((r) => r.tag_name === `v${version}`)) throw new Error(`v${version} is already taken`);
-  await createDraft(ctx, version);
+  await createDraft(ctx, releases, version);
   ctx.log(`reserved v${version}`);
   return { published: false, version };
 }
@@ -279,7 +286,7 @@ async function bootstrap(ctx, dir, version) {
   await stage(ctx, dir, version); // before any draft exists
   if (!own) {
     if (releases.some((r) => r.tag_name === `v${version}`)) throw new Error(`v${version} belongs to another source`);
-    own = await createDraft(ctx, version, { bootstrap: true });
+    own = await createDraft(ctx, releases, version, { bootstrap: true });
   }
   assertNotSuperseded(releases, own);
   return publishDraft(ctx, own, dir, {
@@ -359,7 +366,6 @@ function baseContext(plan, client) {
   return {
     plan, client,
     floor: parseVersion(version) ? version.split('-')[0] : null,
-    changelog: fs.readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8'),
     now: () => new Date(),
     log: (l) => process.stderr.write(`${l}\n`),
   };
