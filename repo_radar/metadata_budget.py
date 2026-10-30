@@ -70,6 +70,7 @@ class Budget:
         self.retained = 0.0        # reservations kept because the cost is unknown
         self.unknown_calls = 0
         self._open = {}            # key -> upper
+        self.extra = {}            # attempt facts for the record: changed and read bytes
 
     def upper_bound(self, input_tokens, max_output):
         if self.price is None:
@@ -131,7 +132,8 @@ class Budget:
     def summary(self):
         return {'model': self.model, 'calls': self.calls, 'input_tokens': self.input_tokens,
                 'output_tokens': self.output_tokens, 'cost_usd': round(self.cost, 6),
-                'unknown_cost_calls': self.unknown_calls, 'retained_reservation_usd': round(self.retained, 6)}
+                'unknown_cost_calls': self.unknown_calls, 'retained_reservation_usd': round(self.retained, 6),
+                **self.extra}
 
 
 class Ledger:

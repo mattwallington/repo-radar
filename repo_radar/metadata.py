@@ -281,7 +281,7 @@ def stale_label(state, document_text, info):
     """A one-line stale note when the latest attempt failed or was skipped after this document was
     written, or None when the document is current. The document's committed generation wins over a
     leftover attempt: the note applies only to an attempt made from exactly this document."""
-    if not state or state.get('status') not in ('pending', 'failed', 'skipped'):
+    if not state or state.get('status') not in ('pending', 'committing', 'failed', 'skipped'):
         return None
     if state.get('baseline_doc_sha256') != hashlib.sha256(document_text.encode('utf-8')).hexdigest():
         return None
@@ -308,6 +308,65 @@ def write_text_atomic(path, text):
         except OSError:
             pass
         raise
+
+
+# Quick Reference table rows: (field, label, value that hides the row). Same layout as the full
+# generator writes, so a document from either path reads the same.
+_QUICK_REF_ROWS = (
+    ('type', 'Type', None), ('language', 'Language', None), ('framework', 'Framework', 'none'),
+    ('database', 'Database', 'none'), ('apis', 'APIs Exposed', 'none'), ('port', 'Port', 'n/a'),
+    ('dependencies', 'Key Dependencies', None),
+)
+
+
+def quick_reference_from_table(body):
+    """Recover quick-reference fields from a document's Quick Reference table."""
+    labels = {label: field for field, label, _hide in _QUICK_REF_ROWS}
+    out = {}
+    for match in re.finditer(r'^\| \*\*(.+?)\*\* \| (.*) \|$', body, re.M):
+        field = labels.get(match.group(1))
+        if field:
+            out[field] = match.group(2)
+    return out
+
+
+def render_metadata_document(full_name, cache_name, clone_url, commit, updated, quick_ref, brief,
+                             related_repos, analysis, provenance):
+    """A complete metadata document in the full generator's format, plus provenance fields.
+
+    `provenance` is an ordered mapping of extra one-line frontmatter fields (generation and full-build
+    records); readers that don't know them ignore them.
+    """
+    table = "## Quick Reference\n\n| Property | Value |\n|----------|-------|\n"
+    for field, label, hide in _QUICK_REF_ROWS:
+        value = quick_ref.get(field)
+        if value is not None and (hide is None or value.lower() != hide):
+            table += f"| **{label}** | {value} |\n"
+    table += "\n---\n\n"
+    extra = ''.join(f"{key}: {value}\n" for key, value in provenance.items())
+    analysis = analysis.rstrip('\n')  # the template ends the file with exactly one newline
+    return f"""---
+repo_name: {full_name.split('/')[-1]}
+full_name: {full_name}
+cache_dir: {cache_name}
+clone_url: {clone_url}
+last_commit: {commit}
+last_updated: {updated}
+brief: {brief}
+type: {quick_ref.get('type', 'Unknown')}
+language: {quick_ref.get('language', 'Unknown')}
+framework: {quick_ref.get('framework', 'None')}
+database: {quick_ref.get('database', 'None')}
+apis: {quick_ref.get('apis', 'None')}
+port: {quick_ref.get('port', 'N/A')}
+related_repos: {json.dumps(related_repos)}
+parse_status: {PARSE_STATUS_OK}
+{extra}---
+
+# Repository: {full_name}
+
+{table}{analysis}
+"""
 
 
 def _parse_status_of(info):
@@ -379,7 +438,9 @@ def regenerate_index(args):
                             'apis': info.get('apis', 'None'),
                             'related_repos': info.get('related_repos', '[]'),
                             'parse_status': _parse_status_of(info),
-                            'metadata_file': metadata_file.name
+                            'metadata_file': metadata_file.name,
+                            'stale': stale_label(read_attempt_state(
+                                PRISTINE_DIR, info.get('cache_dir') or metadata_file.stem), content, info),
                         })
         except Exception as e:
             print(f"  {YELLOW}Warning: Could not parse {metadata_file.name}:{RESET} {e}")
@@ -398,6 +459,23 @@ def regenerate_index(args):
                          f"metadata** (re-sync to regenerate): {names}\n")
         print(f"  {YELLOW}{len(degraded)} of {len(repos_info)} entries have degraded "
               f"metadata{RESET}")
+
+    # Incremental metadata: a document whose latest update failed or was skipped is stale, not current;
+    # an opted-in repository whose first build failed has no metadata at all. Say both.
+    stale = [i for i in repos_info if i.get('stale')]
+    if stale:
+        names = ', '.join(i['full_name'] or i['metadata_file'] for i in stale)
+        degraded_note += (f"\n> **{len(stale)} of {len(repos_info)} entries are stale** (their latest metadata "
+                          f"update failed or was skipped; the previous metadata is shown): {names}\n")
+    documented = {i['cache_dir'] for i in repos_info}
+    unavailable = []
+    state_dir = PRISTINE_DIR / STATE_DIR_NAME
+    for state_file in sorted(state_dir.glob('*.json')) if state_dir.is_dir() else []:
+        state = read_attempt_state(PRISTINE_DIR, state_file.stem)
+        if state and state_file.stem not in documented and state.get('status') in ('pending', 'committing', 'failed', 'skipped'):
+            unavailable.append(f"{state.get('full_name') or state_file.stem} ({state.get('reason') or 'interrupted'})")
+    if unavailable:
+        degraded_note += f"\n> **Metadata unavailable:** {'; '.join(unavailable)}\n"
 
     # Generate INDEX.md
     index_content = f"""# Pristine Repository Index
@@ -435,6 +513,7 @@ def regenerate_index(args):
         apis_str = info.get('apis', 'None')
         if not apis_str or apis_str == 'None':
             apis_str = "N/A"
+        status_line = f"**Status:** ⚠ {info['stale']}\n" if info.get('stale') else ''
 
         index_content += f"""### {info['full_name']} (`{info['cache_dir']}/`)
 **Type:** {info['type']}
@@ -443,14 +522,13 @@ def regenerate_index(args):
 **Exposes:** {apis_str}
 **Database:** {info['database']}
 **Interfaces:** {related_str}
-**[View Details]({info['metadata_file']})**
+{status_line}**[View Details]({info['metadata_file']})**
 
 ---
 
 """
 
-    # Write INDEX.md
-    with open(INDEX_FILE, 'w') as f:
-        f.write(index_content)
+    # Write INDEX.md atomically: readers see the old index or the new one, never part of it.
+    write_text_atomic(INDEX_FILE, index_content)
 
     print(f"  {GREEN}✓ INDEX.md updated{RESET} ({len(repos_info)} repositories)")
