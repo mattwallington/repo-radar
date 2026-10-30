@@ -24,6 +24,7 @@ Follow [Keep a Changelog](https://keepachangelog.com/) conventions:
 
 ## Releases
 
-- Dev releases go out on the `dev` branch via `./release.sh` (creates pre-release)
-- Production releases go out on `main` via `./release.sh` (creates stable release)
+- Releases publish from GitHub Actions (`.github/workflows/desktop-release.yml`) to `ReperioHealth/repo-radar-releases`: a push to `dev` publishes a Repo Radar Dev prerelease, a push to `main` publishes Repo Radar as Latest. See "Releasing" in DEVELOPMENT.md.
+- The workflow picks the version and takes release notes from `CHANGELOG.md` (`[Unreleased]`, or a section for the exact stable version). Update the changelog in the same PR as the change; never commit a version bump.
+- `release.sh` publishing is paused. `build-local.sh` builds and verifies a signed app without publishing.
 - Always test on dev first, then merge to main for production
