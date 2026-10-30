@@ -37,7 +37,7 @@ repo-radar/
 │   ├── ui.py                  # Help text, formatting, status updates
 │   ├── modes/                 # CLI modes (configure, sync, analyze, clean)
 │   └── tests/                 # Unit tests
-├── VERSION                    # Single source of truth for version
+├── VERSION                    # Release version floor: the workflow publishes the next patch above it or higher
 ├── requirements.txt           # Python dependencies (litellm pinned)
 ├── build-local.sh             # Build, sign, notarize and verify (used by the release workflow)
 ├── release.sh                 # Old release script; publishing is paused
@@ -60,10 +60,18 @@ repo-radar/
 Releases publish from GitHub Actions (`.github/workflows/desktop-release.yml`) to the public, code-free [ReperioHealth/repo-radar-releases](https://github.com/ReperioHealth/repo-radar-releases), which is also the apps' update feed.
 
 - **What publishes:** a push to `main` publishes **Repo Radar** as the Latest release. A push to `dev` publishes **Repo Radar Dev** as a prerelease. Merging to `main` is the release decision; there is no second approval. Setting `PUBLISH_DEV: 'false'` in the workflow stops Dev publishing without affecting stable.
-- **Versions** come from the workflow, not from `package.json` or `VERSION`, and nothing commits a version bump. Stable takes the next patch above every stable release (1.0.35 or later). Dev uses that base, or a higher Dev base already in use, with a UTC timestamp suffix, such as `1.0.35-dev.20261030010000`. A minor or major bump is a deliberate change to `menubar/scripts/release-control.js`.
+- **Versions** come from the workflow, and nothing commits a version bump; `package.json`'s version is not used. Stable takes the next patch above the highest of every stable version in `repo-radar-releases` (published or draft), the bootstrap floor 1.0.34 and the base of the checkout's `VERSION`. So the first is 1.0.35, and with `VERSION` at 1.1.0 the next stable is at least 1.1.1. Dev uses that base, or a higher Dev base already in use, with a UTC timestamp suffix, such as `1.0.35-dev.20261030010000`. A minor or major bump is a deliberate change to `menubar/scripts/release-control.js`.
 - **Release notes** are written when the draft is reserved: a link comparing the source with the previous published release of the same channel (or to the source commit, for the first one), and a link to `CHANGELOG.md` as of that commit. Keep `[Unreleased]` in the changelog current in the PR that makes the change.
 - **How a run works:** it reserves a draft release keyed to its commit, builds both architectures with `build-local.sh` on a pinned macOS runner, signs and notarizes the DMGs, uploads everything with a `release-receipt.json`, checks every uploaded hash, and only then publishes. Rerunning a commit that already published does nothing. If the branch has moved on, or a newer release of the same channel exists, the run stops without publishing. Published releases are never changed: fix a bad release with a new version.
 - **Setup:** until the repository has a `desktop-release` environment, runs report "not configured" and publish nothing. An admin creates that environment, limited to the `main` and `dev` branches, and provides these secrets, as organization or environment secrets: `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `ASC_API_KEY_P8`, `ASC_API_KEY_ID`, `ASC_API_ISSUER_ID`, and `RELEASES_REPO_TOKEN`, a fine-grained token with Contents read and write on only `repo-radar-releases`. Once the environment exists, a missing secret fails the run.
+
+### When a release run fails
+
+- **A newer push wins.** If the branch moves while a build runs, that run stops before publishing; the newer push's run publishes instead. The older run's draft stays reserved in `repo-radar-releases`, and later versions number above it.
+- **Rerun the failed jobs** after fixing the cause. A rerun reuses its draft, and a commit that already published does nothing.
+- **First live run.** It is the first real test of asset uploads and downloads, of Python 3.14.10 and Xcode 16.4 on the runner, and of the signing and notary credentials. Any failure stops before publishing.
+- **Expired token.** `RELEASES_REPO_TOKEN` is a fine-grained token with an expiry date. Once it expires, runs fail with HTTP 401 and publish nothing; renew it and rerun.
+- `queue: max` in the workflow's concurrency and the `actions: read` permission are supported by GitHub; older actionlint versions flag `queue` anyway.
 
 ### By hand
 
