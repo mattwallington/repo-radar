@@ -7,8 +7,9 @@
 //   release-control.js publish --dir <dist>    GitHub Actions: upload the finalized build to its draft,
 //                                              verify the uploaded bytes, then publish it
 //   release-control.js bootstrap --dir <dist> --version <x.y.z> --source <sha>
-//                                              Operator, with local gh auth: publish a stable build made
-//                                              with build-local.sh from <sha>, which must be on main
+//                                              Operator, with local gh auth: publish the preserved 1.0.34
+//                                              build from 4283e74 (pinned in release-artifacts.js), after
+//                                              release-dmg.js has finalized its DMGs
 //
 // A release is keyed by channel plus source commit and tree, recorded in its body. Stable takes the next
 // patch above every stable tag, the bootstrap floor and the checkout's VERSION; Dev takes the greater of
@@ -21,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
-const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, channelOf, fileIdentity } = require('./release-artifacts');
+const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, BOOTSTRAP_BUILD, channelOf, fileIdentity } = require('./release-artifacts');
 const { verifyFinalized } = require('./release-dmg');
 
 const SOURCE_REPO = 'ReperioHealth/repo-radar';
@@ -179,7 +180,7 @@ async function verifyPublished(ctx, release) {
 // The finalized build: both ZIPs, both stapled DMGs, the channel's feed and any ZIP blockmaps, exactly
 // as the DMG finalizer recorded them, with both DMGs passing the read-only Apple checks again.
 async function stage(ctx, dir, version) {
-  const finalization = await verifyFinalized({ dir, version, source: ctx.plan.sourceCommit, run: ctx.appleRun });
+  const finalization = await verifyFinalized({ dir, version, source: ctx.plan.sourceCommit, pins: ctx.bootstrapBuild || BOOTSTRAP_BUILD, run: ctx.appleRun });
   const artifacts = [...finalization.zips, ...finalization.dmgs.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
     finalization.feed, ...finalization.zipBlockmaps];
   return { artifacts, finalization };
@@ -263,7 +264,10 @@ async function publish(ctx, dir) {
 
 async function bootstrap(ctx, dir, version) {
   const { client, plan } = ctx;
-  if (channelOf(version) !== 'stable') throw new Error('bootstrap publishes a stable version only');
+  const pin = ctx.bootstrapBuild || BOOTSTRAP_BUILD;
+  if (version !== pin.version || plan.sourceCommit !== pin.source) {
+    throw new Error(`bootstrap publishes only the preserved ${pin.version} build from ${pin.source}`);
+  }
   if (!await client.onBranch(plan.sourceCommit, plan.branch)) throw new Error(`${plan.sourceCommit} is not on ${plan.branch}`);
   const releases = await client.listReleases();
   let own = findOwn(releases, plan);

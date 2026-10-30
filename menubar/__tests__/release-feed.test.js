@@ -7,9 +7,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const yaml = require('js-yaml');
-const { identity, inspectFeed, dumpFeed, checkFeedDir, fileIdentity } = require('../scripts/release-artifacts');
+const { identity, inspectFeed, dumpFeed, checkFeedDir, fileIdentity, inspectZips } = require('../scripts/release-artifacts');
 const { finalize, verifyFinalized, FINALIZATION } = require('../scripts/release-dmg');
-const { makeBuild, appleTools } = require('./helpers/release-fixtures');
+const { makeBuild, appleTools, appZip } = require('./helpers/release-fixtures');
 
 const SOURCE = '4'.repeat(40);
 const tempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-feed-'));
@@ -33,6 +33,12 @@ test('the feed must describe both architectures and the exact bytes', () => {
     assert.throws(check((d) => { d.sha512 = d.files[1].sha512; }), /top-level sha512/);
     // A DMG blockmap size is only a format error in a finalized feed; it is never proof of finalization.
     assert.throws(check((d) => { d.files[2].blockMapSize = 123; }, true), /pre-staple blockmap/);
+
+    // The apps are read from inside the ZIPs: architecture from the Mach-O header, not the file name.
+    assert.deepStrictEqual(inspectZips(dir, { version: '1.0.35', channel: 'stable', source: SOURCE }).map((a) => a.arch), ['arm64', 'x64']);
+    fs.rmSync(path.join(dir, names.zips[0]));
+    appZip(dir, names.zips[0], { version: '1.0.35', channel: 'stable', source: SOURCE, arch: 'x64' });
+    assert.throws(() => inspectZips(dir, { version: '1.0.35', channel: 'stable', source: SOURCE }), /executable is x64, expected arm64/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

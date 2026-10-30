@@ -11,8 +11,10 @@
 // the finalizer has signed and stapled them, those entries must describe the final DMG bytes.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const TEAM_ID = 'F8UY7565VM';
 const SIGNING_IDENTITY = `Developer ID Application: Reperio Health, Inc. (${TEAM_ID})`;
@@ -160,6 +162,98 @@ function checkAppUpdate(text, channel) {
   }
 }
 
+// ---- the apps inside the ZIPs -------------------------------------------------------------------------
+// The ZIPs are what updating apps download, so their contents are checked directly, never a loose .app.
+
+const MACHO_CPU = Object.freeze({ 0x0100000c: 'arm64', 0x01000007: 'x64' });
+const ARCH_NAMES = Object.freeze({ arm64: 'arm64', aarch64: 'arm64', x64: 'x64', x86_64: 'x64' });
+
+// Reads one file from an asar archive: a size pickle, a header pickle with the JSON index, then data.
+function asarFile(archive, name) {
+  const buf = fs.readFileSync(archive);
+  const headerSize = buf.readUInt32LE(4);
+  const jsonSize = buf.readUInt32LE(12);
+  const index = JSON.parse(buf.toString('utf8', 16, 16 + jsonSize));
+  const entry = index.files && index.files[name];
+  if (!entry || entry.offset === undefined) throw new Error(`${path.basename(archive)} has no ${name}`);
+  const start = 8 + headerSize + Number(entry.offset);
+  return buf.subarray(start, start + entry.size).toString('utf8');
+}
+
+function machoArch(file) {
+  const head = Buffer.alloc(8);
+  const fd = fs.openSync(file, 'r');
+  try { fs.readSync(fd, head, 0, 8, 0); } finally { fs.closeSync(fd); }
+  if (head.readUInt32LE(0) !== 0xfeedfacf) throw new Error(`${path.basename(file)} is not a single-architecture 64-bit Mach-O executable`);
+  const arch = MACHO_CPU[head.readUInt32LE(4)];
+  if (!arch) throw new Error(`${path.basename(file)} has an unexpected CPU type`);
+  return arch;
+}
+
+// Checks the app inside `zip`: one top-level app with the channel's name, bundle ID and version, an
+// executable for `arch`, the channel's update settings, and build-info.json naming this version,
+// channel and source commit.
+function inspectZipApp(zip, { version, channel, source, arch }) {
+  const product = PRODUCT_NAMES[channel];
+  const listed = execFileSync('/usr/bin/unzip', ['-Z1', zip], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    .split('\n').filter(Boolean).filter((n) => !n.startsWith('__MACOSX/'));
+  const tops = [...new Set(listed.map((n) => n.split('/')[0]))];
+  if (tops.length !== 1 || tops[0] !== `${product}.app`) throw new Error(`${path.basename(zip)} holds ${tops.join(', ')}, not ${product}.app`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-zip-'));
+  try {
+    const contents = `${product}.app/Contents`;
+    const extract = (...members) => execFileSync('/usr/bin/unzip', ['-qq', '-o', zip, ...members, '-d', tmp]);
+    extract(`${contents}/Info.plist`, `${contents}/Resources/app.asar`, `${contents}/Resources/app-update.yml`);
+    const local = (rel) => path.join(tmp, contents, rel);
+    const info = JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', local('Info.plist')], { encoding: 'utf8' }));
+    const name = path.basename(zip);
+    if (info.CFBundleIdentifier !== BUNDLE_IDS[channel]) throw new Error(`${name}: bundle ID ${info.CFBundleIdentifier}, expected ${BUNDLE_IDS[channel]}`);
+    if (info.CFBundleShortVersionString !== version) throw new Error(`${name}: version ${info.CFBundleShortVersionString}, expected ${version}`);
+    extract(`${contents}/MacOS/${info.CFBundleExecutable}`);
+    const machine = machoArch(local(`MacOS/${info.CFBundleExecutable}`));
+    if (machine !== arch) throw new Error(`${name}: executable is ${machine}, expected ${arch}`);
+    checkAppUpdate(fs.readFileSync(local('Resources/app-update.yml'), 'utf8'), channel);
+    const build = JSON.parse(asarFile(local('Resources/app.asar'), 'build-info.json'));
+    if (build.version !== version || build.channel !== channel) throw new Error(`${name}: build-info is ${build.channel} ${build.version}`);
+    if (build.commit !== source) throw new Error(`${name}: built from ${build.commit}, not ${source}`);
+    if (build.arch !== undefined && ARCH_NAMES[build.arch] !== arch) throw new Error(`${name}: build-info declares ${build.arch}`);
+    return { name, product, bundleId: info.CFBundleIdentifier, version, arch: machine, commit: build.commit };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function inspectZips(dir, { version, channel, source }) {
+  const names = artifactNames(version, channel);
+  return names.zips.map((zip, i) => inspectZipApp(path.join(dir, zip), { version, channel, source, arch: ARCHES[i] }));
+}
+
+// ---- the one build published by hand -----------------------------------------------------------------
+// 1.0.34 was built locally before the release workflow existed. Its original artifacts are pinned here;
+// finalization may change only the DMGs (and the feed's DMG entries).
+const BOOTSTRAP_BUILD = Object.freeze({
+  version: '1.0.34',
+  source: '4283e7411263aca1fb32342bff48df1dc1c22392',
+  original: Object.freeze({
+    'repo-radar-1.0.34-arm64-mac.zip': 'f622dd42b8e7f51615f0dcd82d1f2406b95b41d9983bee8568d5ba3bdcb36266',
+    'repo-radar-1.0.34-x64-mac.zip': '5b5edbbaa3a02de585d3cc41230477adb9e9a1b4722c4c902434cad95be89a29',
+    'repo-radar-1.0.34-arm64-mac.dmg': '6161e41f314c9937453dcf21ddf6b7ba54d7468d902573763366a697543aad3a',
+    'repo-radar-1.0.34-x64-mac.dmg': '8ba1561da577db939b8cc01ba9a74f7ea25edd875047628d82022274c741f697',
+    'latest-mac.yml': '953180e64dec2d6bcbdc2244174d5e09911daa4f288fdcfe9e5158d8c5a71e6b',
+    'repo-radar-1.0.34-arm64-mac.zip.blockmap': '36f44ebdeb3998f8eb0ea4707d96b071b9cb8b21c8a257eee7bc8fdc137a6f90',
+    'repo-radar-1.0.34-x64-mac.zip.blockmap': 'ec33125eeb070ccdfc89cf005d38a09cf786392d4a905837b9dcc2492eca9621',
+  }),
+});
+
+// For a pinned build: the source must be the pinned one and each named file its original bytes.
+function checkPinned(dir, pin, source, names) {
+  if (source !== pin.source) throw new Error(`${pin.version} was built from ${pin.source}, not ${source}`);
+  for (const n of names) {
+    if (!pin.original[n]) throw new Error(`${n} is not part of the pinned ${pin.version} build`);
+    if (fileIdentity(path.join(dir, n)).sha256 !== pin.original[n]) throw new Error(`${n} is not the original ${pin.version} file`);
+  }
+}
+
 function main(argv) {
   const [command, ...rest] = argv;
   const opt = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
@@ -193,4 +287,5 @@ if (require.main === module) {
 module.exports = {
   TEAM_ID, SIGNING_IDENTITY, NOTARY_PROFILE, FEED_OWNER, FEED_REPO, ARCHES, STABLE_VERSION, DEV_VERSION, BUNDLE_IDS, PRODUCT_NAMES, APP_UPDATE,
   channelOf, feedName, artifactNames, identity, fileIdentity, inspectFeed, dumpFeed, checkFeedDir, checkAppUpdate,
+  inspectZipApp, inspectZips, checkPinned, BOOTSTRAP_BUILD,
 };

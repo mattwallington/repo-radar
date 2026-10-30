@@ -6,10 +6,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { artifactNames } = require('../scripts/release-artifacts');
+const { artifactNames, fileIdentity } = require('../scripts/release-artifacts');
 const { finalize } = require('../scripts/release-dmg');
 const { planVersion, reserve, publish, bootstrap, recordOf } = require('../scripts/release-control');
-const { makeBuild, appleTools } = require('./helpers/release-fixtures');
+const { makeBuild, appleTools, appZip, writeFeed } = require('./helpers/release-fixtures');
 
 const NOW = new Date('2026-10-30T01:00:00Z');
 const sha = (n) => String(n).repeat(40).slice(0, 40);
@@ -154,41 +154,100 @@ test('a build whose files changed after finalization is never uploaded', async (
   }
 });
 
+// Pins for a fixture build, the way BOOTSTRAP_BUILD pins the real 1.0.34.
+function pinsFor(dir, source) {
+  const names = artifactNames('1.0.34', 'stable');
+  const original = {};
+  for (const n of [...names.zips, ...names.dmgs, names.feed, ...names.zipBlockmaps]) original[n] = fileIdentity(path.join(dir, n)).sha256;
+  return { version: '1.0.34', source, original };
+}
+
+function bootstrapFixture(state) {
+  const nothingPublished = () => {
+    assert.ok(state.releases.every((r) => r.draft && r.assets.length === 0), 'zero uploads, nothing published');
+  };
+  return { nothingPublished, scratch: fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-bootstrap-')) };
+}
+
 test('bootstrap publishes only a finalized build whose DMGs still pass the Apple checks', async () => {
   const { state, client } = fakeGitHub();
   const source = sha('f');
   state.ancestors.main = [source];
-  const ctx = context(client, planFor('stable', source));
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-bootstrap-'));
-  const nothingPublished = () => {
-    assert.ok(state.releases.every((r) => r.draft && r.assets.length === 0), 'zero uploads, nothing published');
+  const { nothingPublished, scratch } = bootstrapFixture(state);
+  const build = (name) => {
+    const dir = path.join(scratch, name);
+    makeBuild(dir, { version: '1.0.34', channel: 'stable', source });
+    return { dir, pins: pinsFor(dir, source) };
   };
+  const ctxFor = (pins, appleRun = appleTools().run) => ({ ...context(client, planFor('stable', source)), bootstrapBuild: pins, appleRun });
   try {
     // The builder's own output: its feed has no DMG blockMapSize, so only the finalizer's record can tell.
-    const raw = path.join(scratch, 'raw');
-    makeBuild(raw, { version: '1.0.34', channel: 'stable', source });
-    await assert.rejects(bootstrap(ctx, raw, '1.0.34'), /no release-finalization\.json/);
+    const raw = build('raw');
+    await assert.rejects(bootstrap(ctxFor(raw.pins), raw.dir, '1.0.34'), /no release-finalization\.json/);
     nothingPublished();
 
     // Finalized, then a DMG changed.
-    const changed = path.join(scratch, 'changed');
-    makeBuild(changed, { version: '1.0.34', channel: 'stable', source });
-    await finalize({ dir: changed, version: '1.0.34', source, run: appleTools().run, env: {} });
-    fs.appendFileSync(path.join(changed, artifactNames('1.0.34', 'stable').dmgs[0]), 'x');
-    await assert.rejects(bootstrap(ctx, changed, '1.0.34'), /is not the file that was finalized/);
+    const changed = build('changed');
+    await finalize({ dir: changed.dir, version: '1.0.34', source, pins: changed.pins, run: appleTools().run, env: {} });
+    fs.appendFileSync(path.join(changed.dir, artifactNames('1.0.34', 'stable').dmgs[0]), 'x');
+    await assert.rejects(bootstrap(ctxFor(changed.pins), changed.dir, '1.0.34'), /is not the file that was finalized/);
     nothingPublished();
 
     // Finalized, but a DMG no longer passes Gatekeeper.
-    const good = path.join(scratch, 'good');
-    makeBuild(good, { version: '1.0.34', channel: 'stable', source });
-    await finalize({ dir: good, version: '1.0.34', source, run: appleTools().run, env: {} });
-    await assert.rejects(bootstrap({ ...ctx, appleRun: appleTools({ fail: 'assess' }).run }, good, '1.0.34'), /assess exited 1/);
+    const good = build('good');
+    await finalize({ dir: good.dir, version: '1.0.34', source, pins: good.pins, run: appleTools().run, env: {} });
+    await assert.rejects(bootstrap(ctxFor(good.pins, appleTools({ fail: 'assess' }).run), good.dir, '1.0.34'), /assess exited 1/);
     nothingPublished();
 
-    // The same finalized build with passing checks publishes as Latest.
-    assert.deepStrictEqual(await bootstrap(ctx, good, '1.0.34'), { published: true, version: '1.0.34' });
-    assert.strictEqual(state.releases.filter((r) => !r.draft).length, 1);
-    assert.strictEqual(state.releases.find((r) => !r.draft).make_latest, 'true');
+    // Control: the same finalized build from the pinned source, ZIPs unchanged and checks passing, publishes as Latest.
+    assert.deepStrictEqual(await bootstrap(ctxFor(good.pins), good.dir, '1.0.34'), { published: true, version: '1.0.34' });
+    const published = state.releases.filter((r) => !r.draft);
+    assert.strictEqual(published.length, 1);
+    assert.strictEqual(published[0].make_latest, 'true');
+    assert.strictEqual(recordOf(published[0]).sourceCommit, source);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap binds the pinned source and original ZIPs, read from inside the archives', async () => {
+  const { state, client } = fakeGitHub();
+  const real = sha('f');
+  const parent = sha('9'); // also on main, so ancestry alone would accept it
+  state.ancestors.main = [real, parent];
+  const { nothingPublished, scratch } = bootstrapFixture(state);
+  const names = artifactNames('1.0.34', 'stable');
+  try {
+    // A different source than the pinned one is refused before any draft.
+    const dir = path.join(scratch, 'build');
+    makeBuild(dir, { version: '1.0.34', channel: 'stable', source: real });
+    const pins = pinsFor(dir, real);
+    await finalize({ dir, version: '1.0.34', source: real, pins, run: appleTools().run, env: {} });
+    const ctx = { ...context(client, planFor('stable', parent)), bootstrapBuild: pins };
+    await assert.rejects(bootstrap(ctx, dir, '1.0.34'), /only the preserved 1\.0\.34 build from f+/);
+    nothingPublished();
+
+    // Pins that name the parent cannot be satisfied: the apps inside the ZIPs say they came from the real source.
+    const claimed = path.join(scratch, 'claimed');
+    makeBuild(claimed, { version: '1.0.34', channel: 'stable', source: real });
+    const wrongPins = pinsFor(claimed, parent);
+    await assert.rejects(finalize({ dir: claimed, version: '1.0.34', source: parent, pins: wrongPins, run: appleTools().run, env: {} }),
+      new RegExp(`arm64-mac\\.zip: built from ${real}, not ${parent}`));
+    await assert.rejects(bootstrap({ ...ctx, bootstrapBuild: wrongPins }, claimed, '1.0.34'), /no release-finalization\.json/);
+    nothingPublished();
+
+    // A replaced ZIP with a regenerated, self-consistent feed still fails the pinned ZIP identity.
+    const replaced = path.join(scratch, 'replaced');
+    makeBuild(replaced, { version: '1.0.34', channel: 'stable', source: real });
+    const originalPins = pinsFor(replaced, real);
+    fs.rmSync(path.join(replaced, names.zips[0]));
+    appZip(replaced, names.zips[0], { version: '1.0.34', channel: 'stable', source: real, arch: 'arm64' });
+    writeFeed(replaced, '1.0.34', 'stable');
+    await assert.rejects(finalize({ dir: replaced, version: '1.0.34', source: real, pins: originalPins, run: appleTools().run, env: {} }),
+      /arm64-mac\.zip is not the original 1\.0\.34 file/);
+    await assert.rejects(bootstrap({ ...context(client, planFor('stable', real)), bootstrapBuild: originalPins }, replaced, '1.0.34'),
+      /no release-finalization\.json/);
+    nothingPublished();
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
