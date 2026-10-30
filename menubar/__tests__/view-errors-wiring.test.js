@@ -209,10 +209,16 @@ test('a refused sync is refused BEFORE the progress window is opened or the stat
   assert.notStrictEqual(showLog, -1, 'triggerSync still opens the progress window for manual syncs');
   assert.ok(guard < showLog, 'the guard must refuse before the progress window is ever created');
 
-  const reset = body.indexOf("status.logOutput = ''");
-  assert.notStrictEqual(reset, -1, 'triggerSync still resets status for a real sync');
+  // The run's rows/errors/log are reset by syncState.begin() once the attempt holds the root lock
+  // (runSync's onChild), not up front: a refusal of any kind leaves the previous run's intact.
+  const onChild = body.indexOf('onChild: async (child) => {');
+  const reset = body.indexOf('syncState.begin(st, runtimeChannel', onChild);
+  assert.notStrictEqual(onChild, -1, 'triggerSync still hands runSync an onChild callback');
+  assert.notStrictEqual(reset, -1, 'triggerSync still resets status for a real sync, in onChild');
   assert.ok(guard < reset,
     'a refusal must leave the previous errorLog/errorList intact -- the reset belongs to the spawn path');
+  assert.strictEqual(/status\.(logOutput|errorLog|errorList|repos) = (''|\[\])/.test(body.slice(0, onChild)), false,
+    'nothing above the spawn path clears the previous run\'s rows, errors or log');
 
   assert.ok(guard < body.indexOf('sendSyncStartedWhenReady'),
     'no sync-started may be scheduled for an attempt that is about to be refused');

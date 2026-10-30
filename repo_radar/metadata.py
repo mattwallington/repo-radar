@@ -257,7 +257,7 @@ def _parse_status_of(info):
     brief = (info.get('brief') or '').strip()
     if info.get('type', 'Unknown') == 'Unknown' or info.get('language', 'Unknown') == 'Unknown':
         return PARSE_STATUS_DEGRADED
-    if brief.startswith(_FRAGMENT_PREFIXES) or not brief:
+    if not brief or _looks_like_fragment(brief):
         return PARSE_STATUS_DEGRADED
     return PARSE_STATUS_OK
 

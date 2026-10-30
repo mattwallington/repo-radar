@@ -20,7 +20,7 @@ GATE_STUB = """import json, os, sys
 name = os.path.basename(sys.argv[0])
 with open(os.environ["RR_LOG"], "a") as f:
     f.write(json.dumps({"gate": name, "exe": sys.executable, "argv": sys.argv[1:],
-                        "no_bytecode": sys.flags.dont_write_bytecode}) + "\\n")
+                        "no_bytecode": sys.flags.dont_write_bytecode, "isolated": sys.flags.isolated}) + "\\n")
 sys.exit(1 if os.environ.get("RR_FAIL_GATE") == name else 0)
 """
 
@@ -120,6 +120,7 @@ def test_gates_run_in_supplied_venv_and_failures_block_release(checkout):
         assert g["exe"] == venv_python, "venv path must be used as supplied, not resolved"
         assert g["argv"][0] == "--target-date" and len(g["argv"][1]) == 10
         assert g["no_bytecode"] == 1
+        assert g["isolated"] == 1, "gates must run in isolated mode (-I)"
     assert not [e for e in entries if e.get("ambient")], "ambient python3 must never run"
     _assert_nothing_released(repo, entries)
 

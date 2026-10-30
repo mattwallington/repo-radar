@@ -1,6 +1,12 @@
 import asyncio, threading, time, pytest, repo_radar.preflight as pf
 from unittest.mock import patch
 from types import SimpleNamespace
+from litellm.llms.anthropic.count_tokens.token_counter import anthropic_count_tokens_handler
+@pytest.fixture(autouse=True)
+def _fake_key(monkeypatch): monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+def _provider(fake):
+    """Stand in for Anthropic's Count Tokens API at the handler preflight calls; fake returns its JSON."""
+    return patch.object(anthropic_count_tokens_handler, "handle_count_tokens_request", fake)
 def _resp(total, tt="anthropic_api", error=False, rm="claude-opus-5", mu="claude-opus-5"):
     return SimpleNamespace(total_tokens=total, tokenizer_type=tt, error=error, request_model=rm, model_used=mu)
 def test_gate_all_conditions():
@@ -10,12 +16,12 @@ def test_gate_all_conditions():
         assert pf._is_authoritative(bad, "claude-opus-5") is False
 def test_count_once_timeout_and_error_and_fatal():
     loop = pf.PreflightLoop(); loop.start()
-    async def slow(**kw): await asyncio.sleep(1); return _resp(5)
-    with patch("litellm.acount_tokens", slow): assert loop.submit(pf._count_once("claude-opus-5","x",0.01)).authoritative is False
+    async def slow(**kw): await asyncio.sleep(1); return {"input_tokens": 5}
+    with _provider(slow): assert loop.submit(pf._count_once("claude-opus-5","x",0.01)) == (None, False, "TimeoutError")
     async def boom(**kw): raise RuntimeError()
-    with patch("litellm.acount_tokens", boom): assert loop.submit(pf._count_once("claude-opus-5","x",5)).authoritative is False
+    with _provider(boom): assert loop.submit(pf._count_once("claude-opus-5","x",5)) == (None, False, "RuntimeError")
     async def ki(**kw): raise KeyboardInterrupt()
-    with patch("litellm.acount_tokens", ki):
+    with _provider(ki):
         out = loop.submit(pf._count_once("claude-opus-5","x",5)); assert isinstance(out, pf._Fatal)
     loop.close()
 def test_runs_and_closes():
@@ -113,8 +119,8 @@ def test_cancellation_resistant_task_keeps_close_retryable_and_bounded():
 
 def test_local_strategy_never_calls_provider():
     calls = []
-    async def fake(**kw): calls.append(1); return _resp(5)
-    with patch("litellm.acount_tokens", fake), pf.PreflightSession(timeout_s=5) as s:
+    async def fake(**kw): calls.append(1); return {"input_tokens": 5}
+    with _provider(fake), pf.PreflightSession(timeout_s=5) as s:
         assert s.count("gpt-5.4-mini", "x", 16384).authoritative is False
     assert calls == []
 
@@ -133,8 +139,8 @@ def _concurrent_two(total):
     async def fake(**kw):
         calls.append(1); entered.set()
         await asyncio.get_event_loop().run_in_executor(None, release.wait)
-        return _resp(total, rm=kw["model"], mu=kw["model"])
-    with patch("litellm.acount_tokens", fake), pf.PreflightSession(timeout_s=5) as s:
+        return {"input_tokens": total}
+    with _provider(fake), pf.PreflightSession(timeout_s=5) as s:
         lp = s._loop._loop; f1 = f2 = None
         try:
             f1 = asyncio.run_coroutine_threadsafe(s._guarded("claude-opus-5", "same"), lp)
@@ -161,18 +167,18 @@ def test_breaker_per_model_and_logs_downgrade_once(caplog):
     import logging; caplog.set_level(logging.WARNING, logger="repo_radar.preflight")
     seen = []
     async def fake(**kw):
-        seen.append(kw["model"]); return _resp(0 if kw["model"]=="claude-opus-5" else 50, rm=kw["model"], mu=kw["model"])
-    with patch("litellm.acount_tokens", fake), pf.PreflightSession(timeout_s=5) as s:
+        seen.append(kw["model"]); return {"input_tokens": 0 if kw["model"]=="claude-opus-5" else 50}
+    with _provider(fake), pf.PreflightSession(timeout_s=5) as s:
         assert s.count("claude-opus-5","a",8192).authoritative is False
         assert s.count("claude-opus-5","b",8192).authoritative is False            # breaker open, no call
         assert s.count("claude-sonnet-5","c",8192).authoritative is True           # different model still tries
     assert seen == ["claude-opus-5", "claude-sonnet-5"]
-    downgrades = [r for r in caplog.records if "downgraded to Branch 1" in r.getMessage() and "claude-opus-5" in r.getMessage()]
+    downgrades = [r for r in caplog.records if "token count unavailable for claude-opus-5" in r.getMessage()]
     assert len(downgrades) == 1                                                    # logged exactly once
 
 
 def test_fatal_reraised_on_caller_thread():
     async def ki(**kw): raise KeyboardInterrupt()
-    with patch("litellm.acount_tokens", ki), pf.PreflightSession(timeout_s=5) as s:
+    with _provider(ki), pf.PreflightSession(timeout_s=5) as s:
         try: s.count("claude-opus-5","x",8192); assert False
         except KeyboardInterrupt: pass

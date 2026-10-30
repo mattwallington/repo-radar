@@ -27,7 +27,8 @@ def test_real_manifest_exact_set_and_passes_at_release():
     ids = [r["id"] for r in rows]
     assert len(ids) == len(set(ids)), "duplicate ids in manifest"
     assert set(ids) == set(model_catalog.MODEL_CAPS) | set(llm.MODEL_MIGRATIONS)
-    assert gate.check(str(MANIFEST), set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), RELEASE) == []
+    assert gate.check(str(MANIFEST), set(model_catalog.MODEL_CAPS), set(llm.MODEL_MIGRATIONS), RELEASE,
+                      tiers=llm.MODEL_TIERS) == []
 
 def test_happy_row_passes():
     assert _run(
@@ -57,6 +58,21 @@ def test_failures_are_returned_not_raised():
         assert fails, (rows, "expected failures")
         if sub:
             assert any(sub in f for f in fails), (sub, fails)
+
+def test_fully_retired_tier_fails_by_name_even_without_lifecycle_rows():
+    # Codex's last member retiring leaves its ids with nowhere to land. With the rows deleted and the
+    # known/migration sets emptied to match, only the tier table can still catch it.
+    tiers = {"openai-codex": ["gpt-5.3-codex", "gpt-5.2-codex"], "openai-sol": ["gpt-6.1-sol"]}
+    p = _tmp([{"id": "gpt-6.1-sol", "status": "active", "shutdown_date": None, "source_url": OK}])
+    try:
+        fails = gate.check(p, {"gpt-6.1-sol"}, set(), RELEASE, tiers=tiers)
+    finally:
+        os.unlink(p)
+    assert any("tier openai-codex" in f and "no known member" in f for f in fails), fails
+    assert any("tier openai-codex" in f and "gpt-5.3-codex" in f and "gpt-5.2-codex" in f
+               for f in fails if "neither known nor migrated" in f), fails
+    assert not any("openai-sol" in f for f in fails), fails
+
 
 def test_cli_requires_iso_date():
     p = subprocess.run([sys.executable, str(ROOT / "scripts" / "check_model_lifecycle.py"),

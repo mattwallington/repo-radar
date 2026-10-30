@@ -67,11 +67,18 @@ test('renderer.js still parses', () => {
 });
 
 test('the LockBusy branch tells the progress window it was refused', () => {
-  // The catch's LockBusy arm, from its `e.code === 75` test to its own `return`.
-  const branch = between('if (e && e.code === 75) {', "activityGlue.onContention(activity.writer, 'root-busy');");
+  // The catch's LockBusy arm, from its `e.code === 75` test to the start of the other arm.
+  const branch = between('if (e && e.code === 75) {', "console.error('runSync failed to start sync:', e);");
 
   assert.ok(/refuseProgressWindow\('already-running'\)/.test(branch),
     'the LockBusy branch must refuse the progress window it already opened, with its own reason');
+  // The refused attempt is recorded as skipped, and stops being pending, before the window is
+  // chosen: until then its Activity lease must not be read as another running worker.
+  inOrder(branch, [
+    "activityGlue.onContention(activity.writer, 'root-busy')",
+    'settlePending()',
+    'showRunningSyncInstead()',
+  ], 'the LockBusy branch');
 
   // The two existing effects are untouched -- this fix ADDS a third.
   assert.ok(/Notification\.isSupported\(\)/.test(branch), 'the macOS Notification stays');
@@ -117,12 +124,12 @@ test('the refusal is gated on this attempt having opened the window, and its pay
     'a window still loading would drop the send -- wait for it, like sendSyncStartedWhenReady does');
   assert.ok(/syncRefusedForThisAttempt = true;/.test(helper),
     'the refusal must latch, so a pending sync-started can be short-circuited');
-  assert.ok(/pendingFreshSync = false;/.test(helper),
+  assert.ok(/clearPendingStart\(\);/.test(helper),
     'the fresh-sync replay skip no longer applies once the attempt is refused');
 });
 
 test("the attempt's window is captured where it is opened", () => {
-  const opener = between('if (showWindow) {\n    pendingFreshSync = true;', 'let syncRefusedForThisAttempt');
+  const opener = between('let startToken = null;', 'let syncRefusedForThisAttempt');
   assert.ok(/showLogWindow\(\);/.test(opener) && /attemptWindow = logWindow;/.test(opener),
     'attemptWindow is captured right after showLogWindow(), inside the showWindow branch');
   assert.ok(opener.indexOf('showLogWindow()') < opener.indexOf('attemptWindow = logWindow;'),
@@ -138,9 +145,11 @@ test('a refused attempt can never have a late sync-started painted over it', () 
   const sender = between('const sendSyncStartedWhenReady = () => {', 'setTimeout(sendSyncStartedWhenReady, 300);');
 
   const guardAt = sender.indexOf('if (syncRefusedForThisAttempt)');
+  const fillAt = sender.indexOf('replaySyncToWindow(win)');
   assert.notStrictEqual(guardAt, -1, 'the sender must check the refusal latch');
-  assert.ok(guardAt < sender.indexOf("logWindow.webContents.send('sync-started'"),
-    'the latch is checked BEFORE the sync-started send -- the 300ms timer and the 100ms isLoading ' +
+  assert.notStrictEqual(fillAt, -1, 'the sender fills only the window it captured');
+  assert.ok(guardAt < fillAt,
+    'the latch is checked BEFORE the window is filled -- the 300ms timer and the 100ms isLoading ' +
     'poll both re-enter here, and either could otherwise repaint the waiting grid over the refusal');
 
   // The latch is declared per-attempt (a closure variable of triggerSync), not module state --
@@ -175,7 +184,7 @@ test('the legacy progress renderer listens for sync-refused, in its existing ipc
   assert.ok(/ipcRenderer\.on\('sync-refused', \(event, data\) => \{/.test(rendererSrc),
     "renderer.js must register an ipcRenderer 'sync-refused' listener");
 
-  const handler = between("ipcRenderer.on('sync-refused', (event, data) => {", "ipcRenderer.on('version-info'", rendererSrc);
+  const handler = between("ipcRenderer.on('sync-refused', (event, data) => {", "const { applySyncState }", rendererSrc);
   assert.ok(/applySyncRefused\(document, data && data\.reason\)/.test(handler),
     'the listener hands the bare reason to the pure DOM function (mapping proven by sync-refused-dom.test.js)');
   assert.strictEqual(/textContent|log\([^)]*reason/.test(handler), false,

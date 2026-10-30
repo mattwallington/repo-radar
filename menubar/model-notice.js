@@ -1,22 +1,19 @@
 'use strict';
 const { migrateModel, suggestUpgrade, KNOWN_MODEL_IDS } = require('./model-policy');
 
-// Compound-aware notice: migration and suggestion are NOT mutually exclusive (several retired
-// ids migrate onto a suggestion key). suggestUpgrade is evaluated on the EFFECTIVE model.
+// A retired id migrates to the newest model of its tier, which never has a suggestion of its own
+// (drift-check.js enforces it), so a notice is either a migration or a suggestion, never both.
 function computeModelNotice(rawModel) {
   if (!rawModel) return null;
   const effective = migrateModel(rawModel);
-  const migrated = effective !== rawModel;
-  const suggested = suggestUpgrade(effective);
-  if (migrated && suggested) return { kind: 'compound',   from: rawModel, effective, suggested };
-  if (migrated)              return { kind: 'migration',  from: rawModel, effective };
-  if (suggested)             return { kind: 'suggestion', from: rawModel, effective, suggested };
+  if (effective !== rawModel) return { kind: 'migration', from: rawModel, effective };
+  const suggested = suggestUpgrade(rawModel);
+  if (suggested) return { kind: 'suggestion', from: rawModel, effective, suggested };
   return null;
 }
 
 function noticeSignature(n) {
   if (!n) return null;
-  if (n.kind === 'compound')  return `compound:${n.from}>${n.effective}>${n.suggested}`;
   if (n.kind === 'migration') return `migration:${n.from}>${n.effective}`;
   return `suggestion:${n.effective}>${n.suggested}`;
 }
@@ -56,17 +53,7 @@ function renderNoticeText(notice, labelMap) {
       ],
     };
   }
-  // compound
-  return {
-    title: 'Your model was updated',
-    body: `Your model ${L(notice.from)} was retired — you're now on ${L(notice.effective)}. ` +
-          `A newer model in its tier is also available: ${L(notice.effective)} → ${L(notice.suggested)}.`,
-    buttons: [
-      { action: 'switch', label: `Switch to ${L(notice.suggested)}` },
-      { action: 'keep', label: `Keep ${L(notice.effective)}` },
-      { action: 'review', label: 'Review Models…' },
-    ],
-  };
+  return null;
 }
 
 // Per-kind allow-list + conservative 'close' mapping. Returns null for a disallowed action.
@@ -81,12 +68,6 @@ function resolveNoticeAction(action, notice) {
     if (action === 'switch') return { finalModel: sug, openSettings: false };
     if (action === 'keep' || action === 'close') return { finalModel: null, openSettings: false };
     if (action === 'review') return { finalModel: null, openSettings: true };
-    return null;
-  }
-  if (notice.kind === 'compound') {
-    if (action === 'switch') return { finalModel: sug, openSettings: false };
-    if (action === 'keep' || action === 'close') return { finalModel: eff, openSettings: false };
-    if (action === 'review') return { finalModel: eff, openSettings: true };
     return null;
   }
   return null;

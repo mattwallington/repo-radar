@@ -21,3 +21,7 @@ def test_budget_subtracts_requested_output_and_1pct():
 def test_gpt_4_turbo_removed_and_every_model_serves_16384():
     assert mc.get_caps("gpt-4-turbo") is None
     assert all(c.max_output >= 16384 for c in mc.MODEL_CAPS.values())
+def test_sonnet_4_6_output_cap_is_anthropics_128k():
+    # https://platform.claude.com/docs/en/models/sonnet-4-6/overview documents 128K max output; the
+    # catalog had carried 64K.
+    assert mc.MODEL_CAPS["claude-sonnet-4-6"].max_output == 128000
