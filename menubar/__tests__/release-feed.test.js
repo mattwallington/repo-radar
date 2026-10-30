@@ -77,23 +77,46 @@ test('finalizing updates only the DMG entries, drops the DMG blockmaps and recor
     assert.strictEqual(record.source, SOURCE);
     assert.ok(record.dmgs.every((d) => /^[0-9a-f-]{36}$/.test(d.submission)));
     await verifyFinalized({ dir, version, source: SOURCE, run: appleTools().run });
+
+    // Rerunning on the finalized folder only verifies it: same bytes everywhere, read-only commands only.
+    const snapshot = () => Object.fromEntries(fs.readdirSync(dir).map((n) => [n, fileIdentity(path.join(dir, n)).sha256]));
+    const before = snapshot();
+    const rerun = appleTools();
+    assert.deepStrictEqual(await finalize({ dir, version, source: SOURCE, run: rerun.run, env }), record);
+    assert.deepStrictEqual(snapshot(), before);
+    assert.deepStrictEqual([...new Set(rerun.calls.map((c) => c.step))].sort(),
+      ['assess', 'codesign --display', 'codesign --verify', 'xcrun stapler validate']);
+
+    // A different source, or an artifact changed since, is refused without signing or touching the record.
+    const refused = appleTools();
+    await assert.rejects(finalize({ dir, version, source: 'b'.repeat(40), run: refused.run, env }), /made for source 4+, not b+/);
+    fs.appendFileSync(path.join(dir, names.zips[1]), 'changed');
+    await assert.rejects(finalize({ dir, version, source: SOURCE, run: refused.run, env }), /is not the file that was finalized/);
+    assert.deepStrictEqual(refused.calls, []);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, FINALIZATION), 'utf8')), record);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a failed finalization leaves no record, even over an earlier one', async () => {
+test('a failed finalization leaves no record; an existing record that does not verify is kept and refused', async () => {
   const dir = tempDir();
   try {
     const names = makeBuild(dir, { version: '1.0.35', channel: 'stable', source: SOURCE });
     const before = fs.readFileSync(path.join(dir, names.feed), 'utf8');
-    fs.writeFileSync(path.join(dir, FINALIZATION), '{"from":"an earlier attempt"}');
     const tools = appleTools({ notaryStatus: 'Invalid' });
     await assert.rejects(finalize({ dir, version: '1.0.35', source: SOURCE, run: tools.run, env: {} }), /Invalid", not Accepted/);
     assert.ok(!tools.calls.some((c) => c.step === 'xcrun stapler staple'), 'nothing is stapled after a rejected submission');
     assert.strictEqual(fs.readFileSync(path.join(dir, names.feed), 'utf8'), before);
     assert.ok(!fs.existsSync(path.join(dir, FINALIZATION)));
     await assert.rejects(verifyFinalized({ dir, version: '1.0.35', source: SOURCE, run: appleTools().run }), /no release-finalization\.json/);
+
+    const stale = '{"from":"an earlier attempt"}';
+    fs.writeFileSync(path.join(dir, FINALIZATION), stale);
+    const again = appleTools();
+    await assert.rejects(finalize({ dir, version: '1.0.35', source: SOURCE, run: again.run, env: {} }), /is not for stable 1\.0\.35/);
+    assert.deepStrictEqual(again.calls, [], 'no signing or notary submission starts');
+    assert.strictEqual(fs.readFileSync(path.join(dir, FINALIZATION), 'utf8'), stale);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

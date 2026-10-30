@@ -14,6 +14,8 @@
 // timed-out step stops everything: no retry, and a timed-out notary submission is never re-sent.
 // Only when every step has succeeded does it write release-finalization.json, recording the input and
 // final hashes and the notary submissions. The publisher requires that record and rechecks it.
+// Run again on a finalized folder, it only verifies the record and changes nothing. A folder whose
+// output is invalid is refused as it is; recover from a fresh copy of the original build output.
 //
 //   node menubar/scripts/release-dmg.js --dir <dist> --version <x.y.z or x.y.z-dev.N> --source <commit>
 //
@@ -163,8 +165,13 @@ async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = pr
   const channel = channelOf(version);
   if (!channel) throw new Hold(`not a release version: ${version}`);
   if (!SHA.test(source || '')) throw new Hold(`not a source commit: ${source}`);
-  // A previous result never survives a new attempt, so a failure below leaves no success marker.
-  fs.rmSync(path.join(dir, FINALIZATION), { force: true });
+  // A folder that was already finalized is only verified: nothing is signed, submitted, stapled or
+  // rewritten again, and a record that no longer verifies is kept and refused, never replaced.
+  if (fs.existsSync(path.join(dir, FINALIZATION))) {
+    log(`${FINALIZATION} exists: verifying it instead of finalizing again`);
+    return verifyFinalized({ dir, version, source, pins, env, run });
+  }
+  // The record is written only at the very end, so a failure below leaves no success marker.
   const names = artifactNames(version, channel);
   const feedPath = path.join(dir, names.feed);
   const ids = {};
@@ -257,8 +264,9 @@ async function verifyFinalized({ dir, version, source, pins = BOOTSTRAP_BUILD, e
   const names = artifactNames(version, channel);
   const file = path.join(dir, FINALIZATION);
   if (!fs.existsSync(file)) throw new Hold(`no ${FINALIZATION} in ${dir}: run release-dmg.js on this build first`);
-  const result = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (result.schema !== FINALIZATION_SCHEMA || result.version !== version || result.channel !== channel) {
+  let result;
+  try { result = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { throw new Hold(`${FINALIZATION} is not valid JSON`); }
+  if (!result || result.schema !== FINALIZATION_SCHEMA || result.version !== version || result.channel !== channel) {
     throw new Hold(`${FINALIZATION} is not for ${channel} ${version}`);
   }
   if (result.source !== source) throw new Hold(`${FINALIZATION} was made for source ${result.source}, not ${source}`);
