@@ -21,7 +21,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const childProcess = require('child_process');
+const { releaseEnv } = require('./release-env');
 const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, BOOTSTRAP_BUILD, channelOf, fileIdentity } = require('./release-artifacts');
 const { verifyFinalized } = require('./release-dmg');
 
@@ -351,7 +352,7 @@ function githubClient({ sourceRepo, sourceToken, releasesToken }) {
 
 // ---- CLI ------------------------------------------------------------------------------------------
 
-const git = (...args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' }).trim();
+const git = (...args) => childProcess.execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', env: releaseEnv() }).trim();
 const opt = (argv, name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
 const sha256File = (file) => fileIdentity(file).sha256;
 
@@ -384,13 +385,21 @@ function actionsContext() {
   return baseContext(plan, githubClient({ sourceRepo: SOURCE_REPO, sourceToken: env.SOURCE_TOKEN, releasesToken: env.RELEASES_REPO_TOKEN }));
 }
 
+// The operator's GitHub token for bootstrap: one supplied explicitly, or gh's saved login. gh runs
+// with the minimal environment; the token stays in this process and is never printed.
+function localToken(env) {
+  if (env.GH_TOKEN || env.GITHUB_TOKEN) return env.GH_TOKEN || env.GITHUB_TOKEN;
+  return childProcess.execFileSync('gh', ['auth', 'token', '--hostname', 'github.com'], { encoding: 'utf8', env: releaseEnv(env) }).trim();
+}
+
 // What built the release, for its receipt. Runs after the build, when the release venv exists.
 function toolchain(env) {
-  const python = execFileSync(env.REPO_RADAR_RELEASE_PYTHON, ['-I', '-c', 'import sys;print(sys.version.split()[0])'], { encoding: 'utf8' }).trim();
+  const python = childProcess.execFileSync(env.REPO_RADAR_RELEASE_PYTHON, ['-I', '-c', 'import sys;print(sys.version.split()[0])'],
+    { encoding: 'utf8', env: releaseEnv(env) }).trim();
   const lock = `cp3${python.split('.')[1]}-${process.arch === 'arm64' ? 'arm64' : 'x86_64'}.lock`;
   return {
     node: process.version,
-    xcode: execFileSync('xcodebuild', ['-version'], { encoding: 'utf8' }).trim().replace(/\n/g, ' / '),
+    xcode: childProcess.execFileSync('xcodebuild', ['-version'], { encoding: 'utf8', env: releaseEnv(env) }).trim().replace(/\n/g, ' / '),
     python,
     runnerImage: `${env.ImageOS || 'unknown'} ${env.ImageVersion || ''}`.trim(),
     npmLockSha256: sha256File(path.join(ROOT, 'menubar', 'package-lock.json')),
@@ -426,7 +435,7 @@ async function main(argv) {
       throw new Error('usage: release-control.js bootstrap --dir <dist> --version <x.y.z> --source <40-character sha>');
     }
     if (process.env.GITHUB_ACTIONS === 'true') throw new Error('bootstrap is an operator command; CI uses reserve and publish');
-    const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
+    const token = localToken(process.env);
     const client = githubClient({ sourceRepo: SOURCE_REPO, sourceToken: token, releasesToken: token });
     const plan = { channel: 'stable', branch: 'main', sourceRepo: SOURCE_REPO, sourceCommit: source, sourceTree: await client.commitTree(source) };
     const r = await bootstrap(baseContext(plan, client), path.resolve(dir), version);
@@ -446,4 +455,5 @@ if (require.main === module) {
 module.exports = {
   SCHEMA, RECEIPT, SOURCE_REPO, RELEASES_REPO, BOOTSTRAP_FLOOR,
   parseVersion, compareVersion, planVersion, recordOf, notesFor, reserve, publish, bootstrap, verifyPublished,
+  actionsContext, toolchain, localToken,
 };

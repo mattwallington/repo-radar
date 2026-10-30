@@ -14,7 +14,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const childProcess = require('child_process');
+const { releaseEnv } = require('./release-env');
 
 const TEAM_ID = 'F8UY7565VM';
 const SIGNING_IDENTITY = `Developer ID Application: Reperio Health, Inc. (${TEAM_ID})`;
@@ -195,17 +196,17 @@ function machoArch(file) {
 // channel and source commit.
 function inspectZipApp(zip, { version, channel, source, arch }) {
   const product = PRODUCT_NAMES[channel];
-  const listed = execFileSync('/usr/bin/unzip', ['-Z1', zip], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  const listed = childProcess.execFileSync('/usr/bin/unzip', ['-Z1', zip], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: releaseEnv() })
     .split('\n').filter(Boolean).filter((n) => !n.startsWith('__MACOSX/'));
   const tops = [...new Set(listed.map((n) => n.split('/')[0]))];
   if (tops.length !== 1 || tops[0] !== `${product}.app`) throw new Error(`${path.basename(zip)} holds ${tops.join(', ')}, not ${product}.app`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-zip-'));
   try {
     const contents = `${product}.app/Contents`;
-    const extract = (...members) => execFileSync('/usr/bin/unzip', ['-qq', '-o', zip, ...members, '-d', tmp]);
+    const extract = (...members) => childProcess.execFileSync('/usr/bin/unzip', ['-qq', '-o', zip, ...members, '-d', tmp], { env: releaseEnv() });
     extract(`${contents}/Info.plist`, `${contents}/Resources/app.asar`, `${contents}/Resources/app-update.yml`);
     const local = (rel) => path.join(tmp, contents, rel);
-    const info = JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', local('Info.plist')], { encoding: 'utf8' }));
+    const info = JSON.parse(childProcess.execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', local('Info.plist')], { encoding: 'utf8', env: releaseEnv() }));
     const name = path.basename(zip);
     if (info.CFBundleIdentifier !== BUNDLE_IDS[channel]) throw new Error(`${name}: bundle ID ${info.CFBundleIdentifier}, expected ${BUNDLE_IDS[channel]}`);
     if (info.CFBundleShortVersionString !== version) throw new Error(`${name}: version ${info.CFBundleShortVersionString}, expected ${version}`);
