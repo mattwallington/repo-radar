@@ -134,6 +134,20 @@ test('publishing uploads and verifies the full set; a published source is a no-o
     const dmg = release.assets.find((a) => a.name === names.dmgs[0]);
     state.bytes.set(dmg.id, Buffer.alloc(dmg.size));
     await assert.rejects(reserve(ctx), /hash differs/);
+
+    // Notes for the next stable compare against the previous published stable release, ignoring a
+    // published Dev release and a newer stable draft.
+    state.branches.dev = sha('7');
+    await reserve(context(client, planFor('dev', sha('7'))));
+    state.releases.find((r) => r.prerelease).draft = false;
+    state.branches.main = sha('8');
+    await reserve(context(client, planFor('stable', sha('8')))); // stays a draft: v1.0.36
+    state.branches.main = sha('d');
+    const next = await reserve(context(client, planFor('stable', sha('d'))));
+    assert.strictEqual(next.version, '1.0.37');
+    const body = state.releases.find((r) => r.tag_name === 'v1.0.37').body;
+    assert.ok(body.startsWith(`Changes since v1.0.35: [ccccccc...ddddddd](https://github.com/ReperioHealth/repo-radar/compare/${sha('c')}...${sha('d')}).`), body);
+    assert.ok(body.includes(`(https://github.com/ReperioHealth/repo-radar/blob/${sha('d')}/CHANGELOG.md)`), body);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
