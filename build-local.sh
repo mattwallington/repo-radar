@@ -90,8 +90,17 @@ for tool in node npm git shasum xcrun codesign spctl; do
 done
 success "Required tools available"
 
-# The channel follows the branch, as in release.sh.
-CURRENT_BRANCH=$(git branch --show-current)
+# The channel follows the branch, as in release.sh. GitHub Actions checks out the triggering commit
+# detached, so there the validated ref names the branch and HEAD must be that ref's commit.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  case "${GITHUB_REF:-}" in
+    refs/heads/main|refs/heads/dev) CURRENT_BRANCH="${GITHUB_REF#refs/heads/}" ;;
+    *) error "Releases build only from refs/heads/main or refs/heads/dev (got: ${GITHUB_REF:-none})" ;;
+  esac
+  [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA:-}" ]] || error "Checkout is not the triggering commit ${GITHUB_SHA:-}"
+else
+  CURRENT_BRANCH=$(git branch --show-current)
+fi
 IS_DEV=false
 if [[ "$CURRENT_BRANCH" == "dev" ]]; then
   IS_DEV=true
@@ -159,11 +168,15 @@ CHANNEL="stable"
 APP_ID="com.mattwallington.repo-radar"
 PRODUCT_NAME="Repo Radar"
 ICON="assets/icon.icns"
+UPDATER_CACHE="repo-radar-updater"
+FEED="latest-mac.yml"
 if $IS_DEV; then
   CHANNEL="dev"
   APP_ID="com.mattwallington.repo-radar-dev"
   PRODUCT_NAME="Repo Radar Dev"
   ICON="assets/icon-dev.icns"
+  UPDATER_CACHE="repo-radar-dev-updater"
+  FEED="dev-mac.yml"
 fi
 
 DIST_DIR="$SCRIPT_DIR/menubar/dist"
@@ -175,7 +188,8 @@ if $DRY_RUN; then
   dry "Remove menubar/dist and run npm ci in menubar"
   dry "electron-builder --mac --arm64 --x64 --publish never: $PRODUCT_NAME ($APP_ID)"
   dry "Notarize with APPLE_KEYCHAIN_PROFILE=$NOTARY_PROFILE only; fail if notarization is skipped"
-  dry "Verify each app: team $TEAM_ID, bundle ID, codesign, spctl, stapler"
+  dry "Verify each app: team $TEAM_ID, bundle ID, codesign, spctl, stapler, update feed settings"
+  dry "Check that $FEED describes both ZIPs and both DMGs"
   dry "Print artifact SHA-256s"
   echo ""
   info "No changes were made. Remove --dry-run to build."
@@ -225,6 +239,7 @@ info "Building for macOS (arm64 + x64), log: $BUILDER_LOG"
     -u APPLE_API_ISSUER -u APPLE_TEAM_ID -u APPLE_KEYCHAIN APPLE_KEYCHAIN_PROFILE="$NOTARY_PROFILE" \
   ./node_modules/.bin/electron-builder --mac --arm64 --x64 --publish never \
     -c.appId="$APP_ID" -c.productName="$PRODUCT_NAME" -c.mac.icon="$ICON" \
+    -c.publish.updaterCacheDirName="$UPDATER_CACHE" \
     -c.extraMetadata.version="$NEW_VERSION") 2>&1 | tee "$BUILDER_LOG"
 
 if grep -qi 'skipped macOS notarization' "$BUILDER_LOG"; then
@@ -251,12 +266,20 @@ for app in "$DIST_DIR/mac-arm64/$PRODUCT_NAME.app" "$DIST_DIR/mac/$PRODUCT_NAME.
   codesign --verify --deep --strict "$app" || error "codesign verification failed: $app"
   spctl -a -vv "$app" || error "Gatekeeper assessment failed: $app"
   xcrun stapler validate "$app" || error "No stapled notarization ticket: $app"
+  node menubar/scripts/release-artifacts.js check-app-update "$app" "$CHANNEL" || error "Wrong update feed settings: $app"
   success "$(basename "$(dirname "$app")")/$(basename "$app"): team $team, $bundle_id $app_version"
 done
 
 # ── Artifacts ─────────────────────────────────────────────────────────────────
 
 step "Artifacts"
+
+# electron-builder names its feed latest-mac.yml. Dev apps look for dev-mac.yml in Dev releases.
+if $IS_DEV; then
+  mv "$DIST_DIR/latest-mac.yml" "$DIST_DIR/$FEED" || error "electron-builder wrote no latest-mac.yml"
+fi
+node menubar/scripts/release-artifacts.js check-feed --dir "$DIST_DIR" --version "$NEW_VERSION" --channel "$CHANNEL" \
+  || error "$FEED does not match the built artifacts"
 
 # Artifact prefix is always "repo-radar" (the npm package name, used by ${name} in artifactName)
 ARTIFACTS=()
@@ -267,7 +290,7 @@ for arch in arm64 x64; do
     ARTIFACTS+=("$f")
   done
 done
-for f in "$DIST_DIR"/*.blockmap "$DIST_DIR"/*-mac.yml; do
+for f in "$DIST_DIR"/*.blockmap "$DIST_DIR/$FEED"; do
   [[ -f "$f" ]] && ARTIFACTS+=("$f")
 done
 
@@ -276,5 +299,6 @@ done
 echo ""
 echo -e "  ${GREEN}${BOLD}$PRODUCT_NAME $NEW_VERSION built, signed and notarized.${NC} Not published."
 echo "  Source: $SOURCE_SHA ($CURRENT_BRANCH)   Builder log: $BUILDER_LOG"
-echo "  The DMGs themselves are not notarized; the apps inside them are, and are stapled."
+echo "  The DMGs themselves are not notarized yet; the apps inside them are, and are stapled."
+echo "  To sign and notarize the DMGs: node menubar/scripts/release-dmg.js --dir menubar/dist --version $NEW_VERSION"
 echo "  Install: quit $PRODUCT_NAME, open the DMG for your Mac and replace /Applications/$PRODUCT_NAME.app."
