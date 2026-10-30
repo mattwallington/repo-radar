@@ -37,7 +37,8 @@ const SHA = /^[0-9a-f]{40}$/;
 const FINALIZATION = 'release-finalization.json';
 const FINALIZATION_SCHEMA = 'repo-radar-finalization/1';
 // Apple tools see only these; no credential variable reaches them (notarytool gets the profile by name).
-const CHILD_ENV_KEYS = Object.freeze(['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG']);
+// DEVELOPER_DIR keeps xcrun on the pinned Xcode.
+const CHILD_ENV_KEYS = Object.freeze(['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'DEVELOPER_DIR']);
 const CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 
 class Hold extends Error {}

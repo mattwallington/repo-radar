@@ -51,9 +51,14 @@ test('finalizing updates only the DMG entries, drops the DMG blockmaps and recor
     const names = makeBuild(dir, { version, channel: 'dev', source: SOURCE });
     const zipsBefore = names.zips.map((n) => fileIdentity(path.join(dir, n)).sha256);
     const tools = appleTools();
-    const result = await finalize({ dir, version, source: SOURCE, run: tools.run, env: {} });
+    const env = { HOME: '/Users/ci', DEVELOPER_DIR: '/Applications/Xcode_16.4.app/Contents/Developer', APPLE_ID: 'x', ASC_API_KEY_P8: 'y' };
+    const result = await finalize({ dir, version, source: SOURCE, run: tools.run, env });
 
     assert.strictEqual(tools.calls.filter((c) => c.step === 'xcrun notarytool').length, 2);
+    // Apple tools run on the pinned Xcode and never see credential variables.
+    for (const c of tools.calls) {
+      assert.deepStrictEqual(c.env, { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: '/Users/ci', DEVELOPER_DIR: env.DEVELOPER_DIR });
+    }
     const feed = yaml.load(fs.readFileSync(path.join(dir, names.feed), 'utf8'));
     for (const dmg of names.dmgs) {
       const entry = feed.files.find((f) => f.url === dmg);
