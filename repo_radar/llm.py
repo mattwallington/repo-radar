@@ -325,6 +325,7 @@ class Conversation:
     Chat Completions keeps OpenAI-style messages (litellm translates them per provider, including
     Anthropic thinking blocks and tool results); the Responses API keeps input items, including the
     reasoning items a tool-call reply must send back. Fresh for every attempt; never persisted.
+    With system=None the request is just the messages, as call_llm sends a single prompt.
     """
 
     def __init__(self, model, system, tools=()):
@@ -355,13 +356,14 @@ class Conversation:
         """The complete request for the next turn, as plain JSON data."""
         out = output_budget(self.model, max_tokens)
         if self.endpoint == 'chat':
-            req = {"endpoint": "chat", "model": self.model,
-                   "messages": [{"role": "system", "content": self.system}, *self.items], "max_tokens": out}
+            system = [{"role": "system", "content": self.system}] if self.system is not None else []
+            req = {"endpoint": "chat", "model": self.model, "messages": [*system, *self.items], "max_tokens": out}
             if self.model in CLAUDE_MEDIUM_EFFORT_MODELS:
                 req["output_config"] = {"effort": "medium"}
         else:
-            req = {"endpoint": "responses", "model": self.model, "instructions": self.system,
-                   "input": list(self.items), "max_output_tokens": out}
+            req = {"endpoint": "responses", "model": self.model, "input": list(self.items), "max_output_tokens": out}
+            if self.system is not None:
+                req["instructions"] = self.system
         if self.tools:
             req["tools"] = self._tool_defs()
         return req
