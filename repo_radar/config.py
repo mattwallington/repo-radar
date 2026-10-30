@@ -1,6 +1,7 @@
 """Configuration loading/saving and path constants."""
 
 import json
+import re
 import os
 import tempfile
 import hashlib
@@ -41,6 +42,33 @@ def get_cache_name(clone_url, repo_name):
     hash_obj = hashlib.sha256(clone_url.encode())
     hash_suffix = hash_obj.hexdigest()[:7]
     return f"{repo_name}-{hash_suffix}"
+
+
+# An exact GitHub "owner/repository" identity: no wildcards, globs or partial names.
+_REPO_IDENTITY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$')
+
+
+def incremental_metadata_repos(config):
+    """The repositories opted in to incremental metadata (`incremental_metadata_repos`).
+
+    Optional; absent or empty means none, and every repository keeps the full-generation path.
+    Each entry must be an exact `owner/repository` identity as configured under `repositories`.
+    Raises ValueError for anything else rather than guessing what a malformed value meant.
+    """
+    value = (config or {}).get('incremental_metadata_repos', [])
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise ValueError("incremental_metadata_repos must be a list of owner/repository names")
+    names = []
+    for entry in value:
+        if not isinstance(entry, str) or not _REPO_IDENTITY.match(entry) or entry.endswith(('/.', '/..')):
+            raise ValueError(f"incremental_metadata_repos has an invalid entry: {entry!r} "
+                             f"(use an exact owner/repository name)")
+        names.append(entry)
+    if len(set(names)) != len(names):
+        raise ValueError("incremental_metadata_repos lists a repository more than once")
+    return frozenset(names)
 
 
 def load_config():
