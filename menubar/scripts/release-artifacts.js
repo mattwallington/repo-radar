@@ -26,6 +26,8 @@ const SHA512_B64 = /^[A-Za-z0-9+/]{86}==$/;
 const FEED_KEYS = new Set(['version', 'files', 'path', 'sha512', 'releaseDate']);
 const FILE_KEYS = new Set(['url', 'sha512', 'size', 'blockMapSize']);
 // The installed app finds its feed through app-update.yml. Dev keeps a separate download cache.
+const BUNDLE_IDS = Object.freeze({ stable: 'com.mattwallington.repo-radar', dev: 'com.mattwallington.repo-radar-dev' });
+const PRODUCT_NAMES = Object.freeze({ stable: 'Repo Radar', dev: 'Repo Radar Dev' });
 const APP_UPDATE = Object.freeze({
   stable: { provider: 'github', owner: FEED_OWNER, repo: FEED_REPO, updaterCacheDirName: 'repo-radar-updater' },
   dev: { provider: 'github', owner: FEED_OWNER, repo: FEED_REPO, updaterCacheDirName: 'repo-radar-dev-updater' },
@@ -189,6 +191,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  TEAM_ID, SIGNING_IDENTITY, NOTARY_PROFILE, FEED_OWNER, FEED_REPO, ARCHES, STABLE_VERSION, DEV_VERSION,
+  TEAM_ID, SIGNING_IDENTITY, NOTARY_PROFILE, FEED_OWNER, FEED_REPO, ARCHES, STABLE_VERSION, DEV_VERSION, BUNDLE_IDS, PRODUCT_NAMES, APP_UPDATE,
   channelOf, feedName, artifactNames, identity, fileIdentity, inspectFeed, dumpFeed, checkFeedDir, checkAppUpdate,
 };

@@ -36,6 +36,7 @@
     "appId": "com.mattwallington.repo-radar",
     "productName": "Repo Radar",
     "forceCodeSigning": true,
+    "afterPack": "./scripts/release-after-pack.js",
     "publish": {
       "provider": "github",
       "owner": "ReperioHealth",

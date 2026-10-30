@@ -168,14 +168,12 @@ CHANNEL="stable"
 APP_ID="com.mattwallington.repo-radar"
 PRODUCT_NAME="Repo Radar"
 ICON="assets/icon.icns"
-UPDATER_CACHE="repo-radar-updater"
 FEED="latest-mac.yml"
 if $IS_DEV; then
   CHANNEL="dev"
   APP_ID="com.mattwallington.repo-radar-dev"
   PRODUCT_NAME="Repo Radar Dev"
   ICON="assets/icon-dev.icns"
-  UPDATER_CACHE="repo-radar-dev-updater"
   FEED="dev-mac.yml"
 fi
 
@@ -239,7 +237,6 @@ info "Building for macOS (arm64 + x64), log: $BUILDER_LOG"
     -u APPLE_API_ISSUER -u APPLE_TEAM_ID -u APPLE_KEYCHAIN APPLE_KEYCHAIN_PROFILE="$NOTARY_PROFILE" \
   ./node_modules/.bin/electron-builder --mac --arm64 --x64 --publish never \
     -c.appId="$APP_ID" -c.productName="$PRODUCT_NAME" -c.mac.icon="$ICON" \
-    -c.publish.updaterCacheDirName="$UPDATER_CACHE" \
     -c.extraMetadata.version="$NEW_VERSION") 2>&1 | tee "$BUILDER_LOG"
 
 if grep -qi 'skipped macOS notarization' "$BUILDER_LOG"; then
