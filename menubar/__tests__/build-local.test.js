@@ -28,6 +28,7 @@ function fixture(dir) {
   fs.copyFileSync(path.join(root, 'build-local.sh'), path.join(repo, 'build-local.sh'));
   fs.chmodSync(path.join(repo, 'build-local.sh'), 0o755);
   write(path.join(repo, 'VERSION'), '1.0.32\n');
+  write(path.join(repo, '.gitignore'), 'menubar/build-info.json\nmenubar/dist/\n');
   write(path.join(repo, 'menubar', 'package.json'), '{}\n');
   write(path.join(repo, 'scripts', 'check_release_python.js'), `require('fs').appendFileSync(${JSON.stringify(calls)}, 'check_release_python\\n');\n`);
   write(path.join(repo, 'menubar', 'scripts', 'pydeps.js'), `require('fs').appendFileSync(${JSON.stringify(calls)}, 'pydeps\\n');\n`);
@@ -36,7 +37,7 @@ function fixture(dir) {
   // The stub records the notary credentials it was given, then reports a skipped notarization.
   write(path.join(repo, 'menubar', 'node_modules', '.bin', 'electron-builder'),
     record('electron-builder') +
-    `echo "APPLE_ID=\${APPLE_ID-unset} APPLE_API_KEY=\${APPLE_API_KEY-unset} PROFILE=\${APPLE_KEYCHAIN_PROFILE-unset}" > "${path.join(rec, 'builder-env.txt')}"\n` +
+    `echo "APPLE_ID=\${APPLE_ID-unset} APPLE_API_KEY=\${APPLE_API_KEY-unset} PROFILE=\${APPLE_KEYCHAIN_PROFILE-unset} KEYCHAIN=\${APPLE_KEYCHAIN-unset}" > "${path.join(rec, 'builder-env.txt')}"\n` +
     'echo "  • skipped macOS notarization  reason=`notarize` options were unable to be generated"\n' +
     'exit 0\n', 0o755);
   const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: repo, stdio: 'ignore' });
@@ -44,7 +45,7 @@ function fixture(dir) {
   git('add', '-A');
   git('commit', '-q', '-m', 'fixture');
 
-  const run = (...args) => spawnSync(path.join(repo, 'build-local.sh'), args, {
+  const run = (args, extraEnv = {}) => spawnSync(path.join(repo, 'build-local.sh'), args, {
     cwd: repo,
     encoding: 'utf8',
     env: {
@@ -54,6 +55,7 @@ function fixture(dir) {
       TMPDIR: rec,
       APPLE_ID: 'someone@example.com',
       APPLE_API_KEY: 'stray-key',
+      ...extraEnv,
     },
   });
   const recorded = () => fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean);
@@ -69,20 +71,25 @@ const darwinOnly = { skip: process.platform !== 'darwin' };
 
 test('build-local.sh fails when electron-builder skips notarization', darwinOnly, () => withTempDir((dir) => {
   const { repo, rec, run, recorded } = fixture(dir);
-  const result = run('--version', '1.0.33-dev.202610271200');
+  const builderEnv = () => fs.readFileSync(path.join(rec, 'builder-env.txt'), 'utf8').trim();
+  const result = run(['--version', '1.0.33-dev.202610271200'], { APPLE_KEYCHAIN: '/stale/inherited.keychain-db' });
 
   assert.notStrictEqual(result.status, 0, `build-local.sh should fail:\n${result.stdout}`);
   assert.match(result.stderr, /Notarization was skipped/);
   assert.ok(recorded().includes('electron-builder'), recorded().join(','));
-  // The builder saw only the keychain profile, and the bundled VERSION was put back.
-  assert.strictEqual(fs.readFileSync(path.join(rec, 'builder-env.txt'), 'utf8').trim(), 'APPLE_ID=unset APPLE_API_KEY=unset PROFILE=reperio-notary');
+  // The builder saw only the keychain profile, found in the login keychain, and the bundled VERSION was put back.
+  assert.strictEqual(builderEnv(), 'APPLE_ID=unset APPLE_API_KEY=unset PROFILE=reperio-notary KEYCHAIN=unset');
   assert.strictEqual(fs.readFileSync(path.join(repo, 'VERSION'), 'utf8'), '1.0.32\n');
+
+  // In CI the profile lives in the throwaway keychain that CSC_KEYCHAIN names.
+  run(['--version', '1.0.33-dev.202610271200'], { CSC_KEYCHAIN: '/runner/temp/repo-radar-release.keychain-db' });
+  assert.strictEqual(builderEnv(), 'APPLE_ID=unset APPLE_API_KEY=unset PROFILE=reperio-notary KEYCHAIN=/runner/temp/repo-radar-release.keychain-db');
 }));
 
 test('build-local.sh refuses a checkout with an untracked file before any gate', darwinOnly, () => withTempDir((dir) => {
   const { repo, run, recorded } = fixture(dir);
   write(path.join(repo, 'menubar', 'stray.txt'), 'not committed\n');
-  const result = run('--version', '1.0.33-dev.202610271200', '--dry-run');
+  const result = run(['--version', '1.0.33-dev.202610271200', '--dry-run']);
 
   assert.notStrictEqual(result.status, 0, `build-local.sh should fail:\n${result.stdout}`);
   assert.match(result.stderr, /uncommitted changes or untracked files/);

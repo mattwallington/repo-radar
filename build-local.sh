@@ -231,10 +231,13 @@ BUILDER_LOG="$LOG_DIR/electron-builder.log"
 
 # Only the builder's environment changes: the keychain profile is the one notary credential.
 # electron-builder 24 prefers APPLE_ID or the APPLE_API_* trio over the profile, and with no
-# credential at all it skips notarization and still exits 0.
+# credential at all it skips notarization and still exits 0. In CI the profile lives in the
+# throwaway keychain named by CSC_KEYCHAIN; locally it is found in the login keychain.
+NOTARY_ENV=(APPLE_KEYCHAIN_PROFILE="$NOTARY_PROFILE")
+if [[ -n "${CSC_KEYCHAIN:-}" ]]; then NOTARY_ENV+=(APPLE_KEYCHAIN="$CSC_KEYCHAIN"); fi
 info "Building for macOS (arm64 + x64), log: $BUILDER_LOG"
 (cd menubar && env -u APPLE_ID -u APPLE_APP_SPECIFIC_PASSWORD -u APPLE_API_KEY -u APPLE_API_KEY_ID \
-    -u APPLE_API_ISSUER -u APPLE_TEAM_ID -u APPLE_KEYCHAIN APPLE_KEYCHAIN_PROFILE="$NOTARY_PROFILE" \
+    -u APPLE_API_ISSUER -u APPLE_TEAM_ID -u APPLE_KEYCHAIN "${NOTARY_ENV[@]}" \
   ./node_modules/.bin/electron-builder --mac --arm64 --x64 --publish never \
     -c.appId="$APP_ID" -c.productName="$PRODUCT_NAME" -c.mac.icon="$ICON" \
     -c.extraMetadata.version="$NEW_VERSION") 2>&1 | tee "$BUILDER_LOG"

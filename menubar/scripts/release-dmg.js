@@ -43,7 +43,8 @@ const CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 
 class Hold extends Error {}
 
-function commandPlan(dmg) {
+// `keychain` names the keychain holding the notary profile when it is not the login keychain (CI).
+function commandPlan(dmg, keychain) {
   return [
     { step: 'sign', timeoutMs: BOUNDS.toolMs, argv: ['/usr/bin/codesign', '--sign', SIGNING_IDENTITY, '--timestamp', dmg] },
     { step: 'verify', timeoutMs: BOUNDS.toolMs, argv: ['/usr/bin/codesign', '--verify', '--strict', '--verbose=2', dmg] },
@@ -51,7 +52,8 @@ function commandPlan(dmg) {
     {
       step: 'notarize',
       timeoutMs: BOUNDS.notaryMs,
-      argv: ['/usr/bin/xcrun', 'notarytool', 'submit', dmg, '--keychain-profile', NOTARY_PROFILE, '--wait', '--output-format', 'json'],
+      argv: ['/usr/bin/xcrun', 'notarytool', 'submit', dmg, '--keychain-profile', NOTARY_PROFILE,
+        ...(keychain ? ['--keychain', keychain] : []), '--wait', '--output-format', 'json'],
     },
     { step: 'staple', timeoutMs: BOUNDS.toolMs, argv: ['/usr/bin/xcrun', 'stapler', 'staple', dmg] },
     { step: 'validate', timeoutMs: BOUNDS.toolMs, argv: ['/usr/bin/xcrun', 'stapler', 'validate', dmg] },
@@ -191,7 +193,7 @@ async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = pr
   const childEnvironment = childEnv(env);
   const submissions = {};
   for (const dmg of names.dmgs) {
-    for (const cmd of commandPlan(path.join(dir, dmg))) {
+    for (const cmd of commandPlan(path.join(dir, dmg), env.CSC_KEYCHAIN)) {
       log(`${dmg}: ${cmd.step}`);
       const r = await run(cmd.argv, { timeoutMs: cmd.timeoutMs, env: childEnvironment });
       try {
