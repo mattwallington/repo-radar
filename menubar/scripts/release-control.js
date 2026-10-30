@@ -21,9 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
-const {
-  FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, channelOf, artifactNames, fileIdentity, checkFeedDir,
-} = require('./release-artifacts');
+const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, channelOf, fileIdentity } = require('./release-artifacts');
+const { verifyFinalized } = require('./release-dmg');
 
 const SOURCE_REPO = 'ReperioHealth/repo-radar';
 const RELEASES_REPO = `${FEED_OWNER}/${FEED_REPO}`;
@@ -177,17 +176,13 @@ async function verifyPublished(ctx, release) {
   return r;
 }
 
-// The finalized build: both ZIPs, both stapled DMGs, the channel's feed and any ZIP blockmaps.
-function stage(dir, version) {
-  const channel = channelOf(version);
-  const names = artifactNames(version, channel);
-  checkFeedDir(dir, { version, channel, finalized: true });
-  const required = [...names.zips, ...names.dmgs, names.feed];
-  const optional = names.zipBlockmaps.filter((n) => fs.existsSync(path.join(dir, n)));
-  return [...required, ...optional].map((name) => {
-    const { size, sha256 } = fileIdentity(path.join(dir, name));
-    return { name, size, sha256 };
-  });
+// The finalized build: both ZIPs, both stapled DMGs, the channel's feed and any ZIP blockmaps, exactly
+// as the DMG finalizer recorded them, with both DMGs passing the read-only Apple checks again.
+async function stage(ctx, dir, version) {
+  const finalization = await verifyFinalized({ dir, version, source: ctx.plan.sourceCommit, run: ctx.appleRun });
+  const artifacts = [...finalization.zips, ...finalization.dmgs.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
+    finalization.feed, ...finalization.zipBlockmaps];
+  return { artifacts, finalization };
 }
 
 // Replaces everything on an owned draft with the staged files and receipt, checks every uploaded byte,
@@ -195,10 +190,10 @@ function stage(dir, version) {
 async function publishDraft(ctx, own, dir, { recheck, receiptExtra }) {
   const { client, plan } = ctx;
   const record = recordOf(own);
-  const artifacts = stage(dir, record.version);
+  const { artifacts, finalization } = await stage(ctx, dir, record.version);
   const receipt = {
     schema: SCHEMA, channel: record.channel, version: record.version, sourceRepo: record.sourceRepo,
-    sourceCommit: record.sourceCommit, sourceTree: record.sourceTree, artifacts, ...receiptExtra,
+    sourceCommit: record.sourceCommit, sourceTree: record.sourceTree, artifacts, finalization, ...receiptExtra,
   };
   const receiptPath = path.join(dir, RECEIPT);
   fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
@@ -277,6 +272,7 @@ async function bootstrap(ctx, dir, version) {
     return { published: true, version: r.version, already: true };
   }
   if (own && recordOf(own).version !== version) throw new Error(`this source is reserved as v${recordOf(own).version}, not v${version}`);
+  await stage(ctx, dir, version); // before any draft exists
   if (!own) {
     if (releases.some((r) => r.tag_name === `v${version}`)) throw new Error(`v${version} belongs to another source`);
     own = await createDraft(ctx, version, { bootstrap: true });

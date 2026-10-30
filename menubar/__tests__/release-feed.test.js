@@ -1,108 +1,83 @@
 // Feed integrity: the published feed must describe the exact ZIP and DMG bytes for both architectures,
-// and finalizing the DMGs (which changes their bytes) must update only the feed's DMG entries.
+// finalizing the DMGs (which changes their bytes) must update only the feed's DMG entries, and only a
+// completed finalization leaves the record the publisher requires.
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const crypto = require('crypto');
-const { artifactNames, identity, inspectFeed, dumpFeed, checkFeedDir, SIGNING_IDENTITY } = require('../scripts/release-artifacts');
-const { finalize } = require('../scripts/release-dmg');
+const yaml = require('js-yaml');
+const { identity, inspectFeed, dumpFeed, checkFeedDir, fileIdentity } = require('../scripts/release-artifacts');
+const { finalize, verifyFinalized, FINALIZATION } = require('../scripts/release-dmg');
+const { makeBuild, appleTools } = require('./helpers/release-fixtures');
 
-// A dist directory shaped like electron-builder's: both ZIPs, both DMGs, their blockmaps and the feed.
-function dist(version, channel) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-feed-'));
-  const names = artifactNames(version, channel);
-  const ids = {};
-  for (const name of [...names.zips, ...names.dmgs, ...names.zipBlockmaps, ...names.dmgBlockmaps]) {
-    const bytes = crypto.randomBytes(512);
-    fs.writeFileSync(path.join(dir, name), bytes);
-    ids[name] = identity(bytes);
-  }
-  const files = [...names.zips, ...names.dmgs].map((url) => ({ url, sha512: ids[url].sha512, size: ids[url].size }));
-  files[2].blockMapSize = 123; // a pre-staple DMG blockmap the finalizer must drop
-  const doc = { version, files, path: names.zips[0], sha512: ids[names.zips[0]].sha512, releaseDate: '2026-10-30T00:00:00.000Z' };
-  fs.writeFileSync(path.join(dir, names.feed), dumpFeed(doc));
-  return { dir, names, ids, doc };
-}
-
-// Stands in for codesign, notarytool, stapler and spctl. Stapling appends to the DMG, as the real one does.
-function appleTools({ notaryStatus = 'Accepted' } = {}) {
-  const calls = [];
-  const ok = (stdout = '', stderr = '') => ({ status: 0, stdout, stderr, timedOut: false, truncated: false, error: null });
-  const run = async (argv) => {
-    const dmg = argv[argv.length - 1];
-    calls.push(`${path.basename(argv[0])} ${argv[1]}`);
-    if (argv[1] === '--display') {
-      return ok('', `Authority=${SIGNING_IDENTITY}\nAuthority=Developer ID Certification Authority\nTimestamp=Oct 30, 2026\nTeamIdentifier=F8UY7565VM\n`);
-    }
-    if (argv[1] === 'notarytool') {
-      return { ...ok(JSON.stringify({ id: crypto.randomUUID(), status: notaryStatus })), status: notaryStatus === 'Accepted' ? 0 : 1 };
-    }
-    if (argv[1] === 'stapler' && argv[2] === 'staple') fs.appendFileSync(dmg, 'ticket');
-    if (argv[0] === '/usr/sbin/spctl') return ok('', `${dmg}: accepted\nsource=Notarized Developer ID\n`);
-    return ok();
-  };
-  return { run, calls };
-}
+const SOURCE = '4'.repeat(40);
+const tempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-feed-'));
 
 test('the feed must describe both architectures and the exact bytes', () => {
-  const { dir, names, ids, doc } = dist('1.0.35', 'stable');
+  const dir = tempDir();
   try {
+    const names = makeBuild(dir, { version: '1.0.35', channel: 'stable', source: SOURCE });
     assert.doesNotThrow(() => checkFeedDir(dir, { version: '1.0.35', channel: 'stable' }));
-    const check = (mutate) => {
+    const ids = Object.fromEntries([...names.zips, ...names.dmgs].map((n) => [n, identity(fs.readFileSync(path.join(dir, n)))]));
+    const doc = yaml.load(fs.readFileSync(path.join(dir, names.feed), 'utf8'));
+    const check = (mutate, finalized = false) => {
       const copy = JSON.parse(JSON.stringify(doc));
       mutate(copy);
-      return () => inspectFeed(dumpFeed(copy), { version: '1.0.35', channel: 'stable', ids });
+      return () => inspectFeed(dumpFeed(copy), { version: '1.0.35', channel: 'stable', ids, finalized });
     };
     assert.throws(check((d) => { d.files[0].size += 1; }), /does not match its bytes/);
-    assert.throws(check((d) => { d.files = d.files.filter((f) => !f.url.includes('arm64-mac.zip')); }), /does not list .*arm64-mac\.zip/);
+    assert.throws(check((d) => { d.files = d.files.filter((f) => !f.url.includes('x64-mac.zip')); }), /does not list .*x64-mac\.zip/);
     assert.throws(check((d) => { d.files.push({ ...d.files[0], url: 'repo-radar-1.0.34-x64-mac.zip' }); }), /foreign file/);
     assert.throws(check((d) => { d.version = '1.0.34'; }), /not 1\.0\.35/);
     assert.throws(check((d) => { d.sha512 = d.files[1].sha512; }), /top-level sha512/);
-    // A Dev release's feed is dev-mac.yml, and a stable version can't be checked as Dev.
-    assert.strictEqual(artifactNames('1.0.35-dev.20261030010000', 'dev').feed, 'dev-mac.yml');
-    assert.throws(() => artifactNames('1.0.35', 'dev'), /not a dev version/);
-    assert.ok(names.zips.every((n) => fs.existsSync(path.join(dir, n))));
+    // A DMG blockmap size is only a format error in a finalized feed; it is never proof of finalization.
+    assert.throws(check((d) => { d.files[2].blockMapSize = 123; }, true), /pre-staple blockmap/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('finalizing updates only the DMG entries and drops the stale DMG blockmaps', async () => {
+test('finalizing updates only the DMG entries, drops the DMG blockmaps and records the result last', async () => {
   const version = '1.0.35-dev.20261030010000';
-  const { dir, names, ids } = dist(version, 'dev');
+  const dir = tempDir();
   try {
+    const names = makeBuild(dir, { version, channel: 'dev', source: SOURCE });
+    const zipsBefore = names.zips.map((n) => fileIdentity(path.join(dir, n)).sha256);
     const tools = appleTools();
-    const result = await finalize({ dir, version, run: tools.run, env: {} });
+    const result = await finalize({ dir, version, source: SOURCE, run: tools.run, env: {} });
 
-    assert.strictEqual(tools.calls.filter((c) => c === 'xcrun notarytool').length, 2);
-    const feed = require('js-yaml').load(fs.readFileSync(path.join(dir, names.feed), 'utf8'));
+    assert.strictEqual(tools.calls.filter((c) => c.step === 'xcrun notarytool').length, 2);
+    const feed = yaml.load(fs.readFileSync(path.join(dir, names.feed), 'utf8'));
     for (const dmg of names.dmgs) {
-      const bytes = fs.readFileSync(path.join(dir, dmg));
       const entry = feed.files.find((f) => f.url === dmg);
-      assert.strictEqual(entry.sha512, identity(bytes).sha512, `${dmg} entry describes the stapled bytes`);
-      assert.strictEqual(entry.blockMapSize, undefined);
-      assert.strictEqual(result.dmgs.find((d) => d.name === dmg).sha256, identity(bytes).sha256);
+      assert.strictEqual(entry.sha512, identity(fs.readFileSync(path.join(dir, dmg))).sha512, `${dmg} entry describes the stapled bytes`);
     }
-    for (const zip of names.zips) assert.strictEqual(feed.files.find((f) => f.url === zip).sha512, ids[zip].sha512);
+    assert.deepStrictEqual(names.zips.map((n) => fileIdentity(path.join(dir, n)).sha256), zipsBefore);
     assert.ok(names.dmgBlockmaps.every((n) => !fs.existsSync(path.join(dir, n))));
     assert.ok(names.zipBlockmaps.every((n) => fs.existsSync(path.join(dir, n))));
-    assert.doesNotThrow(() => checkFeedDir(dir, { version, channel: 'dev', finalized: true }));
+    const record = JSON.parse(fs.readFileSync(path.join(dir, FINALIZATION), 'utf8'));
+    assert.deepStrictEqual(record, result);
+    assert.strictEqual(record.source, SOURCE);
+    assert.ok(record.dmgs.every((d) => /^[0-9a-f-]{36}$/.test(d.submission)));
+    await verifyFinalized({ dir, version, source: SOURCE, run: appleTools().run });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a notary result other than Accepted stops finalization and leaves the feed alone', async () => {
-  const { dir, names } = dist('1.0.35', 'stable');
+test('a failed finalization leaves no record, even over an earlier one', async () => {
+  const dir = tempDir();
   try {
+    const names = makeBuild(dir, { version: '1.0.35', channel: 'stable', source: SOURCE });
     const before = fs.readFileSync(path.join(dir, names.feed), 'utf8');
+    fs.writeFileSync(path.join(dir, FINALIZATION), '{"from":"an earlier attempt"}');
     const tools = appleTools({ notaryStatus: 'Invalid' });
-    await assert.rejects(finalize({ dir, version: '1.0.35', run: tools.run, env: {} }), /Invalid", not Accepted/);
-    assert.ok(!tools.calls.includes('xcrun stapler'), 'nothing is stapled after a rejected submission');
+    await assert.rejects(finalize({ dir, version: '1.0.35', source: SOURCE, run: tools.run, env: {} }), /Invalid", not Accepted/);
+    assert.ok(!tools.calls.some((c) => c.step === 'xcrun stapler staple'), 'nothing is stapled after a rejected submission');
     assert.strictEqual(fs.readFileSync(path.join(dir, names.feed), 'utf8'), before);
-    assert.ok(names.dmgBlockmaps.every((n) => fs.existsSync(path.join(dir, n))));
+    assert.ok(!fs.existsSync(path.join(dir, FINALIZATION)));
+    await assert.rejects(verifyFinalized({ dir, version: '1.0.35', source: SOURCE, run: appleTools().run }), /no release-finalization\.json/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

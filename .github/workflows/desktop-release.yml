@@ -146,7 +146,7 @@ jobs:
         if: steps.reserve.outputs.published == 'false'
         env:
           RELEASE_VERSION: ${{ steps.reserve.outputs.version }}
-        run: node menubar/scripts/release-dmg.js --dir menubar/dist --version "$RELEASE_VERSION"
+        run: node menubar/scripts/release-dmg.js --dir menubar/dist --version "$RELEASE_VERSION" --source "$GITHUB_SHA"
 
       - name: Upload, verify and publish
         if: steps.reserve.outputs.published == 'false'

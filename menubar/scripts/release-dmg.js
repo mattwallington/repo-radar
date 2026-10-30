@@ -12,8 +12,10 @@
 // sha512, dropping any blockMapSize) and deletes the DMG blockmaps, which describe the pre-staple bytes.
 // The ZIPs, their blockmaps and the feed's ZIP entries must not change. Any failed, unexpected or
 // timed-out step stops everything: no retry, and a timed-out notary submission is never re-sent.
+// Only when every step has succeeded does it write release-finalization.json, recording the input and
+// final hashes and the notary submissions. The publisher requires that record and rechecks it.
 //
-//   node menubar/scripts/release-dmg.js --dir <dist> --version <x.y.z or x.y.z-dev.N>
+//   node menubar/scripts/release-dmg.js --dir <dist> --version <x.y.z or x.y.z-dev.N> --source <commit>
 //
 // The directory needs both ZIPs, both DMGs and the channel's feed, exactly as build-local.sh left them.
 // Signing uses whichever keychain holds the Reperio identity and the reperio-notary profile: the login
@@ -24,11 +26,15 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
-  SIGNING_IDENTITY, TEAM_ID, NOTARY_PROFILE, channelOf, artifactNames, fileIdentity, inspectFeed, dumpFeed,
+  SIGNING_IDENTITY, TEAM_ID, NOTARY_PROFILE, channelOf, artifactNames, fileIdentity, inspectFeed, dumpFeed, checkFeedDir,
 } = require('./release-artifacts');
 
 const BOUNDS = Object.freeze({ toolMs: 120_000, notaryMs: 1_800_000, outputBytes: 256 * 1024 });
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA = /^[0-9a-f]{40}$/;
+// The finalizer's result, written next to the artifacts only after every step succeeded.
+const FINALIZATION = 'release-finalization.json';
+const FINALIZATION_SCHEMA = 'repo-radar-finalization/1';
 // Apple tools see only these; no credential variable reaches them (notarytool gets the profile by name).
 const CHILD_ENV_KEYS = Object.freeze(['HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG']);
 const CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
@@ -53,6 +59,11 @@ function commandPlan(dmg) {
       argv: ['/usr/sbin/spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', '--verbose=2', dmg],
     },
   ];
+}
+
+// The read-only subset, for checking a DMG that was finalized earlier.
+function verifyPlan(dmg) {
+  return commandPlan(dmg).filter((c) => ['verify', 'display', 'validate', 'assess'].includes(c.step));
 }
 
 // Resolves once the child has exited; a timed-out or over-talkative child is killed.
@@ -142,9 +153,14 @@ function writeAtomically(file, text) {
   fs.renameSync(tmp, file);
 }
 
-async function finalize({ dir, version, env = process.env, run = runBounded, log = () => {} }) {
+const identityOf = (dir, name) => { const { size, sha256 } = fileIdentity(path.join(dir, name)); return { name, size, sha256 }; };
+
+async function finalize({ dir, version, source, env = process.env, run = runBounded, log = () => {} }) {
   const channel = channelOf(version);
   if (!channel) throw new Hold(`not a release version: ${version}`);
+  if (!SHA.test(source || '')) throw new Hold(`not a source commit: ${source}`);
+  // A previous result never survives a new attempt, so a failure below leaves no success marker.
+  fs.rmSync(path.join(dir, FINALIZATION), { force: true });
   const names = artifactNames(version, channel);
   const feedPath = path.join(dir, names.feed);
   const ids = {};
@@ -159,6 +175,10 @@ async function finalize({ dir, version, env = process.env, run = runBounded, log
   try { doc = inspectFeed(feedText, { version, channel, ids }); } catch (e) { throw new Hold(`before finalizing: ${e.message}`); }
   const zipBlockmaps = names.zipBlockmaps.filter((n) => fs.existsSync(path.join(dir, n)));
   const zipBlockmapIds = Object.fromEntries(zipBlockmaps.map((n) => [n, fileIdentity(path.join(dir, n)).sha256]));
+  const inputs = {
+    feed: { name: names.feed, sha256: fileIdentity(feedPath).sha256 },
+    dmgs: names.dmgs.map((n) => ({ name: n, size: ids[n].size, sha256: ids[n].sha256 })),
+  };
 
   const childEnvironment = childEnv(env);
   const submissions = {};
@@ -203,20 +223,75 @@ async function finalize({ dir, version, env = process.env, run = runBounded, log
   writeAtomically(feedPath, text);
   for (const n of names.dmgBlockmaps) fs.rmSync(path.join(dir, n), { force: true });
 
-  return {
+  // Written last: its presence means every step above succeeded for exactly these bytes.
+  const result = {
+    schema: FINALIZATION_SCHEMA,
     version,
     channel,
-    feed: names.feed,
+    source,
+    inputs,
+    zips: names.zips.map((n) => identityOf(dir, n)),
+    zipBlockmaps: zipBlockmaps.map((n) => identityOf(dir, n)),
+    feed: identityOf(dir, names.feed),
     dmgs: names.dmgs.map((n) => ({ name: n, size: finalIds[n].size, sha256: finalIds[n].sha256, submission: submissions[n] })),
   };
+  writeAtomically(path.join(dir, FINALIZATION), `${JSON.stringify(result, null, 2)}\n`);
+  return result;
+}
+
+// Read-only proof that `dir` holds a finalized build of `version` from `source`: the finalizer's result
+// must describe the exact current files, and both DMGs must still pass the signature, staple and
+// Gatekeeper checks. Used before anything is uploaded.
+async function verifyFinalized({ dir, version, source, env = process.env, run = runBounded }) {
+  const channel = channelOf(version);
+  const names = artifactNames(version, channel);
+  const file = path.join(dir, FINALIZATION);
+  if (!fs.existsSync(file)) throw new Hold(`no ${FINALIZATION} in ${dir}: run release-dmg.js on this build first`);
+  const result = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (result.schema !== FINALIZATION_SCHEMA || result.version !== version || result.channel !== channel) {
+    throw new Hold(`${FINALIZATION} is not for ${channel} ${version}`);
+  }
+  if (result.source !== source) throw new Hold(`${FINALIZATION} was made for source ${result.source}, not ${source}`);
+  const same = (a, b) => a.name === b.name && a.size === b.size && a.sha256 === b.sha256;
+  const present = names.zipBlockmaps.filter((n) => fs.existsSync(path.join(dir, n)));
+  const expect = [
+    ...names.zips.map((n, i) => [result.zips[i], n]),
+    ...names.dmgs.map((n, i) => [result.dmgs[i], n]),
+    [result.feed, names.feed],
+  ];
+  if (present.length !== result.zipBlockmaps.length) throw new Hold('the ZIP blockmaps differ from the finalized build');
+  present.forEach((n, i) => expect.push([result.zipBlockmaps[i], n]));
+  for (const [recorded, name] of expect) {
+    if (!recorded || !same(recorded, identityOf(dir, name))) throw new Hold(`${name} is not the file that was finalized`);
+  }
+  for (const d of result.dmgs) if (!UUID.test(d.submission || '')) throw new Hold(`${d.name} has no notary submission id`);
+  checkFeedDir(dir, { version, channel, finalized: true });
+
+  const childEnvironment = childEnv(env);
+  for (const dmg of names.dmgs) {
+    for (const cmd of verifyPlan(path.join(dir, dmg))) {
+      const r = await run(cmd.argv, { timeoutMs: cmd.timeoutMs, env: childEnvironment });
+      try {
+        requireClean(cmd.step, r);
+        if (cmd.step === 'display') requireDisplay(r);
+        if (cmd.step === 'assess') requireAssessed(r);
+      } catch (e) {
+        throw new Hold(`${dmg}: ${e.message}`);
+      }
+    }
+  }
+  return result;
 }
 
 function parseArgv(argv) {
   const opt = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
   const dir = opt('--dir');
   const version = opt('--version');
-  if (argv.length !== 4 || !dir || !version) throw new Hold('usage: release-dmg.js --dir <dist> --version <version>');
-  return { dir: path.resolve(dir), version };
+  const source = opt('--source');
+  if (argv.length !== 6 || !dir || !version || !source) {
+    throw new Hold('usage: release-dmg.js --dir <dist> --version <version> --source <source commit>');
+  }
+  return { dir: path.resolve(dir), version, source };
 }
 
 async function main(argv) {
@@ -234,4 +309,6 @@ if (require.main === module) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }
 
-module.exports = { Hold, commandPlan, finalize, notaryResult, requireAssessed, requireDisplay };
+module.exports = {
+  Hold, FINALIZATION, commandPlan, verifyPlan, runBounded, finalize, verifyFinalized, notaryResult, requireAssessed, requireDisplay,
+};

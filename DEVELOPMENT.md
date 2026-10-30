@@ -67,7 +67,7 @@ Releases publish from GitHub Actions (`.github/workflows/desktop-release.yml`) t
 
 ### By hand
 
-`build-local.sh` builds and verifies a signed app on your Mac without publishing it (see README, "Building a signed app locally"). To sign and notarize its DMGs, run `node menubar/scripts/release-dmg.js --dir menubar/dist --version <version>`. To publish such a stable build (the first org release, 1.0.34, goes out this way), run `node menubar/scripts/release-control.js bootstrap --dir <dir> --version <x.y.z> --source <commit on main>` with `gh` signed in as someone who can write to `repo-radar-releases`. Publishing with `release.sh` stays paused.
+`build-local.sh` builds and verifies a signed app on your Mac without publishing it (see README, "Building a signed app locally"). To sign and notarize its DMGs, run `node menubar/scripts/release-dmg.js --dir menubar/dist --version <version> --source <commit>`. It writes `release-finalization.json` only after every step succeeds, and publishing requires that file to match the exact files. To publish such a stable build (the first org release, 1.0.34, goes out this way), run `node menubar/scripts/release-control.js bootstrap --dir <dir> --version <x.y.z> --source <commit on main>` with `gh` signed in as someone who can write to `repo-radar-releases`. Publishing with `release.sh` stays paused.
 
 ## Dev Branch
 

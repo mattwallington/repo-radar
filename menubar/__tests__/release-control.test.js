@@ -6,15 +6,17 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { artifactNames, identity, dumpFeed } = require('../scripts/release-artifacts');
-const { planVersion, reserve, publish, recordOf } = require('../scripts/release-control');
+const { artifactNames } = require('../scripts/release-artifacts');
+const { finalize } = require('../scripts/release-dmg');
+const { planVersion, reserve, publish, bootstrap, recordOf } = require('../scripts/release-control');
+const { makeBuild, appleTools } = require('./helpers/release-fixtures');
 
 const NOW = new Date('2026-10-30T01:00:00Z');
 const sha = (n) => String(n).repeat(40).slice(0, 40);
 
 // The releases repository and the source branches, as the controller sees them through its client.
 function fakeGitHub() {
-  const state = { releases: [], branches: {}, bytes: new Map(), nextId: 1 };
+  const state = { releases: [], branches: {}, ancestors: {}, bytes: new Map(), nextId: 1 };
   const find = (id) => state.releases.find((r) => r.id === id);
   const copy = (r) => JSON.parse(JSON.stringify(r));
   const client = {
@@ -40,30 +42,27 @@ function fakeGitHub() {
     assetSha256: async (asset) => crypto.createHash('sha256').update(state.bytes.get(asset.id)).digest('hex'),
     assetText: async (asset) => state.bytes.get(asset.id).toString('utf8'),
     branchSha: async (branch) => state.branches[branch],
+    onBranch: async (commit, branch) => (state.ancestors[branch] || []).includes(commit),
   };
   return { state, client };
 }
 
 function context(client, plan) {
-  return { client, plan, floor: '1.0.32', changelog: '## [Unreleased]\n\n- Sync fix\n', now: () => NOW, log: () => {}, toolchain: { node: 'test' }, run: { id: '1' } };
+  return {
+    client, plan, floor: '1.0.32', changelog: '## [Unreleased]\n\n- Sync fix\n', now: () => NOW, log: () => {},
+    toolchain: { node: 'test' }, run: { id: '1' }, appleRun: appleTools().run,
+  };
 }
 
 const planFor = (channel, commit) => ({
   channel, branch: channel === 'stable' ? 'main' : 'dev', sourceRepo: 'ReperioHealth/repo-radar', sourceCommit: commit, sourceTree: sha('e'),
 });
 
-// A finalized build directory: both ZIPs, both stapled DMGs and a feed describing them.
-function finalizedDist(version, channel) {
+// A build from `commit` that the DMG finalizer has completed (with stand-in Apple tools).
+async function finalizedDist(version, channel, commit) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-control-'));
-  const names = artifactNames(version, channel);
-  const ids = {};
-  for (const name of [...names.zips, ...names.dmgs, ...names.zipBlockmaps]) {
-    const bytes = crypto.randomBytes(256);
-    fs.writeFileSync(path.join(dir, name), bytes);
-    ids[name] = identity(bytes);
-  }
-  const files = [...names.zips, ...names.dmgs].map((url) => ({ url, sha512: ids[url].sha512, size: ids[url].size }));
-  fs.writeFileSync(path.join(dir, names.feed), dumpFeed({ version, files, path: names.zips[0], sha512: ids[names.zips[0]].sha512 }));
+  makeBuild(dir, { version, channel, source: commit });
+  await finalize({ dir, version, source: commit, run: appleTools().run, env: {} });
   return dir;
 }
 
@@ -94,7 +93,7 @@ test('a retry reuses its reservation; a moved branch or newer release stops it',
   // A newer push moves dev: the old source can neither reserve nor publish.
   state.branches.dev = sha('b');
   await assert.rejects(reserve(ctx), /stale/);
-  const dir = finalizedDist(first.version, 'dev');
+  const dir = await finalizedDist(first.version, 'dev', sha('a'));
   try {
     await assert.rejects(publish(ctx, dir), /stale/);
     // Even back on the old commit, a newer same-channel reservation supersedes the draft.
@@ -112,7 +111,7 @@ test('publishing uploads and verifies the full set; a published source is a no-o
   state.branches.main = sha('c');
   const ctx = context(client, planFor('stable', sha('c')));
   const { version } = await reserve(ctx);
-  const dir = finalizedDist(version, 'stable');
+  const dir = await finalizedDist(version, 'stable', sha('c'));
   try {
     const result = await publish(ctx, dir);
     assert.deepStrictEqual(result, { published: true, version: '1.0.35' });
@@ -122,6 +121,8 @@ test('publishing uploads and verifies the full set; a published source is a no-o
     const names = artifactNames(version, 'stable');
     assert.deepStrictEqual(release.assets.map((a) => a.name).sort(),
       [...names.zips, ...names.dmgs, ...names.zipBlockmaps, names.feed, 'release-receipt.json'].sort());
+    const receipt = JSON.parse(state.bytes.get(release.assets.find((a) => a.name === 'release-receipt.json').id).toString());
+    assert.strictEqual(receipt.finalization.source, sha('c'), 'the receipt carries the verified finalization result');
 
     // main moves on; rerunning the old run reports the published release instead of building again.
     state.branches.main = sha('d');
@@ -137,18 +138,58 @@ test('publishing uploads and verifies the full set; a published source is a no-o
   }
 });
 
-test('a build whose feed does not match its files is never uploaded', async () => {
+test('a build whose files changed after finalization is never uploaded', async () => {
   const { state, client } = fakeGitHub();
   state.branches.main = sha('c');
   const ctx = context(client, planFor('stable', sha('c')));
   const { version } = await reserve(ctx);
-  const dir = finalizedDist(version, 'stable');
+  const dir = await finalizedDist(version, 'stable', sha('c'));
   try {
     fs.appendFileSync(path.join(dir, artifactNames(version, 'stable').zips[1]), 'changed after the feed was written');
-    await assert.rejects(publish(ctx, dir), /does not match its bytes/);
+    await assert.rejects(publish(ctx, dir), /is not the file that was finalized/);
     assert.strictEqual(state.releases[0].assets.length, 0);
     assert.strictEqual(state.releases[0].draft, true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bootstrap publishes only a finalized build whose DMGs still pass the Apple checks', async () => {
+  const { state, client } = fakeGitHub();
+  const source = sha('f');
+  state.ancestors.main = [source];
+  const ctx = context(client, planFor('stable', source));
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'rr-release-bootstrap-'));
+  const nothingPublished = () => {
+    assert.ok(state.releases.every((r) => r.draft && r.assets.length === 0), 'zero uploads, nothing published');
+  };
+  try {
+    // The builder's own output: its feed has no DMG blockMapSize, so only the finalizer's record can tell.
+    const raw = path.join(scratch, 'raw');
+    makeBuild(raw, { version: '1.0.34', channel: 'stable', source });
+    await assert.rejects(bootstrap(ctx, raw, '1.0.34'), /no release-finalization\.json/);
+    nothingPublished();
+
+    // Finalized, then a DMG changed.
+    const changed = path.join(scratch, 'changed');
+    makeBuild(changed, { version: '1.0.34', channel: 'stable', source });
+    await finalize({ dir: changed, version: '1.0.34', source, run: appleTools().run, env: {} });
+    fs.appendFileSync(path.join(changed, artifactNames('1.0.34', 'stable').dmgs[0]), 'x');
+    await assert.rejects(bootstrap(ctx, changed, '1.0.34'), /is not the file that was finalized/);
+    nothingPublished();
+
+    // Finalized, but a DMG no longer passes Gatekeeper.
+    const good = path.join(scratch, 'good');
+    makeBuild(good, { version: '1.0.34', channel: 'stable', source });
+    await finalize({ dir: good, version: '1.0.34', source, run: appleTools().run, env: {} });
+    await assert.rejects(bootstrap({ ...ctx, appleRun: appleTools({ fail: 'assess' }).run }, good, '1.0.34'), /assess exited 1/);
+    nothingPublished();
+
+    // The same finalized build with passing checks publishes as Latest.
+    assert.deepStrictEqual(await bootstrap(ctx, good, '1.0.34'), { published: true, version: '1.0.34' });
+    assert.strictEqual(state.releases.filter((r) => !r.draft).length, 1);
+    assert.strictEqual(state.releases.find((r) => !r.draft).make_latest, 'true');
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
   }
 });
