@@ -37,9 +37,10 @@ repo-radar/
 │   ├── ui.py                  # Help text, formatting, status updates
 │   ├── modes/                 # CLI modes (configure, sync, analyze, clean)
 │   └── tests/                 # Unit tests
-├── VERSION                    # Single source of truth for version
+├── VERSION                    # Release version floor: the workflow publishes the next patch above it or higher
 ├── requirements.txt           # Python dependencies (litellm pinned)
-├── release.sh                 # Build + sign + notarize + release workflow
+├── build-local.sh             # Build, sign, notarize and verify (used by the release workflow)
+├── release.sh                 # Old release script; publishing is paused
 └── menubar/                   # Electron menubar app
     ├── main.js                # Main process (tray, scheduling, IPC)
     ├── entitlements.plist     # macOS hardened runtime entitlements
@@ -56,60 +57,37 @@ repo-radar/
 
 ## Releasing
 
-**Current process:** releases are now built locally with `build-local.sh`, signed and notarized with Reperio Health's Apple team (see https://github.com/mattwallington/repo-radar/pull/4 and README's "Building a signed app locally"). It builds the channel that matches the branch, needs an explicit `--version`, runs the same release checks as `release.sh`, and publishes nothing. Publishing with `release.sh` is paused until the update feed moves to the ReperioHealth org: its `--dry-run` still runs every check, but a real run stops after them. The `release.sh` instructions below describe publishing once it resumes.
+Releases publish from GitHub Actions (`.github/workflows/desktop-release.yml`) to the public, code-free [ReperioHealth/repo-radar-releases](https://github.com/ReperioHealth/repo-radar-releases), which is also the apps' update feed.
 
-Releases are managed via `release.sh`, which handles versioning, building, signing, notarizing, and publishing to GitHub Releases. The app includes auto-update — existing users are prompted when a new version is available.
+- **What publishes:** a push to `main` publishes **Repo Radar** as the Latest release. A push to `dev` publishes **Repo Radar Dev** as a prerelease. Merging to `main` is the release decision; there is no second approval. Setting `PUBLISH_DEV: 'false'` in the workflow stops Dev publishing without affecting stable.
+- **Versions** come from the workflow, and nothing commits a version bump; `package.json`'s version is not used. Stable takes the next patch above the highest of every stable version in `repo-radar-releases` (published or draft), the bootstrap floor 1.0.34 and the base of the checkout's `VERSION`. So the first is 1.0.35, and with `VERSION` at 1.1.0 the next stable is at least 1.1.1. Dev uses that base, or a higher Dev base already in use, with a UTC timestamp suffix, such as `1.0.35-dev.20261030010000`. A minor or major bump is a deliberate change to `menubar/scripts/release-control.js`.
+- **Release notes** are written when the draft is reserved: a link comparing the source with the previous published release of the same channel (or to the source commit, for the first one), and a link to `CHANGELOG.md` as of that commit. Keep `[Unreleased]` in the changelog current in the PR that makes the change.
+- **How a run works:** it reserves a draft release keyed to its commit, builds both architectures with `build-local.sh` on a pinned macOS runner, signs and notarizes the DMGs, uploads everything with a `release-receipt.json`, checks every uploaded hash, and only then publishes. Rerunning a commit that already published does nothing. If the branch has moved on, or a newer release of the same channel exists, the run stops without publishing. Published releases are never changed: fix a bad release with a new version.
+- **Setup:** until the repository has a `desktop-release` environment, runs report "not configured" and publish nothing. An admin creates that environment, limited to the `main` and `dev` branches, and provides these secrets, as organization or environment secrets: `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `ASC_API_KEY_P8`, `ASC_API_KEY_ID`, `ASC_API_ISSUER_ID`, and `RELEASES_REPO_TOKEN`, a fine-grained token with Contents read and write on only `repo-radar-releases`. Once the environment exists, a missing secret fails the run.
 
-Before any run, including `--dry-run`, set `REPO_RADAR_RELEASE_PYTHON` to a release venv built from the matching dependency lock. See "Preparing a release" in [README.md](README.md#preparing-a-release) or `./release.sh --help`.
+### When a release run fails
 
-```bash
-# Patch release (default, no args needed)
-./release.sh
+- **A newer push wins.** If the branch moves while a build runs, that run stops before publishing; the newer push's run publishes instead. The older run's draft stays reserved in `repo-radar-releases`, and later versions number above it.
+- **Rerun the failed jobs** after fixing the cause. A rerun reuses its draft, and a commit that already published does nothing.
+- **First live run.** It is the first real test of asset uploads and downloads, of Python 3.14.10 and Xcode 16.4 on the runner, and of the signing and notary credentials. Any failure stops before publishing.
+- **Expired token.** `RELEASES_REPO_TOKEN` is a fine-grained token with an expiry date. Once it expires, runs fail with HTTP 401 and publish nothing; renew it and rerun.
+- `queue: max` in the workflow's concurrency and the `actions: read` permission are supported by GitHub; older actionlint versions flag `queue` anyway.
 
-# Minor release (1.0.5 -> 1.1.0)
-./release.sh --minor
+### By hand
 
-# Major release (1.0.5 -> 2.0.0)
-./release.sh --major
-
-# Dry run (show what would happen)
-./release.sh --dry-run
-
-# Help
-./release.sh --help
-```
-
-The script will:
-1. Bump the version in `VERSION`, `package.json`, and `package-lock.json`
-2. Commit and tag
-3. Build the Electron app for arm64 + x64
-4. Sign with Developer ID and notarize with Apple
-5. Push and create a GitHub Release with artifacts attached
-
-### Requirements for signing/notarization
-
-- Developer ID Application certificate in Keychain
-- Environment variables:
-  - `APPLE_ID` — your Apple ID email
-  - `APPLE_APP_SPECIFIC_PASSWORD` — generated at [appleid.apple.com](https://appleid.apple.com)
-  - `APPLE_TEAM_ID` — your Apple Developer team ID
+`build-local.sh` builds and verifies a signed app on your Mac without publishing it (see README, "Building a signed app locally"). If you run electron-builder yourself, run it from `menubar/`, as `build-local.sh` does: it loads the `./scripts/release-after-pack.js` hook relative to the current directory, and the build stops if the hook can't be found. To sign and notarize its DMGs, run `node menubar/scripts/release-dmg.js --dir menubar/dist --version <version> --source <commit>`. It writes `release-finalization.json` only after every step succeeds, and publishing requires that file to match the exact files. Running it again on a finalized folder only verifies it and changes nothing. If a folder's output is invalid, it refuses as it is; start again from a fresh copy of the original build output. The preserved 1.0.34 build, the first organization release, is published once by hand: put its two ZIPs, two DMGs, `latest-mac.yml` and ZIP blockmaps in one folder, run `node menubar/scripts/release-dmg.js --dir <dir> --version 1.0.34 --source 4283e7411263aca1fb32342bff48df1dc1c22392`, then `node menubar/scripts/release-control.js bootstrap --dir <dir> --version 1.0.34 --source 4283e7411263aca1fb32342bff48df1dc1c22392` with `gh` signed in as someone who can write to `repo-radar-releases`. Both refuse anything but that build's original files (pinned in `menubar/scripts/release-artifacts.js`), and they read the apps inside the ZIPs to confirm their source, version, channel and architecture. Publishing with `release.sh` stays paused.
 
 ## Dev Branch
 
 The `dev` branch builds a separate **Repo Radar Dev** app that can run alongside production:
 
-- Separate app ID (`com.mattwallington.repo-radar-dev`) and orange icon
-- Releases are created as GitHub pre-releases
-- Auto-updater only checks pre-releases (doesn't affect production users)
+- Separate app ID (`com.mattwallington.repo-radar-dev`), orange icon and update download cache
+- Releases are prereleases in `repo-radar-releases`, each with a `dev-mac.yml` feed
+- Dev apps update only to newer Dev releases; stable apps never see them
 - Uses port 3848 for status updates (production uses 3847)
 
 ```bash
 git checkout dev
-# make changes, commit
-./release.sh          # builds "Repo Radar Dev", creates pre-release
-
-# when ready for production:
-git checkout main
-git merge dev
-./release.sh          # builds "Repo Radar", creates stable release
+# make changes, commit, push: a Repo Radar Dev prerelease publishes
+# when ready for production, merge dev into main through a PR: Repo Radar publishes
 ```
