@@ -1,8 +1,10 @@
 """Metadata parsing, response extraction, and index generation."""
 
+import hashlib
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -242,6 +244,70 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
             pass
 
     return target
+
+
+# Incremental metadata keeps its latest attempt per repository here, owner-only, so INDEX can say
+# when a document is stale (an update failed or was skipped after it was written).
+STATE_DIR_NAME = '.metadata-state'
+
+
+def parse_frontmatter(content):
+    """The `key: value` frontmatter of a metadata document as a dict, or None without one."""
+    if not content.startswith('---'):
+        return None
+    parts = content.split('---', 2)
+    if len(parts) < 3:
+        return None
+    info = {}
+    for line in parts[1].split('\n'):
+        if ':' in line:
+            key, value = line.split(':', 1)
+            info[key.strip()] = value.strip()
+    return info
+
+
+def read_attempt_state(pristine_dir, cache_name):
+    """The latest incremental-metadata attempt recorded for `cache_name`, or None."""
+    path = Path(pristine_dir) / STATE_DIR_NAME / f"{cache_name}.json"
+    try:
+        with open(path, 'r') as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def stale_label(state, document_text, info):
+    """A one-line stale note when the latest attempt failed or was skipped after this document was
+    written, or None when the document is current. The document's committed generation wins over a
+    leftover attempt: the note applies only to an attempt made from exactly this document."""
+    if not state or state.get('status') not in ('pending', 'failed', 'skipped'):
+        return None
+    if state.get('baseline_doc_sha256') != hashlib.sha256(document_text.encode('utf-8')).hexdigest():
+        return None
+    if state.get('generation_id') and state.get('generation_id') == info.get('generation_id'):
+        return None
+    analyzed = (info.get('last_commit') or 'unknown')[:7]
+    attempted = (state.get('target_commit') or 'unknown')[:7]
+    reason = state.get('reason') or ('interrupted' if state.get('status') == 'pending' else 'update failed')
+    return f"stale: analyzed {analyzed}, update to {attempted} {state.get('status')}: {reason}"
+
+
+def write_text_atomic(path, text):
+    """Replace `path` with `text` via a sibling temporary file, so readers see old or new, never part."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _parse_status_of(info):
