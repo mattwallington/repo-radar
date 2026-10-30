@@ -1,0 +1,166 @@
+name: Desktop release
+
+# Pushes to main publish Repo Radar (Latest); pushes to dev publish Repo Radar Dev (a prerelease).
+# Releases go to ReperioHealth/repo-radar-releases. Manual runs are for setup and recovery on those branches.
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch: {}
+
+# One queue for both channels. A running release is never cancelled by a newer push.
+concurrency:
+  group: repo-radar-desktop-release
+  queue: max
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # Set to 'false' to stop publishing Dev prereleases from dev. Stable releases from main are unaffected.
+  PUBLISH_DEV: 'true'
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+    steps:
+      - name: Check the branch and the desktop-release environment
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip() {
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Desktop release skipped: $1"
+            echo "Desktop release skipped: $1. Nothing was published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          case "$GITHUB_REF" in
+            refs/heads/main) ;;
+            refs/heads/dev) [[ "$PUBLISH_DEV" == true ]] || skip "Dev publishing is turned off (PUBLISH_DEV)" ;;
+            *) echo "::error::Releases run only from main or dev, not $GITHUB_REF"; exit 1 ;;
+          esac
+          [[ "$GITHUB_REPOSITORY" == ReperioHealth/repo-radar ]] || skip "not configured ($GITHUB_REPOSITORY is not ReperioHealth/repo-radar)"
+          # Only an absent environment skips. Once it exists, missing secrets and every later error fail the run.
+          if err=$(gh api "repos/$GITHUB_REPOSITORY/environments/desktop-release" 2>&1 >/dev/null); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 404' <<< "$err"; then
+            skip "not configured (no desktop-release environment)"
+          else
+            echo "::error::Could not check the desktop-release environment: $err"
+            exit 1
+          fi
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.run == 'true'
+    environment: desktop-release
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      # Organization and environment secrets both arrive through the secrets context.
+      - name: Check signing and publication secrets
+        env:
+          CONFIGURED: >-
+            ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' &&
+                secrets.ASC_API_KEY_P8 != '' && secrets.ASC_API_KEY_ID != '' && secrets.ASC_API_ISSUER_ID != '' &&
+                secrets.RELEASES_REPO_TOKEN != '' }}
+        run: |
+          if [[ "$CONFIGURED" != true ]]; then
+            echo "::error::desktop-release exists, but a secret is missing. Needed (organization or environment): MACOS_CERTIFICATE_P12_BASE64, MACOS_CERTIFICATE_PASSWORD, ASC_API_KEY_P8, ASC_API_KEY_ID, ASC_API_ISSUER_ID, RELEASES_REPO_TOKEN."
+            exit 1
+          fi
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.20.0'
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: python
+        with:
+          python-version: '3.14.10'
+
+      - name: Check runner architecture and pinned toolchain
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(node --version)" = v22.20.0
+          test "$(xcodebuild -version)" = $'Xcode 16.4\nBuild version 16F6'
+          test "$("$PYTHON" -I -c 'import sys; print(sys.version.split()[0])')" = 3.14.10
+
+      - name: Reserve this commit's version
+        id: reserve
+        env:
+          SOURCE_TOKEN: ${{ github.token }}
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: node menubar/scripts/release-control.js reserve
+
+      - name: Report an already-published release
+        if: steps.reserve.outputs.published == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.reserve.outputs.version }}
+        run: echo "v$RELEASE_VERSION is already published from this commit. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the release venv from the checked-in lock
+        if: steps.reserve.outputs.published == 'false'
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          venv="$RUNNER_TEMP/release-venv"
+          "$PYTHON" -I -m venv "$venv"
+          # The lock's bootstrap pip must be the one this Python bundles; nothing is installed unpinned.
+          want=$(node -p 'require("./resources/pydeps/cp314-arm64.manifest.json").bootstrap.pip')
+          have=$("$venv/bin/python" -I -m pip --version | awk '{print $2}')
+          [[ "$have" == "$want" ]] || { echo "::error::The venv's pip is $have; the lock expects $want"; exit 1; }
+          "$venv/bin/python" -I -m pip install --require-hashes -r resources/pydeps/cp314-arm64.lock
+          echo "REPO_RADAR_RELEASE_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Load signing credentials into a throwaway keychain
+        if: steps.reserve.outputs.published == 'false'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: scripts/release-keychain.sh
+
+      - name: Build, sign and notarize both architectures
+        if: steps.reserve.outputs.published == 'false'
+        env:
+          RELEASE_VERSION: ${{ steps.reserve.outputs.version }}
+        run: ./build-local.sh --version "$RELEASE_VERSION"
+
+      - name: Sign, notarize and staple the DMGs
+        if: steps.reserve.outputs.published == 'false'
+        env:
+          RELEASE_VERSION: ${{ steps.reserve.outputs.version }}
+        run: node menubar/scripts/release-dmg.js --dir menubar/dist --version "$RELEASE_VERSION"
+
+      - name: Upload, verify and publish
+        if: steps.reserve.outputs.published == 'false'
+        env:
+          RELEASE_VERSION: ${{ steps.reserve.outputs.version }}
+          SOURCE_TOKEN: ${{ github.token }}
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          node menubar/scripts/release-control.js publish --dir menubar/dist
+          echo "Published v$RELEASE_VERSION to ReperioHealth/repo-radar-releases." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/repo-radar-release.keychain-db"
+          if [[ -f "$keychain" ]]; then security delete-keychain "$keychain"; fi
+          rm -f "$RUNNER_TEMP/repo-radar-certificate.p12" "$RUNNER_TEMP/repo-radar-notary.p8"
