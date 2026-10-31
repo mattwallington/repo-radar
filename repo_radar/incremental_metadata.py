@@ -187,7 +187,28 @@ def _analysis_of(doc):
 
 Section = namedtuple('Section', 'id text sha256')
 _HEADING = re.compile(r'^#{1,6}\s')
-_FENCE = re.compile(r'^\s*(```|~~~)')
+_FENCE_OPEN = re.compile(r'^[ \t]*(`{3,}|~{3,})(.*)$')
+_FENCE_CLOSE = re.compile(r'^[ \t]*(`{3,}|~{3,})[ \t]*$')
+
+
+def _code_lines(lines):
+    """For each line, whether it is part of fenced code; and whether a fence is left open. A fence
+    closes only on a line of the same character, at least as long as the opening run, and nothing else
+    (CommonMark), so a four-backtick block can show a three-backtick example."""
+    flags, fence = [], None
+    for line in lines:
+        bare = line.rstrip('\r\n')
+        if fence is None:
+            m = _FENCE_OPEN.match(bare)
+            if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):
+                fence = (m.group(1)[0], len(m.group(1)))
+            flags.append(fence is not None)
+        else:
+            m = _FENCE_CLOSE.match(bare)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                fence = None
+            flags.append(True)
+    return flags, fence is not None
 QUICK_REF_FIELDS = ('type', 'language', 'framework', 'database', 'apis', 'port', 'dependencies')
 
 
@@ -198,12 +219,11 @@ class PatchError(Exception):
 def split_sections(analysis):
     """Split the analysis at Markdown headings outside fenced code. Joining the texts gives back the
     analysis exactly. Text before the first heading is its own section."""
-    starts, fenced = [], False
+    starts = []
     lines = analysis.splitlines(keepends=True)
+    code, _open = _code_lines(lines)
     for i, line in enumerate(lines):
-        if _FENCE.match(line):
-            fenced = not fenced
-        elif not fenced and _HEADING.match(line):
+        if not code[i] and _HEADING.match(line):
             starts.append(i)
     if not starts or starts[0] != 0:
         starts.insert(0, 0)
@@ -283,6 +303,8 @@ def apply_patch(sections, fields, patch, base_sha):
         content = op.get('content')
         if not isinstance(content, str) or not content.strip():
             raise PatchError(f"{kind} needs non-empty content")
+        if _code_lines(content.splitlines(keepends=True))[1]:
+            raise PatchError(f"{kind} content leaves a code fence open")
         if kind == 'insert' and not _HEADING.match(content):
             raise PatchError("inserted content must start with a Markdown heading")
         if kind == 'replace' and _HEADING.match(by_id[op['id']].text) and not _HEADING.match(content):
@@ -749,14 +771,18 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         provenance = _provenance(decision.strategy, model, decision, doc, target, now,
                                  candidate.coverage_note, candidate.omitted, candidate.outside_selection)
         generation_id = uuid.uuid4().hex
-        text = render_metadata_document(
-            full_name, cache_name, repo_config['clone_url'], target, datetime.now().isoformat(),
-            fields['quick_reference'], fields['brief'], fields['related_repos'], candidate.analysis,
-            {'generation_id': generation_id, **provenance})
-        from repo_radar.metadata import parse_frontmatter, degradation_reasons
+        from repo_radar.metadata import UnsafeHeader, degradation_reasons
+        try:
+            # Renders and reads the header back: identity, revisions, provenance and parse status.
+            text = render_metadata_document(
+                full_name, cache_name, repo_config['clone_url'], target, datetime.now().isoformat(),
+                fields['quick_reference'], fields['brief'], fields['related_repos'], candidate.analysis,
+                {'generation_id': generation_id, **provenance})
+        except UnsafeHeader as e:
+            raise StaleUpdate(f"the updated document's header is unsafe: {e}") from None
         check = {'quick_ref': fields['quick_reference'], 'brief': fields['brief'],
                  'related_repos': fields['related_repos'], 'analysis': candidate.analysis}
-        if degradation_reasons(check) or not candidate.analysis.strip() or parse_frontmatter(text) is None:
+        if degradation_reasons(check) or not candidate.analysis.strip():
             raise StaleUpdate('the updated document failed its health checks')
         attempt.update(status='committing', generation_id=generation_id)
         write_state(pristine_dir, cache_name, attempt)

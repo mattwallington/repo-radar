@@ -378,6 +378,15 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
         assert new.info['full_build_at'] == (NOW - timedelta(days=1)).isoformat() and new.info['apis'] == 'REST, webhooks'
         assert new.info['full_build_model'] == 'unknown'
 
+        # Fences: a four-backtick block showing a three-backtick example, and a tilde block, stay code.
+    fenced = ("## Usage\n````md\n```\n## not a heading\n```\n````\n~~~\n```\n## also code\n~~~\n## Next\nafter\n")
+    parts = im.split_sections(fenced)
+    assert [p.text.split('\n', 1)[0] for p in parts] == ['## Usage', '## Next'] and ''.join(p.text for p in parts) == fenced
+    with pytest.raises(im.PatchError, match='fence open'):
+        im.apply_patch(parts, {}, {'base_document_sha256': 'h', 'sections': [
+            {'op': 'replace', 'id': parts[0].id, 'expected_sha256': parts[0].sha256,
+             'content': '## Usage\n```\nunclosed\n## Next\n'}]}, 'h')
+
         # Edits against a hash the section doesn't have can't publish.
         repo.write('src/m3.py', 'z = 3\n')
         repo.commit()
@@ -549,7 +558,7 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize('failure', ['generation_error', 'parse_failure', 'interrupt_before_replace',
                                      'interrupt_after_replace', 'state_lost_after_replace', 'repository_moved',
-                                     'full_degraded'])
+                                     'full_degraded', 'delimiter_in_brief', 'delimiter_in_coverage_note'])
 def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure):
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     repo.write('src/m0.py', (repo.path / 'src/m0.py').read_text() + '# more\n')
@@ -563,6 +572,10 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         repo.commit('pushed meanwhile')
         return good
 
+    unsafe = {'delimiter_in_brief': {'fields': {'brief': 'Payments --- API'}},
+              'delimiter_in_coverage_note': {'coverage_note': 'checked src --- skipped tests'}}
+    if failure in unsafe:
+        good = answer({'base_document_sha256': old.sha256, 'sections': [], **unsafe[failure]})
     provider.replies = {'generation_error': [httpx.Response(500, json={"error": {"message": "boom"}})],
                         'parse_failure': [claude([{"type": "text", "text": "Here is my update!"}])],
                         'full_degraded': [claude([{"type": "text", "text": "A repository. No markers here."}])],
@@ -591,6 +604,8 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         else:
             outcome = update(pristine, repo, session, force=failure == 'full_degraded')
             assert outcome.status == ('skipped' if failure == 'repository_moved' else 'failed'), outcome
+            if failure in unsafe:
+                assert "header is unsafe" in outcome.reason
     monkeypatch.setattr(metadata, 'write_text_atomic', real_atomic)
     monkeypatch.setattr(im, 'write_state', real_write_state)
     doc = im.load_document(pristine, 'app-abc1234')
@@ -600,6 +615,11 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         # The replacement committed: the new document is complete and current despite the stale marker.
         assert doc.info['last_commit'] == target and doc.info['generation_id']
         assert 'stale' not in index
+        # The published header reads back whole: identity, revisions, provenance and a healthy status.
+        assert (doc.info['full_name'], doc.info['parse_status'], doc.info['base_commit']) == (FULL, 'ok', base)
+        assert doc.info['semantic_policy'] == im.SEMANTIC_POLICY and doc.info['full_build_model'] == 'unknown'
+        assert doc.info['coverage'] == 'required diff examined' and doc.info['brief'] == 'A payments API.'
+        assert im.usable_baseline(doc, FULL)[0]
         return
     assert doc.text == old.text, 'old document kept byte for byte'
     assert 'degraded_reason' not in doc.text
