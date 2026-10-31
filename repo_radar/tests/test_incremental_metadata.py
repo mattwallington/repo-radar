@@ -419,7 +419,7 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
         assert new.info['full_build_at'] == (NOW - timedelta(days=1)).isoformat() and new.info['apis'] == 'REST, webhooks'
         assert new.info['full_build_model'] == 'unknown'
 
-        # Fences: a four-backtick block showing a three-backtick example, and a tilde block, stay code.
+    # Fences: a four-backtick block showing a three-backtick example, and a tilde block, stay code.
     fenced = ("## Usage\n````md\n```\n## not a heading\n```\n````\n~~~\n```\n## also code\n~~~\n## Next\nafter\n")
     parts = im.split_sections(fenced)
     assert [p.text.split('\n', 1)[0] for p in parts] == ['## Usage', '## Next'] and ''.join(p.text for p in parts) == fenced
@@ -428,20 +428,25 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
             {'op': 'replace', 'id': parts[0].id, 'expected_sha256': parts[0].sha256,
              'content': '## Usage\n```\nunclosed\n## Next\n'}]}, 'h')
 
-        # Edits against a hash the section doesn't have can't publish.
-        repo.write('src/m3.py', 'z = 3\n')
-        repo.commit()
-        stale = im.split_sections(im._analysis_of(new))[1]
+    # Edits against a hash the section doesn't have can't publish, and an oversized model-chosen id
+    # never reaches saved state or the reason unbounded. Both updates really run.
+    repo.write('src/m3.py', 'z = 3\n')
+    repo.commit()
+    stale = im.split_sections(im._analysis_of(new))[1]
+    sent = len(provider.messages())
+    with PreflightSession() as session:
         provider.replies = [answer({'base_document_sha256': new.sha256, 'sections': [
             {'op': 'replace', 'id': stale.id, 'expected_sha256': '0' * 16, 'content': '## Key Components\nwrong\n'}]})]
         failed = update(pristine, repo, session)
-        assert failed.status == 'failed' and 'expected_sha256' in failed.reason
+        assert failed.status == 'failed' and 'expected_sha256' in failed.reason and not provider.replies
+        assert im.load_document(pristine, 'app-abc1234').text == new.text
         provider.replies = [answer({'base_document_sha256': new.sha256, 'sections': [
             {'op': 'delete', 'id': 'x\n' * 3000, 'expected_sha256': stale.sha256}]})]
         huge = update(pristine, repo, session)
-        saved = metadata.read_attempt_state(pristine, 'app-abc1234')['reason']
-        assert huge.status == 'failed' and len(huge.reason) <= 240 and saved == huge.reason and '\n' not in saved
-        assert im.load_document(pristine, 'app-abc1234').text == new.text
+        assert not provider.replies and len(provider.messages()) == sent + 2
+    saved = metadata.read_attempt_state(pristine, 'app-abc1234')['reason']
+    assert huge.status == 'failed' and len(huge.reason) <= 240 and saved == huge.reason and '\n' not in saved
+    assert im.load_document(pristine, 'app-abc1234').text == new.text
 
 
 FULL_REPLY = ("QUICK_REFERENCE_START\nType: API Service\nLanguage: Python\nFramework: None\nDatabase: None\n"
