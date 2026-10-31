@@ -665,3 +665,37 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
         assert reopened.spent() == pytest.approx(usage['retained_reservation_usd'])
         with pytest.raises(BudgetExceeded, match='reconcile'):
             Budget(MODEL, ledger=reopened, label='full').reserve({'other': 1}, 1, 1)
+
+    # Two pilot invocations can't overlap: while A holds the pilot lock, B stops before any setup,
+    # ledger or provider work; once A releases it, B runs and sees the same ledger and cap.
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    pilot_dir = tmp_path / 'locked-pilot'
+    pilot_dir.mkdir()
+    shared = Ledger(pilot_dir / 'ledger.json', 40.0, allowances)
+    spent = Budget(MODEL, ledger=shared, label='full')
+    spent.settle(spent.reserve({'done': 1}, 0, 100_000), types.SimpleNamespace(input_tokens=5, output_tokens=100_000), 1.0)
+    (pilot_dir / 'baseline.md').write_text(
+        legacy_document('app-abc1234', base, NOW - timedelta(days=1)).replace(FULL, 'ReperioHealth/reperio-telehealth'))
+    holder = subprocess.Popen(
+        [sys.executable, '-I', '-c', f"import sys; sys.path.insert(0, {str(root)!r}); "
+         "from repo_radar.metadata_budget import acquire_exclusive_lock; "
+         f"fd = acquire_exclusive_lock({str(pilot_dir / 'pilot.lock')!r}); print('locked', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    env = {'PATH': os.environ['PATH'], 'HOME': str(tmp_path), 'LITELLM_LOCAL_MODEL_COST_MAP': 'True'}
+    pilot = [sys.executable, '-I', str(root / 'scripts' / 'pilot-incremental-metadata.py'), 'plan',
+             '--pilot-dir', str(pilot_dir), '--repo-path', str(repo.path), '--target', repo.git('rev-parse', 'HEAD'),
+             '--model', MODEL]
+    try:
+        assert holder.stdout.readline().strip() == 'locked'
+        blocked = subprocess.run(pilot, capture_output=True, text=True, env=env)
+        assert blocked.returncode == 2 and 'another pilot invocation' in blocked.stderr
+        assert not (pilot_dir / 'pilot.json').exists()
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+    after = subprocess.run(pilot, capture_output=True, text=True, env=env)
+    assert after.returncode == 0, after.stderr
+    assert 'ledger: $1.00 of $40.00 spent' in after.stdout and (pilot_dir / 'pilot.json').exists()
+    assert (pilot_dir / 'pilot.lock').exists()

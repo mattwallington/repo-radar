@@ -9,6 +9,7 @@ An ordinary incremental attempt has an $8 cap. Full rebuilds in sync keep the ex
 cost policy but are still accounted. The telehealth pilot shares one durable Ledger across runs.
 """
 
+import fcntl
 import hashlib
 import json
 import math
@@ -154,6 +155,23 @@ class Budget:
                 'output_tokens': self.output_tokens, 'cost_usd': None if self.unknown_calls else known,
                 'known_cost_usd': known, 'unknown_cost_calls': self.unknown_calls,
                 'retained_reservation_usd': round(self.retained, 6), **self.extra}
+
+
+class LockHeld(Exception):
+    pass
+
+
+def acquire_exclusive_lock(path):
+    """Take a nonblocking exclusive flock on `path` (created owner-only), returning its descriptor.
+    Close the descriptor to release it; never delete or replace the file, since a new inode would let
+    a second holder in. Raises LockHeld when another process holds it."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise LockHeld(str(path)) from None
+    return fd
 
 
 class Ledger:
