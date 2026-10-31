@@ -396,6 +396,24 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     assert tools.run('search', '{"literal": "haystack"}').startswith('[too many matches')
     narrowed = tools.run('search', '{"literal": "haystack", "path_prefix": "src/m"}')
     assert 'src/m0.py:1: # haystack' in narrowed, narrowed
+    # Below the path-count limit but over the argument-size limit (a multibyte name): asked to narrow,
+    # and Git is never started.
+    long_dir = repo.path / 'données'
+    long_dir.mkdir()
+    for i in range(3):
+        (long_dir / (f'fichier-{i}-' + 'é' * 60 + '.py')).write_text('haystack\n')
+    wide = snap.SnapshotTools(base_snap, snap.GitSnapshot(repo.path, repo.commit('wide names')), ['page'])
+    monkeypatch.setattr(snap, 'MAX_SEARCH_ARG_BYTES', 300)
+    spawned = []
+    real_run_git = snap.run_git
+    monkeypatch.setattr(snap, 'run_git', lambda *a, **k: spawned.append(a) or real_run_git(*a, **k))
+    wide.target.manifest()
+    spawned.clear()
+    assert 'use a narrower path_prefix' in wide.run('search', '{"literal": "haystack", "path_prefix": "donn"}')
+    assert not spawned
+    monkeypatch.setattr(snap, 'run_git', real_run_git)
+    monkeypatch.setattr(snap, 'MAX_SEARCH_ARG_BYTES', 64 * 1024)
+    repo.git('reset', '-q', '--hard', 'HEAD~1')
     with pytest.raises(snap.ToolRequestError):
         tools.run('run_shell', '{"cmd": "ls"}')
 

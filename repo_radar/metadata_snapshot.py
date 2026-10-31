@@ -27,6 +27,7 @@ MAX_READ_BYTES = 8 * 1024 * 1024      # one blob read by read_file
 MAX_LINE_CHARS = 2000                 # longer lines are shortened, with a marker
 MAX_SEARCH_OUTPUT = 4 * 1024 * 1024   # git grep output read for one search
 MAX_SEARCH_PATHS = 2000               # files named to git grep for one path_prefix
+MAX_SEARCH_ARG_BYTES = 64 * 1024      # encoded grep arguments for one search, leaving room for the rest
 REGULAR_MODES = frozenset({'100644', '100755'})
 SHA = re.compile(r'^[0-9a-f]{40}$')
 _GIT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'
@@ -468,9 +469,10 @@ class SnapshotTools:
             under = [p for p, e in manifest.items() if p.startswith(prefix) and not self._omitted(e)]
             if not under:
                 return f"[no readable tracked path starts with {prefix!r}]"
-            if len(under) > MAX_SEARCH_PATHS:
-                return f"[{len(under)} files start with {prefix!r}; use a narrower path_prefix]"
             cmd += ['--', *under]
+            arg_bytes = sum(len(os.fsencode(arg)) + 1 for arg in cmd)   # each argument plus its NUL
+            if len(under) > MAX_SEARCH_PATHS or arg_bytes > MAX_SEARCH_ARG_BYTES:
+                return f"[{len(under)} files start with {prefix!r}; use a narrower path_prefix]"
         try:
             raw = run_git(self.target.repo, cmd, MAX_SEARCH_OUTPUT)
         except GitError as e:
