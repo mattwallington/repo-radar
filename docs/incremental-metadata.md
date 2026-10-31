@@ -106,8 +106,10 @@ The pilot compares an incremental update with a clean full rebuild for
 this repository's dependency lock, never through the installed sync. Every request is charged to one
 ledger capped at **$40**: $8 for the incremental candidate, $24 for the full comparison, and $8 held
 back as contingency. The ledger survives restarts, can't have its limits changed, and never buys the
-same request twice. If a candidate can't fit its allowance, the pilot stops; it doesn't change models
-or raise the cap.
+same request twice. Only one pilot command can use a pilot directory at a time; a second one exits
+before touching anything. If a candidate can't fit its allowance, or a reply's cost is unknown, the
+pilot stops; it doesn't change models or raise the cap, and a ledger holding a request of unknown cost
+refuses further paid requests until it's reconciled by hand.
 
 1. Make a pilot directory and copy the latest healthy full telehealth document into it as
    `baseline.md` (for example `~/repos-pristine/reperio-telehealth-fab3ba4.md`). Don't buy a new

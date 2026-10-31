@@ -4,7 +4,8 @@
 Both candidates go to a scratch pilot directory, never to the installed metadata document, and every
 paid request is charged to one durable ledger capped at $40 ($8 for the incremental candidate, $24 for
 the full comparison, the rest held back as contingency). The ledger and its limits survive restarts:
-a rerun cannot reset the cap or buy the same request twice. Nothing here runs the installed sync.
+a rerun cannot reset the cap or buy the same request twice, and only one invocation can use a pilot
+directory at a time (pilot.lock). Nothing here runs the installed sync.
 
 Setup, once (see docs/incremental-metadata.md):
   1. Copy the latest healthy full telehealth document into the pilot directory as baseline.md.
@@ -21,6 +22,7 @@ Usage (the provider key comes from the environment, e.g. ANTHROPIC_API_KEY; noth
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -31,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from repo_radar import incremental_metadata as im  # noqa: E402
 from repo_radar import metadata_snapshot as snap  # noqa: E402
 from repo_radar.metadata import render_metadata_document  # noqa: E402
-from repo_radar.metadata_budget import Budget, Ledger  # noqa: E402
+from repo_radar.metadata_budget import Budget, Ledger, LockHeld, acquire_exclusive_lock  # noqa: E402
 from repo_radar.model_catalog import is_known_model  # noqa: E402
 
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'
@@ -91,6 +93,22 @@ def main(argv):
     parser.add_argument('--model', required=True, help='the configured metadata model, used for both candidates')
     args = parser.parse_args(argv)
 
+    # One invocation per pilot at a time, held from before any setup write through the last result
+    # write, so two runs can't both pass the ledger's cap and duplicate checks.
+    pilot_dir = Path(args.pilot_dir).resolve()
+    if not pilot_dir.is_dir():
+        fail(f"{pilot_dir} is not a directory")
+    try:
+        lock = acquire_exclusive_lock(pilot_dir / 'pilot.lock')
+    except LockHeld:
+        fail(f"another pilot invocation is using {pilot_dir}; wait for it to finish")
+    try:
+        return run(args)
+    finally:
+        os.close(lock)
+
+
+def run(args):
     pilot, doc = load_pilot(args)
     repo = Path(args.repo_path).resolve()
     decision = decide(args, doc, repo)
