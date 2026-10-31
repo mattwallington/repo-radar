@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from repo_radar import incremental_metadata as im  # noqa: E402
 from repo_radar import metadata_snapshot as snap  # noqa: E402
-from repo_radar.metadata import render_metadata_document  # noqa: E402
+from repo_radar.metadata import UnsafeHeader, render_metadata_document  # noqa: E402
 from repo_radar.metadata_budget import Budget, Ledger, LockHeld, acquire_exclusive_lock  # noqa: E402
 from repo_radar.model_catalog import is_known_model  # noqa: E402
 
@@ -76,6 +76,21 @@ def decide(args, doc, repo):
         fail(f"{args.target} is not a full commit ID in {repo}")
     decision = im.decide(repo, PILOT_REPO, doc, None, args.model, target, datetime.now())
     return decision
+
+
+def write_rejected(pilot, mode, candidate):
+    """Save a candidate that was built but can't be accepted as owner-only rejected-<mode>.json."""
+    name = f"rejected-{mode}.json"
+    payload = {'fields': candidate.fields, 'analysis': candidate.analysis, 'coverage_note': candidate.coverage_note,
+               'coverage': im.coverage_line(mode, candidate.omitted, candidate.coverage_note, candidate.outside_selection),
+               'omitted': [{'path': p, 'reason': why} for p, why in candidate.omitted],
+               'outside_collector_selection': candidate.outside_selection}
+    fd = os.open(pilot / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write('\n')
+    os.chmod(pilot / name, 0o600)
+    return name
 
 
 def write_result(pilot, mode, record):
@@ -127,6 +142,7 @@ def run(args):
     started = time.monotonic()
     record = {'mode': args.mode, 'model': args.model, 'baseline_commit': doc.info['last_commit'], 'target': args.target,
               'baseline_sha256': doc.sha256, 'started_at': datetime.now().isoformat()}
+    candidate = None
     try:
         with PreflightSession() as session:
             if args.mode == 'incremental':
@@ -134,24 +150,26 @@ def run(args):
             else:
                 candidate = im.run_full(repo, PILOT_REPO, args.target, args.model, session, budget,
                                         baseline=im.document_commit(repo, doc))
-    except im.StaleUpdate as e:
-        record.update(status='stopped', reason=e.reason)
-    except Exception as e:
-        record.update(status='failed', reason=f"{type(e).__name__}: {str(e)[:200]}")
-    else:
+        coverage = im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note, candidate.outside_selection)
         fields = candidate.fields
         text = render_metadata_document(
             PILOT_REPO, doc.info.get('cache_dir', ''), doc.info.get('clone_url', ''), args.target, datetime.now().isoformat(),
             fields['quick_reference'], fields['brief'], fields['related_repos'], candidate.analysis,
-            {'generation_strategy': args.mode, 'generation_model': args.model, 'pilot': 'true',
-             'coverage': im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note,
-                                          candidate.outside_selection)})
+            {'generation_strategy': args.mode, 'generation_model': args.model, 'pilot': 'true', 'coverage': coverage})
+    except im.StaleUpdate as e:
+        record.update(status='stopped', reason=im.safe_reason(e.reason))
+    except UnsafeHeader as e:
+        record.update(status='failed', reason=im.safe_reason(f"the candidate's header is unsafe: {e}"))
+    except Exception as e:
+        record.update(status='failed', reason=im.safe_reason(f"{type(e).__name__}: {e}"))
+    else:
         (pilot / f"{args.mode}.md").write_text(text)
         record.update(status='complete', output=f"{args.mode}.md", coverage_note=candidate.coverage_note,
-                      coverage=im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note,
-                                                candidate.outside_selection),
-                      omitted=[{'path': p, 'reason': why} for p, why in candidate.omitted],
+                      coverage=coverage, omitted=[{'path': p, 'reason': why} for p, why in candidate.omitted],
                       outside_collector_selection=candidate.outside_selection)
+    if candidate is not None and record['status'] != 'complete':
+        # Paid-for but rejected: keep it as evidence (never as a document), with what it cost below.
+        record['rejected_candidate'] = write_rejected(pilot, args.mode, candidate)
     usage = budget.summary()
     record['cost'] = (f"${usage['cost_usd']:.4f}" if usage['cost_usd'] is not None else
                       f"cost unknown (known subtotal ${usage['known_cost_usd']:.4f}; "

@@ -862,6 +862,18 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
         with pytest.raises(BudgetExceeded, match='reconcile'):
             Budget(MODEL, ledger=reopened, label='full').reserve({'other': 1}, 1, 1)
 
+    # A candidate rejected for an unsafe header still reports what it cost and is kept as evidence,
+    # with no successful Markdown and no second request.
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY.replace('A rebuilt API.', 'Payments --- API')}])]
+    unsafe_dir, result = run_pilot(tmp_path / 'unsafe-pilot', repo, doc.text, 'full', repo.git('rev-parse', 'HEAD'))
+    assert result['status'] == 'failed' and 'header is unsafe' in result['reason']
+    assert result['usage']['calls'] == 1 and result['usage']['known_cost_usd'] > 0 and result['ledger_spent_usd'] > 0
+    rejected = unsafe_dir / result['rejected_candidate']
+    assert json.loads(rejected.read_text())['fields']['brief'] == 'Payments --- API'
+    assert oct(rejected.stat().st_mode & 0o777) == '0o600' and not (unsafe_dir / 'full.md').exists()
+    assert len(provider.messages()) == 1 and not provider.replies
+
     # Two pilot invocations can't overlap: while A holds the pilot lock, B stops before any setup,
     # ledger or provider work; once A releases it, B runs and sees the same ledger and cap.
     import sys
