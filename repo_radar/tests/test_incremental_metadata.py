@@ -472,6 +472,25 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     assert len(provider.messages()) == 1 and outcome.usage['calls'] == 1 and outcome.usage['cost_usd'] > 0
     assert im.load_document(pristine, 'app-abc1234').sha256 == doc.sha256
 
+    # Without a ledger an unreliable-usage reply keeps its reservation and the total is shown as unknown.
+    repo.write('src/m2.py', 'w = 4\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+    zero = tool_use('read_diff', {'page': 1})
+    zero['usage'] = {}
+    provider.replies = [zero, answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    ctx, events = _ctx()
+    with PreflightSession() as session:
+        S.generate_repo_metadata((REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1), session,
+                                 _sync_args(_incremental_repos=frozenset({FULL})), ctx)
+    assert ctx.stats['metadata_generated'] == 1 and ctx.stats['unknown_cost_calls'] == 1
+    assert any(e[0] == 'progress' and e[1] and 'cost unknown (known subtotal $' in e[1] for e in events)
+    logged = [f for name, f in events if name == 'metadata_incremental']
+    assert logged[0]['cost'].startswith('cost unknown') and logged[0]['unknown_cost_calls'] == 1
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['usage']['cost_usd'] is None and state['usage']['retained_reservation_usd'] > 0
+
     # The Responses API shape: a function call, then the final answer.
     from repo_radar import llm
     provider.sends.clear()
@@ -598,6 +617,7 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
     assert ledger.spent('full') == pytest.approx(20.0)
 
     # Reopening reads the same ledger: same spend, same cap, and the same request can't be bought again.
+    # The timed-out request's cost is unresolved, so no further paid request goes out in any mode.
     reopened = Ledger(path, 40.0, allowances)
     assert reopened.spent() == pytest.approx(20.0)
     with pytest.raises(ValueError):
@@ -606,18 +626,42 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
         Budget(MODEL, ledger=reopened, label='full').reserve({'r': 3}, 0, 500_000)
     with pytest.raises(PricingUnavailable):
         Budget('model-without-a-price', ledger=reopened, label='full').reserve({'r': 4}, 1, 1)
+    with pytest.raises(BudgetExceeded, match='unknown cost holding \\$5.00'):
+        Budget(MODEL, ledger=reopened, label='incremental').reserve({'r': 5}, 1, 1)
 
     # The incremental comparison hits the same boundary before anything is sent.
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'repo')
     repo.write('src/m0.py', '# changed\n')
     repo.commit()
     provider = Provider(monkeypatch)
-    incremental = Budget(MODEL, ledger=reopened, label='incremental')
-    incremental.reserve({'earlier': 1}, 0, 790_000)   # $7.90 of the $8 allowance already committed
+    second_path = tmp_path / 'pilot2' / 'ledger.json'
+    incremental = Budget(MODEL, ledger=Ledger(second_path, 40.0, allowances), label='incremental')
+    earlier = incremental.reserve({'earlier': 1}, 0, 790_000)   # $7.90 of the $8 allowance already spent
+    incremental.settle(earlier, types.SimpleNamespace(input_tokens=1, output_tokens=790_000), 7.9)
     doc = im.load_document(pristine, 'app-abc1234')
     decision = decide(repo, pristine)
     with PreflightSession() as session:
         with pytest.raises(im.StaleUpdate, match='allowance'):
             im.run_incremental(repo.path, FULL, doc, decision, MODEL, session, incremental)
     assert not provider.messages()
-    assert Ledger(path, 40.0, allowances).spent('incremental') == pytest.approx(7.9)
+    assert Ledger(second_path, 40.0, allowances).spent('incremental') == pytest.approx(7.9)
+
+    # A reply whose usage is empty or partial is not evidence of a free request: the full reservation
+    # stays, the run stops after that one send, no candidate is produced, and the ledger refuses more.
+    for raw_usage in ({}, {'input_tokens': 900}):
+        ledger_path = tmp_path / f'pilot-usage-{len(raw_usage)}' / 'ledger.json'
+        budget = Budget(MODEL, ledger=Ledger(ledger_path, 40.0, allowances), label='incremental')
+        provider.sends.clear()
+        reply = tool_use('read_diff', {'page': 1})
+        reply['usage'] = raw_usage
+        provider.replies = [reply, answer({'base_document_sha256': doc.sha256, 'sections': []})]
+        with PreflightSession() as session:
+            with pytest.raises(im.StaleUpdate, match="cost is unknown"):
+                im.run_incremental(repo.path, FULL, doc, decision, MODEL, session, budget)
+        assert len(provider.messages()) == 1, raw_usage
+        usage = budget.summary()
+        assert usage['cost_usd'] is None and usage['unknown_cost_calls'] == 1 and usage['retained_reservation_usd'] > 0
+        reopened = Ledger(ledger_path, 40.0, allowances)
+        assert reopened.spent() == pytest.approx(usage['retained_reservation_usd'])
+        with pytest.raises(BudgetExceeded, match='reconcile'):
+            Budget(MODEL, ledger=reopened, label='full').reserve({'other': 1}, 1, 1)

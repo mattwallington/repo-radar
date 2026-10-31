@@ -133,7 +133,11 @@ def main(argv):
                                                 candidate.outside_selection),
                       omitted=[{'path': p, 'reason': why} for p, why in candidate.omitted],
                       outside_collector_selection=candidate.outside_selection)
-    record.update(elapsed_seconds=round(time.monotonic() - started, 1), usage=budget.summary(),
+    usage = budget.summary()
+    record['cost'] = (f"${usage['cost_usd']:.4f}" if usage['cost_usd'] is not None else
+                      f"cost unknown (known subtotal ${usage['known_cost_usd']:.4f}; "
+                      f"${usage['retained_reservation_usd']:.4f} stays reserved)")
+    record.update(elapsed_seconds=round(time.monotonic() - started, 1), usage=usage,
                   ledger_spent_usd=round(ledger.spent(), 4), ledger_spent_this_mode_usd=round(ledger.spent(args.mode), 4))
     write_result(pilot, args.mode, record)
     return 0 if record['status'] == 'complete' else 2
