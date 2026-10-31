@@ -348,6 +348,18 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     assert state['status'] == 'committing' and state['generation_id'] == im.load_document(pristine, 'app-abc1234').info['generation_id']
     assert decide(repo, pristine).strategy == 'none'
 
+    # A later fetch failure is a new attempt from the committed document: no inherited generation ID
+    # or full-rebuild obligation, and INDEX shows it stale.
+    monkeypatch.setattr(im, 'write_state', real_write_state)
+    committed = im.load_document(pristine, 'app-abc1234')
+    S._record_incremental_git_failure(_sync_args(_incremental_repos=frozenset({FULL})), FULL, 'app-abc1234', 'fetch', None)
+    failed = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert failed['attempt_id'] != state['attempt_id'] and failed['baseline_doc_sha256'] == committed.sha256
+    assert failed['generation_id'] is None and failed['strategy'] is None and failed['status'] == 'failed'
+    assert not im.full_rebuild_unfinished(failed, committed) and decide(repo, pristine).strategy == 'none'
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    assert 'stale: analyzed' in (pristine / 'INDEX.md').read_text() and 'fetch failed' in (pristine / 'INDEX.md').read_text()
+
 
 # ── 2. Pinned reads and section edits ────────────────────────────────────────────────────────────
 
