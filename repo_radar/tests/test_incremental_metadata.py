@@ -311,6 +311,8 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     repo.write('deploy/id_rsa', 'PRIVATE\n')
     repo.write('wide.txt', 'w' * 50000 + '\n')
     repo.write('many.py', 'needle = 1\n' * 20000)
+    repo.write('hay.py', 'haystack\n' * 120000)   # more git grep output than one search reads
+    repo.write('src/m0.py', '# haystack\n' + (repo.path / 'src/m0.py').read_text())
     (repo.path / 'link.py').symlink_to('src/m0.py')
     base = repo.commit('fixtures')
     (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
@@ -332,6 +334,9 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     assert 'line shortened from 50000' in tools.run('read_file', '{"path": "wide.txt"}')
     found = tools.run('search', '{"literal": "needle"}')
     assert len(found.encode()) <= snap.MAX_RESULT_BYTES and 'page 1 of' in found
+    assert tools.run('search', '{"literal": "haystack"}').startswith('[too many matches')
+    narrowed = tools.run('search', '{"literal": "haystack", "path_prefix": "src/m"}')
+    assert 'src/m0.py:1: # haystack' in narrowed, narrowed
     with pytest.raises(snap.ToolRequestError):
         tools.run('run_shell', '{"cmd": "ls"}')
 
@@ -364,6 +369,52 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
         failed = update(pristine, repo, session)
         assert failed.status == 'failed' and 'expected_sha256' in failed.reason
         assert im.load_document(pristine, 'app-abc1234').text == new.text
+
+
+FULL_REPLY = ("QUICK_REFERENCE_START\nType: API Service\nLanguage: Python\nFramework: None\nDatabase: None\n"
+              "APIs: REST\nPort: N/A\nDependencies: Stripe\nQUICK_REFERENCE_END\nONE_LINE_SUMMARY_START\n"
+              "A rebuilt API.\nONE_LINE_SUMMARY_END\nRELATED_REPOS_START\nRELATED_REPOS_END\n## Overview\nFresh.\n")
+
+
+def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_path):
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    secrets = {'.env.production.sh': 'export TOKEN=SENTINEL-ENV\n', '.envrc': 'export A=SENTINEL-RC\n',
+               '.pgpass': 'db:5432:*:u:SENTINEL-PG\n', '.htpasswd': 'u:SENTINEL-HT\n', '.boto': 'k=SENTINEL-BOTO\n',
+               '.s3cfg': 'secret_key=SENTINEL-S3\n', 'keys/apns.p8': 'SENTINEL-P8\n', 'keys/putty.ppk': 'SENTINEL-PPK\n',
+               'vault.kdbx': 'SENTINEL-KDBX\n'}
+    for path, text in secrets.items():
+        repo.write(path, text)
+    (repo.path / 'src/blob.py').write_bytes(b'\0\x01SENTINEL-BIN binary payload')   # eligible extension, binary
+    repo.write('.env.example', 'EXAMPLE_VAR=\n')
+    repo.write('src/app.py', 'def handler():\n    return "safe source"\n')
+    repo.commit('secrets and source')
+    provider = Provider(monkeypatch)
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session, force=True)
+    assert outcome.status == 'published', outcome
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL' not in traffic, 'no credential or binary content reaches the provider'
+    assert 'safe source' in traffic and 'EXAMPLE_VAR=' in traffic
+    doc = im.load_document(pristine, 'app-abc1234')
+    assert doc.info['coverage'].startswith('collector-selected source analyzed; 2 files withheld (binary file, credential file)')
+    assert "outside the collector's selection" in doc.info['coverage'] and 'complete' not in doc.info['coverage']
+
+    # The read tools, search and the diff apply the same policy, including a credential-to-ordinary rename.
+    repo.write('.env.production.sh', 'export TOKEN=SENTINEL-ENV2\n')
+    repo.git('mv', '.envrc', 'envrc.txt')
+    target = repo.commit('change secrets')
+    tools = snap.SnapshotTools(snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target), ['p'])
+    for path in [p for p in secrets if p != '.envrc']:
+        assert 'unavailable: credential file' in tools.run('read_file', json.dumps({'path': path}))
+    assert 'unavailable: binary file' in tools.run('read_file', '{"path": "src/blob.py"}')
+    assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
+    base_snap, target_snap = snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target)
+    changes = snap.changes_between(repo.path, doc.info['last_commit'], target)
+    pages, omitted = snap.build_diff(repo.path, doc.info['last_commit'], target, base_snap.manifest(),
+                                     target_snap.manifest(), changes)
+    assert 'SENTINEL' not in ''.join(pages)
+    assert {p for p, _why in omitted} == {'.env.production.sh', 'envrc.txt'}
 
 
 # ── 3. The real request boundary ─────────────────────────────────────────────────────────────────

@@ -125,10 +125,14 @@ def main(argv):
             PILOT_REPO, doc.info.get('cache_dir', ''), doc.info.get('clone_url', ''), args.target, datetime.now().isoformat(),
             fields['quick_reference'], fields['brief'], fields['related_repos'], candidate.analysis,
             {'generation_strategy': args.mode, 'generation_model': args.model, 'pilot': 'true',
-             'coverage': 'complete' if not candidate.omitted else f"limited ({len(candidate.omitted)} changed paths unavailable)"})
+             'coverage': im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note,
+                                          candidate.outside_selection)})
         (pilot / f"{args.mode}.md").write_text(text)
         record.update(status='complete', output=f"{args.mode}.md", coverage_note=candidate.coverage_note,
-                      omitted=[f"{p}: {why}" for p, why in candidate.omitted])
+                      coverage=im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note,
+                                                candidate.outside_selection),
+                      omitted=[{'path': p, 'reason': why} for p, why in candidate.omitted],
+                      outside_collector_selection=candidate.outside_selection)
     record.update(elapsed_seconds=round(time.monotonic() - started, 1), usage=budget.summary(),
                   ledger_spent_usd=round(ledger.spent(), 4), ledger_spent_this_mode_usd=round(ledger.spent(args.mode), 4))
     write_result(pilot, args.mode, record)
