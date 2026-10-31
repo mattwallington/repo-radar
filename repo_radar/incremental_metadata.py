@@ -31,6 +31,7 @@ UNKNOWN = 'unknown'
 
 Document = namedtuple('Document', 'path text sha256 info body')
 Decision = namedtuple('Decision', 'strategy reason base target full_built_at full_model change adopt')
+UNFINISHED = ('pending', 'committing', 'failed', 'skipped')   # attempt statuses that never published
 
 
 def document_path(pristine_dir, cache_name):
@@ -150,7 +151,8 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
     if built is None:
         return full('last full build time unknown', adopt=adopt)
     st = state or {}
-    if (st.get('strategy') == 'full' and st.get('status') in ('pending', 'failed')
+    committed = st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id')
+    if (st.get('strategy') == 'full' and st.get('status') in UNFINISHED and not committed
             and st.get('baseline_doc_sha256') == doc.sha256):
         return full('previous full rebuild did not finish', built=built, adopt=adopt)
     if now - built >= FULL_REBUILD_AFTER:
@@ -633,7 +635,6 @@ def _link(pristine_dir, full_name, cache_name):
         pass
 
 
-UNFINISHED = ('pending', 'committing', 'failed', 'skipped')
 MAX_REASON = 240
 
 
