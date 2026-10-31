@@ -396,6 +396,19 @@ def _parse_status_of(info):
     return PARSE_STATUS_OK
 
 
+def _unavailable_attempts(documented):
+    """'name (reason)' for each recorded incremental attempt that never published and has no document
+    among `documented` cache names: its repository's metadata is unavailable."""
+    found = []
+    state_dir = PRISTINE_DIR / STATE_DIR_NAME
+    for state_file in sorted(state_dir.glob('*.json')) if state_dir.is_dir() else []:
+        state = read_attempt_state(PRISTINE_DIR, state_file.stem)
+        if state and state_file.stem not in documented and state.get('status') in ('pending', 'committing', 'failed', 'skipped'):
+            reason = ' '.join(str(state.get('reason') or 'interrupted').split())[:240]
+            found.append(f"{' '.join(str(state.get('full_name') or state_file.stem).split())[:200]} ({reason})")
+    return found
+
+
 def regenerate_index(args):
     """Regenerate the master INDEX.md file from all metadata files."""
     if args.dry_run:
@@ -413,7 +426,9 @@ def regenerate_index(args):
         if f.name != 'INDEX.md' and not f.is_symlink()
     ]
 
-    if not metadata_files:
+    # No documents but an opted-in repository's failed or unfinished attempt still gets an index, so
+    # its unavailable metadata is visible; with neither there is nothing to index.
+    if not metadata_files and not _unavailable_attempts(set()):
         print(f"  {YELLOW}No metadata files found{RESET}")
         return
 
@@ -476,13 +491,7 @@ def regenerate_index(args):
         names = ', '.join(i['full_name'] or i['metadata_file'] for i in stale)
         degraded_note += (f"\n> **{len(stale)} of {len(repos_info)} entries are stale** (their latest metadata "
                           f"update failed or was skipped; the previous metadata is shown): {names}\n")
-    documented = {i['cache_dir'] for i in repos_info}
-    unavailable = []
-    state_dir = PRISTINE_DIR / STATE_DIR_NAME
-    for state_file in sorted(state_dir.glob('*.json')) if state_dir.is_dir() else []:
-        state = read_attempt_state(PRISTINE_DIR, state_file.stem)
-        if state and state_file.stem not in documented and state.get('status') in ('pending', 'committing', 'failed', 'skipped'):
-            unavailable.append(f"{state.get('full_name') or state_file.stem} ({state.get('reason') or 'interrupted'})")
+    unavailable = _unavailable_attempts({i['cache_dir'] for i in repos_info})
     if unavailable:
         degraded_note += f"\n> **Metadata unavailable:** {'; '.join(unavailable)}\n"
 
