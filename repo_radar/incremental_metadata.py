@@ -517,22 +517,38 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
     raise StaleUpdate(f"no accepted answer within {MAX_TURNS} turns")
 
 
-def pinned_files(snapshot):
+def document_commit(repo_path, doc):
+    """The previous document's analyzed commit when it is present in the repository, else None (a
+    first build, or a commit that's gone). Not decision.base, which full decisions leave unset."""
+    commit = (doc.info.get('last_commit') or '') if doc else ''
+    if not re.fullmatch(r'[0-9a-f]{40}', commit):
+        return None
+    return commit if snap.resolve_commit(repo_path, commit) == commit else None
+
+
+def pinned_files(snapshot, base_snapshot=None):
     """The full collector's input, read from a pinned commit instead of the working tree: tracked
     regular files the collector includes, at most 100 KiB each, decoded the way it decodes them.
 
     The same safety policy as the read tools applies first: credential files and binary blobs are
-    withheld even when the collector's rules would include them. Returns (files, omitted,
-    outside_selection): omitted lists (path, reason) for withheld files, and outside_selection counts
-    tracked files the collector's extension and size rules leave out.
+    withheld even when the collector's rules would include them. With `base_snapshot` (the previous
+    document's commit), credential origin carries over as it does for incremental updates: a file
+    renamed from a credential path, or holding a credential's bytes from either commit, stays
+    withheld. A Git failure reading that protection raises rather than dropping it. Returns (files,
+    omitted, outside_selection): omitted lists (path, reason) for withheld files, and
+    outside_selection counts tracked files the collector's extension and size rules leave out.
     """
     files, omitted, outside = [], [], 0
-    secret = snap.credential_oids(snapshot.manifest())
+    if base_snapshot is None:
+        secret, withheld = snap.credential_oids(snapshot.manifest()), frozenset()
+    else:
+        secret = snap.credential_oids(base_snapshot.manifest(), snapshot.manifest())
+        withheld = snap.renamed_credentials(snap.changes_between(snapshot.repo, base_snapshot.commit, snapshot.commit))
     for path, entry in sorted(snapshot.manifest().items()):
         if not snap.collector_eligible(entry):
             outside += 1
             continue
-        reason = snap.omission_reason(entry, secret_oids=secret)
+        reason = snap.omission_reason(entry, withheld, secret)
         if reason is None:
             data = snapshot.read_blob(entry, snap.COLLECTOR_MAX_BYTES + 1)
             if snap.is_binary(data):
@@ -545,14 +561,16 @@ def pinned_files(snapshot):
     return files, omitted, outside
 
 
-def run_full(repo_path, full_name, target, model, session, budget):
+def run_full(repo_path, full_name, target, model, session, budget, baseline=None):
     """A complete document built from the pinned commit with the existing full-generation prompts,
     partitioning and synthesis, sent through the counted sender. Never written directly: the caller
-    publishes it."""
+    publishes it. `baseline` is the previous document's commit when it is available, so credential
+    origin from it stays withheld (see pinned_files)."""
     from repo_radar import llm
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
-    files, omitted, outside = pinned_files(snap.GitSnapshot(repo_path, target))
+    files, omitted, outside = pinned_files(snap.GitSnapshot(repo_path, target),
+                                           snap.GitSnapshot(repo_path, baseline) if baseline else None)
     if not files:
         raise StaleUpdate("no analyzable source")
 
@@ -761,7 +779,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         if decision.strategy == 'incremental':
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session, budget)
         else:
-            candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget)
+            candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
+                                                  baseline=document_commit(repo_path, doc))
         # Publish only what was built from exactly this document and this commit.
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:

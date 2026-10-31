@@ -448,6 +448,8 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     (repo.path / 'src/blob.py').write_bytes(b'\0\x01SENTINEL-BIN binary payload')   # eligible extension, binary
     repo.write('.env.example', 'EXAMPLE_VAR=\n')
     repo.write('src/app.py', 'def handler():\n    return "safe source"\n')
+    repo.write('.env', '')               # an empty credential shares its blob ID with every empty file,
+    repo.write('src/__init__.py', '')    # which must not make this ordinary empty file a credential
     repo.commit('secrets and source')
     provider = Provider(monkeypatch)
     provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
@@ -460,22 +462,63 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     doc = im.load_document(pristine, 'app-abc1234')
     assert doc.info['coverage'].startswith('collector-selected source analyzed; 2 files withheld (binary file, credential file)')
     assert "outside the collector's selection" in doc.info['coverage'] and 'complete' not in doc.info['coverage']
+    assert 'src/__init__.py' in traffic
 
-    # The read tools, search and the diff apply the same policy, including a credential-to-ordinary rename.
+    # The read tools, search and the diff apply the same policy, including a credential renamed
+    # unchanged to an ordinary, collector-eligible path.
     repo.write('.env.production.sh', 'export TOKEN=SENTINEL-ENV2\n')
-    repo.git('mv', '.envrc', 'envrc.txt')
+    repo.git('mv', '.envrc', 'src/runtime.py')
     target = repo.commit('change secrets')
     tools = snap.SnapshotTools(snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target), ['p'])
     for path in [p for p in secrets if p != '.envrc']:
         assert 'unavailable: credential file' in tools.run('read_file', json.dumps({'path': path}))
     assert 'unavailable: binary file' in tools.run('read_file', '{"path": "src/blob.py"}')
+    assert 'unavailable' not in tools.run('read_file', '{"path": "src/__init__.py"}')
     assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
     base_snap, target_snap = snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target)
     changes = snap.changes_between(repo.path, doc.info['last_commit'], target)
     pages, omitted = snap.build_diff(repo.path, doc.info['last_commit'], target, base_snap.manifest(),
                                      target_snap.manifest(), changes)
     assert 'SENTINEL' not in ''.join(pages)
-    assert {p for p, _why in omitted} == {'.env.production.sh', 'envrc.txt'}
+    assert {p for p, _why in omitted} == {'.env.production.sh', 'src/runtime.py'}
+
+    # A full rebuild from that baseline document keeps the credential's origin too: the renamed file
+    # is withheld from count and send bodies and recorded as omitted, in sync and in the pilot.
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, force=True).status == 'published'
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL' not in traffic and provider.counts and provider.messages()
+    assert 'src/__init__.py' in traffic
+    rebuilt = im.load_document(pristine, 'app-abc1234')
+    assert '3 files withheld (binary file, credential file)' in rebuilt.info['coverage']
+
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    pilot_dir, result = run_pilot(tmp_path / 'pilot', repo, doc.text, 'full', target)
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert result['status'] == 'complete' and 'SENTINEL' not in traffic and provider.messages()
+    assert {'path': 'src/runtime.py', 'reason': 'credential file'} in result['omitted']
+
+
+PILOT_REPO = 'ReperioHealth/reperio-telehealth'
+
+
+def run_pilot(pilot_dir, repo, baseline_text, mode, target):
+    """Run the pilot script in-process (sockets stay blocked) from `baseline_text`, which is renamed
+    to the pilot repository. Returns (pilot_dir, the results JSON)."""
+    import importlib.util
+    from pathlib import Path
+    pilot_dir.mkdir(parents=True, exist_ok=True)
+    (pilot_dir / 'baseline.md').write_text(baseline_text.replace(FULL, PILOT_REPO))
+    path = Path(__file__).resolve().parents[2] / 'scripts' / 'pilot-incremental-metadata.py'
+    spec = importlib.util.spec_from_file_location('pilot_incremental_metadata', path)
+    pilot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pilot)
+    pilot.main([mode, '--pilot-dir', str(pilot_dir), '--repo-path', str(repo.path), '--target', target,
+                '--model', MODEL])
+    return pilot_dir, json.loads((pilot_dir / f'results-{mode}.json').read_text())
 
 
 # ── 3. The real request boundary ─────────────────────────────────────────────────────────────────

@@ -138,9 +138,11 @@ def is_binary(data):
 
 
 def credential_oids(*manifests):
-    """Blobs stored under a credential path anywhere in these manifests. The same bytes stay withheld
-    under any other name."""
-    return frozenset(e.oid for m in manifests for e in m.values() if is_credential_path(e.path))
+    """Non-empty regular blobs stored under a credential path anywhere in these manifests. The same
+    bytes stay withheld under any other name, a template name included. Empty files are left out, so
+    an empty ordinary file never shares an empty credential's identity."""
+    return frozenset(e.oid for m in manifests for e in m.values()
+                     if e.type == 'blob' and e.mode in REGULAR_MODES and e.size > 0 and is_credential_path(e.path))
 
 
 def renamed_credentials(changes):
