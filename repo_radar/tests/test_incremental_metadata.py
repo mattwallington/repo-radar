@@ -23,7 +23,7 @@ from repo_radar.preflight import PreflightSession
 
 MODEL = 'claude-sonnet-5-5'
 FULL = 'o/app'
-NOW = datetime(2026, 10, 30, 12, 0, 0)
+NOW = datetime.now().replace(microsecond=0)
 
 
 @pytest.fixture(autouse=True)
@@ -318,6 +318,35 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     # A malformed opt-in list is refused before any work.
     config['incremental_metadata_repos'] = ['o/*']
     assert S.sync_mode(_sync_args()) == 1
+
+    # A requested full rebuild that never published stays due on an unchanged, recent commit: after a
+    # transient count skip, or an interruption after 'committing' but before the replacement. Once
+    # the replacement is in place under that generation, it isn't bought again.
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'unfinished')
+    provider = Provider(monkeypatch)
+    assert decide(repo, pristine).strategy == 'none'
+    provider.count_tokens = lambda body: httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, force=True).status == 'skipped'
+    assert decide(repo, pristine).reason == 'previous full rebuild did not finish'
+    provider.count_tokens = 1000
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    real_atomic = metadata.write_text_atomic
+    monkeypatch.setattr(metadata, 'write_text_atomic', lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with PreflightSession() as session, pytest.raises(KeyboardInterrupt):
+        update(pristine, repo, session)
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['status'] == 'committing'
+    assert decide(repo, pristine).reason == 'previous full rebuild did not finish'
+    monkeypatch.setattr(metadata, 'write_text_atomic', real_atomic)
+    real_write_state = im.write_state
+    monkeypatch.setattr(im, 'write_state', lambda p, c, st: (_ for _ in ()).throw(KeyboardInterrupt())
+                        if st.get('status') == 'published' else real_write_state(p, c, st))
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    with PreflightSession() as session, pytest.raises(KeyboardInterrupt):
+        update(pristine, repo, session)
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['status'] == 'committing' and state['generation_id'] == im.load_document(pristine, 'app-abc1234').info['generation_id']
+    assert decide(repo, pristine).strategy == 'none'
 
 
 # ── 2. Pinned reads and section edits ────────────────────────────────────────────────────────────
