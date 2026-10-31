@@ -130,7 +130,9 @@ refuses further paid requests until it's reconciled by hand.
    ```
 
    The outputs are `incremental.md` and `full.md`, with `results-*.json` holding usage, cost, calls,
-   elapsed time and ledger totals. The installed document is never touched.
+   elapsed time and ledger totals. A candidate that was built but can't be accepted (for example an
+   unsafe header) is kept as `rejected-<mode>.json` instead, and its cost still counts. The installed
+   document is never touched.
 4. Compare both documents against the actual diff and surrounding source. Look at removed or renamed
    interfaces, effects across components, schema and configuration changes, whether unrelated
    sections were preserved, unsupported claims, and useful detail. If the incremental result loses
