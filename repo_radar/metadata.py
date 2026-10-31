@@ -330,43 +330,52 @@ def quick_reference_from_table(body):
     return out
 
 
+class UnsafeHeader(ValueError):
+    """A rendered document's frontmatter would not read back as written."""
+
+
+def _header_value(key, value):
+    text = str(value)
+    if '---' in text or any(not ch.isprintable() for ch in text):
+        raise UnsafeHeader(f"{key} contains a frontmatter delimiter, a line break or a control character")
+    return text
+
+
 def render_metadata_document(full_name, cache_name, clone_url, commit, updated, quick_ref, brief,
                              related_repos, analysis, provenance):
     """A complete metadata document in the full generator's format, plus provenance fields.
 
     `provenance` is an ordered mapping of extra one-line frontmatter fields (generation and full-build
-    records); readers that don't know them ignore them.
+    records); readers that don't know them ignore them. Every header value is checked, and the
+    rendered header is read back and must give exactly these fields with a healthy parse status;
+    otherwise UnsafeHeader is raised and nothing is written. Values are never rewritten.
     """
+    header = {'repo_name': full_name.split('/')[-1], 'full_name': full_name, 'cache_dir': cache_name,
+              'clone_url': clone_url, 'last_commit': commit, 'last_updated': updated, 'brief': brief,
+              'type': quick_ref.get('type', 'Unknown'), 'language': quick_ref.get('language', 'Unknown'),
+              'framework': quick_ref.get('framework', 'None'), 'database': quick_ref.get('database', 'None'),
+              'apis': quick_ref.get('apis', 'None'), 'port': quick_ref.get('port', 'N/A'),
+              'related_repos': json.dumps(related_repos), 'parse_status': PARSE_STATUS_OK, **provenance}
+    header = {key: _header_value(key, value) for key, value in header.items()}
     table = "## Quick Reference\n\n| Property | Value |\n|----------|-------|\n"
     for field, label, hide in _QUICK_REF_ROWS:
         value = quick_ref.get(field)
         if value is not None and (hide is None or value.lower() != hide):
             table += f"| **{label}** | {value} |\n"
     table += "\n---\n\n"
-    extra = ''.join(f"{key}: {value}\n" for key, value in provenance.items())
     analysis = analysis.rstrip('\n')  # the template ends the file with exactly one newline
-    return f"""---
-repo_name: {full_name.split('/')[-1]}
-full_name: {full_name}
-cache_dir: {cache_name}
-clone_url: {clone_url}
-last_commit: {commit}
-last_updated: {updated}
-brief: {brief}
-type: {quick_ref.get('type', 'Unknown')}
-language: {quick_ref.get('language', 'Unknown')}
-framework: {quick_ref.get('framework', 'None')}
-database: {quick_ref.get('database', 'None')}
-apis: {quick_ref.get('apis', 'None')}
-port: {quick_ref.get('port', 'N/A')}
-related_repos: {json.dumps(related_repos)}
-parse_status: {PARSE_STATUS_OK}
-{extra}---
+    lines = ''.join(f"{key}: {value}\n" for key, value in header.items())
+    text = f"""---
+{lines}---
 
 # Repository: {full_name}
 
 {table}{analysis}
 """
+    expected = {key: value.strip() for key, value in header.items()}
+    if parse_frontmatter(text) != expected:
+        raise UnsafeHeader("the rendered header does not read back as written")
+    return text
 
 
 def _parse_status_of(info):
