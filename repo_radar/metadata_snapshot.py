@@ -26,6 +26,7 @@ MAX_FILE_DIFF_BYTES = 2 * 1024 * 1024 # one file's diff; larger ones are listed 
 MAX_READ_BYTES = 8 * 1024 * 1024      # one blob read by read_file
 MAX_LINE_CHARS = 2000                 # longer lines are shortened, with a marker
 MAX_SEARCH_OUTPUT = 4 * 1024 * 1024   # git grep output read for one search
+MAX_SEARCH_PATHS = 2000               # files named to git grep for one path_prefix
 REGULAR_MODES = frozenset({'100644', '100755'})
 SHA = re.compile(r'^[0-9a-f]{40}$')
 _GIT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'
@@ -115,29 +116,48 @@ def is_ancestor(repo, base, target):
 
 
 def is_credential_path(path):
-    """Paths that typically hold secrets. Their contents never reach the model; `.env.example`
-    and similar templates stay readable."""
+    """Paths that typically hold secrets. Their contents never reach the model, by any route: full
+    collection, read_file, search or either side of a diff. `.env.example` and similar templates stay
+    readable."""
     name = path.rsplit('/', 1)[-1].lower()
     if name in ('.env.example', '.env.sample', '.env.template', '.env.dist'):
         return False
     if name == '.env' or name.startswith('.env.'):
         return True
-    if name.endswith(('.pem', '.key', '.p12', '.pfx', '.jks', '.keystore')):
+    if name.endswith(('.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.p8', '.ppk', '.kdbx')):
         return True
     if re.fullmatch(r'id_(rsa|dsa|ecdsa|ed25519)', name):
         return True
-    return name in ('.netrc', '.npmrc', '.pypirc', '.git-credentials', 'credentials')
+    return name in ('.netrc', '.npmrc', '.pypirc', '.git-credentials', 'credentials', '.envrc', '.pgpass',
+                    '.htpasswd', '.boto', '.s3cfg')
 
 
-def omission_reason(entry):
-    """Why `entry`'s contents are unavailable to the model, or None when it can be read."""
+def is_binary(data):
+    """Git's own rule: a NUL byte in the first 8000 bytes."""
+    return b'\0' in data[:8000]
+
+
+def credential_oids(*manifests):
+    """Blobs stored under a credential path anywhere in these manifests. The same bytes stay withheld
+    under any other name."""
+    return frozenset(e.oid for m in manifests for e in m.values() if is_credential_path(e.path))
+
+
+def renamed_credentials(changes):
+    """New paths of files renamed or copied from a credential path, whose contents stay withheld."""
+    return frozenset(c.new_path for c in changes if c.status in 'RC' and c.old_path and is_credential_path(c.old_path))
+
+
+def omission_reason(entry, withheld=frozenset(), secret_oids=frozenset()):
+    """Why `entry`'s contents are unavailable to the model, or None when it can be read. `withheld` and
+    `secret_oids` carry credential origin: a renamed credential, or a credential's bytes elsewhere."""
     if entry.mode == '120000':
         return 'symlink'
     if entry.type == 'commit':
         return 'submodule'
     if entry.mode not in REGULAR_MODES:
         return 'not a regular file'
-    if is_credential_path(entry.path):
+    if is_credential_path(entry.path) or entry.path in withheld or entry.oid in secret_oids:
         return 'credential file'
     return None
 
@@ -269,10 +289,11 @@ def build_diff(repo, base, target, base_manifest, target_manifest, changes):
     Raises GitError if the whole diff exceeds MAX_DIFF_BYTES.
     """
     lines, omitted, total = [], [], 0
+    withheld, secret = renamed_credentials(changes), credential_oids(base_manifest, target_manifest)
     for c in changes:
         entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
                                target_manifest.get(c.new_path) if c.new_path else None) if e]
-        reasons = {omission_reason(e) for e in entries} - {None}
+        reasons = {omission_reason(e, withheld, secret) for e in entries} - {None}
         label = c.new_path or c.old_path
         if reasons:
             reason = sorted(reasons)[0]
@@ -343,11 +364,16 @@ def _str(args, key, default=None, max_len=1024):
 class SnapshotTools:
     """The model's read-only view of the two pinned commits and the diff between them."""
 
-    def __init__(self, base, target, diff_pages):
+    def __init__(self, base, target, diff_pages, changes=()):
         self.base, self.target = base, target
         self.diff_pages = diff_pages
+        self._withheld = renamed_credentials(changes)
+        self._secret = credential_oids(base.manifest(), target.manifest())
         self.seen_pages = {1}  # the first page is part of the opening message
         self.bytes_read = 0
+
+    def _omitted(self, entry):
+        return omission_reason(entry, self._withheld, self._secret)
 
     def unseen_pages(self):
         return [p for p in range(1, len(self.diff_pages) + 1) if p not in self.seen_pages]
@@ -385,7 +411,7 @@ class SnapshotTools:
         lines = []
         for path, entry in sorted(self.target.manifest().items()):
             if path.startswith(prefix):
-                reason = omission_reason(entry)
+                reason = self._omitted(entry)
                 lines.append(f"{path}\t{entry.size}" + (f"\t(unavailable: {reason})" if reason else '') + "\n")
         pages = _paginate(lines)
         if page > len(pages):
@@ -403,14 +429,14 @@ class SnapshotTools:
         entry = snap.manifest().get(path)
         if entry is None:
             return f"[{path} is not a tracked file at the {version} commit]"
-        reason = omission_reason(entry)
+        reason = self._omitted(entry)
         if reason:
             return f"[{path} is unavailable: {reason}]"
         try:
             data = snap.read_blob(entry, MAX_READ_BYTES)
         except GitError:
             return f"[{path} is unavailable: larger than {MAX_READ_BYTES} bytes]"
-        if b'\0' in data[:8000]:
+        if is_binary(data):
             return f"[{path} is unavailable: binary file]"
         lines = data.decode('utf-8', 'replace').splitlines()
         out, size = [f"[{path} at {version}, {len(lines)} lines]\n"], 0
@@ -433,12 +459,18 @@ class SnapshotTools:
         prefix = _str(args, 'path_prefix', '')
         page = _int(args, 'page', 1, 1, 100000)
         manifest = self.target.manifest()
-        if prefix and not any(p.startswith(prefix) for p in manifest):
-            return f"[no tracked path starts with {prefix!r}]"
         cmd = ['grep', '-I', '-n', '-z', '--no-color', '-F', '-e', literal, self.target.commit]
+        if prefix:
+            # Narrow inside Git, before its output cap, by naming the readable files under the prefix
+            # (literal pathspecs, so a partial file name keeps its prefix meaning).
+            under = [p for p, e in manifest.items() if p.startswith(prefix) and not self._omitted(e)]
+            if not under:
+                return f"[no readable tracked path starts with {prefix!r}]"
+            if len(under) > MAX_SEARCH_PATHS:
+                return f"[{len(under)} files start with {prefix!r}; use a narrower path_prefix]"
+            cmd += ['--', *under]
         try:
             raw = run_git(self.target.repo, cmd, MAX_SEARCH_OUTPUT)
-            truncated = ''
         except GitError as e:
             if 'failed (1)' in str(e):
                 return "[no matches]"
@@ -454,7 +486,7 @@ class SnapshotTools:
                 continue
             path = parts[0].split(':', 1)[1] if ':' in parts[0] else parts[0]
             entry = manifest.get(path)
-            if not path.startswith(prefix) or entry is None or omission_reason(entry):
+            if not path.startswith(prefix) or entry is None or self._omitted(entry):
                 continue
             text = parts[2]
             if len(text) > 300:
@@ -465,4 +497,4 @@ class SnapshotTools:
         pages = _paginate(lines)
         if page > len(pages):
             return f"[no page {page}; {len(pages)} page(s)]"
-        return f"[page {page} of {len(pages)}; {len(lines)} match(es){truncated}]\n{pages[page - 1]}"
+        return f"[page {page} of {len(pages)}; {len(lines)} match(es)]\n{pages[page - 1]}"
