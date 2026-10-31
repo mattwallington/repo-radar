@@ -662,6 +662,22 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         assert decide(repo, pristine).strategy == 'incremental'
 
     if failure == 'generation_error':
+        # A first build that fails with no Markdown at all still gets an INDEX naming the repository
+        # and why its metadata is unavailable; no document is made up for it.
+        empty = tmp_path / 'first-build'
+        first = Repo(empty / 'app-abc1234')
+        first.write('src/a.py', 'a = 1\n')
+        first.commit()
+        monkeypatch.setattr(metadata, 'PRISTINE_DIR', empty)
+        monkeypatch.setattr(metadata, 'INDEX_FILE', empty / 'INDEX.md')
+        Provider(monkeypatch).replies = [httpx.Response(500, json={"error": {"message": "boom"}})]
+        with PreflightSession() as session:
+            assert im.update_repository(empty, first.path, 'app-abc1234', REPO_CONFIG, MODEL, session).status == 'failed'
+        metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+        first_index = (empty / 'INDEX.md').read_text()
+        assert '**Total Repositories:** 0' in first_index and f'**Metadata unavailable:** {FULL} (' in first_index
+        assert [p.name for p in empty.glob('*.md')] == ['INDEX.md']
+
         # What Activity and the progress view show: a failure, never success.
         repo2, _b, pristine2 = setup_pristine(monkeypatch, tmp_path / 'activity')
         repo2.write('src/m0.py', '# changed\n')
