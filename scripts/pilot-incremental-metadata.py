@@ -132,7 +132,8 @@ def run(args):
             if args.mode == 'incremental':
                 candidate = im.run_incremental(repo, PILOT_REPO, doc, decision, args.model, session, budget)
             else:
-                candidate = im.run_full(repo, PILOT_REPO, args.target, args.model, session, budget)
+                candidate = im.run_full(repo, PILOT_REPO, args.target, args.model, session, budget,
+                                        baseline=im.document_commit(repo, doc))
     except im.StaleUpdate as e:
         record.update(status='stopped', reason=e.reason)
     except Exception as e:
