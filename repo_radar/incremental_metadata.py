@@ -565,7 +565,8 @@ def run_full(repo_path, full_name, target, model, session, budget):
 
 # ---- one opted-in repository -------------------------------------------------------------------------
 
-Outcome = namedtuple('Outcome', 'status strategy reason base target usage elapsed')
+# state_error: None, or why the attempt record couldn't be saved (INDEX can't show what wasn't recorded).
+Outcome = namedtuple('Outcome', 'status strategy reason base target usage elapsed state_error', defaults=(None,))
 
 
 def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None):
@@ -610,10 +611,69 @@ def _link(pristine_dir, full_name, cache_name):
         pass
 
 
+UNFINISHED = ('pending', 'committing', 'failed', 'skipped')
+MAX_REASON = 240
+
+
+def safe_reason(reason):
+    """A failure reason as one printable line of at most 240 characters, safe for attempt state,
+    Activity and the progress row (model-chosen ids and provider messages can be anything)."""
+    if reason is None:
+        return None
+    text = ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in str(reason)).split())
+    return text if len(text) <= MAX_REASON else text[:MAX_REASON - 1] + '…'
+
+
+def _try_write_state(pristine_dir, cache_name, state):
+    """Write attempt state, returning None or a short description of why it couldn't be saved."""
+    try:
+        write_state(pristine_dir, cache_name, state)
+        return None
+    except Exception as e:
+        return safe_reason(f"attempt state not saved ({type(e).__name__}: {e})")
+
+
+def record_failure(pristine_dir, cache_name, full_name, reason, target=None, phase='setup', status='failed'):
+    """Best-effort record of an opted-in attempt that failed before or outside the guarded update (a
+    Git step, setup, an escaped worker error), so INDEX can show the document stale or unavailable.
+    Never raises; returns None or why the record couldn't be saved. An unfinished full rebuild stays
+    recorded as one, so it stays due."""
+    import uuid
+    try:
+        doc = load_document(pristine_dir, cache_name)
+    except Exception:
+        doc = None
+    try:
+        state = read_attempt_state(pristine_dir, cache_name) or {}
+    except Exception:
+        state = {}
+    full_due = state.get('strategy') == 'full' and state.get('status') in UNFINISHED
+    record = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
+              'attempt_id': uuid.uuid4().hex, 'status': status, 'strategy': 'full' if full_due else None,
+              'phase': phase, 'base_commit': doc.info.get('last_commit') if doc else None,
+              'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
+              'reason': safe_reason(reason), 'finished_at': datetime.now().isoformat(),
+              'generation_id': None if not full_due else state.get('generation_id')}
+    record.pop('usage', None)
+    return _try_write_state(pristine_dir, cache_name, record)
+
+
+def _cleared_setup_failure(state, now):
+    """A verified no-op clears a failure recorded before any decision; it never clears an unfinished
+    full rebuild or incremental attempt."""
+    if state.get('status') in UNFINISHED and state.get('strategy') is None:
+        return {**state, 'status': 'verified', 'reason': None, 'finished_at': now.isoformat()}
+    return state
+
+
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
-                      now=None, run_incremental_fn=None, run_full_fn=None, log=lambda message: None):
-    """Decide and, when needed, update one opted-in repository's metadata. Never raises for a model,
-    budget or parse failure: the previous document stays and the attempt state says why."""
+                      now=None, run_incremental_fn=None, run_full_fn=None, log=lambda message: None,
+                      missing_credential=None):
+    """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
+    every failure, from reading the baseline to the last state write, keeps the previous document,
+    is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
+    says when the attempt record couldn't be saved. `missing_credential` names the provider key
+    variable when it isn't set; that fails a due update before any count or send."""
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
@@ -624,40 +684,57 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     started = time.monotonic()
     now = now or datetime.now()
     full_name = repo_config['full_name']
-    target = snap.resolve_commit(repo_path, 'HEAD')
-    if target is None:
-        return Outcome('failed', None, 'the repository has no commit', None, None, {}, 0.0)
-    doc = load_document(pristine_dir, cache_name)
-    state = read_attempt_state(pristine_dir, cache_name) or {}
-    decision = decide(repo_path, full_name, doc, state, model, target, now, force=force)
-    if decision.adopt:
-        state = {**state, 'adoption': decision.adopt}
-    if decision.strategy == 'none':
-        if decision.adopt:
-            write_state(pristine_dir, cache_name, state)
-        return Outcome('none', 'none', decision.reason, decision.base, target, {}, 0.0)
+    decision = budget = attempt = target = None
+    committed = False
 
-    attempt = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
-               'attempt_id': uuid.uuid4().hex, 'status': 'pending', 'strategy': decision.strategy,
-               'decision_reason': decision.reason, 'base_commit': decision.base, 'target_commit': target,
-               'baseline_doc_sha256': doc.sha256 if doc else None, 'policy': SEMANTIC_POLICY, 'model': model,
-               'started_at': now.isoformat(), 'reason': None, 'generation_id': None}
-    for stale in ('finished_at', 'usage'):
-        attempt.pop(stale, None)
-    write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
-    log(f"{decision.strategy}: {decision.reason}")
-
-    cap = INCREMENTAL_CAP_USD if decision.strategy == 'incremental' else None
-    budget = Budget(model, cap=cap, label=decision.strategy)
-
-    def finish(status, reason, warning=False):
-        attempt.update(status=status, reason=reason, finished_at=datetime.now().isoformat(),
-                       usage=budget.summary())
-        write_state(pristine_dir, cache_name, attempt)
-        return Outcome(status, decision.strategy, reason, decision.base, target, budget.summary(),
-                       time.monotonic() - started)
+    def finish(status, reason):
+        reason = safe_reason(reason)
+        after = None
+        if committed and status != 'published':
+            # The new document is in place: report what failed afterwards, never the old one as kept.
+            after, status, reason = reason, 'published', None
+        usage = budget.summary() if budget else {}
+        if attempt is None:
+            state_error = record_failure(pristine_dir, cache_name, full_name, reason, target, 'setup', status)
+        else:
+            attempt.update(status=status, reason=reason, finished_at=datetime.now().isoformat(), usage=usage)
+            state_error = _try_write_state(pristine_dir, cache_name, attempt)
+        if after:
+            state_error = safe_reason(f"after publishing: {after}" + (f"; {state_error}" if state_error else ''))
+        return Outcome(status, decision.strategy if decision else None, reason, decision.base if decision else None,
+                       target, usage, time.monotonic() - started, state_error)
 
     try:
+        doc = load_document(pristine_dir, cache_name)
+        state = read_attempt_state(pristine_dir, cache_name) or {}
+        target = snap.resolve_commit(repo_path, 'HEAD')
+        if target is None:
+            return finish('failed', 'the repository has no commit')
+        decision = decide(repo_path, full_name, doc, state, model, target, now, force=force)
+        if decision.adopt:
+            state = {**state, 'adoption': decision.adopt}
+        if decision.strategy == 'none':
+            cleared = _cleared_setup_failure(state, now)
+            if decision.adopt or cleared is not state:
+                write_state(pristine_dir, cache_name, cleared)
+            return Outcome('none', 'none', decision.reason, decision.base, target, {}, time.monotonic() - started)
+
+        attempt = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
+                   'attempt_id': uuid.uuid4().hex, 'status': 'pending', 'strategy': decision.strategy,
+                   'phase': 'update', 'decision_reason': decision.reason, 'base_commit': decision.base,
+                   'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
+                   'policy': SEMANTIC_POLICY, 'model': model, 'started_at': now.isoformat(), 'reason': None,
+                   'generation_id': None}
+        for stale in ('finished_at', 'usage'):
+            attempt.pop(stale, None)
+        write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
+        log(f"{decision.strategy}: {decision.reason}")
+
+        cap = INCREMENTAL_CAP_USD if decision.strategy == 'incremental' else None
+        budget = Budget(model, cap=cap, label=decision.strategy)
+        if missing_credential:
+            return finish('failed', f"no API key: {missing_credential} is not set")
+
         if decision.strategy == 'incremental':
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session, budget)
         else:
@@ -684,6 +761,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         attempt.update(status='committing', generation_id=generation_id)
         write_state(pristine_dir, cache_name, attempt)
         write_text_atomic(document_path(pristine_dir, cache_name), text)   # the commit point
+        committed = True
         _link(pristine_dir, full_name, cache_name)
         return finish('published', None)
     except StaleUpdate as e:
@@ -696,5 +774,5 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('failed', str(e))
     except snap.GitError as e:
         return finish('failed', f"git: {e}")
-    except Exception as e:  # a provider or transport error; its type, never its body
-        return finish('failed', f"{type(e).__name__}: {str(e)[:200]}")
+    except Exception as e:  # a provider, transport or storage error; its type and a bounded message
+        return finish('failed', f"{type(e).__name__}: {e}")

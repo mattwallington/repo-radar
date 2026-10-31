@@ -5,6 +5,7 @@ client (counts). Sockets are blocked, keys are fake, nothing is paid for.
 """
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -197,6 +198,41 @@ def _ctx():
     return ctx, events
 
 
+def sync_fixture(monkeypatch, tmp_path, repo):
+    """Point sync_mode at `repo` through a bare origin that is one commit ahead, with the opt-in set.
+    Returns (origin, config, events): events records Activity events and status-server posts."""
+    origin = tmp_path / 'origin.git'
+    subprocess.run(['git', 'clone', '-q', '--bare', str(repo.path), str(origin)], check=True)
+    repo.git('remote', 'add', 'origin', str(origin))
+    repo.git('fetch', '-q', 'origin')
+    repo.git('branch', '-q', '--set-upstream-to=origin/main', 'main')
+    repo.write('src/m5.py', (repo.path / 'src/m5.py').read_text() + '# upstream\n')
+    repo.commit('upstream')
+    repo.git('push', '-q', 'origin', 'main')
+    repo.git('reset', '-q', '--hard', 'HEAD~1')
+    config = {'repositories': [{'full_name': FULL, 'clone_url': str(origin), 'default_branch': 'main'}],
+              'incremental_metadata_repos': [FULL]}
+    events = []
+
+    class Logger:
+        def event(self, name, **fields):
+            events.append((name, fields))
+
+        def __getattr__(self, name):
+            return lambda *a, **k: events.append((name, k))
+
+    monkeypatch.setattr(S, 'CONFIG_DIR', tmp_path / 'config')
+    monkeypatch.setattr(S, 'load_config', lambda: config)
+    monkeypatch.setattr(S, 'load_cache_index', lambda: {str(origin): 'app-abc1234'})
+    monkeypatch.setattr(S, 'save_cache_index', lambda index: True)
+    monkeypatch.setattr(S, '_open_sync_logger', lambda: Logger())
+    monkeypatch.setattr(S, '_mint_activity_writer', lambda: None)
+    monkeypatch.setattr(S, 'wait_for_network', lambda **kw: True)
+    monkeypatch.setattr(S, 'write_receipt', lambda *a, **k: True)
+    monkeypatch.setattr(S, 'send_status_update', lambda kind, data, server: events.append((kind, data)))
+    return origin, config, events
+
+
 def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     ctx, _events = _ctx()
@@ -261,26 +297,8 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
 
     # --skip-metadata, --repos-only and --dry-run: no provider calls and no attempt state.
     provider = Provider(monkeypatch)
-    origin = tmp_path / 'origin.git'
-    subprocess.run(['git', 'clone', '-q', '--bare', str(repo.path), str(origin)], check=True)
-    repo.git('remote', 'add', 'origin', str(origin))
-    repo.git('fetch', '-q', 'origin')
-    repo.git('branch', '-q', '--set-upstream-to=origin/main', 'main')
-    grow(['src/m5.py'])
-    repo.commit()
-    repo.git('push', '-q', 'origin', 'main')
-    repo.git('reset', '-q', '--hard', 'HEAD~1')
+    origin, config, _sync_events = sync_fixture(monkeypatch, tmp_path, repo)
     (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
-    config = {'repositories': [{'full_name': FULL, 'clone_url': str(origin), 'default_branch': 'main'}],
-              'incremental_metadata_repos': [FULL]}
-    monkeypatch.setattr(S, 'CONFIG_DIR', tmp_path / 'config')
-    monkeypatch.setattr(S, 'load_config', lambda: config)
-    monkeypatch.setattr(S, 'load_cache_index', lambda: {str(origin): 'app-abc1234'})
-    monkeypatch.setattr(S, 'save_cache_index', lambda index: True)
-    monkeypatch.setattr(S, '_open_sync_logger', lambda: None)
-    monkeypatch.setattr(S, '_mint_activity_writer', lambda: None)
-    monkeypatch.setattr(S, 'wait_for_network', lambda **kw: True)
-    monkeypatch.setattr(S, 'write_receipt', lambda *a, **k: True)
     before = (pristine / 'app-abc1234.md').read_text()
     for flags in ({'skip_metadata': True}, {'repos_only': True}, {'dry_run': True}):
         S.sync_mode(_sync_args(**flags))
@@ -368,6 +386,11 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
             {'op': 'replace', 'id': stale.id, 'expected_sha256': '0' * 16, 'content': '## Key Components\nwrong\n'}]})]
         failed = update(pristine, repo, session)
         assert failed.status == 'failed' and 'expected_sha256' in failed.reason
+        provider.replies = [answer({'base_document_sha256': new.sha256, 'sections': [
+            {'op': 'delete', 'id': 'x\n' * 3000, 'expected_sha256': stale.sha256}]})]
+        huge = update(pristine, repo, session)
+        saved = metadata.read_attempt_state(pristine, 'app-abc1234')['reason']
+        assert huge.status == 'failed' and len(huge.reason) <= 240 and saved == huge.reason and '\n' not in saved
         assert im.load_document(pristine, 'app-abc1234').text == new.text
 
 
@@ -525,7 +548,8 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
 # ── 4. The good document survives ────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('failure', ['generation_error', 'parse_failure', 'interrupt_before_replace',
-                                     'interrupt_after_replace', 'repository_moved', 'full_degraded'])
+                                     'interrupt_after_replace', 'state_lost_after_replace', 'repository_moved',
+                                     'full_degraded'])
 def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure):
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     repo.write('src/m0.py', (repo.path / 'src/m0.py').read_text() + '# more\n')
@@ -552,6 +576,8 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
     def write_state(p, c, state):
         if failure == 'interrupt_after_replace' and state.get('status') == 'published':
             raise interrupt
+        if failure == 'state_lost_after_replace' and state.get('status') == 'published':
+            raise OSError(28, 'No space left on device')
         real_write_state(p, c, state)
     monkeypatch.setattr(im, 'write_state', write_state)
 
@@ -559,6 +585,9 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         if failure.startswith('interrupt'):
             with pytest.raises(KeyboardInterrupt):
                 update(pristine, repo, session)
+        elif failure == 'state_lost_after_replace':
+            outcome = update(pristine, repo, session)
+            assert outcome.status == 'published' and 'attempt state not saved' in outcome.state_error
         else:
             outcome = update(pristine, repo, session, force=failure == 'full_degraded')
             assert outcome.status == ('skipped' if failure == 'repository_moved' else 'failed'), outcome
@@ -567,7 +596,7 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
     doc = im.load_document(pristine, 'app-abc1234')
     metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
     index = (pristine / 'INDEX.md').read_text()
-    if failure == 'interrupt_after_replace':
+    if failure in ('interrupt_after_replace', 'state_lost_after_replace'):
         # The replacement committed: the new document is complete and current despite the stale marker.
         assert doc.info['last_commit'] == target and doc.info['generation_id']
         assert 'stale' not in index
@@ -596,7 +625,49 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
         assert ctx.stats['errors'] == 1 and ctx.stats['metadata_generated'] == 0
         assert any(name == 'metadata_incremental' and f['status'] == 'failed' and f['level'] == 'error'
                    for name, f in events if isinstance(f, dict))
-        assert any(e[0] == 'progress' and e[1] and 'metadata stale' in e[1] for e in events)
+        assert any(e[0] == 'progress' and e[1] and '✗ metadata failed' in e[1] for e in events)
+
+
+@pytest.mark.parametrize('failure', ['no_key', 'git_before_model', 'state_write', 'worker_exception', 'fetch_failed'])
+def test_every_opted_in_failure_is_reported_and_keeps_the_document(monkeypatch, tmp_path, failure):
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    provider = Provider(monkeypatch)
+    origin, _config, events = sync_fixture(monkeypatch, tmp_path, repo)
+    before = (pristine / 'app-abc1234.md').read_text()
+    if failure == 'no_key':
+        monkeypatch.delenv('ANTHROPIC_API_KEY')
+    elif failure == 'git_before_model':
+        monkeypatch.setattr(snap.GitSnapshot, 'tree_id', lambda self: (_ for _ in ()).throw(snap.GitError('object store damaged')))
+    elif failure == 'state_write':
+        monkeypatch.setattr(im, 'write_state', lambda *a: (_ for _ in ()).throw(OSError(28, 'No space left on device')))
+    elif failure == 'worker_exception':
+        monkeypatch.setattr(S, '_generate_incremental', lambda *a: (_ for _ in ()).throw(RuntimeError('worker broke')))
+    else:
+        shutil.rmtree(origin)
+
+    assert S.sync_mode(_sync_args(status_server='http://127.0.0.1:9')) == 1, 'the run cannot finish as succeeded'
+    assert (pristine / 'app-abc1234.md').read_text() == before
+    assert not provider.sends and not provider.counts
+    progress = [d['status'] for kind, d in events if kind == 'progress' and d.get('repo') == FULL]
+    index = (pristine / 'INDEX.md').read_text()
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    if failure == 'fetch_failed':
+        assert progress[-1] == '✗ fetch failed' and state['reason'] == 'fetch failed, so metadata was not updated'
+        assert 'stale: analyzed' in index and 'fetch failed' in index
+        return
+    reported = [f for name, f in events if name == 'metadata_incremental']
+    assert len(reported) == 1 and reported[0]['status'] == 'failed' and reported[0]['level'] == 'error'
+    assert progress[-1].startswith('✗ metadata update failed')
+    if failure == 'state_write':
+        assert state is None and 'staleness could not be recorded' in progress[-1]
+        assert 'attempt state not saved' in reported[0]['state_error']
+        assert 'stale' not in index, 'INDEX is not claimed to show what could not be recorded'
+        return
+    assert reported[0]['state_error'] is None and 'marked stale in INDEX' in progress[-1]
+    expected = {'no_key': 'no API key: ANTHROPIC_API_KEY is not set', 'git_before_model': 'git: object store damaged',
+                'worker_exception': 'RuntimeError: worker broke'}[failure]
+    assert state['status'] == 'failed' and state['reason'] == expected
+    assert f"stale: analyzed {base[:7]}" in index and expected in index
 
 
 # ── 5. The pilot cap survives failure and restart ───────────────────────────────────────────────
