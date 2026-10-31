@@ -121,6 +121,17 @@ def _full_build(doc, state, model):
     return built, UNKNOWN, model, adopt
 
 
+def full_rebuild_unfinished(state, doc):
+    """True when `state` is a full rebuild started from exactly `doc` that never published. A state
+    whose generation ID is the document's own reached its commit point and is not unfinished."""
+    st = state or {}
+    if doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED:
+        return False
+    if st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'):
+        return False
+    return st.get('baseline_doc_sha256') == doc.sha256
+
+
 def decide(repo_path, full_name, doc, state, model, target, now, force=False):
     """Choose 'full', 'incremental' or 'none' for an opted-in repository at commit `target`.
 
@@ -150,10 +161,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
         return full('configured model changed', adopt=adopt)
     if built is None:
         return full('last full build time unknown', adopt=adopt)
-    st = state or {}
-    committed = st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id')
-    if (st.get('strategy') == 'full' and st.get('status') in UNFINISHED and not committed
-            and st.get('baseline_doc_sha256') == doc.sha256):
+    if full_rebuild_unfinished(state, doc):
         return full('previous full rebuild did not finish', built=built, adopt=adopt)
     if now - built >= FULL_REBUILD_AFTER:
         return full('weekly full rebuild due', built=built, adopt=adopt)
@@ -688,13 +696,13 @@ def record_failure(pristine_dir, cache_name, full_name, reason, target=None, pha
         state = read_attempt_state(pristine_dir, cache_name) or {}
     except Exception:
         state = {}
-    full_due = state.get('strategy') == 'full' and state.get('status') in UNFINISHED
+    full_due = full_rebuild_unfinished(state, doc)
     record = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
               'attempt_id': uuid.uuid4().hex, 'status': status, 'strategy': 'full' if full_due else None,
               'phase': phase, 'base_commit': doc.info.get('last_commit') if doc else None,
               'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
               'reason': safe_reason(reason), 'finished_at': datetime.now().isoformat(),
-              'generation_id': None if not full_due else state.get('generation_id')}
+              'generation_id': None}   # a generation ID belongs only to a candidate that reached the commit point
     record.pop('usage', None)
     return _try_write_state(pristine_dir, cache_name, record)
 
