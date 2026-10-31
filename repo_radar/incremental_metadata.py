@@ -428,7 +428,11 @@ def _send(conversation, max_output, session, budget, deadline=None, now=None):
     except Exception:
         budget.fail(reservation)
         raise
-    budget.settle(reservation, turn.usage, turn.cost)
+    cost = budget.settle(reservation, turn.usage, turn.cost)
+    if cost is None and budget.ledger is not None:
+        # A capped experiment can't keep spending past a reply whose cost it doesn't know.
+        raise StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
+                          "any further paid request (reconcile the ledger first)")
     return turn
 
 

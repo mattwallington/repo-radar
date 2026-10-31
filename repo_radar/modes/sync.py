@@ -331,14 +331,16 @@ def _generate_incremental(task_data, session, args, ctx):
         force=bool(getattr(args, 'regenerate_metadata', False)),
         log=lambda m: ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{m}[/{task_color}]"))
     usage = outcome.usage or {}
-    cost = usage.get('cost_usd', 0.0) or 0.0
+    cost = usage.get('known_cost_usd') or 0.0
+    unknown_calls = usage.get('unknown_cost_calls') or 0
+    cost_text = f"${cost:.4f}" if not unknown_calls else f"cost unknown (known subtotal ${cost:.4f})"
     label = 'updated' if outcome.strategy == 'incremental' else 'rebuilt'
     if outcome.status == 'none':
         ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ metadata current[/{task_color}]")
         _incremental_status(args, full_name, short_id, '✓ metadata current', 100, color)
     elif outcome.status == 'published':
-        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ metadata {label} (${cost:.4f})[/{task_color}]")
-        _incremental_status(args, full_name, short_id, f'✓ metadata {label} (${cost:.4f})', 100, color)
+        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ metadata {label} ({cost_text})[/{task_color}]")
+        _incremental_status(args, full_name, short_id, f'✓ metadata {label} ({cost_text})', 100, color)
         with ctx.stats_lock:
             ctx.stats['metadata_generated'] += 1
     else:
@@ -358,13 +360,14 @@ def _generate_incremental(task_data, session, args, ctx):
             ctx.stats['skipped' if warning else 'errors'] = ctx.stats.get('skipped' if warning else 'errors', 0) + 1
     with ctx.stats_lock:
         ctx.stats['api_cost'] += cost
+        ctx.stats['unknown_cost_calls'] = ctx.stats.get('unknown_cost_calls', 0) + unknown_calls
     if ctx.sync_logger:
         level = 'info' if outcome.status in ('none', 'published') else ('warn' if outcome.status == 'skipped' else 'error')
         ctx.sync_logger.event(
             "metadata_incremental", level=level, repo=full_name, status=outcome.status, strategy=outcome.strategy,
             reason=outcome.reason, base=(outcome.base or '')[:12], target=(outcome.target or '')[:12], model=model,
             calls=usage.get('calls', 0), input_tokens=usage.get('input_tokens', 0),
-            output_tokens=usage.get('output_tokens', 0), cost=f"${cost:.4f}",
+            output_tokens=usage.get('output_tokens', 0), cost=cost_text,
             unknown_cost_calls=usage.get('unknown_cost_calls', 0), changed_files=usage.get('changed_files'),
             changed_bytes=usage.get('changed_bytes'), read_bytes=usage.get('read_bytes'),
             elapsed=f"{outcome.elapsed:.1f}s")
@@ -1932,7 +1935,10 @@ Stack Trace:
     console.print(f"  Errors: [red]{stats['errors']}[/red]")
     if not args.skip_metadata:
         console.print(f"  Metadata generated: [green]{stats['metadata_generated']}[/green]")
-        if stats['api_cost'] > 0:
+        if stats.get('unknown_cost_calls'):
+            console.print(f"  API cost: unknown (known subtotal ${stats['api_cost']:.4f}; "
+                          f"{stats['unknown_cost_calls']} metadata call(s) of unknown cost)")
+        elif stats['api_cost'] > 0:
             console.print(f"  API cost: ${stats['api_cost']:.4f}")
 
         # Warn if no metadata was generated AND repos don't have existing metadata
@@ -2021,7 +2027,8 @@ Stack Trace:
             skipped=stats['skipped'],
             errors=stats['errors'],
             metadata=stats['metadata_generated'],
-            cost=f"${stats['api_cost']:.4f}",
+            cost=(f"${stats['api_cost']:.4f}" if not stats.get('unknown_cost_calls')
+                  else f"unknown (known subtotal ${stats['api_cost']:.4f})"),
         )
 
     # Durable completion receipt. Progress went to a status server inside the app, so a run that

@@ -11,6 +11,7 @@ cost policy but are still accounted. The telehealth pilot shares one durable Led
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 from collections import namedtuple
@@ -48,6 +49,18 @@ def price_per_token(model):
     if not inputs or not outputs:
         return None
     return max(inputs), max(outputs)
+
+
+def reliable_usage(usage):
+    """True only for genuine positive integer input and output counts. Providers (and litellm's
+    adapters) fill absent counts with zero, which is not evidence that a request was free."""
+    def positive(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return usage is not None and positive(usage.input_tokens) and positive(usage.output_tokens)
+
+
+def reliable_cost(cost):
+    return isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost > 0
 
 
 def request_key(label, request):
@@ -96,19 +109,23 @@ class Budget:
         return Reservation(key, upper)
 
     def settle(self, reservation, usage, reported_cost):
-        """Record a reply. Reported cost wins; else cost from usage; else the reservation is kept."""
+        """Record a reply and return its cost, or None when it is unknown.
+
+        Only reliable usage (positive input and output counts) can release a reservation: with it, a
+        finite positive reported cost wins, else the cost is priced from the usage. Anything else (no
+        usage, zero-filled or partial usage, a missing or invalid cost with no price) keeps the whole
+        reservation counted as spent.
+        """
         upper = self._open.pop(reservation.key, 0.0)
         self.calls += 1
-        if usage is not None:
-            self.input_tokens += usage.input_tokens or 0
-            self.output_tokens += usage.output_tokens or 0
-        cost = reported_cost
-        tokens = (usage.input_tokens or 0) + (usage.output_tokens or 0) if usage else None
-        if cost is not None and cost == 0 and tokens:
-            cost = None                      # a zero cost for real usage means "not priced"
-        if cost is None and usage is not None and usage.input_tokens is not None \
-                and usage.output_tokens is not None and self.price is not None:
-            cost = usage.input_tokens * self.price[0] + usage.output_tokens * self.price[1]
+        cost = None
+        if reliable_usage(usage):
+            self.input_tokens += usage.input_tokens
+            self.output_tokens += usage.output_tokens
+            if reliable_cost(reported_cost):
+                cost = float(reported_cost)
+            elif self.price is not None:
+                cost = usage.input_tokens * self.price[0] + usage.output_tokens * self.price[1]
         if cost is None:
             self.unknown_calls += 1
             self.retained += upper
@@ -130,10 +147,13 @@ class Budget:
             self.ledger.mark_unknown(reservation.key)
 
     def summary(self):
+        """cost_usd is the total, or None when any call's cost is unknown; known_cost_usd is always the
+        settled subtotal, and retained_reservation_usd what unknown calls keep reserved."""
+        known = round(self.cost, 6)
         return {'model': self.model, 'calls': self.calls, 'input_tokens': self.input_tokens,
-                'output_tokens': self.output_tokens, 'cost_usd': round(self.cost, 6),
-                'unknown_cost_calls': self.unknown_calls, 'retained_reservation_usd': round(self.retained, 6),
-                **self.extra}
+                'output_tokens': self.output_tokens, 'cost_usd': None if self.unknown_calls else known,
+                'known_cost_usd': known, 'unknown_cost_calls': self.unknown_calls,
+                'retained_reservation_usd': round(self.retained, 6), **self.extra}
 
 
 class Ledger:
@@ -195,6 +215,11 @@ class Ledger:
             raise PricingUnavailable("the request's cost can't be bounded, so the capped run won't send it")
         if any(e['key'] == key for e in data['entries']):
             raise BudgetExceeded("this exact request was already bought or reserved; it won't be sent again")
+        unresolved = [e for e in data['entries'] if e['status'] in ('reserved', 'unknown')]
+        if unresolved:
+            held = sum(e['reserved_usd'] for e in unresolved)
+            raise BudgetExceeded(f"the ledger has {len(unresolved)} request(s) of unknown cost holding ${held:.2f}; "
+                                 f"ask the manager to reconcile {self.path} before any further paid request")
         if label not in self.allowances:
             raise BudgetExceeded(f"no allowance for {label!r}")
         total, mine = self._spent(data['entries']), self._spent(data['entries'], label)
