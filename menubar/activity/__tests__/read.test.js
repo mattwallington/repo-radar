@@ -137,18 +137,20 @@ test('a failed sync counts its failure once and keeps both diagnostic events', (
       startRec(aid, 0, '2026-08-11T00:00:00-07:00'),
       eventRec(aid, 1, '2026-08-11T00:01:00-07:00', 'error', 'metadata_failed'),
       eventRec(aid, 2, '2026-08-11T00:01:01-07:00', 'error', 'sync_complete', { fields: { errors: 1 } }),
-      terminalRec(aid, 3, '2026-08-11T00:01:02-07:00', 'failed'),
+      eventRec(aid, 3, '2026-08-11T00:01:02-07:00', 'warn', 'sync_complete'),
+      terminalRec(aid, 4, '2026-08-11T00:01:03-07:00', 'failed'),
     ]);
     const summary = read.listActivities(home).items[0];
     const full = detail(home, aid);
     for (const item of [summary, full]) {
       assert.strictEqual(item.errorCount, 1);
+      assert.strictEqual(item.warnCount, 0);
       assert.strictEqual(item.outcome, 'failed');
       assert.strictEqual(item.hasProblems, true);
     }
     for (const rows of [full.events, full.problems.filter((r) => r.kind === 'event')]) {
       assert.deepStrictEqual(rows.map((r) => [r.event, r.level]), [
-        ['metadata_failed', 'error'], ['sync_complete', 'error'],
+        ['metadata_failed', 'error'], ['sync_complete', 'error'], ['sync_complete', 'warn'],
       ]);
     }
   } finally {
