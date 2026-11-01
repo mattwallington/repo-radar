@@ -525,6 +525,60 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
         assert sum(ro == 16384 and "A0" in p for _, p, ro in completed) == 1
 
 
+@pytest.mark.parametrize("stage", ["chunk", "synthesis", "single"])
+@pytest.mark.parametrize("fail_late", [True, False])
+def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stage, fail_late):
+    """Keep partial chunk/synthesis spend and a response's spend before local processing.
+    Successful controls use the same path and catch duplicate credits."""
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    monkeypatch.setenv("AI_MODEL", "claude-sonnet-5")
+    previous = "---\nlast_commit: oldcommit\n---\n\n# previous metadata\n"
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **kw: _files(2))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single" if stage == "single" else "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **kw: llm.PartitionResult([_files(1), _files(1)], None))
+    plans = iter([[["A0"], ["A1"]]])
+    monkeypatch.setattr(llm, "authoritative_synthesis_level",
+                        lambda s, n, analyses, m: next(plans, [analyses]))
+    completed, events = [], []
+    calls = 0
+
+    def send(model, prompt, max_tokens=8192):
+        nonlocal calls
+        calls += 1
+        fail_at = 2 if stage == "chunk" else 4  # second chunk or second synthesis batch
+        if fail_late and stage != "single" and calls == fail_at:
+            raise RuntimeError("later request failed")
+        cost = calls / 8  # exact binary fractions, with a nonzero subtotal before failure
+        completed.append(cost)
+        return f"A{calls - 1}" if max_tokens == 8192 else "SUMMARY", cost, None
+
+    monkeypatch.setattr(sync, "call_llm", send)
+    if stage == "single" and fail_late:
+        def local_failure(response):
+            raise ValueError("local rate tracker failed after the completed response")
+        monkeypatch.setattr(sync.rate_limit_tracker, "update_from_response", local_failure)
+
+    class _Logger:
+        def event(self, name, **kw): events.append((name, kw))
+        def error(self, name, **kw): events.append((name, kw))
+
+    ctx = _fake_ctx()._replace(sync_logger=_Logger())
+    ctx.stats["api_cost"] = 1.0  # previously completed repositories must remain accounted
+    result = sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
+                                        _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
+    subtotal = sum(completed)
+    assert subtotal > 0 and result == subtotal and ctx.stats["api_cost"] == 1.0 + subtotal
+    assert ctx.stats["errors"] == int(fail_late)
+    assert ctx.stats["metadata_generated"] == int(not fail_late)
+    if fail_late:
+        assert (tmp_path / "repo.md").read_text() == previous
+        assert [(n, f["cost"]) for n, f in events] == [("metadata_failed", f"${subtotal:.4f}")]
+    else:
+        assert _read_frontmatter(tmp_path)["last_commit"] == "newcommit"
+        assert [(n, f["cost"]) for n, f in events] == [("metadata_generated", f"${subtotal:.4f}")]
+
+
 @pytest.mark.parametrize("case", ["401", "400-credit", "503", "timeout"])
 def test_count_errors_fail_or_skip_through_the_real_preflight(monkeypatch, tmp_path, case):
     """The real PreflightSession counts each repo through Anthropic's Count Tokens handler, with only
