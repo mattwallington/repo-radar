@@ -627,7 +627,7 @@ function _buildItem(home, aid, filter, redactor) {
   const rawEvents = [];
   for (const r of merged) {
     if (r.type !== 'event') continue;
-    if (r.level === 'error') errorCount += 1;
+    if (r.level === 'error' && r.event !== 'sync_complete') errorCount += 1;
     else if (r.level === 'warn') warnCount += 1;
     rawEvents.push(r);
   }

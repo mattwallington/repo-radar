@@ -129,6 +129,33 @@ test('listActivities: end-to-end over two complete activities -- DTO shape, coun
 // 2. A crashed `running` item (durable start, no terminal, no held lock) reconciles to
 //    `interrupted` -- the Phase-3 gate.
 // -----------------------------------------------------------------------------------------------
+test('a failed sync counts its failure once and keeps both diagnostic events', () => {
+  const home = tmpHome();
+  try {
+    const aid = '00000000-0000-4000-8000-00000000000a';
+    seedSegment(home, aid, [
+      startRec(aid, 0, '2026-08-11T00:00:00-07:00'),
+      eventRec(aid, 1, '2026-08-11T00:01:00-07:00', 'error', 'metadata_failed'),
+      eventRec(aid, 2, '2026-08-11T00:01:01-07:00', 'error', 'sync_complete', { fields: { errors: 1 } }),
+      terminalRec(aid, 3, '2026-08-11T00:01:02-07:00', 'failed'),
+    ]);
+    const summary = read.listActivities(home).items[0];
+    const full = detail(home, aid);
+    for (const item of [summary, full]) {
+      assert.strictEqual(item.errorCount, 1);
+      assert.strictEqual(item.outcome, 'failed');
+      assert.strictEqual(item.hasProblems, true);
+    }
+    for (const rows of [full.events, full.problems.filter((r) => r.kind === 'event')]) {
+      assert.deepStrictEqual(rows.map((r) => [r.event, r.level]), [
+        ['metadata_failed', 'error'], ['sync_complete', 'error'],
+      ]);
+    }
+  } finally {
+    cleanup(home);
+  }
+});
+
 test('listActivities: a crashed running activity (start, no terminal, no lock) reconciles to interrupted', () => {
   const home = tmpHome();
   try {
