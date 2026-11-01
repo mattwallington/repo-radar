@@ -28,7 +28,7 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt,
     authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
-    InputBudgetUnavailable, IncompleteResponseError)
+    InputBudgetUnavailable, IncompleteResponseError, is_transient_server_error)
 from repo_radar.preflight import PreflightSession
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
@@ -527,6 +527,14 @@ _Metadata generation degraded before completion: {reason}_
                         ctx.console.print(f"[red]Error: {error_str[:300]}[/red]")
                         ctx.console.print(f"[bold red]╚══════════════════════════════════════╝[/bold red]\n")
 
+                        if is_transient_server_error(e):
+                            if retry == max_retries - 1:
+                                raise
+                            wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                            ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                            time.sleep(wait_time)
+                            continue
+
                         # Check if it's a rate limit error
                         is_rate_limit = (
                             error_type == 'RateLimitError' or
@@ -605,6 +613,13 @@ _Metadata generation degraded before completion: {reason}_
                         except IncompleteResponseError:
                             raise  # a rejected reply, not a rate limit: no retry or fallback
                         except Exception as exc:
+                            if is_transient_server_error(exc):
+                                if attempt == max_retries - 1:
+                                    raise
+                                wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
+                                ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                                time.sleep(wait_time)
+                                continue
                             err = str(exc)
                             is_rl = (type(exc).__name__ == 'RateLimitError'
                                      or '429' in err or 'RESOURCE_EXHAUSTED' in err)
@@ -648,6 +663,9 @@ _Metadata generation degraded before completion: {reason}_
                     except Exception as e:
                         error_str = str(e)
                         error_type = type(e).__name__
+
+                        if is_transient_server_error(e):
+                            raise  # the request-level budget is exhausted; do not replay batches
 
                         is_rate_limit = (
                             error_type == 'RateLimitError' or
@@ -750,6 +768,14 @@ _Metadata generation degraded before completion: {reason}_
                     ctx.console.print(f"[red]Model: {current_model}[/red]")
                     ctx.console.print(f"[red]Type: {error_type}[/red]")
                     ctx.console.print(f"[red]Message: {error_str[:300]}[/red]")
+
+                    if is_transient_server_error(e):
+                        if retry == max_retries - 1:
+                            raise
+                        wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                        ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                        time.sleep(wait_time)
+                        continue
 
                     is_rate_limit = (
                         error_type == 'RateLimitError' or
