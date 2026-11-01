@@ -223,7 +223,7 @@ def is_transient_server_error(error):
     if isinstance(error, IncompleteResponseError):
         return False
     names = {cls.__name__ for cls in type(error).__mro__}
-    if names & {'AuthenticationError', 'PermissionDeniedError', 'BadRequestError',
+    if names & {'APIConnectionError', 'AuthenticationError', 'PermissionDeniedError', 'BadRequestError',
                 'InvalidRequestError', 'NotFoundError', 'UnprocessableEntityError'}:
         return False
 

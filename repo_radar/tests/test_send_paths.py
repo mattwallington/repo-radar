@@ -450,6 +450,7 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
     limit = 3 if stage.startswith("helper_") else 5
 
     if stage == "single" and not exhausted:
+        from litellm import APIConnectionError
         # Classification guards: only explicit server signals qualify, never a bare number,
         # incomplete reply, or a known client rejection containing a misleading server code.
         for status in (500, 502, 503, 504, 529, 400, 401, 403, 429):
@@ -460,7 +461,8 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
             assert llm.is_transient_server_error(RuntimeError(text))
         unavailable = type("ServiceUnavailableError", (Exception,), {})("opaque")
         assert llm.is_transient_server_error(unavailable)
-        for err in (TimeoutError("timed out"), RuntimeError("processed 503 tokens"),
+        for err in (APIConnectionError(message="connection dropped", llm_provider="gemini", model=model),
+                    TimeoutError("timed out"), RuntimeError("processed 503 tokens"),
                     RuntimeError("HTTP 401: UNAVAILABLE"),
                     type("BadRequestError", (Exception,), {})("HTTP 503"),
                     llm.IncompleteResponseError("HTTP 503")):
