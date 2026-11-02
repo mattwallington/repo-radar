@@ -38,14 +38,20 @@ def offline(monkeypatch):
 
 class Provider:
     """Scripted replies for sends; counts answer `count_tokens` (a number, or a callable of the body,
-    or an exception). Every serialized send and count body is recorded."""
+    or an exception). Every serialized send and count body is recorded. Only a POST to `endpoint`
+    (Anthropic's Messages API unless a test names another provider) is a send: anything else, such as
+    LiteLLM's background model-map GET that another test may already have started, fails locally and
+    never consumes a reply."""
 
     def __init__(self, monkeypatch):
         self.replies, self.sends, self.counts = [], [], []
         self.count_tokens = 1000
+        self.endpoint = ('api.anthropic.com', '/v1/messages')
         provider = self
 
         def handle(transport, request):
+            if (request.method, request.url.host, request.url.path) != ('POST', *provider.endpoint):
+                raise httpx.ConnectError(f"not the scripted provider: {request.method} {request.url}", request=request)
             body = json.loads(request.content or b'{}')
             provider.sends.append((request.url.path, body))
             if not provider.replies:
@@ -637,10 +643,15 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     doc = im.load_document(pristine, 'app-abc1234')
     provider.replies = [tool_use('read_file', {'path': 'src/m0.py', 'limit': 3}),
                         answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    # A stray request through the same transport (here a model-map GET) fails locally: no reply
+    # consumed, nothing recorded, and the next real request still gets the intended reply.
+    with pytest.raises(httpx.ConnectError), httpx.Client() as client:
+        client.get('https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json')
+    assert len(provider.replies) == 2 and not provider.sends
     with PreflightSession() as session:
         assert update(pristine, repo, session).status == 'published'
     sends = provider.messages()
-    assert len(sends) == 2 and len(provider.counts) == 2
+    assert len(sends) == 2 and len(provider.counts) == 2 and len(provider.sends) == 2
     # The second request is counted exactly as it is sent: tools, the thinking block, the tool result.
     count, send = provider.counts[1], sends[1]
     for key in ('messages', 'system', 'tools'):
@@ -704,6 +715,7 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     # The Responses API shape: a function call, then the final answer.
     from repo_radar import llm
     provider.sends.clear()
+    provider.endpoint = ('api.openai.com', '/v1/responses')
     conversation = llm.Conversation('gpt-5.5-pro', 'SYS', snap.TOOL_SPECS)
     conversation.add_user('hi')
     provider.replies = [{"id": "r", "object": "response", "created_at": 0, "status": "completed", "model": "m",
