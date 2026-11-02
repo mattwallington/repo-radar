@@ -102,7 +102,7 @@ def usable_baseline(doc, full_name):
         return False, 'document belongs to a different repository'
     if _parse_status_of(doc.info) != PARSE_STATUS_OK:
         return False, 'document is degraded'
-    if not snap.SHA.match(doc.info.get('last_commit', '')):
+    if not snap.SHA.fullmatch(doc.info.get('last_commit', '')):
         return False, 'document records no analyzed commit'
     if not _analysis_of(doc).strip():
         return False, 'document has no analysis'

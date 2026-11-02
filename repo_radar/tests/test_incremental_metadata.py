@@ -3,6 +3,7 @@
 Disposable Git repositories and a fake provider at the HTTP transport (sends) and at the Count Tokens
 client (counts). Sockets are blocked, keys are fake, nothing is paid for.
 """
+import base64
 import json
 import os
 import shutil
@@ -598,7 +599,12 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     # fails before any count or send; a forced rebuild doesn't get round it, nor does the pilot.
     record = f"{im.EXCLUSIONS_KEY}: {updated.info[im.EXCLUSIONS_KEY]}\n"
     missing = updated.text.replace(record, '')
+    # 40 hex digits plus a newline can never match the real blob, so it must not decode.
+    tampered = json.loads(base64.b64decode(updated.info[im.EXCLUSIONS_KEY]))
+    tampered['oids'] = [oid + '\n' for oid in tampered['oids']]
+    newline_oid = base64.b64encode(json.dumps(tampered, separators=(',', ':'), sort_keys=True).encode()).decode()
     for broken in (missing.encode(), updated.text.replace(record, f"{im.EXCLUSIONS_KEY}: e30=\n").encode(),
+                   updated.text.replace(record, f"{im.EXCLUSIONS_KEY}: {newline_oid}\n").encode(),
                    b'\xff' + updated.text.encode()):
         (pristine / 'app-abc1234.md').write_bytes(broken)
         provider.sends.clear(); provider.counts.clear()

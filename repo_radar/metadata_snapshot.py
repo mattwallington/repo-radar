@@ -30,7 +30,7 @@ MAX_SEARCH_OUTPUT = 4 * 1024 * 1024   # git grep output read for one search
 MAX_SEARCH_PATHS = 2000               # files named to git grep for one path_prefix
 MAX_SEARCH_ARG_BYTES = 64 * 1024      # encoded grep arguments for one search, leaving room for the rest
 REGULAR_MODES = frozenset({'100644', '100755'})
-SHA = re.compile(r'^[0-9a-f]{40}$')
+SHA = re.compile(r'[0-9a-f]{40}')   # use fullmatch: re.match with $ would also accept a trailing newline
 _GIT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'
 
 Entry = namedtuple('Entry', 'path mode type oid size')
@@ -99,14 +99,14 @@ def run_git(repo, args, limit):
 
 def resolve_commit(repo, rev):
     """The full commit ID for `rev` ('HEAD' or a 40-character commit ID), or None."""
-    if rev != 'HEAD' and not SHA.match(rev or ''):
+    if rev != 'HEAD' and not SHA.fullmatch(rev or ''):
         return None
     try:
         out = run_git(repo, ['rev-parse', '--verify', '--quiet', '--end-of-options', f'{rev}^{{commit}}'], 1024)
     except GitError:
         return None
     sha = out.decode().strip()
-    return sha if SHA.match(sha) else None
+    return sha if SHA.fullmatch(sha) else None
 
 
 def is_ancestor(repo, base, target):
@@ -232,7 +232,7 @@ def decode_exclusions(value):
     paths, oids = payload['paths'], payload['oids']
     if not isinstance(paths, list) or not all(_valid_path(p) for p in paths):
         raise ExclusionsError('paths must be relative path strings')
-    if not isinstance(oids, list) or not all(isinstance(o, str) and SHA.match(o) and o != EMPTY_BLOB for o in oids):
+    if not isinstance(oids, list) or not all(isinstance(o, str) and SHA.fullmatch(o) and o != EMPTY_BLOB for o in oids):
         raise ExclusionsError('oids must be full, non-empty blob IDs')
     if paths != sorted(set(paths)) or oids != sorted(set(oids)):
         raise ExclusionsError('paths and oids must be sorted and unique')
@@ -257,7 +257,7 @@ class GitSnapshot:
     """One pinned commit of a repository."""
 
     def __init__(self, repo_path, commit):
-        if not SHA.match(commit or ''):
+        if not SHA.fullmatch(commit or ''):
             raise ValueError(f"not a full commit ID: {commit!r}")
         self.repo = repo_path
         self.commit = commit
