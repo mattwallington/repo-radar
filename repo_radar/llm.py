@@ -218,6 +218,47 @@ class IncompleteResponseError(Exception):
     """A provider reply that must not be used as an analysis: no visible text, or cut off."""
 
 
+def is_transient_server_error(error):
+    """Recognize server failures without treating arbitrary numbers as HTTP statuses."""
+    if isinstance(error, IncompleteResponseError):
+        return False
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & {'APIConnectionError', 'AuthenticationError', 'PermissionDeniedError', 'BadRequestError',
+                'InvalidRequestError', 'NotFoundError', 'UnprocessableEntityError'}:
+        return False
+
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    response = getattr(error, 'response', None)
+    signals = [getattr(error, 'status_code', None), getattr(response, 'status_code', None),
+               getattr(error, 'status', None), getattr(error, 'code', None),
+               detail.get('code'), detail.get('status')]
+    statuses = [int(s) for s in signals if str(s).isdigit() and 100 <= int(s) <= 599]
+    if statuses:
+        return any(s in {500, 502, 503, 504, 529} for s in statuses) and not any(
+            400 <= s < 500 for s in statuses)
+    if 'ServiceUnavailableError' in names:
+        return True
+    if any(s in ('UNAVAILABLE', 'OVERLOADED') for s in signals):
+        return True
+
+    text = str(error)
+    # Some providers expose only a wrapped message. Exclude known client failures first.
+    if re.search(r'\b(?:AuthenticationError|PermissionDeniedError|BadRequestError|'
+                 r'InvalidRequestError|NotFoundError|UNAUTHENTICATED|PERMISSION_DENIED|'
+                 r'INVALID_ARGUMENT)\b', text, re.I):
+        return False
+    statuses = re.findall(
+        r'\b(?:HTTP(?:/\d(?:\.\d)?)?(?:\s+status)?|status(?:_code|\s+code)?|code)'
+        r'[\s\x27\":=]*(\d{3})\b', text, re.I)
+    if statuses:
+        return any(s in {'500', '502', '503', '504', '529'} for s in statuses) and not any(
+            400 <= int(s) < 500 for s in statuses)
+    return bool(re.search(r'\b(?:UNAVAILABLE|OVERLOADED)\b', text))
+
+
 # finish_reason values that mean the reply was cut off. litellm maps Anthropic's max_tokens stop to
 # "length", but it maps any stop reason it doesn't know to "stop", so the context-window stop would
 # read as a clean finish; _map_context_window_stop_as_truncation() maps that one to "length" too.
@@ -717,8 +758,12 @@ def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
         except Exception as e:
             error_str = str(e)
 
-            # Check if it's a rate limit error
-            if 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            transient = is_transient_server_error(e)
+            if transient and retry == max_retries - 1:
+                raise
+
+            # Keep the existing rate-limit policy and delay handling.
+            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                 if retry < max_retries - 1:
                     import time
                     import random
@@ -736,7 +781,8 @@ def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
                         except:
                             pass
 
-                    print(f"    {YELLOW}Rate limit, retrying in {wait_time:.1f}s{RESET}")
+                    reason = "Server unavailable" if transient else "Rate limit"
+                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
                     time.sleep(wait_time)
                     continue
                 else:
@@ -1272,7 +1318,11 @@ def _synthesize_once(full_name, analyses, model=None):
         except Exception as e:
             error_str = str(e)
 
-            if 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            transient = is_transient_server_error(e)
+            if transient and retry == max_retries - 1:
+                raise
+
+            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                 if retry < max_retries - 1:
                     import time
                     import random
@@ -1289,7 +1339,8 @@ def _synthesize_once(full_name, analyses, model=None):
                         except:
                             pass
 
-                    print(f"    {YELLOW}Rate limit, retrying in {wait_time:.1f}s{RESET}")
+                    reason = "Server unavailable" if transient else "Rate limit"
+                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
                     time.sleep(wait_time)
                     continue
                 else:

@@ -424,6 +424,163 @@ def test_rejected_reply_is_not_retried_as_a_rate_limit(monkeypatch, tmp_path, st
     assert (tmp_path / "repo.md").read_text() == previous         # previous metadata and commit kept
 
 
+@pytest.mark.parametrize("stage", ["single", "chunk", "synthesis", "helper_chunk", "helper_synthesis"])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, tmp_path, stage, exhausted):
+    """All five request boundaries retry the same payload; synthesis never replays a completed batch.
+    A 429 in the 503's diagnostic also exercises the outer combine catch's precedence."""
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    model = "gemini/gemini-3.8-flash"
+    monkeypatch.setenv("AI_MODEL", model)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
+    monkeypatch.setattr("random.uniform", lambda lo, hi: lo)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "single" if stage == "single" else "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **k: llm.PartitionResult([_files(1), _files(1)], None))
+    # Budgeting normally enumerates fallback models even without an error. Isolate that
+    # from the retry behavior below while keeping the real synthesis batching/send loop.
+    monkeypatch.setattr(llm, "_synthesis_budget", lambda *a, **k: 500_000)
+    # A real multi-batch combine: the first succeeds, the second fails, then a final reduction.
+    plans = iter([[["A0"], ["A1"]]])
+    monkeypatch.setattr(llm, "authoritative_synthesis_level",
+                        lambda s, n, analyses, m: next(plans, [analyses]))
+    ev, failed_payloads, completed, errors = [], [], [], []
+    failure = RuntimeError("Gemini HTTP 503 UNAVAILABLE (request 429)")
+    failure.status_code = 503
+    limit = 3 if stage.startswith("helper_") else 5
+
+    if stage == "single" and not exhausted:
+        from litellm import APIConnectionError
+        # Classification guards: only explicit server signals qualify, never a bare number,
+        # incomplete reply, or a known client rejection containing a misleading server code.
+        for status in (500, 502, 503, 504, 529, 400, 401, 403, 429):
+            err = RuntimeError("opaque")
+            err.status_code = status
+            assert llm.is_transient_server_error(err) == (status >= 500)
+        for text in ("HTTP 503", "status_code=502", '{"code": 504}', "UNAVAILABLE", "OVERLOADED"):
+            assert llm.is_transient_server_error(RuntimeError(text))
+        unavailable = type("ServiceUnavailableError", (Exception,), {})("opaque")
+        assert llm.is_transient_server_error(unavailable)
+        for err in (APIConnectionError(message="connection dropped", llm_provider="gemini", model=model),
+                    TimeoutError("timed out"), RuntimeError("processed 503 tokens"),
+                    RuntimeError("HTTP 401: UNAVAILABLE"),
+                    type("BadRequestError", (Exception,), {})("HTTP 503"),
+                    llm.IncompleteResponseError("HTTP 503")):
+            assert not llm.is_transient_server_error(err)
+
+    def send(m, prompt, max_tokens=8192):
+        failing = stage != "synthesis" or (max_tokens == 16384 and "A1" in prompt)
+        if stage == "chunk":
+            failing = max_tokens == 8192 and "(chunk 1/2)" in prompt
+        if failing:
+            failed_payloads.append((m, prompt, max_tokens))
+            ev.append("send")
+            if exhausted or len(failed_payloads) == 1:
+                raise failure
+        else:
+            completed.append((m, prompt, max_tokens))
+        # Distinct chunk results let the actual combine exercise more than one batch.
+        return f"A{len(completed) - 1}" if max_tokens == 8192 else "SUMMARY", 0.0, None
+
+    monkeypatch.setattr(sync, "call_llm", send)
+    monkeypatch.setattr(llm, "call_llm", send)
+    monkeypatch.setattr("time.sleep", lambda seconds: ev.append(seconds) if failed_payloads else None)
+    def fallback(m):
+        pytest.fail("transient failures must not request a fallback model")
+    monkeypatch.setattr(sync, "get_fallback_model", fallback)
+    monkeypatch.setattr(llm, "get_fallback_model", fallback)
+
+    class _Logger:
+        def event(self, *a, **kw): pass
+        def error(self, name, **kw): errors.append((name, kw))
+
+    if stage.startswith("helper_"):
+        def run():
+            if stage == "helper_chunk":
+                return llm.analyze_repo_chunk("o/r", _files(1), 1, 1)
+            return llm._synthesize_once("o/r", ["A"], model)
+        if exhausted:
+            with pytest.raises(RuntimeError) as raised:
+                run()
+            assert raised.value is failure
+        else:
+            run()
+    else:
+        ctx = _fake_ctx()._replace(sync_logger=_Logger())
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
+                                    _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
+        assert ctx.stats["errors"] == int(exhausted)
+        assert ctx.stats["metadata_generated"] == int(not exhausted)
+        if exhausted:
+            assert [(n, f["error_type"], f["detail"]) for n, f in errors] == [
+                ("metadata_failed", "RuntimeError", str(failure))]
+
+    attempts = limit if exhausted else 2
+    assert len(failed_payloads) == attempts
+    assert len(set(failed_payloads)) == 1 and failed_payloads[0][0] == model
+    base = 2 if stage.startswith("helper_") else 3
+    # Between failing sends are only the site's existing exponential backoff sleeps.
+    assert ev[:2 * attempts - 1] == [v for i in range(attempts)
+                                                   for v in (["send", base ** (i + 1)] if i < attempts - 1 else ["send"])]
+    if stage == "synthesis":
+        assert sum(ro == 8192 for _, _, ro in completed) == 2
+        assert sum(ro == 16384 and "A0" in p for _, p, ro in completed) == 1
+
+
+@pytest.mark.parametrize("stage", ["chunk", "synthesis", "single"])
+@pytest.mark.parametrize("fail_late", [True, False])
+def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stage, fail_late):
+    """Keep partial chunk/synthesis spend and a response's spend before local processing.
+    Successful controls use the same path and catch duplicate credits."""
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    monkeypatch.setenv("AI_MODEL", "claude-sonnet-5")
+    previous = "---\nlast_commit: oldcommit\n---\n\n# previous metadata\n"
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **kw: _files(2))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single" if stage == "single" else "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **kw: llm.PartitionResult([_files(1), _files(1)], None))
+    plans = iter([[["A0"], ["A1"]]])
+    monkeypatch.setattr(llm, "authoritative_synthesis_level",
+                        lambda s, n, analyses, m: next(plans, [analyses]))
+    completed, events = [], []
+    calls = 0
+
+    def send(model, prompt, max_tokens=8192):
+        nonlocal calls
+        calls += 1
+        fail_at = 2 if stage == "chunk" else 4  # second chunk or second synthesis batch
+        if fail_late and stage != "single" and calls == fail_at:
+            raise RuntimeError("later request failed")
+        cost = calls / 8  # exact binary fractions, with a nonzero subtotal before failure
+        completed.append(cost)
+        return f"A{calls - 1}" if max_tokens == 8192 else "SUMMARY", cost, None
+
+    monkeypatch.setattr(sync, "call_llm", send)
+    if stage == "single" and fail_late:
+        def local_failure(response):
+            raise ValueError("local rate tracker failed after the completed response")
+        monkeypatch.setattr(sync.rate_limit_tracker, "update_from_response", local_failure)
+
+    class _Logger:
+        def event(self, name, **kw): events.append((name, kw))
+        def error(self, name, **kw): events.append((name, kw))
+
+    ctx = _fake_ctx()._replace(sync_logger=_Logger())
+    ctx.stats["api_cost"] = 1.0  # previously completed repositories must remain accounted
+    result = sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
+                                        _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
+    subtotal = sum(completed)
+    assert subtotal > 0 and result == subtotal and ctx.stats["api_cost"] == 1.0 + subtotal
+    assert ctx.stats["errors"] == int(fail_late)
+    assert ctx.stats["metadata_generated"] == int(not fail_late)
+    if fail_late:
+        assert (tmp_path / "repo.md").read_text() == previous
+        assert [(n, f["cost"]) for n, f in events] == [("metadata_failed", f"${subtotal:.4f}")]
+    else:
+        assert _read_frontmatter(tmp_path)["last_commit"] == "newcommit"
+        assert [(n, f["cost"]) for n, f in events] == [("metadata_generated", f"${subtotal:.4f}")]
+
+
 @pytest.mark.parametrize("case", ["401", "400-credit", "503", "timeout"])
 def test_count_errors_fail_or_skip_through_the_real_preflight(monkeypatch, tmp_path, case):
     """The real PreflightSession counts each repo through Anthropic's Count Tokens handler, with only

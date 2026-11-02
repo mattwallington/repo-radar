@@ -418,41 +418,55 @@ test('legacyItems never throws: absent home, absent log dir, garbage input', () 
 // -------------------------------------------------------------------------------------------
 // 8. read.js integration (Ruling P5-2)
 // -------------------------------------------------------------------------------------------
-test('listActivities merges legacy items with durable activities, newest-first', () => {
-  const home = tmpHome();
-  try {
-    const aidOld = '00000000-0000-4000-8000-00000000000a';
-    const aidNew = '00000000-0000-4000-8000-00000000000b';
-    seedActivity(home, aidOld, [
-      startRec(aidOld, 0, '2026-08-13T00:00:00-07:00'),
-      terminalRec(aidOld, 1, '2026-08-13T00:05:00-07:00', 'succeeded'),
-    ]);
-    seedActivity(home, aidNew, [
-      startRec(aidNew, 0, '2026-08-16T00:00:00-07:00'),
-      terminalRec(aidNew, 1, '2026-08-16T00:05:00-07:00', 'succeeded'),
-    ]);
-    // Between the two durable activities in wall-clock order.
-    seedLog(home, 'sync-2026-08-14T09-31-05.log', SAMPLE);
-    // Older than both.
-    seedLog(home, 'sync-2026-08-10T09-31-05.log', '[09:31:05] repos_loaded count=1\n');
+test('listActivities shows only legacy logs older than the first durable sync', () => {
+  const savedCap = limits.LEGACY_MAX_FILES;
+  for (const secondsAfter of [3, 0]) {
+    const home = tmpHome();
+    try {
+      limits.LEGACY_MAX_FILES = 1;
+      const aidOld = '00000000-0000-4000-8000-00000000000a';
+      const aidNew = '00000000-0000-4000-8000-00000000000b';
+      // Match filename-local time while storing an offset timestamp: comparisons must use
+      // instants, and the fractional durable start must exclude a log in that same second.
+      const started = new Date(2026, 7, 13, 9, 31, 5, 750);
+      const offsetStamp = (d) => {
+        const offset = -d.getTimezoneOffset();
+        const sign = offset >= 0 ? '+' : '-';
+        const hh = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+        const mm = String(Math.abs(offset) % 60).padStart(2, '0');
+        return `2026-08-13T09:31:05.750${sign}${hh}:${mm}`;
+      };
+      seedActivity(home, aidOld, [
+        { ...startRec(aidOld, 0, offsetStamp(started)), channel: 'dev' },
+        terminalRec(aidOld, 1, new Date(started.getTime() + 60_000).toISOString().replace('Z', '+00:00'), 'succeeded'),
+      ]);
+      seedActivity(home, aidNew, [
+        startRec(aidNew, 0, '2026-08-16T00:00:00-07:00'),
+        terminalRec(aidNew, 1, '2026-08-16T00:05:00-07:00', 'succeeded'),
+      ]);
+      const modern = `sync-2026-08-13T09-31-${String(5 + secondsAfter).padStart(2, '0')}.log`;
+      seedLog(home, modern, SAMPLE);
+      seedLog(home, 'sync-2026-08-14T09-31-05.log', SAMPLE);
+      const older = seedLog(home, 'sync-2026-08-10T09-31-05.log', SAMPLE);
 
-    const result = read.listActivities(home);
-    assert.strictEqual(result.available, true);
-    assert.strictEqual(result.incomplete, false, 'legacy items never make the RESPONSE incomplete');
-    assert.strictEqual(result.truncated, false);
-    assert.deepStrictEqual(result.items.map((i) => i.id), [
-      aidNew,
-      'legacy:sync-2026-08-14T09:31:05',
-      aidOld,
-      'legacy:sync-2026-08-10T09:31:05',
-    ]);
-    // The durable summaries are unchanged in shape (no `legacy` key at all).
-    assert.strictEqual('legacy' in result.items[0], false);
-    // The legacy item still carries its whole self -- the renderer never calls back for it.
-    assert.strictEqual(result.items[1].legacy, true);
-    assert.ok(result.items[1].excerpt.includes('clone_failed'));
-  } finally {
-    cleanup(home);
+      const result = read.listActivities(home);
+      assert.strictEqual(result.available, true);
+      assert.strictEqual(result.incomplete, false);
+      assert.strictEqual(result.truncated, false, 'excluded modern logs do not count toward the cap');
+      assert.deepStrictEqual(result.items.map((i) => i.id), [
+        aidNew, aidOld, 'legacy:sync-2026-08-10T09:31:05',
+      ]);
+      assert.strictEqual('legacy' in result.items[0], false);
+      assert.strictEqual(result.items[2].legacy, true);
+      assert.ok(result.items[2].excerpt.includes('clone_failed'));
+      // The boundary comes from ALL channels and the full scan, before list pagination.
+      assert.deepStrictEqual(read.listActivities(home, { offset: 2, limit: 1 }).items.map((i) => i.id),
+        ['legacy:sync-2026-08-10T09:31:05']);
+      assert.ok(fs.existsSync(older) && fs.existsSync(path.join(logDir(home), modern)), 'logs stay on disk');
+    } finally {
+      limits.LEGACY_MAX_FILES = savedCap;
+      cleanup(home);
+    }
   }
 });
 

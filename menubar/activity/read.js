@@ -627,8 +627,8 @@ function _buildItem(home, aid, filter, redactor) {
   const rawEvents = [];
   for (const r of merged) {
     if (r.type !== 'event') continue;
-    if (r.level === 'error') errorCount += 1;
-    else if (r.level === 'warn') warnCount += 1;
+    if (r.level === 'error' && r.event !== 'sync_complete') errorCount += 1;
+    else if (r.level === 'warn' && r.event !== 'sync_complete') warnCount += 1;
     rawEvents.push(r);
   }
 
@@ -748,23 +748,23 @@ function _sortKey(entry) {
 //     and not included (see `_appendSystemSection`), so the two views can never be compared and
 //     read as "the logs are gone".
 function _collectItems(home, filter, redactor, opts = {}) {
-  // Built first so the store-state early returns below can still carry them. Each is already a
-  // complete summary DTO (redacted and bounded by legacy.js), so it is wrapped as an entry with
-  // `mtime: 0` -- `_sortKey` reads its `startedAt`, which a legacy item always has.
-  // Ruling P5-5: the DETAILED form, so `legacyOmitted` can carry what legacy.js's own
-  // LEGACY_MAX_FILES cap dropped. Without it the cap is invisible: `truncated` below is derived
-  // from the merged array, which the cap has already shortened, so 26 valid logs reported
-  // `{ items: 25, truncated: false }`.
-  const legacyDetailed = opts.legacy
-    ? legacyMod.legacyItemsDetailed(home, { configuredSecrets: opts.configuredSecrets || [] })
-    : { items: [], omitted: 0 };
-  const legacyOmitted = legacyDetailed.omitted;
-  const legacyEntries = legacyDetailed.items.map((item) => ({ item, mtime: 0 }));
+  // Enumerate after the durable scan so modern text logs cannot duplicate Activity rows.
+  // With no valid durable sync start, keep the legacy-only history fallback.
+  const collectLegacy = (before) => {
+    const detailed = opts.legacy
+      ? legacyMod.legacyItemsDetailed(home, { configuredSecrets: opts.configuredSecrets || [], before })
+      : { items: [], omitted: 0 };
+    return {
+      legacyEntries: detailed.items.map((item) => ({ item, mtime: 0 })),
+      legacyOmitted: detailed.omitted,
+    };
+  };
   const sorted = (entries) => entries.slice().sort((a, b) => _sortKey(b) - _sortKey(a)).map((e) => e.item);
 
   const base = _activityRoot(home);
   const state = _probeRoot(base);
   if (state === 'missing') {
+    const { legacyEntries, legacyOmitted } = collectLegacy();
     return { items: sorted(legacyEntries), available: true, incomplete: false, problems: [], legacyOmitted };
   }
   if (state === 'unreadable') return { items: [], available: false, incomplete: false, problems: [], legacyOmitted: 0 };
@@ -787,12 +787,18 @@ function _collectItems(home, filter, redactor, opts = {}) {
 
   let incomplete = problems.length > 0;
   const entries = [];
+  let before = null;
   for (const aid of aids) {
     const built = _safeBuildItem(home, aid, filter, redactor);
     if (built === null) continue; // reserve-before-start: not history yet
     entries.push(built);
     if (built.item.incomplete) incomplete = true;
+    const started = Date.parse(built.item.startedAt);
+    if (built.item.kind === 'sync' && Number.isFinite(started)) {
+      before = before === null ? started : Math.min(before, started);
+    }
   }
+  const { legacyEntries, legacyOmitted } = collectLegacy(before);
   // AFTER the `incomplete` accumulation above, deliberately: a truncated or refused legacy log
   // marks its OWN item incomplete and must never make the response say the durable store is.
   return {

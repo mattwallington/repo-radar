@@ -28,7 +28,7 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
     _build_analysis_prompt, _build_full_repo_prompt,
     authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
-    InputBudgetUnavailable, IncompleteResponseError)
+    InputBudgetUnavailable, IncompleteResponseError, is_transient_server_error)
 from repo_radar.preflight import PreflightSession
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
@@ -305,6 +305,7 @@ def generate_repo_metadata(task_data, session, args, ctx):
             'color': color
         }, args.status_server)
 
+    total_api_cost = 0.0
     try:
         # Custom metadata generation with progress updates
         if args.dry_run:
@@ -380,8 +381,6 @@ def generate_repo_metadata(task_data, session, args, ctx):
         budget_note = f" / {decision_value:,} {budget_label}" if decision_value != total_tokens else ""
         ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
 
-        total_api_cost = 0.0
-
         def _finish_degraded(reason):
             """Persist ONE degraded metadata record and stop. Recording the CURRENT commit
             stops the repo being retried forever; parse_status=degraded keeps it visible in
@@ -424,7 +423,6 @@ _Metadata generation degraded before completion: {reason}_
             with ctx.stats_lock:
                 ctx.stats['metadata_generated'] += 1
                 ctx.stats['degraded'] = ctx.stats.get('degraded', 0) + 1
-                ctx.stats['api_cost'] += total_api_cost
             if ctx.sync_logger:
                 ctx.sync_logger.event("metadata_degraded",
                                       level=_activity_level("metadata_degraded", is_degraded=True),
@@ -496,6 +494,7 @@ _Metadata generation degraded before completion: {reason}_
                         analysis, api_cost, response = call_llm(
                             current_model, prompt, max_tokens=8192
                         )
+                        total_api_cost += api_cost
 
                         # Update rate limit tracker
                         rate_limit_tracker.update_from_response(response)
@@ -506,7 +505,6 @@ _Metadata generation degraded before completion: {reason}_
                             ctx.console.print(f"    [dim]{rate_status}[/dim]")
 
                         chunk_analyses.append(analysis)
-                        total_api_cost += api_cost
 
                         # Success! Break out of retry loop
                         break
@@ -526,6 +524,14 @@ _Metadata generation degraded before completion: {reason}_
                         ctx.console.print(f"[red]Error Module: {type(e).__module__}[/red]")
                         ctx.console.print(f"[red]Error: {error_str[:300]}[/red]")
                         ctx.console.print(f"[bold red]╚══════════════════════════════════════╝[/bold red]\n")
+
+                        if is_transient_server_error(e):
+                            if retry == max_retries - 1:
+                                raise
+                            wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                            ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                            time.sleep(wait_time)
+                            continue
 
                         # Check if it's a rate limit error
                         is_rate_limit = (
@@ -594,17 +600,25 @@ _Metadata generation degraded before completion: {reason}_
                     returns the model actually used so the caller can re-budget when a
                     fallback has a smaller context window.
                     """
-                    nonlocal current_model_combine
+                    nonlocal current_model_combine, total_api_cost
                     for attempt in range(max_retries):
                         try:
                             text, cost, resp = call_llm(
                                 current_model_combine, prompt, max_tokens=16384
                             )
+                            total_api_cost += cost
                             rate_limit_tracker.update_from_response(resp)
                             return text, cost, current_model_combine
                         except IncompleteResponseError:
                             raise  # a rejected reply, not a rate limit: no retry or fallback
                         except Exception as exc:
+                            if is_transient_server_error(exc):
+                                if attempt == max_retries - 1:
+                                    raise
+                                wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
+                                ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                                time.sleep(wait_time)
+                                continue
                             err = str(exc)
                             is_rl = (type(exc).__name__ == 'RateLimitError'
                                      or '429' in err or 'RESOURCE_EXHAUSTED' in err)
@@ -633,7 +647,7 @@ _Metadata generation degraded before completion: {reason}_
                         #   prompt is too long: 1189532 tokens > 1000000 maximum
                         # on large repositories. Batching happens inside; this call
                         # may perform several LLM requests and returns their total cost.
-                        analysis, combine_cost = combine_chunk_analyses(
+                        analysis, _ = combine_chunk_analyses(
                             full_name, chunk_analyses,
                             model=current_model_combine,
                             synthesize=_synthesize_bounded,
@@ -648,6 +662,9 @@ _Metadata generation degraded before completion: {reason}_
                     except Exception as e:
                         error_str = str(e)
                         error_type = type(e).__name__
+
+                        if is_transient_server_error(e):
+                            raise  # the request-level budget is exhausted; do not replay batches
 
                         is_rate_limit = (
                             error_type == 'RateLimitError' or
@@ -675,13 +692,12 @@ _Metadata generation degraded before completion: {reason}_
                                 raise Exception(f"Rate limit exceeded on combine after {max_retries} retries")
                         else:
                             raise
-                total_api_cost += combine_cost
                 # The combine step may have fallen back to a different model than the
                 # one chunking used; this is the model that actually produced `analysis`.
                 analysis_model = current_model_combine
                 if isinstance(analysis, DegradedSynthesis):
                     # Seam (d2): the per-chunk analysis sends already happened and their cost
-                    # is already in total_api_cost (plus combine_cost); synthesis could not be
+                    # is already in total_api_cost, including completed synthesis calls; it could not be
                     # reduced to fit, so make NO final synthesis send and persist a degraded
                     # record at the current commit.
                     _finish_degraded(analysis.reason)
@@ -713,6 +729,7 @@ _Metadata generation degraded before completion: {reason}_
                     analysis, single_cost, response = call_llm(
                         current_model, prompt, max_tokens=16384
                     )
+                    total_api_cost += single_cost
                     analysis_model = current_model  # may be a fallback after a retry
 
                     # Update rate limit tracker
@@ -733,8 +750,6 @@ _Metadata generation degraded before completion: {reason}_
                             'limit_tokens': rate_limit_tracker.limits.get('tokens')
                         }, args.status_server)
 
-                    total_api_cost = single_cost
-
                     # Success! Break out of retry loop
                     break
 
@@ -750,6 +765,14 @@ _Metadata generation degraded before completion: {reason}_
                     ctx.console.print(f"[red]Model: {current_model}[/red]")
                     ctx.console.print(f"[red]Type: {error_type}[/red]")
                     ctx.console.print(f"[red]Message: {error_str[:300]}[/red]")
+
+                    if is_transient_server_error(e):
+                        if retry == max_retries - 1:
+                            raise
+                        wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
+                        ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
+                        time.sleep(wait_time)
+                        continue
 
                     is_rate_limit = (
                         error_type == 'RateLimitError' or
@@ -894,7 +917,6 @@ parse_status: {parse_status}
 
         with ctx.stats_lock:
             ctx.stats['metadata_generated'] += 1
-            ctx.stats['api_cost'] += total_api_cost
 
         if ctx.sync_logger:
             ctx.sync_logger.event(
@@ -922,8 +944,8 @@ parse_status: {parse_status}
         if ctx.sync_logger:
             ctx.sync_logger.event("metadata_skipped",
                                   level=_activity_level("metadata_skipped", is_degraded=True),
-                                  repo=full_name, reason=str(e))
-        return 0.0
+                                  repo=full_name, reason=str(e), cost=f"${total_api_cost:.4f}")
+        return total_api_cost
 
     except Exception as e:
         import traceback
@@ -1042,9 +1064,14 @@ Stack Trace:
                 repo=full_name,
                 error_type=error_type,
                 detail=full_error,
+                cost=f"${total_api_cost:.4f}",
             )
 
-        return 0.0
+        return total_api_cost
+    finally:
+        # Completed calls count even when later requests or local processing fail.
+        with ctx.stats_lock:
+            ctx.stats['api_cost'] += total_api_cost
 
 
 def sync_mode(args):
