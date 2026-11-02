@@ -301,3 +301,125 @@ class PreflightSession:
         if isinstance(out, _Fatal):
             raise out.exc
         return out
+
+    # ---- complete requests (incremental metadata) -----------------------------------------------
+
+    async def _guarded_request(self, request):
+        model = request["model"]
+        async with self._lock:
+            caps = get_caps(model)
+            if caps is None or caps.count_strategy != "anthropic_api":
+                return _local_request_count(request)
+            if model in self._downgraded:
+                return self._downgraded[model]
+            key = ("request", hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"),
+                                                        default=str).encode()).hexdigest())
+            if key in self._memo:
+                return self._memo[key]
+            out = await _count_request_once(request, self._timeout)
+            if isinstance(out, _Fatal):
+                return out
+            if out.authoritative:
+                self._memo[key] = out
+            else:
+                self._downgraded[model] = out
+                if model not in self._logged:
+                    self._logged.add(model)
+                    logger.warning("preflight: authoritative token count unavailable for %s (%s); "
+                                   "its metadata is skipped for the rest of this sync", model, out.reason)
+            return out
+
+    def count_request(self, request):
+        """Count a complete canonical request (llm.Conversation.request()): instructions, messages,
+        tool definitions, earlier replies and tool results, and reasoning items.
+
+        For Anthropic models the count is authoritative or nothing: the request is transformed exactly
+        as the send transforms it and counted by Anthropic's Count Tokens API directly, never by a
+        local fallback. Unavailability opens this model's breaker as count() does, and a rejected
+        count raises TokenCountRejected. Other providers get litellm's local count of the whole
+        envelope plus a conservative framing allowance (authoritative=False, tokens set).
+        """
+        out = self._loop.submit(self._guarded_request(request))
+        if isinstance(out, _Fatal):
+            raise out.exc
+        return out
+
+
+def anthropic_count_body(request):
+    """The Count Tokens request for a chat request to an Anthropic model, built with the same litellm
+    transformation the send uses, so tools, system blocks, thinking blocks and tool results match."""
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+    from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+
+    model = request["model"]
+    resolved, _provider, _key, _base = get_llm_provider(model=model)
+    config = AnthropicConfig()
+    openai_params = {k: request[k] for k in ("tools", "max_tokens") if k in request}
+    optional = config.map_openai_params(non_default_params=openai_params, optional_params={},
+                                        model=resolved, drop_params=False)
+    body = config.transform_request(model=resolved, messages=json.loads(json.dumps(request["messages"])),
+                                    optional_params=optional, litellm_params={}, headers={})
+    options = {k: body[k] for k in ("thinking", "tool_choice") if k in body}
+    if "output_config" in request:
+        options["output_config"] = request["output_config"]
+    return resolved, body["messages"], body.get("system"), body.get("tools"), options
+
+
+async def _anthropic_count_request(request):
+    from litellm.llms.anthropic.count_tokens.token_counter import anthropic_count_tokens_handler
+
+    model = request["model"]
+    if request.get("endpoint") != "chat":
+        raise TokenCountRejected(model, 400, "Anthropic models are counted on the chat endpoint only")
+    resolved, messages, system, tools, options = anthropic_count_body(request)
+    from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
+    _r, _p, dynamic_key, _b = get_llm_provider(model=model)
+    api_key = dynamic_key or litellm.anthropic_key or litellm.api_key or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise TokenCountRejected(model, 401, "no Anthropic API key is set")
+    result = await anthropic_count_tokens_handler.handle_count_tokens_request(
+        model=resolved, messages=messages, api_key=api_key, tools=tools, system=system, optional_params=options)
+    return types.SimpleNamespace(total_tokens=result.get("input_tokens"), tokenizer_type="anthropic_api",
+                                 error=False, request_model=model, model_used=resolved)
+
+
+async def _count_request_once(request, timeout_s):
+    """_count_once for a complete request: the same transient/rejected/fatal rules."""
+    from litellm.llms.anthropic.common_utils import AnthropicError
+    model = request["model"]
+    try:
+        resp = await asyncio.wait_for(_anthropic_count_request(request), timeout_s)
+    except (KeyboardInterrupt, SystemExit) as e:
+        return _Fatal(e)
+    except TokenCountRejected:
+        raise
+    except AnthropicError as e:
+        status = getattr(e, "status_code", None)
+        if not _is_transient_status(status):
+            raise TokenCountRejected(model, status, _REJECTED_CATEGORIES.get(
+                status, "request rejected; check the model and the Anthropic account")) from None
+        return PreflightResult(None, False, f"AnthropicError (HTTP {status})")
+    except Exception as e:
+        return PreflightResult(None, False, type(e).__name__)
+    if _is_authoritative(resp, model):
+        return PreflightResult(resp.total_tokens, True)
+    return PreflightResult(None, False, "invalid token count")
+
+
+# Local counts are estimates: allow 10% plus fixed framing per request and per message/item.
+_LOCAL_FACTOR = 1.10
+_LOCAL_REQUEST_FRAMING = 1024
+_LOCAL_ITEM_FRAMING = 16
+
+
+def _local_request_count(request):
+    model = request["model"]
+    payload = {k: request.get(k) for k in ("instructions", "messages", "input", "tools") if k in request}
+    text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    try:
+        raw = litellm.token_counter(model=model, text=text)
+    except Exception:
+        raw = int(len(text) / 3.0)
+    items = len(request.get("messages") or request.get("input") or [])
+    tokens = int(raw * _LOCAL_FACTOR) + _LOCAL_REQUEST_FRAMING + _LOCAL_ITEM_FRAMING * items
+    return PreflightResult(tokens, False, "local estimate")

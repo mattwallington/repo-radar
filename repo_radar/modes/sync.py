@@ -16,6 +16,8 @@ import threading
 from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
+from repo_radar.config import incremental_metadata_repos
+from repo_radar import incremental_metadata
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
                                  read_receipt, resolve_channel, resolve_trigger,
@@ -37,6 +39,7 @@ from repo_radar.metadata import (
     PARSE_STATUS_OK,
     degradation_reasons,
     parse_llm_response,
+    read_attempt_state,
     regenerate_index,
     save_degraded_response,
 )
@@ -281,10 +284,146 @@ def _activity_terminal(writer, outcome, **summary):
 SyncContext = namedtuple("SyncContext", "meta_progress meta_tasks stats stats_lock sync_logger console")
 
 
+def _incremental_status(args, full_name, short_id, status, percent, color):
+    if hasattr(args, 'status_server') and args.status_server:
+        send_status_update('progress', {'repo': full_name, 'short_name': short_id, 'status': status,
+                                        'percent': percent, 'color': color}, args.status_server)
+
+
+def _dry_run_decision(repo_path, cache_name, full_name, args):
+    """What an opted-in repository's metadata would get, from its current checkout: read-only Git,
+    no token counts, model calls or state writes."""
+    try:
+        target = incremental_metadata.snap.resolve_commit(repo_path, 'HEAD')
+        if target is None:
+            return 'full rebuild (no commit yet)'
+        decision = incremental_metadata.decide(
+            repo_path, full_name, incremental_metadata.load_document(PRISTINE_DIR, cache_name),
+            read_attempt_state(PRISTINE_DIR, cache_name), get_ai_model(), target, datetime.now(),
+            force=bool(getattr(args, 'regenerate_metadata', False)))
+        return {'none': 'no update needed', 'incremental': 'incremental update',
+                'full': 'full rebuild'}[decision.strategy] + f" ({decision.reason})"
+    except Exception as e:
+        return f"undetermined ({type(e).__name__})"
+
+
+def _generate_incremental(task_data, session, args, ctx):
+    """Metadata for a repository opted in to incremental updates (config incremental_metadata_repos).
+
+    The incremental module decides between nothing, an update from the document's analyzed commit and
+    a full rebuild, and never replaces a good document with a failed attempt. This reports the outcome
+    truthfully: an update that failed or was skipped is never shown as success.
+    """
+    repo_config, cache_name, _commit_hash, short_id, color, _ = task_data
+    full_name = repo_config['full_name']
+    task_id, task_color = ctx.meta_tasks[full_name]
+    model = get_ai_model()
+    env_key = {'gemini': 'GEMINI_API_KEY', 'anthropic': 'ANTHROPIC_API_KEY',
+               'openai': 'OPENAI_API_KEY'}.get(provider_for_model(model))
+    ctx.meta_progress.update(task_id, completed=10, status=f"[{task_color}]checking for changes...[/{task_color}]")
+    _incremental_status(args, full_name, short_id, '🔎 checking metadata...', 10, color)
+    try:
+        outcome = incremental_metadata.update_repository(
+            PRISTINE_DIR, PRISTINE_DIR / cache_name, cache_name, repo_config, model, session,
+            force=bool(getattr(args, 'regenerate_metadata', False)),
+            log=lambda m: ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{m}[/{task_color}]"),
+            missing_credential=env_key if env_key and not os.getenv(env_key) else None)
+    except Exception as e:
+        outcome = _escaped_incremental_outcome(cache_name, full_name, e)
+    return _report_incremental(task_data, outcome, model, args, ctx)
+
+
+def _escaped_incremental_outcome(cache_name, full_name, error):
+    reason = incremental_metadata.safe_reason(f"{type(error).__name__}: {error}")
+    state_error = incremental_metadata.record_failure(PRISTINE_DIR, cache_name, full_name, reason, phase='worker')
+    return incremental_metadata.Outcome('failed', None, reason, None, None, {}, 0.0, state_error)
+
+
+def _report_incremental(task_data, outcome, model, args, ctx):
+    """Progress, Activity and stats for one opted-in repository's outcome, at most once per run."""
+    repo_config, _cache_name, _commit_hash, short_id, color, _ = task_data
+    full_name = repo_config['full_name']
+    reported = getattr(args, '_incremental_reported', None)
+    if reported is not None:
+        if full_name in reported:
+            return 0.0
+        reported.add(full_name)
+    task_id, task_color = ctx.meta_tasks[full_name]
+    usage = outcome.usage or {}
+    cost = usage.get('known_cost_usd') or 0.0
+    unknown_calls = usage.get('unknown_cost_calls') or 0
+    cost_text = f"${cost:.4f}" if not unknown_calls else f"cost unknown (known subtotal ${cost:.4f})"
+    label = 'updated' if outcome.strategy == 'incremental' else 'rebuilt'
+    note = f"; {outcome.state_error}" if outcome.state_error else ''
+    if outcome.status == 'none':
+        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ metadata current[/{task_color}]")
+        _incremental_status(args, full_name, short_id, '✓ metadata current', 100, color)
+    elif outcome.status == 'published':
+        tone = task_color if not outcome.state_error else 'yellow'
+        ctx.meta_progress.update(task_id, completed=100, status=f"[{tone}]✓ metadata {label} ({cost_text}){note}[/{tone}]")
+        _incremental_status(args, full_name, short_id, f'✓ metadata {label} ({cost_text}){note}', 100,
+                            color if not outcome.state_error else 'yellow')
+        with ctx.stats_lock:
+            ctx.stats['metadata_generated'] += 1
+    else:
+        warning = outcome.status == 'skipped'
+        tone = 'yellow' if warning else 'red'
+        mark = '⚠' if warning else '✗'
+        # Only claim INDEX shows the staleness when the attempt was actually recorded.
+        kept = ('previous metadata kept, marked stale in INDEX' if not outcome.state_error
+                else 'previous metadata kept, but the staleness could not be recorded')
+        ctx.meta_progress.update(task_id, completed=100,
+                                 status=f"[{tone}]{mark} metadata {outcome.status}: {outcome.reason}{note}[/{tone}]")
+        _incremental_status(args, full_name, short_id, f'{mark} metadata update {outcome.status}; {kept}', 100, tone)
+        if not warning and hasattr(args, 'status_server') and args.status_server:
+            send_status_update('error', {'repo': full_name, 'message': f'Metadata update failed: {outcome.reason}'[:120],
+                                         'fullError': f"Metadata update failed for {full_name}\n"
+                                                      f"Strategy: {outcome.strategy or 'not decided'}\n"
+                                                      f"Reason: {outcome.reason}\n"
+                                                      f"{kept[0].upper() + kept[1:]}"
+                                                      f"{(': ' + outcome.state_error) if outcome.state_error else ''}."},
+                               args.status_server)
+        with ctx.stats_lock:
+            ctx.stats['skipped' if warning else 'errors'] = ctx.stats.get('skipped' if warning else 'errors', 0) + 1
+    with ctx.stats_lock:
+        ctx.stats['api_cost'] += cost
+        ctx.stats['unknown_cost_calls'] = ctx.stats.get('unknown_cost_calls', 0) + unknown_calls
+    if ctx.sync_logger:
+        level = 'info' if outcome.status in ('none', 'published') else ('warn' if outcome.status == 'skipped' else 'error')
+        if outcome.state_error and level == 'info':
+            level = 'warn'
+        ctx.sync_logger.event(
+            "metadata_incremental", level=level, repo=full_name, status=outcome.status, strategy=outcome.strategy,
+            reason=outcome.reason, state_error=outcome.state_error, base=(outcome.base or '')[:12],
+            target=(outcome.target or '')[:12], model=model,
+            calls=usage.get('calls', 0), input_tokens=usage.get('input_tokens', 0),
+            output_tokens=usage.get('output_tokens', 0), cost=cost_text,
+            unknown_cost_calls=usage.get('unknown_cost_calls', 0), changed_files=usage.get('changed_files'),
+            changed_bytes=usage.get('changed_bytes'), read_bytes=usage.get('read_bytes'),
+            elapsed=f"{outcome.elapsed:.1f}s")
+    return cost
+
+
+def _record_incremental_git_failure(args, full_name, cache_name, step, sync_logger):
+    """An opted-in repository's Git step failed before metadata: record the attempt so INDEX shows its
+    metadata stale or unavailable. Errors were already counted by the Git step."""
+    if (full_name not in getattr(args, '_incremental_repos', ()) or args.dry_run or args.skip_metadata
+            or getattr(args, 'repos_only', False)):
+        return
+    state_error = incremental_metadata.record_failure(
+        PRISTINE_DIR, cache_name, full_name, f"{step} failed, so metadata was not updated", phase='git')
+    args._incremental_index_due = True
+    if state_error and sync_logger:
+        sync_logger.event("metadata_incremental", level='error', repo=full_name, status='failed',
+                          reason=f"{step} failed", state_error=state_error)
+
+
 def generate_repo_metadata(task_data, session, args, ctx):
     """Generate metadata for a single repo with progress updates."""
     repo_config, cache_name, commit_hash, short_id, color, _ = task_data
     full_name = repo_config['full_name']
+    if full_name in getattr(args, '_incremental_repos', ()):
+        return _generate_incremental(task_data, session, args, ctx)
     repo_path = PRISTINE_DIR / cache_name
 
     task_id, task_color = ctx.meta_tasks[full_name]
@@ -1301,6 +1440,25 @@ def sync_mode(args):
         _terminal('blocked', reason='no_configuration')
         return 1
 
+    # Opt-in to incremental metadata. Read on every run, because an opted-in repository must keep off
+    # the full generator even under --repos-only. A malformed list is a configuration error whenever
+    # metadata is enabled; with metadata off nothing uses it.
+    try:
+        args._incremental_repos = incremental_metadata_repos(config)
+    except ValueError as e:
+        if metadata_capable:
+            console.print(f"[red]{e}[/red]")
+            if sync_logger:
+                sync_logger.event("sync_aborted", level=_activity_level("sync_aborted", is_exhausted=True),
+                                  reason="invalid_incremental_metadata_repos")
+                sync_logger.close()
+            _terminal('blocked', reason='invalid_incremental_metadata_repos')
+            return 1
+        args._incremental_repos = frozenset()
+    incremental_repos = args._incremental_repos
+    args._incremental_reported = set()
+    args._incremental_index_due = False
+
     repos = config.get('repositories', [])
     # This run's repositories, so the app can lay out its rows even if it opened the window late
     # or missed the start. Display names and row colors only; nothing else from the config (clone
@@ -1426,7 +1584,10 @@ def sync_mode(args):
                 if args.dry_run:
                     progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would clone[/dim]")
                     time.sleep(0.1)  # Simulate work
-                    progress.update(task_id, completed=100, status=f"[{color}]✓ cloned (dry run)[/{color}]")
+                    note = ''
+                    if full_name in incremental_repos and not args.skip_metadata and not getattr(args, 'repos_only', False):
+                        note = '; metadata: full rebuild (new repository)'
+                    progress.update(task_id, completed=100, status=f"[{color}]✓ cloned (dry run){note}[/{color}]")
                     return (True, 'cloned', cache_name, None, False, short_id, color)
 
                 result = run_git_command(['git', 'clone', clone_url, str(repo_path)], check=False)
@@ -1446,6 +1607,7 @@ def sync_mode(args):
                             'percent': 100,
                             'color': color
                         }, args.status_server)
+                    _record_incremental_git_failure(args, full_name, cache_name, 'clone', sync_logger)
                     with stats_lock:
                         stats['errors'] += 1
                     return (False, 'error', cache_name, None, False, short_id, color)
@@ -1479,6 +1641,8 @@ def sync_mode(args):
                 commit_hash = result.stdout.strip() if result.returncode == 0 else None
 
                 needs_metadata = commit_hash and not args.skip_metadata
+                if full_name in incremental_repos and getattr(args, 'repos_only', False):
+                    needs_metadata = False
 
                 # If metadata is needed, show as 90% with waiting status
                 if needs_metadata:
@@ -1531,7 +1695,10 @@ def sync_mode(args):
                 if args.dry_run:
                     progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would update[/dim]")
                     time.sleep(0.1)  # Simulate work
-                    progress.update(task_id, completed=100, status=f"[{color}]✓ updated (dry run)[/{color}]")
+                    note = ''
+                    if full_name in incremental_repos and not args.skip_metadata and not getattr(args, 'repos_only', False):
+                        note = f"; metadata: {_dry_run_decision(repo_path, cache_name, full_name, args)}"
+                    progress.update(task_id, completed=100, status=f"[{color}]✓ updated (dry run){note}[/{color}]")
                     return (True, 'updated', cache_name, None, False, short_id, color)
 
                 # Get current commit before update
@@ -1584,6 +1751,7 @@ def sync_mode(args):
                             'percent': 100,
                             'color': color
                         }, args.status_server)
+                    _record_incremental_git_failure(args, full_name, cache_name, 'fetch', sync_logger)
                     with stats_lock:
                         stats['errors'] += 1
                     return (False, 'error', cache_name, old_commit, False, short_id, color)
@@ -1618,6 +1786,7 @@ def sync_mode(args):
                                 'percent': 100,
                                 'color': color
                             }, args.status_server)
+                        _record_incremental_git_failure(args, full_name, cache_name, 'pull', sync_logger)
                         with stats_lock:
                             stats['errors'] += 1
                         return (False, 'error', cache_name, old_commit, False, short_id, color)
@@ -1628,7 +1797,11 @@ def sync_mode(args):
 
                 # Check if metadata needs regeneration
                 needs_metadata = False
-                if new_commit and not args.skip_metadata:
+                if full_name in incremental_repos:
+                    # Due work (a weekly rebuild, an unfinished attempt) can exist on an unchanged HEAD,
+                    # so opted-in repositories are always evaluated; the decision may be "nothing".
+                    needs_metadata = bool(new_commit) and not args.skip_metadata and not getattr(args, 'repos_only', False)
+                elif new_commit and not args.skip_metadata:
                     metadata_file = PRISTINE_DIR / f"{cache_name}.md"
 
                     # Force regeneration if requested
@@ -1741,6 +1914,7 @@ Stack Trace:
                     'fullError': detailed_error
                 }, args.status_server)
 
+            _record_incremental_git_failure(args, full_name, cache_name, 'git sync', sync_logger)
             with stats_lock:
                 stats['errors'] += 1
             return (False, 'error', None, None, False, short_id, color)
@@ -1811,14 +1985,19 @@ Stack Trace:
             ctx = SyncContext(meta_progress, meta_tasks, stats, stats_lock, sync_logger, console)
             with Live(meta_progress, console=console, refresh_per_second=10):
                 with ThreadPoolExecutor(max_workers=max_metadata_workers) as executor:
-                    futures = [executor.submit(lambda td: generate_repo_metadata(td, session, args, ctx), task_data)
-                               for task_data in repos_needing_metadata]
+                    futures = {executor.submit(lambda td: generate_repo_metadata(td, session, args, ctx), task_data): task_data
+                               for task_data in repos_needing_metadata}
 
                     for future in as_completed(futures):
                         try:
                             future.result()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            task_data = futures[future]
+                            full_name = task_data[0]['full_name']
+                            if full_name in incremental_repos:
+                                # Same reporting as any other opted-in failure, counted once.
+                                _report_incremental(task_data, _escaped_incremental_outcome(task_data[1], full_name, e),
+                                                    get_ai_model(), args, ctx)
 
         console.print()
 
@@ -1827,6 +2006,9 @@ Stack Trace:
             console.print(f"[cyan]Regenerating INDEX.md...[/cyan]")
             regenerate_index(args)
             console.print(f"[green]✓ INDEX.md updated[/green]")
+    elif args._incremental_index_due and not args.dry_run:
+        # An opted-in repository failed before its metadata phase: INDEX must say so.
+        regenerate_index(args)
 
     # Summary
     console.print()
@@ -1838,7 +2020,10 @@ Stack Trace:
     console.print(f"  Errors: [red]{stats['errors']}[/red]")
     if not args.skip_metadata:
         console.print(f"  Metadata generated: [green]{stats['metadata_generated']}[/green]")
-        if stats['api_cost'] > 0:
+        if stats.get('unknown_cost_calls'):
+            console.print(f"  API cost: unknown (known subtotal ${stats['api_cost']:.4f}; "
+                          f"{stats['unknown_cost_calls']} metadata call(s) of unknown cost)")
+        elif stats['api_cost'] > 0:
             console.print(f"  API cost: ${stats['api_cost']:.4f}")
 
         # Warn if no metadata was generated AND repos don't have existing metadata
@@ -1927,7 +2112,8 @@ Stack Trace:
             skipped=stats['skipped'],
             errors=stats['errors'],
             metadata=stats['metadata_generated'],
-            cost=f"${stats['api_cost']:.4f}",
+            cost=(f"${stats['api_cost']:.4f}" if not stats.get('unknown_cost_calls')
+                  else f"unknown (known subtotal ${stats['api_cost']:.4f})"),
         )
 
     # Durable completion receipt. Progress went to a status server inside the app, so a run that
