@@ -51,6 +51,42 @@ def load_document(pristine_dir, cache_name):
     return Document(path, text, hashlib.sha256(text.encode('utf-8')).hexdigest(), info, body)
 
 
+def read_document(pristine_dir, cache_name):
+    """The current document for an update: None only when there is none (a first build). A document
+    that exists but can't be read or parsed is kept as it is and stops the attempt, rather than
+    looking like a first build with nothing to carry forward."""
+    if not os.path.lexists(document_path(pristine_dir, cache_name)):
+        return None
+    doc = load_document(pristine_dir, cache_name)
+    if doc is None:
+        raise StaleUpdate('the existing metadata document cannot be read or parsed; it is kept as it is')
+    return doc
+
+
+# Header fields only this feature (or its pilot) writes; the full generator writes none of them.
+EXCLUSIONS_KEY = 'credential_exclusions'
+GENERATED_KEYS = ('semantic_policy', 'generation_id', 'generation_strategy', 'generation_model', 'pilot',
+                  'full_build_commit', EXCLUSIONS_KEY)
+
+
+def document_exclusions(doc):
+    """The credential exclusions `doc` carries forward. No document, or a legacy one from the full
+    generator, starts from none (the snapshots then supply what they show). A generated document
+    without a valid record raises StaleUpdate before any content is read, counted or sent: protection
+    is never silently reset."""
+    if doc is None:
+        return snap.NO_EXCLUSIONS
+    value = doc.info.get(EXCLUSIONS_KEY)
+    if value is None:
+        if any(key in doc.info for key in GENERATED_KEYS):
+            raise StaleUpdate('the generated document records no credential exclusions; it is kept as it is')
+        return snap.NO_EXCLUSIONS
+    try:
+        return snap.decode_exclusions(value)
+    except snap.ExclusionsError as e:
+        raise StaleUpdate(f"the document's credential exclusions are invalid ({e}); it is kept as it is") from None
+
+
 def _parse_time(value):
     try:
         return datetime.fromisoformat(value) if value else None
@@ -378,8 +414,10 @@ REQUEST_SECONDS = 10 * 60
 TURN_OUTPUT = 16384
 
 # omitted: (path, reason) for files withheld by the safety policy (credential, binary, symlink...);
-# outside_selection: for full builds, how many tracked files the collector's rules leave out.
-Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection', defaults=(None,))
+# outside_selection: for full builds, how many tracked files the collector's rules leave out;
+# exclusions: the effective credential exclusions every content read used, published with the document.
+Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions',
+                       defaults=(None, None))
 
 
 class StaleUpdate(Exception):
@@ -475,15 +513,18 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
 
     clock = clock or time.monotonic
     deadline = clock() + ATTEMPT_SECONDS
+    inherited = document_exclusions(doc)
     base_snap = snap.GitSnapshot(repo_path, decision.base)
     target_snap = snap.GitSnapshot(repo_path, decision.target)
     changes = snap.changes_between(repo_path, decision.base, decision.target)
+    # The whole closure, before any content is read; the diff and every tool use this one record.
+    exclusions = snap.credential_exclusions(inherited, base_snap.manifest(), target_snap.manifest(), changes)
     try:
         pages, omitted = snap.build_diff(repo_path, decision.base, decision.target,
-                                         base_snap.manifest(), target_snap.manifest(), changes)
+                                         base_snap.manifest(), target_snap.manifest(), changes, exclusions)
     except snap.GitError as e:
         raise StaleUpdate(str(e)) from None
-    tools = snap.SnapshotTools(base_snap, target_snap, pages, changes)
+    tools = snap.SnapshotTools(base_snap, target_snap, pages, exclusions)
     if decision.change is not None:
         budget.extra.update(changed_files=decision.change.changed_files, changed_bytes=decision.change.changed_bytes)
     budget.extra['diff_pages'] = len(pages)
@@ -521,7 +562,7 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
             analysis, new_fields, note = apply_patch(sections, fields, patch, doc.sha256)
         except PatchError as e:
             raise StaleUpdate(f"the model's edits were rejected: {e}") from None
-        return Candidate(analysis, new_fields, note, omitted)
+        return Candidate(analysis, new_fields, note, omitted, None, exclusions)
     raise StaleUpdate(f"no accepted answer within {MAX_TURNS} turns")
 
 
@@ -534,29 +575,21 @@ def document_commit(repo_path, doc):
     return commit if snap.resolve_commit(repo_path, commit) == commit else None
 
 
-def pinned_files(snapshot, base_snapshot=None):
+def pinned_files(snapshot, exclusions):
     """The full collector's input, read from a pinned commit instead of the working tree: tracked
     regular files the collector includes, at most 100 KiB each, decoded the way it decodes them.
 
-    The same safety policy as the read tools applies first: credential files and binary blobs are
-    withheld even when the collector's rules would include them. With `base_snapshot` (the previous
-    document's commit), credential origin carries over as it does for incremental updates: a file
-    renamed from a credential path, or holding a credential's bytes from either commit, stays
-    withheld. A Git failure reading that protection raises rather than dropping it. Returns (files,
-    omitted, outside_selection): omitted lists (path, reason) for withheld files, and
+    The same safety policy as the read tools applies first: credential files, anything `exclusions`
+    protects, and binary blobs are withheld even when the collector's rules would include them.
+    Returns (files, omitted, outside_selection): omitted lists (path, reason) for withheld files, and
     outside_selection counts tracked files the collector's extension and size rules leave out.
     """
     files, omitted, outside = [], [], 0
-    if base_snapshot is None:
-        secret, withheld = snap.credential_oids(snapshot.manifest()), frozenset()
-    else:
-        secret = snap.credential_oids(base_snapshot.manifest(), snapshot.manifest())
-        withheld = snap.renamed_credentials(snap.changes_between(snapshot.repo, base_snapshot.commit, snapshot.commit))
     for path, entry in sorted(snapshot.manifest().items()):
         if not snap.collector_eligible(entry):
             outside += 1
             continue
-        reason = snap.omission_reason(entry, withheld, secret)
+        reason = snap.omission_reason(entry, exclusions)
         if reason is None:
             data = snapshot.read_blob(entry, snap.COLLECTOR_MAX_BYTES + 1)
             if snap.is_binary(data):
@@ -569,16 +602,22 @@ def pinned_files(snapshot, base_snapshot=None):
     return files, omitted, outside
 
 
-def run_full(repo_path, full_name, target, model, session, budget, baseline=None):
+def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited):
     """A complete document built from the pinned commit with the existing full-generation prompts,
     partitioning and synthesis, sent through the counted sender. Never written directly: the caller
-    publishes it. `baseline` is the previous document's commit when it is available, so credential
-    origin from it stays withheld (see pinned_files)."""
+    publishes it. `inherited` is the previous document's credential exclusions (document_exclusions)
+    and `baseline` its commit when that is still available; a rebuild adds to that protection and
+    never resets it. A Git failure reading the protection raises rather than dropping it."""
     from repo_radar import llm
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
-    files, omitted, outside = pinned_files(snap.GitSnapshot(repo_path, target),
-                                           snap.GitSnapshot(repo_path, baseline) if baseline else None)
+    target_snap = snap.GitSnapshot(repo_path, target)
+    base_manifest, changes = None, ()
+    if baseline:
+        base_manifest = snap.GitSnapshot(repo_path, baseline).manifest()
+        changes = snap.changes_between(repo_path, baseline, target)
+    exclusions = snap.credential_exclusions(inherited, base_manifest, target_snap.manifest(), changes)
+    files, omitted, outside = pinned_files(target_snap, exclusions)
     if not files:
         raise StaleUpdate("no analyzable source")
 
@@ -610,7 +649,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         raise StaleUpdate(f"the generated metadata is degraded: {'; '.join(problems) or 'no analysis'}")
     quick = {k: v for k, v in parsed['quick_ref'].items() if k in QUICK_REF_FIELDS}
     fields = {'brief': parsed['brief'], 'quick_reference': quick, 'related_repos': parsed['related_repos']}
-    return Candidate(parsed['analysis'], fields, None, omitted, outside)
+    return Candidate(parsed['analysis'], fields, None, omitted, outside, exclusions)
 
 
 # ---- one opted-in repository -------------------------------------------------------------------------
@@ -633,7 +672,10 @@ def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None)
     return '; '.join(parts)
 
 
-def _provenance(strategy, model, decision, doc, target, now, coverage_note, omitted, outside_selection=None):
+def _provenance(strategy, model, decision, doc, target, now, coverage_note, omitted, outside_selection=None,
+                exclusions=None):
+    if exclusions is None:   # every publication carries its protection forward
+        raise StaleUpdate('the candidate carries no credential exclusions')
     if strategy == 'full':
         full = {'full_build_commit': target, 'full_build_at': now.isoformat(), 'full_build_model': model}
     elif doc.info.get('semantic_policy'):
@@ -644,7 +686,7 @@ def _provenance(strategy, model, decision, doc, target, now, coverage_note, omit
     coverage = coverage_line(strategy, omitted, coverage_note, outside_selection)
     record = {'generation_strategy': strategy, 'generation_model': model, 'configured_model': model,
               'semantic_policy': SEMANTIC_POLICY, 'base_commit': decision.base or 'none', **full,
-              'coverage': coverage}
+              'coverage': coverage, EXCLUSIONS_KEY: snap.encode_exclusions(exclusions)}
     if coverage_note:
         record['coverage_note'] = coverage_note
     return record
@@ -754,7 +796,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                        target, usage, time.monotonic() - started, state_error)
 
     try:
-        doc = load_document(pristine_dir, cache_name)
+        doc = read_document(pristine_dir, cache_name)
+        inherited = document_exclusions(doc)   # before any decision, so a forced rebuild can't skip it
         state = read_attempt_state(pristine_dir, cache_name) or {}
         target = snap.resolve_commit(repo_path, 'HEAD')
         if target is None:
@@ -788,7 +831,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session, budget)
         else:
             candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
-                                                  baseline=document_commit(repo_path, doc))
+                                                  baseline=document_commit(repo_path, doc), inherited=inherited)
         # Publish only what was built from exactly this document and this commit.
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:
@@ -797,7 +840,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             raise StaleUpdate('superseded: the repository moved during the update', warning=True)
         fields = candidate.fields
         provenance = _provenance(decision.strategy, model, decision, doc, target, now,
-                                 candidate.coverage_note, candidate.omitted, candidate.outside_selection)
+                                 candidate.coverage_note, candidate.omitted, candidate.outside_selection,
+                                 candidate.exclusions)
         generation_id = uuid.uuid4().hex
         from repo_radar.metadata import UnsafeHeader, degradation_reasons
         try:

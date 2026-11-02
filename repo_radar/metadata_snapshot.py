@@ -9,6 +9,7 @@ validated commit IDs and manifest membership; model-supplied text is only ever d
 search string, or a path looked up in the manifest).
 """
 
+import base64
 import json
 import os
 import re
@@ -138,29 +139,116 @@ def is_binary(data):
     return b'\0' in data[:8000]
 
 
-def credential_oids(*manifests):
-    """Non-empty regular blobs stored under a credential path anywhere in these manifests. The same
-    bytes stay withheld under any other name, a template name included. Empty files are left out, so
-    an empty ordinary file never shares an empty credential's identity."""
-    return frozenset(e.oid for m in manifests for e in m.values()
-                     if e.type == 'blob' and e.mode in REGULAR_MODES and e.size > 0 and is_credential_path(e.path))
+# ---- credential exclusions ------------------------------------------------------------------------
+
+EXCLUSIONS_VERSION = 1
+EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
 
 
-def renamed_credentials(changes):
-    """New paths of files renamed or copied from a credential path, whose contents stay withheld."""
-    return frozenset(c.new_path for c in changes if c.status in 'RC' and c.old_path and is_credential_path(c.old_path))
+class Exclusions(namedtuple('Exclusions', 'paths oids')):
+    """Credential identities whose contents never reach the model: protected paths, and the non-empty
+    regular blobs that held credential bytes. Each generation carries the record forward and only
+    adds to it, so a credential's origin survives renames, edits and later rebuilds."""
 
 
-def omission_reason(entry, withheld=frozenset(), secret_oids=frozenset()):
-    """Why `entry`'s contents are unavailable to the model, or None when it can be read. `withheld` and
-    `secret_oids` carry credential origin: a renamed credential, or a credential's bytes elsewhere."""
+NO_EXCLUSIONS = Exclusions(frozenset(), frozenset())
+
+
+class ExclusionsError(ValueError):
+    """A stored exclusion record is missing a field, malformed, or not in its canonical form."""
+
+
+def _secret_blob(entry):
+    # Empty files are never recorded, so an ordinary empty file never shares an empty credential's ID.
+    return entry.type == 'blob' and entry.mode in REGULAR_MODES and entry.size > 0
+
+
+def credential_exclusions(inherited, base_manifest, target_manifest, changes=()):
+    """The exclusions for one generation: `inherited` (the previous document's record), plus every
+    credential name in either manifest, plus whatever inherits protection from those. A rename or
+    copy from a protected path or blob, or from a credential name, protects its destination path and
+    blob, edited or not; any entry at a protected path or holding a protected blob adds its path and
+    blob. Repeated until nothing new is found. `base_manifest` is None when the previous commit isn't
+    available; the inherited record still applies. Never drops an inherited entry."""
+    paths, oids = set(inherited.paths), set(inherited.oids)
+    base_manifest = base_manifest or {}
+    entries = [*base_manifest.values(), *target_manifest.values()]
+
+    def protect(entry):
+        added = entry.path not in paths or (_secret_blob(entry) and entry.oid not in oids)
+        paths.add(entry.path)
+        if _secret_blob(entry):
+            oids.add(entry.oid)
+        return added
+
+    for entry in entries:
+        if is_credential_path(entry.path):
+            protect(entry)
+    grew = True
+    while grew:
+        grew = False
+        for entry in entries:
+            if entry.path in paths or (_secret_blob(entry) and entry.oid in oids):
+                grew |= protect(entry)
+        for c in changes:
+            if c.status not in 'RC' or not c.old_path or not c.new_path:
+                continue
+            source = base_manifest.get(c.old_path)
+            if (c.old_path in paths or is_credential_path(c.old_path)
+                    or (source is not None and _secret_blob(source) and source.oid in oids)):
+                destination = target_manifest.get(c.new_path)
+                if destination is not None:
+                    grew |= protect(destination)
+                elif c.new_path not in paths:
+                    paths.add(c.new_path)
+                    grew = True
+    return Exclusions(frozenset(paths), frozenset(oids))
+
+
+def encode_exclusions(exclusions):
+    """One header-safe value: standard base64 of canonical JSON (sorted arrays). Holds identities only,
+    never credential bytes."""
+    payload = {'version': EXCLUSIONS_VERSION, 'paths': sorted(exclusions.paths), 'oids': sorted(exclusions.oids)}
+    return base64.b64encode(json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('ascii')).decode('ascii')
+
+
+def _valid_path(path):
+    return (isinstance(path, str) and path and not path.startswith('/') and '\0' not in path
+            and all(part not in ('', '.', '..') for part in path.split('/')))
+
+
+def decode_exclusions(value):
+    """The Exclusions in a stored header value. Raises ExclusionsError unless it is exactly what
+    encode_exclusions writes: this version, both fields, relative paths and full non-empty blob IDs,
+    sorted and without duplicates."""
+    try:
+        payload = json.loads(base64.b64decode(str(value).encode('ascii'), validate=True).decode('ascii'))
+    except (ValueError, UnicodeError):
+        raise ExclusionsError('not base64-encoded JSON') from None
+    if not isinstance(payload, dict) or set(payload) != {'version', 'paths', 'oids'}:
+        raise ExclusionsError('expected exactly version, paths and oids')
+    if type(payload['version']) is not int or payload['version'] != EXCLUSIONS_VERSION:
+        raise ExclusionsError(f"unsupported version {payload['version']!r}")
+    paths, oids = payload['paths'], payload['oids']
+    if not isinstance(paths, list) or not all(_valid_path(p) for p in paths):
+        raise ExclusionsError('paths must be relative path strings')
+    if not isinstance(oids, list) or not all(isinstance(o, str) and SHA.match(o) and o != EMPTY_BLOB for o in oids):
+        raise ExclusionsError('oids must be full, non-empty blob IDs')
+    if paths != sorted(set(paths)) or oids != sorted(set(oids)):
+        raise ExclusionsError('paths and oids must be sorted and unique')
+    return Exclusions(frozenset(paths), frozenset(oids))
+
+
+def omission_reason(entry, exclusions=NO_EXCLUSIONS):
+    """Why `entry`'s contents are unavailable to the model, or None when it can be read. `exclusions`
+    carries credential origin: a protected path, or a blob that held credential bytes."""
     if entry.mode == '120000':
         return 'symlink'
     if entry.type == 'commit':
         return 'submodule'
     if entry.mode not in REGULAR_MODES:
         return 'not a regular file'
-    if is_credential_path(entry.path) or entry.path in withheld or entry.oid in secret_oids:
+    if is_credential_path(entry.path) or entry.path in exclusions.paths or entry.oid in exclusions.oids:
         return 'credential file'
     return None
 
@@ -283,20 +371,19 @@ def _paginate(lines, page_bytes=MAX_RESULT_BYTES - 1024):
     return pages or ['']
 
 
-def build_diff(repo, base, target, base_manifest, target_manifest, changes):
+def build_diff(repo, base, target, base_manifest, target_manifest, changes, exclusions):
     """The textual diff of an update, split into pages, plus the paths whose contents were omitted.
 
-    Files whose contents are unavailable (credentials, symlinks, submodules) appear only as a status
-    line; binary files as Git reports them. A single file's diff larger than MAX_FILE_DIFF_BYTES is
+    Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
+    submodules) appear only as a status line, on either side; binary files as Git reports them. A single file's diff larger than MAX_FILE_DIFF_BYTES is
     listed as omitted, so the model knows to read the file rather than assume nothing changed.
     Raises GitError if the whole diff exceeds MAX_DIFF_BYTES.
     """
     lines, omitted, total = [], [], 0
-    withheld, secret = renamed_credentials(changes), credential_oids(base_manifest, target_manifest)
     for c in changes:
         entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
                                target_manifest.get(c.new_path) if c.new_path else None) if e]
-        reasons = {omission_reason(e, withheld, secret) for e in entries} - {None}
+        reasons = {omission_reason(e, exclusions) for e in entries} - {None}
         label = c.new_path or c.old_path
         if reasons:
             reason = sorted(reasons)[0]
@@ -365,18 +452,18 @@ def _str(args, key, default=None, max_len=1024):
 
 
 class SnapshotTools:
-    """The model's read-only view of the two pinned commits and the diff between them."""
+    """The model's read-only view of the two pinned commits and the diff between them. `exclusions` is
+    the generation's effective record (credential_exclusions), the same one the diff used."""
 
-    def __init__(self, base, target, diff_pages, changes=()):
+    def __init__(self, base, target, diff_pages, exclusions):
         self.base, self.target = base, target
         self.diff_pages = diff_pages
-        self._withheld = renamed_credentials(changes)
-        self._secret = credential_oids(base.manifest(), target.manifest())
+        self._exclusions = exclusions
         self.seen_pages = {1}  # the first page is part of the opening message
         self.bytes_read = 0
 
     def _omitted(self, entry):
-        return omission_reason(entry, self._withheld, self._secret)
+        return omission_reason(entry, self._exclusions)
 
     def unseen_pages(self):
         return [p for p in range(1, len(self.diff_pages) + 1) if p not in self.seen_pages]

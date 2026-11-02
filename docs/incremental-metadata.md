@@ -99,6 +99,16 @@ incremental update is not followed by an automatic full rebuild; the next ordina
 Attempt records live in `~/repos-pristine/.metadata-state/<cache>.json` (owner-only). Each one holds
 the latest attempt and its usage, never prompts or source.
 
+Each generated document also records which paths and file contents (by Git blob ID) are withheld as
+credentials, in its `credential_exclusions` header. This holds no credential bytes. Every
+publication, full rebuilds included, carries the record forward and only adds to it. So a
+credential renamed, copied or edited under an ordinary name stays withheld after the commit that
+showed its origin is gone. A generated document whose record is missing or invalid, or an existing
+document that can't be read, is kept as it is. Its update fails before anything is read, counted or
+sent, and `--regenerate-metadata` doesn't bypass this. Restoring the record is a manual recovery
+step. A first build, or one from a full-generator document, starts the record from the commits it
+can see.
+
 ## Telehealth pilot
 
 The pilot compares an incremental update with a clean full rebuild for

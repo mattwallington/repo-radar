@@ -346,6 +346,7 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
         update(pristine, repo, session)
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert state['status'] == 'committing' and state['generation_id'] == im.load_document(pristine, 'app-abc1234').info['generation_id']
+    assert im.document_exclusions(im.load_document(pristine, 'app-abc1234')) == snap.NO_EXCLUSIONS   # committed with it
     assert decide(repo, pristine).strategy == 'none'
 
     # A later fetch failure is a new attempt from the committed document: no inherited generation ID
@@ -381,7 +382,7 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     repo.write('src/m0.py', 'DIRTY WORKTREE\n')  # never seen: reads come from the pinned blobs
 
     base_snap, target_snap = snap.GitSnapshot(repo.path, base), snap.GitSnapshot(repo.path, target)
-    tools = snap.SnapshotTools(base_snap, target_snap, ['page'])
+    tools = snap.SnapshotTools(base_snap, target_snap, ['page'], snap.NO_EXCLUSIONS)
     assert 'DIRTY' not in tools.run('read_file', json.dumps({'path': 'src/m0.py', 'limit': 2}))
     for path in ('../etc/passwd', '/etc/passwd', 'src/../.env'):
         assert 'is not a tracked file' in tools.run('read_file', json.dumps({'path': path}))
@@ -402,7 +403,8 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     long_dir.mkdir()
     for i in range(3):
         (long_dir / (f'fichier-{i}-' + 'é' * 60 + '.py')).write_text('haystack\n')
-    wide = snap.SnapshotTools(base_snap, snap.GitSnapshot(repo.path, repo.commit('wide names')), ['page'])
+    wide = snap.SnapshotTools(base_snap, snap.GitSnapshot(repo.path, repo.commit('wide names')), ['page'],
+                              snap.NO_EXCLUSIONS)
     monkeypatch.setattr(snap, 'MAX_SEARCH_ARG_BYTES', 300)
     spawned = []
     real_run_git = snap.run_git
@@ -473,8 +475,9 @@ FULL_REPLY = ("QUICK_REFERENCE_START\nType: API Service\nLanguage: Python\nFrame
 
 
 def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_path):
-    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
-    secrets = {'.env.production.sh': 'export TOKEN=SENTINEL-ENV\n', '.envrc': 'export A=SENTINEL-RC\n',
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path, files=20)
+    secrets = {'.env.production.sh': 'export TOKEN=SENTINEL-ENV\n',
+               '.envrc': 'export A=SENTINEL-RC\n' + ''.join(f'export V{i}={i}\n' for i in range(20)),
                '.pgpass': 'db:5432:*:u:SENTINEL-PG\n', '.htpasswd': 'u:SENTINEL-HT\n', '.boto': 'k=SENTINEL-BOTO\n',
                '.s3cfg': 'secret_key=SENTINEL-S3\n', 'keys/apns.p8': 'SENTINEL-P8\n', 'keys/putty.ppk': 'SENTINEL-PPK\n',
                'vault.kdbx': 'SENTINEL-KDBX\n'}
@@ -498,43 +501,111 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     assert doc.info['coverage'].startswith('collector-selected source analyzed; 2 files withheld (binary file, credential file)')
     assert "outside the collector's selection" in doc.info['coverage'] and 'complete' not in doc.info['coverage']
     assert 'src/__init__.py' in traffic
+    assert {'.envrc', '.env'} <= im.document_exclusions(doc).paths   # identities only, published with A
 
     # The read tools, search and the diff apply the same policy, including a credential renamed
     # unchanged to an ordinary, collector-eligible path.
     repo.write('.env.production.sh', 'export TOKEN=SENTINEL-ENV2\n')
     repo.git('mv', '.envrc', 'src/runtime.py')
     target = repo.commit('change secrets')
-    tools = snap.SnapshotTools(snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target), ['p'])
-    for path in [p for p in secrets if p != '.envrc']:
+    base_snap, target_snap = snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target)
+    changes = snap.changes_between(repo.path, doc.info['last_commit'], target)
+    effective = snap.credential_exclusions(im.document_exclusions(doc), base_snap.manifest(), target_snap.manifest(), changes)
+    tools = snap.SnapshotTools(base_snap, target_snap, ['p'], effective)
+    for path in [p for p in secrets if p != '.envrc'] + ['src/runtime.py']:
         assert 'unavailable: credential file' in tools.run('read_file', json.dumps({'path': path}))
     assert 'unavailable: binary file' in tools.run('read_file', '{"path": "src/blob.py"}')
     assert 'unavailable' not in tools.run('read_file', '{"path": "src/__init__.py"}')
     assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
-    base_snap, target_snap = snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target)
-    changes = snap.changes_between(repo.path, doc.info['last_commit'], target)
     pages, omitted = snap.build_diff(repo.path, doc.info['last_commit'], target, base_snap.manifest(),
-                                     target_snap.manifest(), changes)
+                                     target_snap.manifest(), changes, effective)
     assert 'SENTINEL' not in ''.join(pages)
     assert {p for p, _why in omitted} == {'.env.production.sh', 'src/runtime.py'}
 
-    # A full rebuild from that baseline document keeps the credential's origin too: the renamed file
-    # is withheld from count and send bodies and recorded as omitted, in sync and in the pilot.
-    provider.sends.clear(); provider.counts.clear()
-    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
-    with PreflightSession() as session:
-        assert update(pristine, repo, session, force=True).status == 'published'
-    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
-    assert 'SENTINEL' not in traffic and provider.counts and provider.messages()
-    assert 'src/__init__.py' in traffic
-    rebuilt = im.load_document(pristine, 'app-abc1234')
+    def full_rebuild_traffic():
+        provider.sends.clear(); provider.counts.clear()
+        provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+        with PreflightSession() as session:
+            assert update(pristine, repo, session, force=True).status == 'published'
+        sent = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+        assert 'SENTINEL' not in sent and provider.counts and provider.messages() and not provider.replies
+        assert 'safe source' in sent and '=== src/__init__.py (0 bytes) ===' in sent   # empty source stays readable
+        return im.load_document(pristine, 'app-abc1234')
+
+    # A full rebuild from that baseline document keeps the credential's origin, and publishes it.
+    rebuilt = full_rebuild_traffic()
     assert '3 files withheld (binary file, credential file)' in rebuilt.info['coverage']
+    protected = im.document_exclusions(rebuilt)
+    assert {'.envrc', 'src/runtime.py'} <= protected.paths and protected == effective
+
+    # A -> B -> B: a second rebuild at unchanged B (in a fresh session), where neither commit shows the
+    # rename any more, still withholds it because the published B document carries the protection.
+    again = full_rebuild_traffic()
+    assert again.info['last_commit'] == target and again.sha256 != rebuilt.sha256
+    assert '3 files withheld (binary file, credential file)' in again.info['coverage']
+    assert im.document_exclusions(again) == protected
+
+    # C, from the newly published B document: the protected file is edited and moved, and A's old
+    # .env.production.sh bytes, known now only from the inherited record, reappear under another name.
+    # The incremental diff, reads, search and listing, the pilot's full caller and a published
+    # incremental update all keep them withheld, and the record grows.
+    repo.git('mv', 'src/runtime.py', 'src/settings.py')
+    repo.write('src/settings.py', (repo.path / 'src/settings.py').read_text() + 'export Z=SENTINEL-RC-C\n')
+    repo.write('src/copy.py', secrets['.env.production.sh'])
+    target_c = repo.commit('move, edit and copy the protected file')
+    b_snap, c_snap = snap.GitSnapshot(repo.path, target), snap.GitSnapshot(repo.path, target_c)
+    changes = snap.changes_between(repo.path, target, target_c)
+    assert ('R', 'src/runtime.py', 'src/settings.py') in [tuple(c) for c in changes]   # an edited rename
+    effective = snap.credential_exclusions(im.document_exclusions(again), b_snap.manifest(), c_snap.manifest(), changes)
+    assert {'src/settings.py', 'src/copy.py'} <= effective.paths and protected.paths <= effective.paths
+    assert c_snap.manifest()['src/settings.py'].oid in effective.oids
+    pages, omitted = snap.build_diff(repo.path, target, target_c, b_snap.manifest(), c_snap.manifest(), changes, effective)
+    assert 'SENTINEL' not in ''.join(pages) and {p for p, _why in omitted} == {'src/settings.py', 'src/copy.py'}
+    tools = snap.SnapshotTools(b_snap, c_snap, pages, effective)
+    for args in ({'path': 'src/settings.py'}, {'path': 'src/copy.py'}, {'path': 'src/runtime.py', 'version': 'base'}):
+        assert 'unavailable: credential file' in tools.run('read_file', json.dumps(args))
+    assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
+    assert 'unavailable: credential file' in tools.run('list_paths', '{"prefix": "src/settings"}')
 
     provider.sends.clear(); provider.counts.clear()
     provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
-    pilot_dir, result = run_pilot(tmp_path / 'pilot', repo, doc.text, 'full', target)
+    pilot_dir, result = run_pilot(tmp_path / 'pilot', repo, again.text, 'full', target_c)
     traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
     assert result['status'] == 'complete' and 'SENTINEL' not in traffic and provider.messages()
-    assert {'path': 'src/runtime.py', 'reason': 'credential file'} in result['omitted']
+    for path in ('src/settings.py', 'src/copy.py'):
+        assert {'path': path, 'reason': 'credential file'} in result['omitted']
+    pilot_doc = im.Document(None, '', '', metadata.parse_frontmatter((pilot_dir / 'full.md').read_text()), '')
+    assert im.document_exclusions(pilot_doc) == effective
+
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [tool_use('read_file', {'path': 'src/settings.py'}),
+                        answer({'base_document_sha256': again.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'published'
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL' not in traffic and 'unavailable: credential file' in traffic
+    updated = im.load_document(pristine, 'app-abc1234')
+    assert updated.info['generation_strategy'] == 'incremental' and updated.info['last_commit'] == target_c
+    assert im.document_exclusions(updated) == effective   # a no-op section patch still carries it forward
+
+    # A generated document without a valid record, or one that can't be read, is kept byte for byte and
+    # fails before any count or send; a forced rebuild doesn't get round it, nor does the pilot.
+    record = f"{im.EXCLUSIONS_KEY}: {updated.info[im.EXCLUSIONS_KEY]}\n"
+    missing = updated.text.replace(record, '')
+    for broken in (missing.encode(), updated.text.replace(record, f"{im.EXCLUSIONS_KEY}: e30=\n").encode(),
+                   b'\xff' + updated.text.encode()):
+        (pristine / 'app-abc1234.md').write_bytes(broken)
+        provider.sends.clear(); provider.counts.clear()
+        provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+        with PreflightSession() as session:
+            outcome = update(pristine, repo, session, force=True)
+        assert outcome.status == 'failed' and 'kept as it is' in outcome.reason, outcome
+        assert not provider.sends and not provider.counts and provider.replies
+        assert (pristine / 'app-abc1234.md').read_bytes() == broken
+        assert metadata.read_attempt_state(pristine, 'app-abc1234')['status'] == 'failed'
+    with pytest.raises(SystemExit):
+        run_pilot(tmp_path / 'pilot-unprotected', repo, missing, 'full', target_c)
+    assert not provider.sends and not provider.counts
 
 
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'

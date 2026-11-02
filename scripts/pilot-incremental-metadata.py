@@ -61,10 +61,17 @@ def load_pilot(args):
     for key, value in (('baseline_sha256', digest), ('target', args.target), ('model', args.model)):
         if info[key] != value:
             fail(f"this pilot was set up with {key} {info[key]}, not {value}; both candidates must use the same inputs")
-    doc = im.Document(baseline_path, text, digest, im.parse_frontmatter(text), text.split('---', 2)[2])
+    header = im.parse_frontmatter(text)
+    if header is None:
+        fail("baseline.md has no readable header")
+    doc = im.Document(baseline_path, text, digest, header, text.split('---', 2)[2])
     ok, why = im.usable_baseline(doc, PILOT_REPO)
     if not ok:
         fail(f"baseline.md can't be used: {why}")
+    try:
+        im.document_exclusions(doc)   # a generated baseline must carry its credential protection
+    except im.StaleUpdate as e:
+        fail(f"baseline.md can't be used: {e.reason}")
     if not is_known_model(args.model):
         fail(f"{args.model} is not in the model catalog")
     return pilot, doc
@@ -149,13 +156,14 @@ def run(args):
                 candidate = im.run_incremental(repo, PILOT_REPO, doc, decision, args.model, session, budget)
             else:
                 candidate = im.run_full(repo, PILOT_REPO, args.target, args.model, session, budget,
-                                        baseline=im.document_commit(repo, doc))
+                                        baseline=im.document_commit(repo, doc), inherited=im.document_exclusions(doc))
         coverage = im.coverage_line(args.mode, candidate.omitted, candidate.coverage_note, candidate.outside_selection)
         fields = candidate.fields
         text = render_metadata_document(
             PILOT_REPO, doc.info.get('cache_dir', ''), doc.info.get('clone_url', ''), args.target, datetime.now().isoformat(),
             fields['quick_reference'], fields['brief'], fields['related_repos'], candidate.analysis,
-            {'generation_strategy': args.mode, 'generation_model': args.model, 'pilot': 'true', 'coverage': coverage})
+            {'generation_strategy': args.mode, 'generation_model': args.model, 'pilot': 'true', 'coverage': coverage,
+             im.EXCLUSIONS_KEY: snap.encode_exclusions(candidate.exclusions)})
     except im.StaleUpdate as e:
         record.update(status='stopped', reason=im.safe_reason(e.reason))
     except UnsafeHeader as e:
