@@ -286,7 +286,9 @@ function _candidates(home) {
 // from the reader, and is skipped below without inflating this number.
 //
 // `legacyItems` (below) stays the thin, unchanged wrapper every existing caller already uses.
-function legacyItemsDetailed(home, { configuredSecrets = [] } = {}) {
+// `before` is an exclusive instant (milliseconds or an ISO timestamp). Floor to the filename's
+// second precision so a text log created in the durable start's second is excluded too.
+function legacyItemsDetailed(home, { configuredSecrets = [], before = null } = {}) {
   let redactor;
   try {
     redactor = new redactMod.Redactor(configuredSecrets);
@@ -299,10 +301,15 @@ function legacyItemsDetailed(home, { configuredSecrets = [] } = {}) {
   try {
     const found = _candidates(home);
     if (found === null) return { items: [], omitted: 0 };
+    const instant = typeof before === 'number' ? before : Date.parse(before);
+    const cutoff = Math.floor(instant / 1000) * 1000;
+    const candidates = Number.isFinite(cutoff)
+      ? found.candidates.filter(({ m }) => _dateFromName(m).getTime() < cutoff)
+      : found.candidates;
     // Sorted BEFORE the cap, so the cap drops the OLDEST logs, never the newest.
     const cap = Math.max(0, limits.LEGACY_MAX_FILES);
-    const kept = found.candidates.slice(0, cap);
-    const omitted = found.candidates.length - kept.length;
+    const kept = candidates.slice(0, cap);
+    const omitted = candidates.length - kept.length;
 
     const items = [];
     for (const { name, m } of kept) {

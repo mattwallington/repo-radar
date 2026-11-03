@@ -218,6 +218,47 @@ class IncompleteResponseError(Exception):
     """A provider reply that must not be used as an analysis: no visible text, or cut off."""
 
 
+def is_transient_server_error(error):
+    """Recognize server failures without treating arbitrary numbers as HTTP statuses."""
+    if isinstance(error, IncompleteResponseError):
+        return False
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & {'APIConnectionError', 'AuthenticationError', 'PermissionDeniedError', 'BadRequestError',
+                'InvalidRequestError', 'NotFoundError', 'UnprocessableEntityError'}:
+        return False
+
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    response = getattr(error, 'response', None)
+    signals = [getattr(error, 'status_code', None), getattr(response, 'status_code', None),
+               getattr(error, 'status', None), getattr(error, 'code', None),
+               detail.get('code'), detail.get('status')]
+    statuses = [int(s) for s in signals if str(s).isdigit() and 100 <= int(s) <= 599]
+    if statuses:
+        return any(s in {500, 502, 503, 504, 529} for s in statuses) and not any(
+            400 <= s < 500 for s in statuses)
+    if 'ServiceUnavailableError' in names:
+        return True
+    if any(s in ('UNAVAILABLE', 'OVERLOADED') for s in signals):
+        return True
+
+    text = str(error)
+    # Some providers expose only a wrapped message. Exclude known client failures first.
+    if re.search(r'\b(?:AuthenticationError|PermissionDeniedError|BadRequestError|'
+                 r'InvalidRequestError|NotFoundError|UNAUTHENTICATED|PERMISSION_DENIED|'
+                 r'INVALID_ARGUMENT)\b', text, re.I):
+        return False
+    statuses = re.findall(
+        r'\b(?:HTTP(?:/\d(?:\.\d)?)?(?:\s+status)?|status(?:_code|\s+code)?|code)'
+        r'[\s\x27\":=]*(\d{3})\b', text, re.I)
+    if statuses:
+        return any(s in {'500', '502', '503', '504', '529'} for s in statuses) and not any(
+            400 <= int(s) < 500 for s in statuses)
+    return bool(re.search(r'\b(?:UNAVAILABLE|OVERLOADED)\b', text))
+
+
 # finish_reason values that mean the reply was cut off. litellm maps Anthropic's max_tokens stop to
 # "length", but it maps any stop reason it doesn't know to "stop", so the context-window stop would
 # read as a clean finish; _map_context_window_stop_as_truncation() maps that one to "length" too.
@@ -297,6 +338,137 @@ def call_llm(model, prompt, max_tokens=8192):
         api_cost = hidden.get('response_cost') or 0.0
 
     return text, api_cost, response
+
+
+# ── One structured turn (incremental metadata) ──────────────────────────────────────────────────
+# A separate sender for multi-turn, tool-using requests. call_llm and its callers are unchanged.
+# The canonical request built by Conversation.request() is exactly what call_model_turn sends and
+# what preflight.PreflightSession.count_request counts, so the counted request and the sent request
+# cannot drift. No retries, model fallback or SDK retries happen here: one request, one reply.
+
+ToolCall = namedtuple("ToolCall", "id name arguments")
+TurnResult = namedtuple("TurnResult", "status text tool_calls usage cost reply_items")
+TurnUsage = namedtuple("TurnUsage", "input_tokens output_tokens")
+
+
+def _plain(item):
+    """A provider object as plain JSON data, dropping unset fields."""
+    if hasattr(item, 'model_dump'):
+        return item.model_dump(exclude_none=True)
+    if isinstance(item, dict):
+        return {k: v for k, v in item.items() if v is not None}
+    return dict(item)
+
+
+class Conversation:
+    """One attempt's request history, kept in the native shape of the model's endpoint.
+
+    Chat Completions keeps OpenAI-style messages (litellm translates them per provider, including
+    Anthropic thinking blocks and tool results); the Responses API keeps input items, including the
+    reasoning items a tool-call reply must send back. Fresh for every attempt; never persisted.
+    With system=None the request is just the messages, as call_llm sends a single prompt.
+    """
+
+    def __init__(self, model, system, tools=()):
+        self.model = model
+        self.endpoint = 'responses' if _needs_responses_api(model) else 'chat'
+        self.system = system
+        self.tools = list(tools)
+        self.items = []
+
+    def add_user(self, text):
+        self.items.append({"role": "user", "content": text})
+
+    def add_reply(self, turn):
+        self.items.extend(turn.reply_items)
+
+    def add_tool_result(self, call_id, text):
+        if self.endpoint == 'chat':
+            self.items.append({"role": "tool", "tool_call_id": call_id, "content": text})
+        else:
+            self.items.append({"type": "function_call_output", "call_id": call_id, "output": text})
+
+    def _tool_defs(self):
+        if self.endpoint == 'chat':
+            return [{"type": "function", "function": dict(t)} for t in self.tools]
+        return [{"type": "function", **t} for t in self.tools]
+
+    def request(self, max_tokens):
+        """The complete request for the next turn, as plain JSON data."""
+        out = output_budget(self.model, max_tokens)
+        if self.endpoint == 'chat':
+            system = [{"role": "system", "content": self.system}] if self.system is not None else []
+            req = {"endpoint": "chat", "model": self.model, "messages": [*system, *self.items], "max_tokens": out}
+            if self.model in CLAUDE_MEDIUM_EFFORT_MODELS:
+                req["output_config"] = {"effort": "medium"}
+        else:
+            req = {"endpoint": "responses", "model": self.model, "input": list(self.items), "max_output_tokens": out}
+            if self.system is not None:
+                req["instructions"] = self.system
+        if self.tools:
+            req["tools"] = self._tool_defs()
+        return req
+
+
+def call_model_turn(request, timeout):
+    """Send one canonical request (Conversation.request()) and classify the reply.
+
+    Returns TurnResult(status, text, tool_calls, usage, cost, reply_items). status is 'tool_calls'
+    (valid intermediate work), 'complete', or 'incomplete' / 'refused' / 'empty', which are never
+    publishable. usage is TurnUsage or None; cost is the provider-reported cost or None when it
+    wasn't reported, never a guessed zero. Exceptions propagate; nothing is retried.
+    """
+    import litellm
+
+    model = request["model"]
+    provider = provider_for_model(model)
+    params = {k: v for k, v in request.items() if k != "endpoint"}
+    if request["endpoint"] == "responses":
+        response = litellm.responses(custom_llm_provider=provider, timeout=timeout, max_retries=0, **params)
+        items = [_plain(i) for i in (getattr(response, 'output', None) or [])]
+        calls = [ToolCall(i.get("call_id"), i.get("name"), i.get("arguments") or "{}")
+                 for i in items if i.get("type") == "function_call"]
+        parts = [c for i in items if i.get("type") == "message" for c in (i.get("content") or [])]
+        text = "".join(c.get("text", "") for c in parts if c.get("type") == "output_text")
+        if getattr(response, 'status', None) != "completed":
+            status = "incomplete"
+        elif any(c.get("type") == "refusal" for c in parts):
+            status = "refused"
+        elif calls:
+            status = "tool_calls"
+        else:
+            status = "complete" if text.strip() else "empty"
+        raw = getattr(response, 'usage', None)
+        usage = (TurnUsage(getattr(raw, 'input_tokens', None), getattr(raw, 'output_tokens', None))
+                 if raw is not None else None)
+        reply = items
+    else:
+        if provider == 'anthropic':
+            _map_context_window_stop_as_truncation()
+        response = litellm.completion(custom_llm_provider=provider, timeout=timeout, num_retries=0,
+                                      max_retries=0, **params)
+        choice = response.choices[0] if response.choices else None
+        message = getattr(choice, 'message', None)
+        finish = getattr(choice, 'finish_reason', None)
+        text = (getattr(message, 'content', None) or '') if message is not None else ''
+        calls = [ToolCall(tc.id, tc.function.name, tc.function.arguments or "{}")
+                 for tc in (getattr(message, 'tool_calls', None) or [])]
+        if finish in _TRUNCATED_FINISH_REASONS:
+            status = "incomplete"
+        elif finish == "content_filter":
+            status = "refused"
+        elif calls:
+            status = "tool_calls"
+        else:
+            status = "complete" if text.strip() else "empty"
+        raw = getattr(response, 'usage', None)
+        usage = (TurnUsage(getattr(raw, 'prompt_tokens', None), getattr(raw, 'completion_tokens', None))
+                 if raw is not None else None)
+        reply = [{"role": "assistant", **_plain(message)}] if message is not None else []
+    hidden = getattr(response, '_hidden_params', None)
+    cost = hidden.get('response_cost') if isinstance(hidden, dict) else None
+    cost = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+    return TurnResult(status, text, calls, usage, cost, reply)
 
 
 def get_chunking_threshold(model):
@@ -717,8 +889,12 @@ def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
         except Exception as e:
             error_str = str(e)
 
-            # Check if it's a rate limit error
-            if 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            transient = is_transient_server_error(e)
+            if transient and retry == max_retries - 1:
+                raise
+
+            # Keep the existing rate-limit policy and delay handling.
+            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                 if retry < max_retries - 1:
                     import time
                     import random
@@ -736,7 +912,8 @@ def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
                         except:
                             pass
 
-                    print(f"    {YELLOW}Rate limit, retrying in {wait_time:.1f}s{RESET}")
+                    reason = "Server unavailable" if transient else "Rate limit"
+                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
                     time.sleep(wait_time)
                     continue
                 else:
@@ -1272,7 +1449,11 @@ def _synthesize_once(full_name, analyses, model=None):
         except Exception as e:
             error_str = str(e)
 
-            if 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+            transient = is_transient_server_error(e)
+            if transient and retry == max_retries - 1:
+                raise
+
+            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
                 if retry < max_retries - 1:
                     import time
                     import random
@@ -1289,7 +1470,8 @@ def _synthesize_once(full_name, analyses, model=None):
                         except:
                             pass
 
-                    print(f"    {YELLOW}Rate limit, retrying in {wait_time:.1f}s{RESET}")
+                    reason = "Server unavailable" if transient else "Rate limit"
+                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
                     time.sleep(wait_time)
                     continue
                 else:
