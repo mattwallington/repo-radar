@@ -536,8 +536,7 @@ function showErrorIcon() {
   }
   
   const status = loadStatus();
-  const errorCount = status.stats?.errors || 0;
-  tray.setToolTip(`Sync failed with ${errorCount} error${errorCount !== 1 ? 's' : ''}`);
+  tray.setToolTip(syncState.finishedWithErrors(status.stats?.errors) || 'Sync failed');
 }
 
 // Start icon animation
