@@ -324,12 +324,16 @@ def _generate_incremental(task_data, session, args, ctx):
                'openai': 'OPENAI_API_KEY'}.get(provider_for_model(model))
     ctx.meta_progress.update(task_id, completed=10, status=f"[{task_color}]checking for changes...[/{task_color}]")
     _incremental_status(args, full_name, short_id, '🔎 checking metadata...', 10, color)
+
+    def stage(message, percent=20):
+        ctx.meta_progress.update(task_id, completed=percent, status=f"[{task_color}]{message}[/{task_color}]")
+        _incremental_status(args, full_name, short_id, f'🔎 {message}', percent, color)
+
     try:
         outcome = incremental_metadata.update_repository(
             PRISTINE_DIR, PRISTINE_DIR / cache_name, cache_name, repo_config, model, session,
             force=bool(getattr(args, 'regenerate_metadata', False)),
-            log=lambda m, percent=20: ctx.meta_progress.update(task_id, completed=percent,
-                                                               status=f"[{task_color}]{m}[/{task_color}]"),
+            log=stage,
             missing_credential=env_key if env_key and not os.getenv(env_key) else None,
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
     except Exception as e:
@@ -404,6 +408,9 @@ def _report_incremental(task_data, outcome, model, args, ctx):
             output_tokens=usage.get('output_tokens', 0), cost=cost_text,
             unknown_cost_calls=usage.get('unknown_cost_calls', 0), changed_files=usage.get('changed_files'),
             changed_bytes=usage.get('changed_bytes'), read_bytes=usage.get('read_bytes'),
+            diff_pages=usage.get('diff_pages'), omitted_paths=usage.get('omitted_paths'),
+            map_calls=usage.get('map_calls'), merge_calls=usage.get('merge_calls'), edit_turns=usage.get('edit_turns'),
+            estimated_total_usd=usage.get('estimated_total_usd'),
             elapsed=f"{outcome.elapsed:.1f}s")
     return cost
 
