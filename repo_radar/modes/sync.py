@@ -326,7 +326,8 @@ def _generate_incremental(task_data, session, args, ctx):
         outcome = incremental_metadata.update_repository(
             PRISTINE_DIR, PRISTINE_DIR / cache_name, cache_name, repo_config, model, session,
             force=bool(getattr(args, 'regenerate_metadata', False)),
-            log=lambda m: ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{m}[/{task_color}]"),
+            log=lambda m, percent=20: ctx.meta_progress.update(task_id, completed=percent,
+                                                               status=f"[{task_color}]{m}[/{task_color}]"),
             missing_credential=env_key if env_key and not os.getenv(env_key) else None)
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)

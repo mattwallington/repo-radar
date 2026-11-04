@@ -22,7 +22,6 @@ from repo_radar.files import should_include_file
 
 COLLECTOR_MAX_BYTES = 100 * 1024     # files.collect_repo_files skips files larger than this
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
-MAX_DIFF_BYTES = 16 * 1024 * 1024     # the whole textual diff of one update
 MAX_FILE_DIFF_BYTES = 2 * 1024 * 1024 # one file's diff; larger ones are listed as omitted, not cut
 MAX_PAGE_BYTES = MAX_RESULT_BYTES - 1024   # one spooled page, its framing included
 MAX_SPOOL_BYTES = 256 * 1024 * 1024   # all spooled pages of one update
@@ -45,10 +44,6 @@ class GitError(Exception):
 
 class GitOutputTooLarge(GitError):
     """A read-only Git command produced more output than its limit. Any other GitError is a failed read."""
-
-
-class DiffTooLarge(GitError):
-    """The whole textual diff of an update exceeds MAX_DIFF_BYTES."""
 
 
 class ResourceLimit(Exception):
@@ -386,41 +381,6 @@ def _paginate(lines, page_bytes=MAX_RESULT_BYTES - 1024):
     return pages or ['']
 
 
-def build_diff(repo, base, target, base_manifest, target_manifest, changes, exclusions):
-    """The textual diff of an update, split into pages, plus the paths whose contents were omitted.
-
-    Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
-    submodules) appear only as a status line, on either side; binary files as Git reports them. A single file's diff larger than MAX_FILE_DIFF_BYTES is
-    listed as omitted, so the model knows to read the file rather than assume nothing changed.
-    Raises DiffTooLarge if the whole diff exceeds MAX_DIFF_BYTES.
-    """
-    lines, omitted, total = [], [], 0
-    for c in changes:
-        entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
-                               target_manifest.get(c.new_path) if c.new_path else None) if e]
-        reasons = {omission_reason(e, exclusions) for e in entries} - {None}
-        label = c.new_path or c.old_path
-        if reasons:
-            reason = sorted(reasons)[0]
-            lines.append(f"### {c.status} {label} (contents omitted: {reason})\n")
-            omitted.append((label, reason))
-            continue
-        paths = [p for p in (c.old_path, c.new_path) if p]
-        try:
-            text = run_git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '-M', base, target,
-                                  '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES).decode('utf-8', 'replace')
-        except GitError:
-            lines.append(f"### {c.status} {label} (diff omitted: larger than {MAX_FILE_DIFF_BYTES} bytes; "
-                         f"use read_file)\n")
-            omitted.append((label, 'diff too large'))
-            continue
-        total += len(text.encode('utf-8'))
-        if total > MAX_DIFF_BYTES:
-            raise DiffTooLarge(f"the diff is larger than {MAX_DIFF_BYTES} bytes")
-        lines.extend(text.splitlines(keepends=True))
-    return _paginate(lines), omitted
-
-
 # ---- the page stream: complete, independently readable pages ---------------------------------------
 
 # Explicit lists, not "all JSON or configuration": ordinary manifests and source stay visible.
@@ -656,14 +616,6 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
 # ---- read-only tools ------------------------------------------------------------------------------
 
 TOOL_SPECS = [
-    {"name": "read_diff",
-     "description": "Read one page of the textual diff between the analyzed and new commit. Every page must be read before answering.",
-     "parameters": {"type": "object", "properties": {"page": {"type": "integer", "minimum": 1}},
-                    "required": ["page"], "additionalProperties": False}},
-    {"name": "list_paths",
-     "description": "List tracked paths at the new commit that start with a prefix, with sizes and any reason a file is unavailable.",
-     "parameters": {"type": "object", "properties": {"prefix": {"type": "string"}, "page": {"type": "integer", "minimum": 1}},
-                    "required": ["prefix"], "additionalProperties": False}},
     {"name": "read_file",
      "description": "Read lines of a tracked text file at the new commit (version 'target') or the analyzed commit (version 'base').",
      "parameters": {"type": "object", "properties": {
@@ -699,21 +651,16 @@ def _str(args, key, default=None, max_len=1024):
 
 
 class SnapshotTools:
-    """The model's read-only view of the two pinned commits and the diff between them. `exclusions` is
-    the generation's effective record (credential_exclusions), the same one the diff used."""
+    """The model's targeted, read-only view of the two pinned commits. `exclusions` is the generation's
+    effective record (credential_exclusions), the same one the pages used."""
 
-    def __init__(self, base, target, diff_pages, exclusions):
+    def __init__(self, base, target, exclusions):
         self.base, self.target = base, target
-        self.diff_pages = diff_pages
         self._exclusions = exclusions
-        self.seen_pages = {1}  # the first page is part of the opening message
         self.bytes_read = 0
 
     def _omitted(self, entry):
         return omission_reason(entry, self._exclusions)
-
-    def unseen_pages(self):
-        return [p for p in range(1, len(self.diff_pages) + 1) if p not in self.seen_pages]
 
     def run(self, name, raw_args):
         try:
@@ -722,8 +669,7 @@ class SnapshotTools:
             raise ToolRequestError(f"{name}: arguments are not valid JSON") from None
         if not isinstance(args, dict):
             raise ToolRequestError(f"{name}: arguments must be an object")
-        handler = {'read_diff': self._read_diff, 'list_paths': self._list_paths,
-                   'read_file': self._read_file, 'search': self._search}.get(name)
+        handler = {'read_file': self._read_file, 'search': self._search}.get(name)
         if handler is None:
             raise ToolRequestError(f"unknown tool: {name}")
         allowed = {s['name']: set(s['parameters']['properties']) for s in TOOL_SPECS}[name]
@@ -736,24 +682,6 @@ class SnapshotTools:
             text = data[:MAX_RESULT_BYTES - 200].decode('utf-8', 'ignore') + "\n[result truncated at 64 KiB]\n"
         self.bytes_read += len(text.encode('utf-8'))
         return text
-
-    def _read_diff(self, args):
-        page = _int(args, 'page', 1, 1, len(self.diff_pages))
-        self.seen_pages.add(page)
-        return f"[diff page {page} of {len(self.diff_pages)}]\n{self.diff_pages[page - 1]}"
-
-    def _list_paths(self, args):
-        prefix = _str(args, 'prefix', '')
-        page = _int(args, 'page', 1, 1, 100000)
-        lines = []
-        for path, entry in sorted(self.target.manifest().items()):
-            if path.startswith(prefix):
-                reason = self._omitted(entry)
-                lines.append(f"{path}\t{entry.size}" + (f"\t(unavailable: {reason})" if reason else '') + "\n")
-        pages = _paginate(lines)
-        if page > len(pages):
-            return f"[no page {page}; {len(pages)} page(s)]"
-        return f"[page {page} of {len(pages)}; {len(lines)} path(s)]\n{pages[page - 1]}"
 
     def _read_file(self, args):
         path = _str(args, 'path')
