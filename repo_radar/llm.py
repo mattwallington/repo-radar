@@ -393,14 +393,21 @@ class Conversation:
             return [{"type": "function", "function": dict(t)} for t in self.tools]
         return [{"type": "function", **t} for t in self.tools]
 
-    def request(self, max_tokens):
-        """The complete request for the next turn, as plain JSON data."""
+    def request(self, max_tokens, low_effort=False, json_reply=False):
+        """The complete request for the next turn, as plain JSON data. On Gemini, where thinking shares the
+        output limit, a short stage can ask for low reasoning effort and a JSON-only reply; other providers
+        keep their usual options."""
         out = output_budget(self.model, max_tokens)
         if self.endpoint == 'chat':
             system = [{"role": "system", "content": self.system}] if self.system is not None else []
             req = {"endpoint": "chat", "model": self.model, "messages": [*system, *self.items], "max_tokens": out}
             if self.model in CLAUDE_MEDIUM_EFFORT_MODELS:
                 req["output_config"] = {"effort": "medium"}
+            if provider_for_model(self.model) == 'gemini':
+                if low_effort:
+                    req["reasoning_effort"] = "low"
+                if json_reply:
+                    req["response_format"] = {"type": "json_object"}
         else:
             req = {"endpoint": "responses", "model": self.model, "input": list(self.items), "max_output_tokens": out}
             if self.system is not None:
