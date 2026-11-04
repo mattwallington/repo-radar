@@ -4,21 +4,37 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.32] - 2026-09-01
+## [1.0.36] - Unreleased
+
+### Fixed
+- **Long diffs go straight to a full summary rebuild.** An incremental summary update had to read its whole diff within 16 model turns, so a long diff ran out of turns, spent money and failed, and every later sync repeated it until the weekly rebuild. When the filtered diff is over 8 pages (or over the 16 MiB diff limit), Repo Radar now chooses a full rebuild before making any model call. The other limits are unchanged, and a failed incremental update still isn't followed by an automatic full rebuild.
+- **A finished sync with errors no longer says "Sync failed".** When every repository was processed and some had errors, the progress window and tray tooltip now say so, for example "Sync finished — 1 repo had an error (see ⚠️ View Errors)", in amber. "Sync failed" is kept for a sync that didn't complete.
+- **Check for Updates shows a short message when it fails.** The dialog used to show the raw HTTP response, including headers and cookies. When the update feed isn't there it now says "In-app updates aren't set up yet. Install updates manually.", and any other failure gets one short line.
+
+## [1.0.35] - 2026-11-03
+
+### Added
+- **Incremental summaries for selected repositories.** Repositories listed in `incremental_metadata_repos` have their summary updated from the Git diff, with read-only access to the surrounding source, instead of being regenerated on every change. A full rebuild still runs weekly, after a large change, or when the model or policy changes. Each update is capped at $8, a failed one keeps the previous summary, and credential files are never sent. It's off unless you list a repository. See `docs/incremental-metadata.md`.
+- **A release workflow for `ReperioHealth/repo-radar-releases`.** GitHub Actions can build, sign and notarize a new version, DMGs included, when `main` (Repo Radar) or `dev` (Repo Radar Dev) changes, and publish it with its update feed. Repo Radar Dev keeps its own update download cache.
+
+### Fixed
+- **Temporary model server errors are retried on the same model,** with no change of model. Connection failures aren't treated as server errors.
+- **Costs of completed model calls are kept** when metadata generation fails afterwards.
+- **Activity History counts are accurate.** Each sync failure counts once, completion summaries no longer count as warnings, and the legacy list shows only logs from before Activity History.
+
+## [1.0.34] - 2026-10-29
 
 ### Fixed
 - **Sync blocked after Homebrew's default Python moved to 3.15.** When Homebrew updated its default `python3` past the supported range, the app could no longer find a usable Python to rebuild its runtime, so every sync — manual and scheduled — was blocked. It now also looks for the versioned Homebrew Pythons (3.14 down to 3.10), so relaunching the app rebuilds the runtime from one that is still installed.
 - **Blocked syncs now show why.** Selecting an attempt in Activity History that was blocked before it recorded any events opens it on Problems, where its reason is shown, instead of an empty Events list. You can still switch to Events.
-- **Progress window stuck on "Starting sync…".** When Sync Now was refused because another sync already held the lock (for example right after an auto-update), or the sync failed before its process could start, the progress window opened and then sat on "Starting sync…" forever. It now says "Not started — another sync is already running" or "Sync could not start — see ⚠️ View Errors in the menu", and the attempt is recorded in Activity History either way.
-
 - **Claude metadata is skipped, not sent, when its size can't be verified.** Repo Radar checks each Claude prompt with Anthropic's token count before sending it. If that count became unavailable partway through, after it had already found a file or chunk too large, Repo Radar sent the unverified prompt anyway, which could exceed the model's window. It now skips that repository's metadata for this sync with a warning: the previous metadata stays, and the repository is retried on the next sync. Other providers are unchanged.
 - **INDEX.md lists every repository again.** Metadata files written before `parse_status` existed made index regeneration fail with "name '_FRAGMENT_PREFIXES' is not defined", so each was left out (one sync listed 13 of 30 repos). They're indexed again, with a leaked-fragment summary marked as degraded.
+
 ### Changed
 - **OpenAI's October retirements handled.** OpenAI shut down `gpt-4.1-nano`, `o4-mini`, `o1`, `o3-mini` and `o1-pro` on October 23, 2026. A saved selection of one of these now runs on the newest model of its own tier: GPT-6 Luna for `gpt-4.1-nano`, GPT-6.1 Terra for `o4-mini` and `o3-mini`, GPT-6.1 Sol for `o1`, and GPT-5.5 Pro for `o1-pro`. On the stable channel the app shows a notice naming the replacement, with Review Models to pick something else.
 - **Gemini 2.5 Pro, Flash and Flash-Lite stay selectable.** Google has not deprecated them or set a shutdown date, so the October 16 dates recorded earlier were wrong and have been removed. Existing selections keep working unchanged.
 - **Upcoming shutdowns recorded.** Claude Sonnet 4.5 retires November 30, 2026. GPT-5, GPT-5 mini and nano, o3 and o3-pro shut down December 11, 2026. GPT-4.1, GPT-4.1 mini, GPT-4o and GPT-4o mini shut down January 14, 2027. GPT-5.1, GPT-5.3-codex and GPT-5.4 nano retire April 1, 2027, and Gemini 3.1 Flash-Lite no earlier than May 7, 2027. They stay selectable until then.
 - **Signed by Reperio Health.** Builds are now signed with Reperio Health's Apple Developer ID (team F8UY7565VM) and notarized through its `reperio-notary` keychain profile, and they check for updates at `ReperioHealth/repo-radar-releases`. Copies signed by the earlier personal team can't update to these builds automatically, so replace each installed app once by hand; settings, mirrors and runtime are kept. The new `build-local.sh` builds and verifies a signed app without publishing it, and stops if notarization was skipped. Publishing with `release.sh` is paused until the update feed moves to `ReperioHealth/repo-radar-releases`, because it would still publish to the old feed; `--dry-run` still runs its gates. See README, "Building a signed app locally".
-- **Releases publish from ReperioHealth/repo-radar-releases.** New versions are built, signed and notarized by GitHub Actions when `main` (Repo Radar) or `dev` (Repo Radar Dev) changes, and published with their installers and update feed to the public `ReperioHealth/repo-radar-releases` repository. The DMG installers are now notarized too. Repo Radar Dev keeps its own update download cache.
 - **Releases run their model gates in a dedicated release environment.** `release.sh` now requires `REPO_RADAR_RELEASE_PYTHON` and checks that venv against the checked-in dependency lock before anything else. See README, "Preparing a release".
 - **New default model: Claude Sonnet 5.5.** New installs, and installs that never picked a model, use it. A model you picked yourself stays selected; if a newer model of the same kind exists, you're offered it once.
 - **Retired models move to the newest model of the same kind.** A retired model now always lands on the newest model of its own provider, family and tier, for example any older Gemini Flash to Gemini 3.8 Flash, or any older Claude Sonnet to Sonnet 5.5. It is never moved to a different tier or provider. This corrects a few earlier routes: `o3-mini` and `o1-mini` now go to GPT-6.1 Terra (not a flagship model), and `o1-pro` goes to GPT-5.5 Pro.
@@ -32,6 +48,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Security
 - **LiteLLM upgraded from 1.93.0 to 1.105.6.** 1.93.0 is inside the affected range of CVE-2026-84377, an authenticated SSRF in LiteLLM's proxy server (1.89.0 through 1.96.1, fixed in 1.96.2). Repo Radar uses only the LiteLLM SDK, never the proxy, but the pin is now outside that range. Releases from 1.106.0 on aren't used: they break GPT Pro and Codex sends unless the proxy's `mcp` package is installed. What has been verified for 1.105.6: its eight PyPI files were uploaded October 27, 2026 at 19:42 UTC and aren't yanked, and their SHA-256 hashes are exactly the ones in all ten dependency locks. All 2,693 Python files in the installed wheel are byte-identical to LiteLLM's `v1.105.6` source tag (commit `3a05120f`); the tag has one extra benchmark test file. What can't be verified: the wheel's compiled Rust extension can't be checked against source, and the tag is controlled by the same project owners, so the comparison isn't independent evidence. LiteLLM reports that an attacker had owner-level access from October 10, 2026. 1.105.6 was published after LiteLLM's reported recovery, but no version-specific all-clear has been published for it or any other release.
+
+## [1.0.32] - 2026-09-01
+
+### Fixed
+- **Progress window stuck on "Starting sync…".** When Sync Now was refused because another sync already held the lock (for example right after an auto-update), or the sync failed before its process could start, the progress window opened and then sat on "Starting sync…" forever. It now says "Not started — another sync is already running" or "Sync could not start — see ⚠️ View Errors in the menu", and the attempt is recorded in Activity History either way.
 
 ## [1.0.31] - 2026-09-01
 

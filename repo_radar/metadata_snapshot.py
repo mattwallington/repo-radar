@@ -41,6 +41,10 @@ class GitError(Exception):
     """A read-only Git command failed or produced more output than allowed."""
 
 
+class DiffTooLarge(GitError):
+    """The whole textual diff of an update exceeds MAX_DIFF_BYTES."""
+
+
 def _git_env():
     return {
         'PATH': _GIT_PATH,
@@ -377,7 +381,7 @@ def build_diff(repo, base, target, base_manifest, target_manifest, changes, excl
     Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
     submodules) appear only as a status line, on either side; binary files as Git reports them. A single file's diff larger than MAX_FILE_DIFF_BYTES is
     listed as omitted, so the model knows to read the file rather than assume nothing changed.
-    Raises GitError if the whole diff exceeds MAX_DIFF_BYTES.
+    Raises DiffTooLarge if the whole diff exceeds MAX_DIFF_BYTES.
     """
     lines, omitted, total = [], [], 0
     for c in changes:
@@ -401,7 +405,7 @@ def build_diff(repo, base, target, base_manifest, target_manifest, changes, excl
             continue
         total += len(text.encode('utf-8'))
         if total > MAX_DIFF_BYTES:
-            raise GitError(f"the diff is larger than {MAX_DIFF_BYTES} bytes")
+            raise DiffTooLarge(f"the diff is larger than {MAX_DIFF_BYTES} bytes")
         lines.extend(text.splitlines(keepends=True))
     return _paginate(lines), omitted
 

@@ -46,7 +46,10 @@ The decision, in order:
    changed-file and changed-byte fractions. Additions, deletions, renames (both paths) and files
    crossing the size limit all count. Exactly 20% stays incremental.
 4. **Nothing to do** when the tracked tree is identical.
-5. **Incremental update** otherwise.
+5. **Full rebuild** when the diff the model would read, after the credential and file filters, has more
+   than 8 pages or exceeds the 16 MiB diff limit. The model has to read every page within its 16 turns,
+   so a longer diff would only spend money on an attempt that is likely to fail.
+6. **Incremental update** otherwise.
 
 An existing document written by the full generator is adopted once without a paid rebuild. Its
 `last_updated` becomes its full-build time, and its model is recorded as unknown.
@@ -125,7 +128,7 @@ refuses further paid requests until it's reconciled by hand.
    `baseline.md` (for example `~/repos-pristine/reperio-telehealth-fab3ba4.md`). Don't buy a new
    baseline.
 2. Pick a later commit that is a descendant of the baseline's `last_commit`, changes 20% or less of
-   the eligible source, and is within seven days of the baseline. Check it:
+   the eligible source, has a diff of at most 8 pages, and is within seven days of the baseline. Check it:
 
    ```bash
    python3 -I scripts/pilot-incremental-metadata.py plan --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4 --target <commit> --model claude-sonnet-5-5
