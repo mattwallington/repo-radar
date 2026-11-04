@@ -48,6 +48,19 @@ def get_cache_name(clone_url, repo_name):
 _REPO_IDENTITY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$')
 
 
+DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS = 7
+
+
+def incremental_full_rebuild_days(config):
+    """How many days after its last full build an opted-in repository is rebuilt in full
+    (`incremental_full_rebuild_days`); 0 turns the age trigger off. Raises ValueError unless it is a
+    nonnegative integer."""
+    value = (config or {}).get('incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"incremental_full_rebuild_days must be a nonnegative whole number of days, not {value!r}")
+    return value
+
+
 def incremental_metadata_repos(config):
     """The repositories opted in to incremental metadata (`incremental_metadata_repos`).
 

@@ -18,6 +18,7 @@ from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from repo_radar.config import DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
 from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, parse_frontmatter, read_attempt_state,
                                  _parse_status_of)
 from repo_radar import metadata_snapshot as snap
@@ -25,8 +26,6 @@ from repo_radar import metadata_snapshot as snap
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
 # every opted-in document is rebuilt once under the new policy.
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
-FULL_REBUILD_AFTER = timedelta(days=7)
-CHANGE_THRESHOLD = 0.20            # strictly more than this fraction changed -> full rebuild
 UNKNOWN = 'unknown'
 PIPELINE_VERSION = 'map-reduce/1'  # the update engine; a new one doesn't force a rebuild the way a policy does
 
@@ -34,6 +33,11 @@ Document = namedtuple('Document', 'path text sha256 info body')
 Decision = namedtuple('Decision', 'strategy reason base target full_built_at full_model change adopt')
 PreparedDiff = namedtuple('PreparedDiff', 'base_snap target_snap changes exclusions pages')
 UNFINISHED = ('pending', 'committing', 'failed', 'skipped')   # attempt statuses that never published
+# Why older versions chose a full rebuild, for triggers that no longer exist: a rebuild that didn't finish
+# for one of these reasons isn't owed any more.
+_REMOVED_TRIGGER = re.compile(r'\d+% of the source changed|\d+ diff pages exceeds \d+|'
+                              r'diff exceeds the incremental size limit|no analyzable source')
+WEEKLY_REASON = 'weekly full rebuild due'
 
 
 def document_path(pristine_dir, cache_name):
@@ -159,15 +163,31 @@ def _full_build(doc, state, model):
     return built, UNKNOWN, model, adopt
 
 
-def full_rebuild_unfinished(state, doc):
-    """True when `state` is a full rebuild started from exactly `doc` that never published. A state
-    whose generation ID is the document's own reached its commit point and is not unfinished."""
+def full_rebuild_unfinished(state, doc, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
+    """True when `state` is a full rebuild started from exactly `doc` that never published and is still
+    owed. A state whose generation ID is the document's own reached its commit point and is not
+    unfinished. One chosen only by a trigger that no longer applies (a removed size rule, or the weekly
+    rule once it's turned off) isn't owed; an explicitly forced one still is."""
     st = state or {}
     if doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED:
         return False
     if st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'):
         return False
+    reason = st.get('decision_reason') or ''
+    if _REMOVED_TRIGGER.fullmatch(reason) or (reason == WEEKLY_REASON and not full_rebuild_days):
+        return False
     return st.get('baseline_doc_sha256') == doc.sha256
+
+
+def _dropped_full_attempt(state, doc, full_rebuild_days):
+    """The record of a full rebuild that didn't finish and is no longer owed, kept as evidence when a
+    new attempt replaces it. None when there isn't one."""
+    st = state or {}
+    if (doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED
+            or st.get('baseline_doc_sha256') != doc.sha256 or full_rebuild_unfinished(st, doc, full_rebuild_days)
+            or (st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'))):
+        return None
+    return {k: st.get(k) for k in ('status', 'reason', 'decision_reason', 'target_commit', 'finished_at')}
 
 
 def prepare_diff(repo_path, doc, base, target, spool_dir, check=lambda: None):
@@ -184,14 +204,16 @@ def prepare_diff(repo_path, doc, base, target, spool_dir, check=lambda: None):
     return PreparedDiff(base_snap, target_snap, changes, exclusions, pages)
 
 
-def decide(repo_path, full_name, doc, state, model, target, now, force=False):
+def decide(repo_path, full_name, doc, state, model, target, now, force=False,
+           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
     """Choose 'full', 'incremental' or 'none' for an opted-in repository at commit `target`.
 
     Pure apart from read-only Git: no model calls, token counts or state writes, so dry runs can
     report it. Rules, in order: a forced or unusable baseline, a changed model or policy, an
-    unknown full-build time or an unfinished full rebuild means full; seven days since the last
-    full build means full; more than 20% of the eligible source changed means full; an unchanged
-    tree means nothing to do; anything else is incremental.
+    unknown full-build time or an unfinished full rebuild still owed means full; `full_rebuild_days`
+    since the last full build means full (0 turns this off); an unchanged tree means nothing to do;
+    anything else is incremental. How much changed picks the amount of work, never a full rebuild;
+    the fraction changed is only a diagnostic.
     """
     def full(reason, change=None, built=None, adopt=None):
         return Decision('full', reason, None, target, built, None, change, adopt)
@@ -213,10 +235,10 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
         return full('configured model changed', adopt=adopt)
     if built is None:
         return full('last full build time unknown', adopt=adopt)
-    if full_rebuild_unfinished(state, doc):
+    if full_rebuild_unfinished(state, doc, full_rebuild_days):
         return full('previous full rebuild did not finish', built=built, adopt=adopt)
-    if now - built >= FULL_REBUILD_AFTER:
-        return full('weekly full rebuild due', built=built, adopt=adopt)
+    if full_rebuild_days and now - built >= timedelta(days=full_rebuild_days):
+        return full(WEEKLY_REASON, built=built, adopt=adopt)
 
     base_snap, target_snap = snap.GitSnapshot(repo_path, base), snap.GitSnapshot(repo_path, target)
     if base_snap.tree_id() == target_snap.tree_id():
@@ -224,12 +246,8 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
                         full_model, None, adopt)
     changes = snap.changes_between(repo_path, base, target)
     change = snap.change_fraction(base_snap.manifest(), target_snap.manifest(), changes)
-    if change is None:
-        return full('no analyzable source', built=built, adopt=adopt)
-    if change.fraction > CHANGE_THRESHOLD:
-        return full(f"{change.fraction:.0%} of the source changed", change, built, adopt)
-    return Decision('incremental', f"{change.fraction:.1%} of the source changed", base, target, built,
-                    full_model, change, adopt)
+    reason = f"{change.fraction:.1%} of the source changed" if change else 'the tracked tree changed'
+    return Decision('incremental', reason, base, target, built, full_model, change, adopt)
 
 
 def _analysis_of(doc):
@@ -710,7 +728,7 @@ def _cleared_setup_failure(state, now):
 
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
-                      missing_credential=None):
+                      missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
     """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
@@ -736,6 +754,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
         usage = budget.summary() if budget else {}
+        if attempt is not None and status == 'published':
+            attempt.pop('dropped_full_attempt', None)
         if attempt is None:
             state_error = record_failure(pristine_dir, cache_name, full_name, reason, target, 'setup', status)
         else:
@@ -753,7 +773,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         target = snap.resolve_commit(repo_path, 'HEAD')
         if target is None:
             return finish('failed', 'the repository has no commit')
-        decision = decide(repo_path, full_name, doc, state, model, target, now, force=force)
+        decision = decide(repo_path, full_name, doc, state, model, target, now, force=force,
+                          full_rebuild_days=full_rebuild_days)
         if decision.adopt:
             state = {**state, 'adoption': decision.adopt}
         if decision.strategy == 'none':
@@ -768,6 +789,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                    'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
                    'policy': SEMANTIC_POLICY, 'model': model, 'started_at': now.isoformat(), 'reason': None,
                    'generation_id': None}
+        dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
+        if dropped:   # its failure stays on record while the new path runs
+            attempt['dropped_full_attempt'] = dropped
+        if decision.strategy == 'incremental':
+            attempt['pipeline_version'] = PIPELINE_VERSION
         for stale in ('finished_at', 'usage'):
             attempt.pop(stale, None)
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible

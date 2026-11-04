@@ -16,7 +16,8 @@ import threading
 from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
-from repo_radar.config import incremental_metadata_repos
+from repo_radar.config import (DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, incremental_full_rebuild_days,
+                               incremental_metadata_repos)
 from repo_radar import incremental_metadata
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
@@ -300,7 +301,8 @@ def _dry_run_decision(repo_path, cache_name, full_name, args):
         decision = incremental_metadata.decide(
             repo_path, full_name, incremental_metadata.load_document(PRISTINE_DIR, cache_name),
             read_attempt_state(PRISTINE_DIR, cache_name), get_ai_model(), target, datetime.now(),
-            force=bool(getattr(args, 'regenerate_metadata', False)))
+            force=bool(getattr(args, 'regenerate_metadata', False)),
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
         return {'none': 'no update needed', 'incremental': 'incremental update',
                 'full': 'full rebuild'}[decision.strategy] + f" ({decision.reason})"
     except Exception as e:
@@ -328,7 +330,8 @@ def _generate_incremental(task_data, session, args, ctx):
             force=bool(getattr(args, 'regenerate_metadata', False)),
             log=lambda m, percent=20: ctx.meta_progress.update(task_id, completed=percent,
                                                                status=f"[{task_color}]{m}[/{task_color}]"),
-            missing_credential=env_key if env_key and not os.getenv(env_key) else None)
+            missing_credential=env_key if env_key and not os.getenv(env_key) else None,
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)
@@ -1446,6 +1449,7 @@ def sync_mode(args):
     # metadata is enabled; with metadata off nothing uses it.
     try:
         args._incremental_repos = incremental_metadata_repos(config)
+        args._incremental_full_rebuild_days = incremental_full_rebuild_days(config)
     except ValueError as e:
         if metadata_capable:
             console.print(f"[red]{e}[/red]")
@@ -1456,6 +1460,7 @@ def sync_mode(args):
             _terminal('blocked', reason='invalid_incremental_metadata_repos')
             return 1
         args._incremental_repos = frozenset()
+        args._incremental_full_rebuild_days = 0
     incremental_repos = args._incremental_repos
     args._incremental_reported = set()
     args._incremental_index_due = False
