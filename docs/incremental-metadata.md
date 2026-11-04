@@ -2,10 +2,10 @@
 
 Incremental metadata is an opt-in mode for selected repositories. Instead of regenerating a
 repository's whole metadata document after every change, Repo Radar updates the previous document
-from the commit it was built from. It gives the model the git diff, the previous document and
-read-only access to the surrounding source, and the model edits only the sections the change
-affects. A full rebuild still happens weekly, after a large change, or when the model or policy
-changes.
+from the commit it was built from. It summarizes each page of the Git diff in a short model call of
+its own, merges those notes when there are too many to hand over together, and then one short
+conversation edits only the sections the change affects. Diff size selects the amount of work, not a
+different strategy. A full rebuild still happens weekly, or when the model or policy changes.
 
 It is off for every repository unless you list it. Repositories that aren't listed keep today's
 full-generation path unchanged.
@@ -27,6 +27,9 @@ full-generation path on its next metadata-enabled sync. The extra frontmatter fi
 incremental documents carry are ignored by everything else. To force a full rebuild of an opted-in
 repository, run `repo-radar sync --regenerate-metadata`.
 
+`"incremental_full_rebuild_days"` sets how old a full build can get before the next one: a whole
+number of days, 7 by default, with 0 turning the age trigger off. There's no Settings control for it.
+
 ## What happens on each sync
 
 Every metadata-enabled sync evaluates each opted-in repository, even when its HEAD didn't move,
@@ -38,54 +41,80 @@ The decision, in order:
 1. **Full rebuild** when it's forced; when there's no usable document (missing, degraded, or for
    another repository); when the analyzed commit is missing or isn't an ancestor of the new HEAD;
    when the configured model or the metadata policy changed; when the last full-build time is
-   unknown; or when the previous full rebuild didn't finish.
-2. **Full rebuild** when seven days have passed since the last successful full rebuild, even on an
-   unchanged HEAD. A failed rebuild and an incremental update don't reset this clock.
-3. **Full rebuild** when more than 20% of the eligible source changed. Eligible means what the full
-   generator would read: its file rules and 100 KiB limit. The figure is the larger of the
-   changed-file and changed-byte fractions. Additions, deletions, renames (both paths) and files
-   crossing the size limit all count. Exactly 20% stays incremental.
-4. **Nothing to do** when the tracked tree is identical.
-5. **Full rebuild** when the diff the model would read, after the credential and file filters, has more
-   than 8 pages or exceeds the 16 MiB diff limit. The model has to read every page within its 16 turns,
-   so a longer diff would only spend money on an attempt that is likely to fail.
-6. **Incremental update** otherwise.
+   unknown; or when a previous full rebuild that's still owed didn't finish.
+2. **Full rebuild** when `incremental_full_rebuild_days` have passed since the last successful full
+   rebuild, even on an unchanged HEAD. A failed rebuild and an incremental update don't reset this clock.
+3. **Nothing to do** when the tracked tree is identical.
+4. **Incremental update** otherwise, however large the change.
+
+How much of the source changed is recorded as a diagnostic only. A full rebuild that older versions
+chose because a change was large, and that never finished, isn't owed any more: its failure stays on
+record and the update takes the incremental path. A requested rebuild that didn't finish is still due.
 
 An existing document written by the full generator is adopted once without a paid rebuild. Its
-`last_updated` becomes its full-build time, and its model is recorded as unknown.
+`last_updated` becomes its full-build time, and its model is recorded as unknown. A document also
+records its `pipeline_version`; a new version doesn't force a rebuild.
 
-## What the model can see and do
+## How an update runs
 
 All reads come from Git objects of the two pinned commits, never the working tree. Git runs without
 external diff or textconv helpers, without global or system config, and without credentials in its
-environment. The model gets:
+environment. Credential files (`.env`, private keys, `.netrc` and similar; `.env.example` stays
+readable), symlinks, submodules and binary files are unavailable, and the update records them as
+omissions. There are no shell, network, host-filesystem or write tools.
 
-- the previous document's sections (each with an id and a hash) and its summary fields;
-- every changed path with its status, and the textual diff, in pages of at most 64 KiB;
-- four tools: `read_diff`, `list_paths`, `read_file` (either commit) and literal `search`.
+1. **Pages.** The filtered diff is spooled to an owner-only directory as pages of at most 63 KiB, up to
+   256 MiB in all, and removed afterwards. Each page names its commits and its files, breaks at a file
+   or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
+   files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
+   which need no model call. They're listed as not analyzed, never described as analyzed source.
+2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
+   tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
+   validated note of at most 3 KiB.
+3. **Merging.** If the notes total more than 96 KiB or don't fit the editor's request, ordered groups of
+   up to 16 notes and 64 KiB are merged into notes of at most 12 KiB (4,096 output tokens, 90 seconds),
+   as many levels as it takes. The app tracks which pages each note covers and requires every page to be
+   covered exactly once; a model can't change that.
+4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes
+   and what wasn't analyzed: at most 4 turns, 6 `read_file` or `search` calls, 64 KiB of tool results,
+   65,536 input tokens per request and 16,384 output tokens. Its answer is a set of section edits:
+   replace, delete or insert, each naming the section's id and hash. Edits that don't match are rejected,
+   untouched sections keep their exact bytes, and the app writes the commit IDs, timestamps and
+   provenance itself.
 
-Credential files (`.env`, private keys, `.netrc` and similar; `.env.example` stays readable),
-symlinks, submodules and binary files are unavailable, and the update records them as omissions.
-There are no shell, network, host-filesystem or write tools. The model must read every diff page
-before it answers. Its answer is a set of section edits: replace, delete or insert, each naming the
-section's id and hash. Edits that don't match are rejected, untouched sections keep their exact
-bytes, and the app writes the commit IDs, timestamps and provenance itself.
+On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
+usual options and output floors, which are priced in. A whole update has 20 minutes, from preparing its
+pages to draining its last call.
 
-Limits per attempt: 16 model turns, 64 tool calls, 20 minutes, 64 KiB per tool result. A fresh
-conversation is used for each attempt; nothing is saved or resumed.
+Each generated document also records which paths and file contents (by Git blob ID) are withheld as
+credentials, in its `credential_exclusions` header. This holds no credential bytes. Every
+publication, full rebuilds included, carries the record forward and only adds to it. So a
+credential renamed, copied or edited under an ordinary name stays withheld after the commit that
+showed its origin is gone. Every page, note and tool uses that one record. A generated document whose
+record is missing or invalid, or an existing document that can't be read, is kept as it is. Its update
+fails before anything is read, counted or sent, and `--regenerate-metadata` doesn't bypass this.
+Restoring the record is a manual recovery step. A first build, or one from a full-generator document,
+starts the record from the commits it can see.
 
 ## Spending
 
-Every request is counted in full before it's sent: instructions, the conversation so far, tool
+Before the first generation call, the whole update is quoted at worst case and uncached prices: the
+counted request for every page, the merge tree the note limits imply, and all four editing turns. A quote
+over **$12** (`INCREMENTAL_CAP_USD`), an unknown price or a request that can't fit stops the update
+before anything is sent. A larger diff never turns into an uncapped full rebuild.
+
+The quote is only a check. Every request is still counted in full before it's sent: instructions, tool
 definitions and tool results. For Claude the count comes from Anthropic's Count Tokens API, from the
 same request shape that is sent. If that count isn't available, the update is skipped rather than
 sent on a local estimate.
 
-The request's input plus its maximum output is then priced at uncached rates and reserved. An
-incremental update stops before any request that would take it past **$8**. A reply settles its
-reservation with its reported or computed cost. If the cost isn't known, the whole reservation stays
-counted. There are no automatic retries or model fallbacks. Full rebuilds follow the existing
-full-generation cost policy.
+The requests of a wave are reserved together at their input plus maximum output, so they can't each
+pass against the same remaining budget. A reply settles its reservation with its reported or computed
+cost. If the cost isn't known, the whole reservation stays counted and no further request goes out. An
+update uses one set of prices throughout, including Google's announced January 2027 price for Gemini
+3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
+automatic retries, including after a 429 or 503, and no model fallbacks. Full rebuilds follow the
+existing full-generation cost policy.
 
 ## When an update fails
 
@@ -96,58 +125,61 @@ the document it started from is unchanged, and the repository is still at the sa
 `INDEX.md` marks such a document stale and names the analyzed revision, the attempted revision and
 the reason. An opted-in repository that has never had a document is listed as having metadata
 unavailable. The sync's progress view and Activity report the update as failed (an error) or skipped
-(a warning, for example an unavailable token count or price, or a spending limit). A failed
-incremental update is not followed by an automatic full rebuild; the next ordinary sync tries again.
+(a warning, for example an unavailable token count or price, a spending limit, or the spool limit).
+When any call fails, nothing further is started, the calls already launched finish and are accounted
+for, and no partial set of notes is used. A failed incremental update is not followed by an automatic
+full rebuild; the next ordinary sync tries again. A document too large for the editor's request fails
+before anything is spent, and stays until a weekly or requested rebuild replaces it.
 
 Attempt records live in `~/repos-pristine/.metadata-state/<cache>.json` (owner-only). Each one holds
 the latest attempt and its usage, never prompts or source.
 
-Each generated document also records which paths and file contents (by Git blob ID) are withheld as
-credentials, in its `credential_exclusions` header. This holds no credential bytes. Every
-publication, full rebuilds included, carries the record forward and only adds to it. So a
-credential renamed, copied or edited under an ordinary name stays withheld after the commit that
-showed its origin is gone. A generated document whose record is missing or invalid, or an existing
-document that can't be read, is kept as it is. Its update fails before anything is read, counted or
-sent, and `--regenerate-metadata` doesn't bypass this. Restoring the record is a manual recovery
-step. A first build, or one from a full-generator document, starts the record from the commits it
-can see.
-
 ## Telehealth pilot
 
-The pilot compares an incremental update with a clean full rebuild for
-`ReperioHealth/reperio-telehealth` only. It runs from a checkout with a Python environment built from
-this repository's dependency lock, never through the installed sync. Every request is charged to one
-ledger capped at **$40**: $8 for the incremental candidate, $24 for the full comparison, and $8 held
-back as contingency. The ledger survives restarts, can't have its limits changed, and never buys the
-same request twice. Only one pilot command can use a pilot directory at a time; a second one exits
-before touching anything. If a candidate can't fit its allowance, or a reply's cost is unknown, the
-pilot stops; it doesn't change models or raise the cap, and a ledger holding a request of unknown cost
-refuses further paid requests until it's reconciled by hand.
+The pilot measures this engine against real telehealth history before live use. It runs from a checkout
+with a Python environment built from this repository's dependency lock, never through the installed
+sync, and installed documents and state are never updated. Matt runs the paid commands with his own key.
 
-1. Make a pilot directory and copy the latest healthy full telehealth document into it as
-   `baseline.md` (for example `~/repos-pristine/reperio-telehealth-fab3ba4.md`). Don't buy a new
-   baseline.
-2. Pick a later commit that is a descendant of the baseline's `last_commit`, changes 20% or less of
-   the eligible source, has a diff of at most 8 pages, and is within seven days of the baseline. Check it:
+A replay manifest names the model and, for each case, immutable commits, where its baseline comes from
+and its output directory. A case's baseline must have been built at exactly its `base` commit, so a later
+document is never relabeled as a historical one. For example:
 
-   ```bash
-   python3 -I scripts/pilot-incremental-metadata.py plan --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4 --target <commit> --model claude-sonnet-5-5
-   ```
+```json
+{"schema": "repo-radar-pilot-replay/1", "model": "gemini/gemini-3.8-flash",
+ "clone_url": "https://github.com/ReperioHealth/reperio-telehealth.git", "cases": [
+  {"id": "oct27-baseline", "kind": "full_baseline", "target": "07c0fc386349ebe6a7e6662b01df248aecf994dc"},
+  {"id": "oct27", "kind": "replay", "baseline_from": "oct27-baseline", "weekly_trigger": false,
+   "base": "07c0fc386349ebe6a7e6662b01df248aecf994dc", "target": "da7c4b7209f29353d863f186cf3640c0060d5596"},
+  {"id": "oct28", "kind": "replay", "baseline_from": "oct27", "weekly_trigger": false,
+   "base": "da7c4b7209f29353d863f186cf3640c0060d5596", "target": "6d7f496e011a360a7d55fb1c091b60a7ba001980"},
+  {"id": "nov3", "kind": "replay", "baseline_file": "/path/to/a/copy/of/full-scheduled.md",
+   "base": "4a5bec61bebc3a9a3b471993f0654fa755e6584d", "target": "d8f327b17f87b44a6380fc75a132660a4b1db9f6"}]}
+```
 
-   The first run fixes the baseline, target and model for both candidates.
-3. With the provider key in the environment, build each candidate once:
+`weekly_trigger: false` stops today's clock from replacing a historical case with an age-triggered full
+rebuild; the other baseline and safety checks stay. Use a fresh, empty pilot directory:
 
-   ```bash
-   python3 -I scripts/pilot-incremental-metadata.py incremental --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4 --target <commit> --model claude-sonnet-5-5
-   python3 -I scripts/pilot-incremental-metadata.py full --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4 --target <commit> --model claude-sonnet-5-5
-   ```
+```bash
+# Free, needs no key: each case's pages, omissions and admission quote, in plan.json.
+python3 -I scripts/pilot-incremental-metadata.py plan --manifest manifest.json --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4
+# Paid: runs the cases in order and stops the chain at the first failure.
+python3 -I scripts/pilot-incremental-metadata.py replay --manifest manifest.json --pilot-dir ~/pilot --repo-path ~/repos-pristine/reperio-telehealth-fab3ba4
+```
 
-   The outputs are `incremental.md` and `full.md`, with `results-*.json` holding usage, cost, calls,
-   elapsed time and ledger totals. A candidate that was built but can't be accepted (for example an
-   unsafe header) is kept as `rejected-<mode>.json` instead, and its cost still counts. The installed
-   document is never touched.
-4. Compare both documents against the actual diff and surrounding source. Look at removed or renamed
-   interfaces, effects across components, schema and configuration changes, whether unrelated
-   sections were preserved, unsupported claims, and useful detail. If the incremental result loses
-   useful facts or doesn't save money, leave enrollment off and report that. Don't rerun to buy a
-   better result.
+Every request is charged to one ledger capped at **$40**: $24 for the scratch baseline and $16 for all
+replays, with each replay also under the $12 update cap. The ledger survives restarts, can't have its
+limits changed, and never buys the same request twice; a request's identity includes its case, stage,
+commits, page or group, model and prompt version. Only one pilot command can use a directory at a time. A
+ledger holding a request of unknown cost refuses further paid requests until it's reconciled by hand. A
+completed case isn't bought again, and a case that stopped is never rerun from the same directory.
+
+Each case's directory holds `candidate.md`, `notes.json` (every note, the page and file inventory, and
+every call with its latency, tokens and cost) and `result.json` (commits and hashes, page coverage,
+omissions, calls and latencies per stage, rates, estimated and actual cost, and which sections changed).
+The spooled pages stay in `pages/` for inspection. Compare each candidate with the significant changed
+APIs, schemas, configuration and removals in the diff, including effects across components; unchanged
+sections must stay unchanged. Don't turn on live use until the results and any budget change are accepted.
+
+The older single-case commands (`plan`, `incremental` and `full` with `--target` and `--model`) remain,
+from a document copied into the pilot directory as `baseline.md`, with their own $40 ledger of $8 for the
+incremental candidate and $24 for the full comparison.

@@ -4,7 +4,18 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.36] - Unreleased
+## [Unreleased]
+
+### Changed
+- **Incremental summaries now scale to any diff.** The model used to read a whole diff within 16 turns, which made long diffs fail expensively. Now each page of the diff gets one short model call, the notes are merged when there are too many to hand over, and one short conversation edits the summary. A large change is no longer a reason for a full rebuild: the 20%, eight-page and 16 MiB rules are gone. Lockfiles, generated files and diffs over 2 MiB are listed as not analyzed rather than summarized. Any failure keeps the previous summary, with no retries and no automatic full rebuild.
+- **The incremental spending limit is now $12 per update, up from $8,** and the whole update is quoted against it before the first model call. A quote over the limit stops the update with nothing sent. Spending checks also stop using Gemini's priority prices, which requests never pay, and follow Google's announced January 2027 price for Gemini 3.8 Flash.
+
+### Added
+- **`incremental_full_rebuild_days` sets how often an opted-in repository gets a full rebuild.** The default is still 7, and 0 turns the age trigger off. A malformed value stops a metadata sync before any work.
+- **The progress view shows how far a long summary update has got.**
+- **The telehealth pilot can replay historical changes from a manifest,** with a free `plan` mode that reports each case's pages and quote.
+
+## [1.0.36] - 2026-11-04
 
 ### Fixed
 - **Long diffs go straight to a full summary rebuild.** An incremental summary update had to read its whole diff within 16 model turns, so a long diff ran out of turns, spent money and failed, and every later sync repeated it until the weekly rebuild. When the filtered diff is over 8 pages (or over the 16 MiB diff limit), Repo Radar now chooses a full rebuild before making any model call. The other limits are unchanged, and a failed incremental update still isn't followed by an automatic full rebuild.
