@@ -620,6 +620,53 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     assert not provider.sends and not provider.counts
 
 
+def test_a_diff_too_long_to_read_goes_straight_to_a_full_rebuild(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', '# edited\n')
+    target = repo.commit('a change below the 20% threshold')
+    small = decide(repo, pristine)
+    assert small.strategy == 'incremental'
+
+    def too_large(*_args):
+        raise snap.DiffTooLarge('too large')
+    monkeypatch.setattr(snap, 'build_diff', too_large)
+    assert decide(repo, pristine)[:2] == ('full', 'diff exceeds the incremental size limit')
+
+    def git_failed(*_args):
+        raise snap.GitError('broken')
+    monkeypatch.setattr(snap, 'build_diff', git_failed)
+    with pytest.raises(snap.GitError):   # only the size signal selects a full rebuild
+        decide(repo, pristine)
+
+    monkeypatch.setattr(snap, 'build_diff', lambda *_args: (['page'] * 35, []))
+    provider = Provider(monkeypatch)
+
+    # A direct caller holding an older decision stops without sending anything.
+    with PreflightSession() as session, pytest.raises(im.StaleUpdate, match='35 diff pages exceeds 8'):
+        im.run_incremental(repo.path, FULL, im.load_document(pristine, 'app-abc1234'), small, MODEL, session,
+                           Budget(MODEL, cap=8, label='incremental'))
+    assert not provider.sends and not provider.counts
+
+    # The planner chooses the full rebuild up front, with nothing counted or sent first.
+    def no_incremental(*_args, **_kw):
+        raise AssertionError('the incremental runner was entered')
+
+    def full_runs_first(*args, **kw):
+        assert not provider.sends and not provider.counts
+        return im.run_full(*args, **kw)
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    logged = []
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session, run_incremental_fn=no_incremental, run_full_fn=full_runs_first,
+                         log=logged.append)
+    assert (outcome.status, outcome.strategy) == ('published', 'full'), outcome
+    assert logged == ['full: 35 diff pages exceeds 8']
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['decision_reason'] == '35 diff pages exceeds 8'
+    assert provider.messages() and not provider.replies
+    doc = im.load_document(pristine, 'app-abc1234')
+    assert doc.info['generation_strategy'] == 'full' and doc.info['last_commit'] == target
+
+
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'
 
 
