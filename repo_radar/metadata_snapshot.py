@@ -24,6 +24,8 @@ COLLECTOR_MAX_BYTES = 100 * 1024     # files.collect_repo_files skips files larg
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
 MAX_DIFF_BYTES = 16 * 1024 * 1024     # the whole textual diff of one update
 MAX_FILE_DIFF_BYTES = 2 * 1024 * 1024 # one file's diff; larger ones are listed as omitted, not cut
+MAX_PAGE_BYTES = MAX_RESULT_BYTES - 1024   # one spooled page, its framing included
+MAX_SPOOL_BYTES = 256 * 1024 * 1024   # all spooled pages of one update
 MAX_READ_BYTES = 8 * 1024 * 1024      # one blob read by read_file
 MAX_LINE_CHARS = 2000                 # longer lines are shortened, with a marker
 MAX_SEARCH_OUTPUT = 4 * 1024 * 1024   # git grep output read for one search
@@ -41,8 +43,17 @@ class GitError(Exception):
     """A read-only Git command failed or produced more output than allowed."""
 
 
+class GitOutputTooLarge(GitError):
+    """A read-only Git command produced more output than its limit. Any other GitError is a failed read."""
+
+
 class DiffTooLarge(GitError):
     """The whole textual diff of an update exceeds MAX_DIFF_BYTES."""
+
+
+class ResourceLimit(Exception):
+    """Preparing an update's pages hit the spool ceiling, a full disk or the deadline. The update stops
+    with this reason; it never turns into a full rebuild."""
 
 
 def _git_env():
@@ -94,7 +105,7 @@ def run_git(repo, args, limit):
     proc.wait()
     reader.join(timeout=5)
     if too_large:
-        raise GitError(f"git {args[0]} produced more than {limit} bytes")
+        raise GitOutputTooLarge(f"git {args[0]} produced more than {limit} bytes")
     if proc.returncode != 0:
         detail = err.decode('utf-8', 'replace').strip().splitlines()
         raise GitError(f"git {args[0]} failed ({proc.returncode})" + (f": {detail[-1][:200]}" if detail else ''))
@@ -408,6 +419,238 @@ def build_diff(repo, base, target, base_manifest, target_manifest, changes, excl
             raise DiffTooLarge(f"the diff is larger than {MAX_DIFF_BYTES} bytes")
         lines.extend(text.splitlines(keepends=True))
     return _paginate(lines), omitted
+
+
+# ---- the page stream: complete, independently readable pages ---------------------------------------
+
+# Explicit lists, not "all JSON or configuration": ordinary manifests and source stay visible.
+LOCKFILE_NAMES = frozenset({
+    'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb', 'deno.lock',
+    'composer.lock', 'gemfile.lock', 'cargo.lock', 'poetry.lock', 'pipfile.lock', 'uv.lock', 'pdm.lock', 'go.sum',
+    'mix.lock', 'pubspec.lock', 'podfile.lock', 'flake.lock', 'packages.lock.json', 'gradle.lockfile',
+})
+GENERATED_DIRS = frozenset({'node_modules', 'vendor', 'dist', '.next', '.nuxt', '__pycache__', 'pods', '.gradle',
+                            '.terraform', 'coverage'})
+GENERATED_SUFFIXES = ('.min.js', '.min.css', '.js.map', '.css.map', '.pb.go', '_pb2.py')
+OVERSIZED_DIFF = 'diff larger than 2 MiB'
+
+FileRef = namedtuple('FileRef', 'id status old_path new_path')
+Omission = namedtuple('Omission', 'file_id status path reason')
+Page = namedtuple('Page', 'id kind file_ids path size')   # kind: 'diff', or 'omissions' (no model call)
+
+
+def generated_reason(path):
+    """Why a changed path's body isn't worth a model's attention, or None for ordinary files."""
+    parts = path.lower().split('/')
+    if parts[-1] in LOCKFILE_NAMES:
+        return 'lockfile'
+    if any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES):
+        return 'generated or vendored'
+    return None
+
+
+def _shown(path):
+    """A path as page text: names that aren't valid UTF-8 can't go into a request as they are."""
+    return path.encode('utf-8', 'replace').decode('utf-8')
+
+
+def _file_label(ref):
+    if ref.old_path and ref.new_path and ref.old_path != ref.new_path:
+        return f"{_shown(ref.old_path)} -> {_shown(ref.new_path)}"
+    return _shown(ref.new_path or ref.old_path)
+
+
+def _diff_lines(text):
+    return re.findall(r'[^\n]*\n|[^\n]+', text)
+
+
+class _PageWriter:
+    """Writes pages of at most `limit` bytes to an owner-only spool, holding only the current page.
+
+    Every page names its commits and the files on it. A page breaks at a file or hunk boundary when it
+    can. A split hunk or line repeats its file and hunk heading and says it is a continuation, so a page
+    is never an anonymous middle fragment.
+    """
+
+    def __init__(self, spool_dir, base, target, limit, spool_limit):
+        self.dir, self.base, self.target = spool_dir, base, target
+        self.limit, self.spool_limit = limit, spool_limit
+        self.pages, self.total = [], 0
+        self.kind = 'diff'
+        self.started = set()   # files that already have a heading on some page
+        self._header = len(self._heading(9_999_999))
+        self._clear()
+
+    def _heading(self, number):
+        return (f"[page p{number} base={self.base} target={self.target}]\n"
+                f"[files on this page: id, status, path]\n[end of list]\n\n")
+
+    def _clear(self):
+        self.refs, self.refs_size = {}, 0
+        self.body, self.size = [], 0
+        self.current, self.current_hunk = None, None
+
+    def room(self):
+        return self.limit - self._header - self.refs_size - self.size
+
+    @staticmethod
+    def _ref_line(ref):
+        return f"{ref.id} {ref.status} {_file_label(ref)}\n"
+
+    def _write(self, text):
+        self.body.append(text)
+        self.size += len(text.encode('utf-8'))
+
+    def flush(self):
+        if not self.body:
+            return
+        number = len(self.pages) + 1
+        listing = ''.join(self._ref_line(ref) for ref in self.refs.values())
+        text = (f"[page p{number} base={self.base} target={self.target}]\n"
+                f"[files on this page: id, status, path]\n{listing}[end of list]\n\n{''.join(self.body)}")
+        data = text.encode('utf-8')
+        if self.total + len(data) > self.spool_limit:
+            raise ResourceLimit(f"the update's filtered diff is larger than the {self.spool_limit // (1024 * 1024)} "
+                                f"MiB spool limit")
+        path = os.path.join(self.dir, f"page-{number:07d}.txt")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as handle:
+                handle.write(data)
+        except OSError as e:
+            raise ResourceLimit(f"the page spool could not be written ({e.strerror or type(e).__name__})") from None
+        self.total += len(data)
+        self.pages.append(Page(f"p{number}", self.kind, tuple(self.refs), path, len(data)))
+        self._clear()
+
+    def _enter(self, ref, hunk, at_hunk_start):
+        """Identify the file, and when a hunk continues here the hunk, at this point of the page."""
+        title = f"### {ref.id} {ref.status} {_file_label(ref)}"
+        lines = ''
+        if self.current != ref.id:
+            lines = f"{title}{' (continued)' if ref.id in self.started else ''}\n"
+        if hunk and not at_hunk_start and self.current_hunk != hunk:
+            lines += f"{hunk.rstrip()} (continued)\n"
+        listing = 0 if ref.id in self.refs else len(self._ref_line(ref).encode('utf-8'))
+        if len(lines.encode('utf-8')) + listing + 256 > self.room() and self.body:
+            self.flush()
+            return self._enter(ref, hunk, at_hunk_start)
+        if ref.id not in self.refs:
+            self.refs[ref.id] = ref
+            self.refs_size += listing
+        if lines:
+            self._write(lines)
+        self.current = ref.id
+        self.started.add(ref.id)
+
+    def _stream(self, ref, lines, hunk=None):
+        for index, line in enumerate(lines):
+            data = line.encode('utf-8', 'replace')
+            while True:
+                self._enter(ref, hunk, hunk is not None and index == 0)
+                if len(data) <= self.room():
+                    self._write(data.decode('utf-8'))
+                    self.current_hunk = hunk
+                    break
+                # Only a line longer than a whole page is cut, with the rest marked as its continuation.
+                fresh = self.limit - self._header - len(self._ref_line(ref).encode('utf-8')) - 1024
+                if len(data) <= fresh and self.body:
+                    self.flush()
+                    continue
+                marker = ' [line continues]\n'
+                take = data[:max(self.room() - len(marker), 1)].decode('utf-8', 'ignore')
+                self._write(take + marker)
+                self.current_hunk = hunk
+                data = b'[line continued] ' + data[len(take.encode('utf-8')):]
+                self.flush()
+
+    def add_file(self, ref, text):
+        lines = _diff_lines(text)
+        first = next((i for i, line in enumerate(lines) if line.startswith('@@ ')), len(lines))
+        self._stream(ref, lines[:first] or ['(no textual change)\n'])
+        starts = [i for i in range(first, len(lines)) if lines[i].startswith('@@ ')]
+        for at, start in enumerate(starts):
+            end = starts[at + 1] if at + 1 < len(starts) else len(lines)
+            hunk = lines[start:end]
+            size = sum(len(line.encode('utf-8', 'replace')) for line in hunk)
+            # Keep a hunk whole when a fresh page can hold it.
+            if size + 512 > self.room() and self.body and size + 2048 < self.limit - self._header - self.refs_size:
+                self.flush()
+            self._stream(ref, hunk, hunk=lines[start])
+
+
+class PageSet:
+    """Every page of one update, indexed before anything is sent, with the omission records kept apart
+    from anything a model writes. Page text lives in the spool; read() brings back one page."""
+
+    def __init__(self, base, target, files, omissions, pages, total):
+        self.base, self.target, self.files, self.omissions = base, target, files, omissions
+        self.pages, self.total_bytes = pages, total
+
+    def read(self, page):
+        try:
+            with open(page.path, encoding='utf-8') as handle:
+                return handle.read()
+        except OSError as e:
+            raise ResourceLimit(f"the page spool could not be read ({e.strerror or type(e).__name__})") from None
+
+    @property
+    def diff_pages(self):
+        return [p for p in self.pages if p.kind == 'diff']
+
+    @property
+    def omission_pages(self):
+        return [p for p in self.pages if p.kind == 'omissions']
+
+    @property
+    def omitted(self):
+        return [(o.path, o.reason) for o in self.omissions]
+
+
+def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, exclusions, spool_dir,
+                  page_bytes=MAX_PAGE_BYTES, spool_bytes=MAX_SPOOL_BYTES, check=lambda: None):
+    """Spool the filtered diff of an update as complete pages in owner-only `spool_dir`.
+
+    Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
+    submodules, binary files), known lockfiles and generated artifacts, and any single diff larger than
+    MAX_FILE_DIFF_BYTES become omission records with path, status and reason instead of bodies, on their
+    own pages at the end. Only a Git output-size limit can become an oversized-diff omission; a failed
+    Git read raises. `check` runs before each file, so a deadline can stop the work. Raises ResourceLimit
+    past the spool ceiling or when the disk is full.
+    """
+    writer = _PageWriter(spool_dir, base, target, page_bytes, spool_bytes)
+    files, omissions = {}, []
+    for number, c in enumerate(changes, 1):
+        check()
+        ref = FileRef(f"f{number}", c.status, c.old_path, c.new_path)
+        files[ref.id] = ref
+        label = c.new_path or c.old_path
+        entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
+                               target_manifest.get(c.new_path) if c.new_path else None) if e]
+        reasons = {omission_reason(e, exclusions) for e in entries} - {None}
+        reason = sorted(reasons)[0] if reasons else generated_reason(label)
+        text = None
+        if reason is None:
+            paths = [p for p in (c.old_path, c.new_path) if p]
+            try:
+                text = run_git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '-M', base, target,
+                                      '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES).decode('utf-8', 'replace')
+            except GitOutputTooLarge:
+                reason = OVERSIZED_DIFF
+            else:
+                if re.search(r'^Binary files .* differ$', text, re.M) and '\n@@ ' not in text:
+                    reason = 'binary file'
+        if reason is not None:
+            omissions.append(Omission(ref.id, c.status, label, reason))
+            continue
+        writer.add_file(ref, text)
+    writer.flush()
+    writer.kind = 'omissions'
+    for record in omissions:
+        changed = ' changed' if record.reason == 'lockfile' else ''
+        writer._stream(files[record.file_id], [f"{record.reason}{changed}; body not analyzed\n"])
+    writer.flush()
+    return PageSet(base, target, files, omissions, writer.pages, writer.total)
 
 
 # ---- read-only tools ------------------------------------------------------------------------------
