@@ -699,7 +699,7 @@ class SnapshotTools:
             return f"[{path} is unavailable: {reason}]"
         try:
             data = snap.read_blob(entry, MAX_READ_BYTES)
-        except GitError:
+        except GitOutputTooLarge:
             return f"[{path} is unavailable: larger than {MAX_READ_BYTES} bytes]"
         if is_binary(data):
             return f"[{path} is unavailable: binary file]"
