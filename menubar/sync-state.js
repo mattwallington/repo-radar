@@ -566,12 +566,27 @@ const OUTCOME_TEXTS = {
 };
 const NETWORK_ABORT_TEXT = 'No network connectivity — sync aborted';
 
+// A run that reached its final `complete` stats finished; some repositories had errors. The worker
+// still records any error as `failed`, so this is what tells it apart from a run that didn't complete.
+function finishedWithErrors(errors) {
+  if (!Number.isInteger(errors) || errors <= 0) return null;
+  return `Sync finished — ${errors} repo${errors === 1 ? '' : 's'} had an error`;
+}
+
+function _finishedWithErrorsText(view) {
+  if (!view || view.phase !== FINISHED || view.outcome !== 'failed') return null;
+  if (view.reason === 'no_network_connectivity') return null;
+  return finishedWithErrors(view.stats && view.stats.errors);
+}
+
 function syncStateText(view) {
   if (!view) return PHASE_TEXTS.unknown;
   if (view.phase === FINISHED) {
     if (view.outcome === 'failed' && view.reason === 'no_network_connectivity') {
       return NETWORK_ABORT_TEXT;
     }
+    const finished = _finishedWithErrorsText(view);
+    if (finished) return `${finished} (see ⚠️ View Errors)`;
     return Object.prototype.hasOwnProperty.call(OUTCOME_TEXTS, view.outcome)
       ? OUTCOME_TEXTS[view.outcome] : OUTCOME_TEXTS.interrupted;
   }
@@ -582,6 +597,7 @@ function syncStateText(view) {
 function _textColor(view) {
   if (!view) return '';
   if (view.phase === 'waiting-for-network' || view.phase === 'unknown') return WAIT_COLOR;
+  if (_finishedWithErrorsText(view)) return WAIT_COLOR;
   if (view.phase === FINISHED && (view.outcome === 'failed' || view.outcome === 'blocked')) {
     return FAIL_COLOR;
   }
@@ -611,4 +627,5 @@ function applySyncState(doc, view) {
 module.exports = {
   FINISHED, UNKNOWN, PHASES, PHASE_TEXTS, OUTCOME_TEXTS, NETWORK_ABORT_TEXT,
   current, admit, begin, finish, retire, resolve, project, store, syncStateText, applySyncState,
+  finishedWithErrors,
 };

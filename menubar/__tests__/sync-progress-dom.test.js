@@ -686,7 +686,7 @@ function assertKeepsItsOwnOutcome(h, runId, refusedId, rows) {
   assert.strictEqual((entry.retired || []).includes(runId), false, 'the refused attempt never retired it');
   for (let i = 0; i < 2; i++) {
     const win = h.openWindow();
-    assert.strictEqual(win.status(), 'Sync failed — see ⚠️ View Errors in the menu');
+    assert.strictEqual(win.status(), 'Sync finished — 1 repo had an error (see ⚠️ View Errors)');
     assert.deepStrictEqual(win.rows(), rows);
     assert.strictEqual(win.stopEnabled(), false);
     h.closeWindow();
@@ -782,7 +782,7 @@ test('final stats that arrive after the outcome are kept without turning it into
   assert.ok(!h.icons.slice(iconsBefore).includes('icon-success.png'), 'and no success icon');
 
   const win = h.openWindow();
-  assert.strictEqual(win.status(), 'Sync failed — see ⚠️ View Errors in the menu');
+  assert.strictEqual(win.status(), 'Sync finished — 1 repo had an error (see ⚠️ View Errors)');
   assert.strictEqual(win.doc.getElementById('repo-count').textContent, '3 repos synced');
   assert.strictEqual(win.stopEnabled(), false);
 });
@@ -1042,10 +1042,11 @@ test('a stray update while a run is known to be executing leaves no doubt once i
 
 test('a progress or complete update for a run that already failed never paints Syncing or Complete', (t) => {
   const failedText = 'Sync failed — see ⚠️ View Errors in the menu';
-  const agrees = (h, win, label) => {
+  const finishedText = 'Sync finished — 1 repo had an error (see ⚠️ View Errors)';
+  const agrees = (h, win, label, expected = failedText) => {
     const view = h.main.currentSyncView();
     assert.deepStrictEqual([view.phase, view.outcome], ['finished', 'failed'], label);
-    assert.strictEqual(win.status(), failedText, label);
+    assert.strictEqual(win.status(), expected, label);
     assert.strictEqual(win.stopEnabled(), false, `${label}: no Stop`);
   };
   const established = (h) => {
@@ -1071,13 +1072,13 @@ test('a progress or complete update for a run that already failed never paints S
       assert.strictEqual(h.status().repos[0].status, 'Merging');
     } else {
       b.post({ type: 'complete', stats: { total: 1, errors: 1, updated: 0, cloned: 0 } });
-      agrees(h, win, 'after complete');
+      agrees(h, win, 'after complete', finishedText);
       assert.strictEqual(h.status().syncState.stable.stats.total, 1, 'its stats are stored');
       assert.strictEqual(win.doc.getElementById('repo-count').textContent, '1 repos synced',
         'a failed run shows its own numbers');
     }
     h.closeWindow();
-    agrees(h, h.openWindow(), `${first}: reopened`);
+    agrees(h, h.openWindow(), `${first}: reopened`, first === 'complete' ? finishedText : failedText);
   }
 
   // Control: still running (live lease). Its stats are stored but nothing is summarized, and the

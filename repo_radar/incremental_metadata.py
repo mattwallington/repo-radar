@@ -27,10 +27,12 @@ from repo_radar import metadata_snapshot as snap
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
 FULL_REBUILD_AFTER = timedelta(days=7)
 CHANGE_THRESHOLD = 0.20            # strictly more than this fraction changed -> full rebuild
+MAX_INCREMENTAL_DIFF_PAGES = 8     # more filtered diff pages than this -> full rebuild, leaving turns to explore
 UNKNOWN = 'unknown'
 
 Document = namedtuple('Document', 'path text sha256 info body')
 Decision = namedtuple('Decision', 'strategy reason base target full_built_at full_model change adopt')
+PreparedDiff = namedtuple('PreparedDiff', 'base_snap target_snap changes exclusions pages omitted')
 UNFINISHED = ('pending', 'committing', 'failed', 'skipped')   # attempt statuses that never published
 
 
@@ -168,6 +170,20 @@ def full_rebuild_unfinished(state, doc):
     return st.get('baseline_doc_sha256') == doc.sha256
 
 
+def prepare_diff(repo_path, doc, base, target):
+    """The pinned snapshots, changes, credential exclusions and filtered diff pages of an update from
+    `doc`, shared by planning and execution so both see the same pages. The whole exclusion closure is
+    worked out before any content is read."""
+    inherited = document_exclusions(doc)
+    base_snap = snap.GitSnapshot(repo_path, base)
+    target_snap = snap.GitSnapshot(repo_path, target)
+    changes = snap.changes_between(repo_path, base, target)
+    exclusions = snap.credential_exclusions(inherited, base_snap.manifest(), target_snap.manifest(), changes)
+    pages, omitted = snap.build_diff(repo_path, base, target, base_snap.manifest(), target_snap.manifest(),
+                                     changes, exclusions)
+    return PreparedDiff(base_snap, target_snap, changes, exclusions, pages, omitted)
+
+
 def decide(repo_path, full_name, doc, state, model, target, now, force=False):
     """Choose 'full', 'incremental' or 'none' for an opted-in repository at commit `target`.
 
@@ -175,7 +191,8 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
     report it. Rules, in order: a forced or unusable baseline, a changed model or policy, an
     unknown full-build time or an unfinished full rebuild means full; seven days since the last
     full build means full; more than 20% of the eligible source changed means full; an unchanged
-    tree means nothing to do; anything else is incremental.
+    tree means nothing to do; a filtered diff too large to read within the turn limit means full;
+    anything else is incremental.
     """
     def full(reason, change=None, built=None, adopt=None):
         return Decision('full', reason, None, target, built, None, change, adopt)
@@ -212,6 +229,12 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False):
         return full('no analyzable source', built=built, adopt=adopt)
     if change.fraction > CHANGE_THRESHOLD:
         return full(f"{change.fraction:.0%} of the source changed", change, built, adopt)
+    try:
+        pages = len(prepare_diff(repo_path, doc, base, target).pages)
+    except snap.DiffTooLarge:
+        return full('diff exceeds the incremental size limit', change, built, adopt)
+    if pages > MAX_INCREMENTAL_DIFF_PAGES:
+        return full(f"{pages} diff pages exceeds {MAX_INCREMENTAL_DIFF_PAGES}", change, built, adopt)
     return Decision('incremental', f"{change.fraction:.1%} of the source changed", base, target, built,
                     full_model, change, adopt)
 
@@ -513,21 +536,18 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
 
     clock = clock or time.monotonic
     deadline = clock() + ATTEMPT_SECONDS
-    inherited = document_exclusions(doc)
-    base_snap = snap.GitSnapshot(repo_path, decision.base)
-    target_snap = snap.GitSnapshot(repo_path, decision.target)
-    changes = snap.changes_between(repo_path, decision.base, decision.target)
-    # The whole closure, before any content is read; the diff and every tool use this one record.
-    exclusions = snap.credential_exclusions(inherited, base_snap.manifest(), target_snap.manifest(), changes)
     try:
-        pages, omitted = snap.build_diff(repo_path, decision.base, decision.target,
-                                         base_snap.manifest(), target_snap.manifest(), changes, exclusions)
+        prepared = prepare_diff(repo_path, doc, decision.base, decision.target)
     except snap.GitError as e:
         raise StaleUpdate(str(e)) from None
+    base_snap, target_snap, changes, exclusions, pages, omitted = prepared
+    # The diff and every tool use this one exclusion record.
     tools = snap.SnapshotTools(base_snap, target_snap, pages, exclusions)
     if decision.change is not None:
         budget.extra.update(changed_files=decision.change.changed_files, changed_bytes=decision.change.changed_bytes)
     budget.extra['diff_pages'] = len(pages)
+    if len(pages) > MAX_INCREMENTAL_DIFF_PAGES:   # for direct callers; never falls over to a second strategy
+        raise StaleUpdate(f"{len(pages)} diff pages exceeds {MAX_INCREMENTAL_DIFF_PAGES}")
     sections = split_sections(_analysis_of(doc))
     fields = current_fields(doc)
     conversation = llm.Conversation(model, SYSTEM_PROMPT, snap.TOOL_SPECS)

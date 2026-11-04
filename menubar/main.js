@@ -33,6 +33,7 @@ const { ACTIVITY_WEB_PREFERENCES } = require('./activity/window-options');
 const activityRead = require('./activity/read');
 // The per-attempt progress view (phase/outcome per channel) the progress window replays.
 const syncState = require('./sync-state');
+const { updateCheckFailureDialog } = require('./update-check');
 const activityLease = require('./activity/lease');
 const activityPaths = require('./activity/paths');
 const activityReconcile = require('./activity/reconcile');
@@ -536,8 +537,7 @@ function showErrorIcon() {
   }
   
   const status = loadStatus();
-  const errorCount = status.stats?.errors || 0;
-  tray.setToolTip(`Sync failed with ${errorCount} error${errorCount !== 1 ? 's' : ''}`);
+  tray.setToolTip(syncState.finishedWithErrors(status.stats?.errors) || 'Sync failed');
 }
 
 // Start icon animation
@@ -809,12 +809,7 @@ function updateTrayMenu() {
             });
           }
         }).catch((err) => {
-          dialog.showMessageBox({
-            type: 'error',
-            title: 'Update Check Failed',
-            message: 'Could not check for updates.',
-            detail: err.message
-          });
+          dialog.showMessageBox(updateCheckFailureDialog(err));
         });
       }
     },
