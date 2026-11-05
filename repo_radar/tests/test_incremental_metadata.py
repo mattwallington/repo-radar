@@ -1017,14 +1017,23 @@ def test_an_edited_copy_of_an_unchanged_credential_stays_withheld(monkeypatch, t
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     secret = 'export TOKEN=SENTINEL-OLD\n' + ''.join(f'export V{i}={i}\n' for i in range(40))
     repo.write('.envrc', secret)
+    ordinary = ''.join(f'def handler_{i}():\n    return {i}\n' for i in range(30))
+    repo.write('src/common.py', ordinary)
     base = repo.commit('a credential')
     (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
     repo.write('src/settings.txt', secret + 'export Z=SENTINEL-EDIT\n')   # .envrc itself doesn't change
     repo.write('src/m0.py', 'visible = "ordinary source"\n')
-    repo.commit('copy the credential and edit the copy')
+    # An ordinary copy whose source also changed: its diff shows the copy alone, and the source's change once.
+    repo.write('src/common.py', ordinary + 'SOURCE_ONLY_CHANGE = 1\n')
+    repo.write('src/common_copy.py', ordinary + 'COPY_ONLY_CHANGE = 2\n')
+    target = repo.commit('copy the credential and edit the copy')
+    changes = snap.changes_between(repo.path, base, target)
+    assert ('C', 'src/common.py', 'src/common_copy.py') in [tuple(c) for c in changes]
     provider = Provider(monkeypatch)
     traffic, doc = credential_traffic(provider, pristine, repo)
     assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    maps = json.dumps([b for b in provider.messages() if 'tools' not in b])
+    assert maps.count('SOURCE_ONLY_CHANGE') == 1 and maps.count('COPY_ONLY_CHANGE') == 1
     assert 'src/settings.txt' in im.document_exclusions(doc).paths
     later_edit_stays_withheld(provider, pristine, repo, 'src/settings.txt')
 

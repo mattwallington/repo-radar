@@ -638,7 +638,8 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
         reason = sorted(reasons)[0] if reasons else generated_reason(label)
         text = None
         if reason is None:
-            paths = [p for p in (c.old_path, c.new_path) if p]
+            # A copy's source has its own record if it changed, so its diff isn't repeated here.
+            paths = [c.new_path] if c.status == 'C' else [p for p in (c.old_path, c.new_path) if p]
             try:
                 text = run_git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '-M', base, target,
                                       '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES,
