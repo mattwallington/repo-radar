@@ -48,7 +48,7 @@ TOOL_CALL_LIMIT_NOTICE = f"[tool call limit of {EDIT_TOOL_CALLS} reached; answer
 TOOL_BYTES_NOTICE = "[the 64 KiB tool result budget is used up; answer from what you have]"
 TOOL_ROOM_NOTICE = "[unavailable: the request has no room left for this result; answer from what you have]"
 TOOL_TRUNCATED_NOTICE = "\n[truncated: no room for the rest of this result]\n"
-TOOL_NOTICE_RESERVE = 128           # keeps the aggregate cap true of every notice too
+TOOL_MINIMUM_NOTICE = "[unavailable]"   # what every result in a batch can always be, so none is ever blank
 FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply now with only the JSON answer."
 
 MAP_SYSTEM = """You read one page of a Git diff so that a repository's technical summary can be kept accurate.
@@ -540,29 +540,33 @@ class Pipeline:
 
     # ---- edit ------------------------------------------------------------------------------------
 
-    def _tool_body(self, tools, call):
-        """One targeted read within the call limit and what's left of the delivered-bytes budget."""
+    def _tool_body(self, tools, call, left):
+        """One targeted read, or the notice saying why not, in at most `left` bytes of delivered results."""
         self.tools_used += 1
         if self.tools_used > EDIT_TOOL_CALLS:
-            return TOOL_CALL_LIMIT_NOTICE
-        left = EDIT_TOOL_BYTES - self.delivered_bytes - TOOL_NOTICE_RESERVE
-        if left <= 0:
-            return TOOL_BYTES_NOTICE
+            return self._notice(TOOL_CALL_LIMIT_NOTICE, left)
+        room = left - len(TOOL_TRUNCATED_NOTICE.encode('utf-8'))
+        if room < 256:
+            return self._notice(TOOL_BYTES_NOTICE, left)
         try:
             result = tools.run(call.name, call.arguments)
         except snap.ToolRequestError as e:
             raise im.StaleUpdate(f"invalid tool request: {e}") from None
         data = result.encode('utf-8')
         if len(data) > left:
-            return data[:left].decode('utf-8', 'ignore') + TOOL_TRUNCATED_NOTICE
+            return data[:room].decode('utf-8', 'ignore') + TOOL_TRUNCATED_NOTICE
         return result
 
-    def _fit_tool_result(self, conversation, item, body):
+    @staticmethod
+    def _notice(text, left):
+        return text if len(text.encode('utf-8')) <= left else TOOL_MINIMUM_NOTICE
+
+    def _fit_tool_result(self, conversation, item, body, left):
         """Put as much of `body` into `item` as the next request has counted room for, leaving room for the
-        closing instruction. If no useful part fits, the result says it is unavailable."""
+        closing instruction. If no useful part fits, the result says it is unavailable. The minimum notice
+        already sitting in `item` was counted, so there's always something true to send."""
         key = 'content' if 'content' in item else 'output'
-        item[key] = ''
-        empty, out, limit = self._edit_output_and_limit(conversation.request(EDIT_OUTPUT))
+        empty, _out, limit = self._edit_output_and_limit(conversation.request(EDIT_OUTPUT))
         room = limit - CONTINUATION_TOKENS - empty
         item[key] = body
         for _attempt in range(6):
@@ -575,23 +579,35 @@ class Pipeline:
                 break
             body = data[:keep].decode('utf-8', 'ignore') + TOOL_TRUNCATED_NOTICE
             item[key] = body
-        item[key] = TOOL_ROOM_NOTICE
+        item[key] = self._notice(TOOL_ROOM_NOTICE, left)
+        if self._edit_output_and_limit(conversation.request(EDIT_OUTPUT))[0] - empty > room:
+            item[key] = TOOL_MINIMUM_NOTICE
         return item[key]
 
     def _deliver_tool_results(self, conversation, tools, turn):
-        """The reply goes in first, with a placeholder for every call, so what's counted is the real next
-        request. Then each result takes what room is left, and what's delivered counts against the cap."""
+        """The reply goes in first, with the minimum notice for every call, so what's counted is the real next
+        request and every result can at least say it's unavailable. If even that can't fit either cap, the
+        update stops rather than sending blanks. Then each result takes what room is left, and what's delivered
+        counts against the byte cap, leaving the later results their notices."""
         conversation.add_reply(turn)
         start = len(conversation.items)
         for call in turn.tool_calls:
-            conversation.add_tool_result(call.id, '')
-        for call, item in zip(turn.tool_calls, conversation.items[start:]):
-            text = self._fit_tool_result(conversation, item, self._tool_body(tools, call))
-            size = len(text.encode('utf-8'))
-            if self.delivered_bytes + size > EDIT_TOOL_BYTES:   # only a notice can get here, and there's no room
-                text, size = '', 0
-                item['content' if 'content' in item else 'output'] = text
-            self.delivered_bytes += size
+            conversation.add_tool_result(call.id, TOOL_MINIMUM_NOTICE)
+        calls = len(turn.tool_calls)
+        notice = len(TOOL_MINIMUM_NOTICE.encode('utf-8'))
+        if self.delivered_bytes + notice * calls > EDIT_TOOL_BYTES:
+            raise im.StaleUpdate(f"resource limit: {calls} tool results don't fit what's left of the 64 KiB result budget")
+        tokens, _out, limit = self._edit_output_and_limit(conversation.request(EDIT_OUTPUT))
+        if tokens > limit:
+            raise im.StaleUpdate(f"resource limit: the next request ({tokens:,} tokens) would not fit its {limit:,} token "
+                                 f"limit even with minimum notices for its {calls} tool results")
+        # Later results keep room to say why they're empty, when the budget can spare it.
+        fuller = max(len(n.encode('utf-8')) for n in (TOOL_CALL_LIMIT_NOTICE, TOOL_BYTES_NOTICE, TOOL_ROOM_NOTICE))
+        reserve = fuller if self.delivered_bytes + fuller * calls <= EDIT_TOOL_BYTES else notice
+        for index, (call, item) in enumerate(zip(turn.tool_calls, conversation.items[start:])):
+            left = EDIT_TOOL_BYTES - self.delivered_bytes - reserve * (calls - index - 1)
+            text = self._fit_tool_result(conversation, item, self._tool_body(tools, call, left), left)
+            self.delivered_bytes += len(text.encode('utf-8'))
         self.budget.extra.update(read_bytes=self.delivered_bytes, raw_read_bytes=tools.bytes_read,
                                  tool_calls=self.tools_used)
 

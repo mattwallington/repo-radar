@@ -1259,6 +1259,37 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     assert last['tool_choice']['type'] == 'none' and provider.counts[-1]['tool_choice'] == last['tool_choice']
     assert 'tool_choice' not in provider.messages()[1]
 
+    # A batch of more reads than the budget allows: results are cut, then replaced by notices, and none
+    # is ever blank. A batch that couldn't hold even the minimum notices stops rather than send blanks.
+    repo.write('src/big.py', 'filler_line = "x" * 20\n' * 3000)
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+
+    def read_batch(count):
+        calls = [{"type": "tool_use", "id": f"toolu_{i}", "name": "read_file", "input": {"path": "src/big.py", "limit": 2000}}
+                 for i in range(count)]
+        return claude([{"type": "thinking", "thinking": "plan", "signature": "sig"}, *calls], stop='tool_use')
+    # The new file's diff takes two pages.
+    provider.replies = [note(), note(), read_batch(9), answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        batch = update(pristine, repo, session)
+    assert batch.status == 'published', batch
+    delivered = [b['content'] for m in provider.messages()[-1]['messages'] if isinstance(m['content'], list)
+                 for b in m['content'] if b.get('type') == 'tool_result']
+    texts = [c if isinstance(c, str) else c[0]['text'] for c in delivered]
+    assert len(texts) == 9 and all(texts) and batch.usage['read_bytes'] == sum(len(t.encode()) for t in texts)
+    assert batch.usage['read_bytes'] <= mr.EDIT_TOOL_BYTES and 'budget is used up' in texts[5] and 'limit of 6' in texts[8]
+    repo.write('src/m2.py', 'r = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), read_batch(mr.EDIT_TOOL_BYTES // len(mr.TOOL_MINIMUM_NOTICE) + 1)]
+    with PreflightSession() as session:
+        overflow = update(pristine, repo, session)
+    assert overflow.status == 'failed' and 'resource limit' in overflow.reason and len(provider.messages()) == 2
+    assert im.load_document(pristine, 'app-abc1234').sha256 == doc.sha256
+
     # A tool result that pushes the next request past the input budget stops before that send.
     repo.write('src/m1.py', 'q = 1\n')
     repo.commit()
