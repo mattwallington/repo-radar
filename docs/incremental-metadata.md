@@ -68,29 +68,39 @@ omissions. There are no shell, network, host-filesystem or write tools.
    or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
    files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
    which need no model call. They're listed as not analyzed, never described as analyzed source.
+   Generated or vendored means an explicit list: a directory named `node_modules`, `vendor`, `dist`,
+   `.next`, `.nuxt`, `__pycache__`, `Pods`, `.gradle`, `.terraform` or `coverage` at any depth, or a name
+   ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go` or `_pb2.py`. A real source directory
+   with one of those names is listed as not analyzed too.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
-3. **Merging.** If the notes total more than 96 KiB or don't fit the editor's request, ordered groups of
-   up to 16 notes and 64 KiB are merged into notes of at most 12 KiB (4,096 output tokens, 90 seconds),
-   as many levels as it takes. The app tracks which pages each note covers and requires every page to be
-   covered exactly once; a model can't change that.
-4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes
-   and what wasn't analyzed: at most 4 turns, 6 `read_file` or `search` calls, 64 KiB of tool results,
-   65,536 input tokens per request and 16,384 output tokens. Its answer is a set of section edits:
-   replace, delete or insert, each naming the section's id and hash. Edits that don't match are rejected,
-   untouched sections keep their exact bytes, and the app writes the commit IDs, timestamps and
-   provenance itself.
+3. **Merging.** If the notes total more than 96 KiB or leave the editor too little room, they're merged
+   into notes of at most 12 KiB (4,096 output tokens, 90 seconds) on one fixed schedule: groups of 16 map
+   notes, then groups of 5, for as many levels as it takes. A note on its own passes through without a
+   call. Each merge request also names the status and paths of the file ids its notes cite. The app tracks
+   which pages each note covers and requires every page to be covered exactly once; a model can't change
+   that.
+4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
+   the status and paths of the file ids they cite, and what wasn't analyzed: at most 4 turns, 6 `read_file`
+   or `search` calls, 64 KiB of delivered tool results, 65,536 input tokens per request and 16,384 output
+   tokens. Tools are offered only while a tool-calling reply and its results would still fit, and never on
+   the last turn. A result is cut to the room left in the counted request, with a notice saying so. Its
+   answer is a set of section edits: replace, delete or insert, each naming the section's id and hash.
+   Edits that don't match are rejected, untouched sections keep their exact bytes, and the app writes the
+   commit IDs, timestamps and provenance itself.
 
 On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
 usual options and output floors, which are priced in. A whole update has 20 minutes, from preparing its
-pages to draining its last call.
+pages and counting its requests to draining its last call.
 
 Each generated document also records which paths and file contents (by Git blob ID) are withheld as
 credentials, in its `credential_exclusions` header. This holds no credential bytes. Every
-publication, full rebuilds included, carries the record forward and only adds to it. So a
-credential renamed, copied or edited under an ordinary name stays withheld after the commit that
-showed its origin is gone. Every page, note and tool uses that one record. A generated document whose
+publication, full rebuilds included, carries the record forward and only adds to it. So a known
+protected path or blob, and whatever Git detects as a rename or copy of one, edited or not, stays
+withheld under an ordinary name after the commit that showed its origin is gone. Git's detection is by
+similarity, so this isn't a scan for secret content: a copy rewritten until Git no longer sees it as a
+copy isn't recognized. Every page, note and tool uses that one record. A generated document whose
 record is missing or invalid, or an existing document that can't be read, is kept as it is. Its update
 fails before anything is read, counted or sent, and `--regenerate-metadata` doesn't bypass this.
 Restoring the record is a manual recovery step. A first build, or one from a full-generator document,
@@ -99,9 +109,12 @@ starts the record from the commits it can see.
 ## Spending
 
 Before the first generation call, the whole update is quoted at worst case and uncached prices: the
-counted request for every page, the merge tree the note limits imply, and all four editing turns. A quote
-over **$12** (`INCREMENTAL_CAP_USD`), an unknown price or a request that can't fit stops the update
-before anything is sent. A larger diff never turns into an uncapped full rebuild.
+counted request for every page, the merge schedule all the way down to one note, each at its full input
+limit, and all four editing turns. A quote over **$12** (`INCREMENTAL_CAP_USD`), an unknown price or a
+request that can't fit stops the update before anything is sent. A larger diff never turns into an
+uncapped full rebuild. Gemini is priced at its Standard tier, which is what a request naming no tier gets.
+Other providers keep their priority and flex rates in the bound, because such a request can run on the
+project's configured tier.
 
 The quote is only a check. Every request is still counted in full before it's sent: instructions, tool
 definitions and tool results. For Claude the count comes from Anthropic's Count Tokens API, from the
@@ -128,8 +141,10 @@ unavailable. The sync's progress view and Activity report the update as failed (
 (a warning, for example an unavailable token count or price, a spending limit, or the spool limit).
 When any call fails, nothing further is started, the calls already launched finish and are accounted
 for, and no partial set of notes is used. A failed incremental update is not followed by an automatic
-full rebuild; the next ordinary sync tries again. A document too large for the editor's request fails
-before anything is spent, and stays until a weekly or requested rebuild replaces it.
+full rebuild; the next ordinary sync tries again from the start, spending again. A document too large for
+the editor's request fails before anything is spent, and stays until a weekly or requested rebuild
+replaces it. A full rebuild that fails stays owed for the reason it was first chosen, kept across retries;
+an older record that shows only the generic retry reason owes nothing, and the current rules decide.
 
 Attempt records live in `~/repos-pristine/.metadata-state/<cache>.json` (owner-only). Each one holds
 the latest attempt and its usage, never prompts or source.
@@ -152,7 +167,7 @@ document is never relabeled as a historical one. For example:
    "base": "07c0fc386349ebe6a7e6662b01df248aecf994dc", "target": "da7c4b7209f29353d863f186cf3640c0060d5596"},
   {"id": "oct28", "kind": "replay", "baseline_from": "oct27", "weekly_trigger": false,
    "base": "da7c4b7209f29353d863f186cf3640c0060d5596", "target": "6d7f496e011a360a7d55fb1c091b60a7ba001980"},
-  {"id": "nov3", "kind": "replay", "baseline_file": "/path/to/a/copy/of/full-scheduled.md",
+  {"id": "nov3", "kind": "replay", "baseline_file": "/path/to/a/copy/of/full-scheduled.md", "weekly_trigger": false,
    "base": "4a5bec61bebc3a9a3b471993f0654fa755e6584d", "target": "d8f327b17f87b44a6380fc75a132660a4b1db9f6"}]}
 ```
 
@@ -170,11 +185,14 @@ Every request is charged to one ledger capped at **$40**: $24 for the scratch ba
 replays, with each replay also under the $12 update cap. The ledger survives restarts, can't have its
 limits changed, and never buys the same request twice; a request's identity includes its case, stage,
 commits, page or group, model and prompt version. Only one pilot command can use a directory at a time. A
-ledger holding a request of unknown cost refuses further paid requests until it's reconciled by hand. A
-completed case isn't bought again, and a case that stopped is never rerun from the same directory.
+ledger holding a request of unknown cost, or an entry it couldn't update, refuses further paid requests
+until it's reconciled by hand. A completed case isn't bought again, and a case that stopped is never rerun
+from the same directory. Each case needs its own output directory, and a completed result counts only if
+its case, model, commits, baseline, prompt and pipeline versions and weekly setting all match and its
+candidate is unchanged; anything else is refused, not rebuilt.
 
-Each case's directory holds `candidate.md`, `notes.json` (every note, the page and file inventory, and
-every call with its latency, tokens and cost) and `result.json` (commits and hashes, page coverage,
+Each case's directory holds `candidate.md`, `notes.json` (every note accepted so far, saved after each
+wave, the page and file inventory, and every call with its latency, tokens and cost) and `result.json` (commits and hashes, page coverage,
 omissions, calls and latencies per stage, rates, estimated and actual cost, and which sections changed).
 The spooled pages stay in `pages/` for inspection. Compare each candidate with the significant changed
 APIs, schemas, configuration and removals in the diff, including effects across components; unchanged
