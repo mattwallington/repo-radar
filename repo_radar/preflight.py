@@ -337,7 +337,7 @@ class PreflightSession:
         Cancellation unwinds through `async with`, so the lock is released and the session stays usable."""
         try:
             return await asyncio.wait_for(self._guarded_request(request, timeout_s), timeout_s)
-        except TimeoutError:
+        except asyncio.TimeoutError:   # on Python 3.10 this isn't the builtin TimeoutError
             return PreflightResult(None, False, "TimeoutError")
 
     def count_request(self, request, timeout=None):
