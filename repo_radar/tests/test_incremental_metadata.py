@@ -315,7 +315,32 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
         kept = update(pristine, repo, session)
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert (kept.strategy, state['dropped_full_attempt']['reason']) == ('incremental', 'turn limit')
-    assert state['pipeline_version'] == im.PIPELINE_VERSION
+    assert state['pipeline_version'] == im.PIPELINE_VERSION and 'full_rebuild_origin' not in state
+
+    # Its origin survives retries, whose own reason is generic. A size-triggered retry from 1.0.36 has no
+    # recoverable origin, so it owes nothing and the current rules decide; a forced one stays owed.
+    generic = {'strategy': 'full', 'status': 'failed', 'decision_reason': im.UNFINISHED_REASON,
+               'baseline_doc_sha256': doc.sha256, 'adoption': d.adopt}
+    for extra, due in (({}, False), ({'full_rebuild_origin': '35 diff pages exceeds 8'}, False),
+                       ({'full_rebuild_origin': 'regeneration requested'}, True)):
+        im.write_state(pristine, 'app-abc1234', {**generic, **extra})
+        assert decide(repo, pristine).strategy == ('full' if due else 'incremental'), extra
+    im.write_state(pristine, 'app-abc1234', {**generic, 'full_rebuild_origin': im.WEEKLY_REASON})
+    assert decide(repo, pristine).reason == im.UNFINISHED_REASON
+    assert decide(repo, pristine, full_rebuild_days=0).strategy == 'incremental'
+
+    # Consecutive real failures: the weekly origin survives a retry, and a setup failure keeps it on record.
+    (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
+    later = NOW + timedelta(days=8)
+    for reason in (im.WEEKLY_REASON, im.UNFINISHED_REASON):
+        with PreflightSession() as session:
+            failed = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, MODEL, session, now=later)
+        state = metadata.read_attempt_state(pristine, 'app-abc1234')
+        assert failed.status == 'failed' and state['decision_reason'] == reason
+        assert state['full_rebuild_origin'] == im.WEEKLY_REASON
+    im.record_failure(pristine, 'app-abc1234', FULL, 'setup broke')
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['full_rebuild_origin'] == im.WEEKLY_REASON
+    assert decide(repo, pristine, full_rebuild_days=0).strategy == 'incremental'
     (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
 
     # A deletion and a file crossing the 100 KiB ceiling both count as changed eligible source.
@@ -393,6 +418,7 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     with PreflightSession() as session, pytest.raises(KeyboardInterrupt):
         update(pristine, repo, session)
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['full_rebuild_origin'] == 'regeneration requested', 'still owed after more than one failure'
     assert state['status'] == 'committing' and state['generation_id'] == im.load_document(pristine, 'app-abc1234').info['generation_id']
     assert im.document_exclusions(im.load_document(pristine, 'app-abc1234')) == snap.NO_EXCLUSIONS   # committed with it
     assert decide(repo, pristine).strategy == 'none'

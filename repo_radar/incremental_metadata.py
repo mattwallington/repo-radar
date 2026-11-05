@@ -38,6 +38,7 @@ UNFINISHED = ('pending', 'committing', 'failed', 'skipped')   # attempt statuses
 _REMOVED_TRIGGER = re.compile(r'\d+% of the source changed|\d+ diff pages exceeds \d+|'
                               r'diff exceeds the incremental size limit|no analyzable source')
 WEEKLY_REASON = 'weekly full rebuild due'
+UNFINISHED_REASON = 'previous full rebuild did not finish'
 
 
 def document_path(pristine_dir, cache_name):
@@ -163,18 +164,28 @@ def _full_build(doc, state, model):
     return built, UNKNOWN, model, adopt
 
 
+def _full_rebuild_origin(state):
+    """Why a full rebuild was first chosen, which a retry's own reason doesn't say. An older record has
+    only its latest reason: a specific one is the origin, the generic retry reason recovers nothing."""
+    st = state or {}
+    origin = st.get('full_rebuild_origin') or st.get('decision_reason')
+    return None if origin == UNFINISHED_REASON else origin
+
+
 def full_rebuild_unfinished(state, doc, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
     """True when `state` is a full rebuild started from exactly `doc` that never published and is still
     owed. A state whose generation ID is the document's own reached its commit point and is not
     unfinished. One chosen only by a trigger that no longer applies (a removed size rule, or the weekly
-    rule once it's turned off) isn't owed; an explicitly forced one still is."""
+    rule once it's turned off) isn't owed; an explicitly forced one still is, however many times it fails.
+    A record whose origin can't be recovered owes nothing: the current rules decide, and a person can
+    force a rebuild again, which is cheaper than buying one nobody asked for."""
     st = state or {}
     if doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED:
         return False
     if st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'):
         return False
-    reason = st.get('decision_reason') or ''
-    if _REMOVED_TRIGGER.fullmatch(reason) or (reason == WEEKLY_REASON and not full_rebuild_days):
+    origin = _full_rebuild_origin(st)
+    if origin is None or _REMOVED_TRIGGER.fullmatch(origin) or (origin == WEEKLY_REASON and not full_rebuild_days):
         return False
     return st.get('baseline_doc_sha256') == doc.sha256
 
@@ -187,7 +198,8 @@ def _dropped_full_attempt(state, doc, full_rebuild_days):
             or st.get('baseline_doc_sha256') != doc.sha256 or full_rebuild_unfinished(st, doc, full_rebuild_days)
             or (st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'))):
         return None
-    return {k: st.get(k) for k in ('status', 'reason', 'decision_reason', 'target_commit', 'finished_at')}
+    return {k: st.get(k) for k in ('status', 'reason', 'decision_reason', 'full_rebuild_origin', 'target_commit',
+                                   'finished_at')}
 
 
 def prepare_diff(repo_path, doc, base, target, spool_dir, check=lambda: None):
@@ -236,7 +248,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     if built is None:
         return full('last full build time unknown', adopt=adopt)
     if full_rebuild_unfinished(state, doc, full_rebuild_days):
-        return full('previous full rebuild did not finish', built=built, adopt=adopt)
+        return full(UNFINISHED_REASON, built=built, adopt=adopt)
     if full_rebuild_days and now - built >= timedelta(days=full_rebuild_days):
         return full(WEEKLY_REASON, built=built, adopt=adopt)
 
@@ -754,8 +766,9 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
         usage = budget.summary() if budget else {}
-        if attempt is not None and status == 'published':
+        if attempt is not None and status == 'published':   # discharged
             attempt.pop('dropped_full_attempt', None)
+            attempt.pop('full_rebuild_origin', None)
         if attempt is None:
             state_error = record_failure(pristine_dir, cache_name, full_name, reason, target, 'setup', status)
         else:
@@ -794,6 +807,10 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             attempt['dropped_full_attempt'] = dropped
         if decision.strategy == 'incremental':
             attempt['pipeline_version'] = PIPELINE_VERSION
+            attempt.pop('full_rebuild_origin', None)
+        else:   # a retry carries the first reason forward; decision_reason stays the latest, for display
+            attempt['full_rebuild_origin'] = (_full_rebuild_origin(state) if decision.reason == UNFINISHED_REASON
+                                              else decision.reason)
         for stale in ('finished_at', 'usage'):
             attempt.pop(stale, None)
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
