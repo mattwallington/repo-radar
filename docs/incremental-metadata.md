@@ -91,8 +91,10 @@ omissions. There are no shell, network, host-filesystem or write tools.
    commit IDs, timestamps and provenance itself.
 
 On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
-usual options and output floors, which are priced in. A whole update has 20 minutes, from preparing its
-pages and counting its requests to draining its last call.
+usual options and output floors, which are priced in. A whole update has one 20-minute allowance, from
+listing its changes through preparing its pages and counting its requests to draining its last call. A
+full rebuild's listing of changes has its own 20 minutes; its generation time isn't limited. Running out
+reports the update as skipped and keeps the document, and it never uses a partial list of changes.
 
 Each generated document also records which paths and file contents (by Git blob ID) are withheld as
 credentials, in its `credential_exclusions` header. This holds no credential bytes. Every
@@ -100,7 +102,7 @@ publication, full rebuilds included, carries the record forward and only adds to
 protected path or blob, and whatever Git detects as a rename or copy of one, edited or not, stays
 withheld under an ordinary name after the commit that showed its origin is gone. Git's detection is by
 similarity, so this isn't a scan for secret content: a copy rewritten until Git no longer sees it as a
-copy isn't recognized. Every page, note and tool uses that one record. A generated document whose
+copy isn't recognized. An edited copy made in the same update that first adds a credential file is not recognized either, just as a secret pasted into a new ordinary file is not scanned for. Every page, note and tool uses that one record. A generated document whose
 record is missing or invalid, or an existing document that can't be read, is kept as it is. Its update
 fails before anything is read, counted or sent, and `--regenerate-metadata` doesn't bypass this.
 Restoring the record is a manual recovery step. A first build, or one from a full-generator document,
