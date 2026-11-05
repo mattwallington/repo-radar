@@ -129,7 +129,14 @@ cost. If the cost isn't known, the whole reservation stays counted and no furthe
 update uses one set of prices throughout, including Google's announced January 2027 price for Gemini
 3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
 automatic retries, including after a 429 or 503, and no model fallbacks. Full rebuilds follow the
-existing full-generation cost policy.
+existing full-generation cost policy: they aren't under the $12 cap.
+
+On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
+thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
+for synthesis or a single pass. Low thinking makes truncation less likely but doesn't rule it out: a truncated
+reply is still rejected, nothing is retried, and the document stays. Attempt usage's `full_stage` records the
+last call attempted: its stage, call number, chunk and total, output limit, finish reason, and the provider's
+total and reasoning output counts when reported. The failure reason names the stage and call too.
 
 ## When an update fails
 
@@ -199,6 +206,10 @@ omissions, calls and latencies per stage, rates, estimated and actual cost, and 
 The spooled pages stay in `pages/` for inspection. Compare each candidate with the significant changed
 APIs, schemas, configuration and removals in the diff, including effects across components; unchanged
 sections must stay unchanged. Don't turn on live use until the results and any budget change are accepted.
+
+The scratch baseline is also the real test of low thinking on a telehealth full build, which hasn't been shown
+to finish yet. If it stops at the output limit anyway, its `result.json` has the `full_stage` details to size a
+separate decision about the limit. The chain stops there: nothing is rebought and no limit is raised automatically.
 
 The older single-case commands (`plan`, `incremental` and `full` with `--target` and `--model`) remain,
 from a document copied into the pilot directory as `baseline.md`, with their own $40 ledger of $8 for the

@@ -567,6 +567,8 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     with PreflightSession() as session:
         outcome = update(pristine, repo, session, force=True)
     assert outcome.status == 'published', outcome
+    assert provider.messages()[0]['output_config'] == {'effort': 'medium'}   # other providers keep their options
+    assert 'reasoning_effort' not in provider.messages()[0]
     traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
     assert 'SENTINEL' not in traffic, 'no credential or binary content reaches the provider'
     assert 'safe source' in traffic and 'EXAMPLE_VAR=' in traffic
@@ -965,6 +967,41 @@ def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkey
         assert update(pristine, repo, session).status == 'published'
     traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
     assert 'SENTINEL-' not in traffic and '[no matches]' in traffic and 'src/runtime.py' in traffic
+
+
+def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
+    from repo_radar import llm
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    monkeypatch.setattr(llm, 'authoritative_partition', lambda *a: 'chunk')
+    monkeypatch.setattr(llm, 'authoritative_chunks', lambda session, name, files, model: llm.PartitionResult(
+        [files[:5], files[5:]], None))
+    cut_off = httpx.Response(200, json={
+        "candidates": [{"content": {"parts": [{"text": "## Overview\nCut o"}], "role": "model"}, "finishReason": "MAX_TOKENS"}],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 40, "thoughtsTokenCount": 16344,
+                          "totalTokenCount": 16484}})
+
+    def reply(stage, text):
+        assert stage == 'full'
+        return cut_off if len(fake.sends) == 3 else '## Analysis\nOne chunk.\n'
+    fake = GeminiFake(monkeypatch, reply)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, force=True, now=NOW)
+
+    # Low thinking and the unchanged limits on all three requests, with no JSON mode and no retry.
+    configs = [body['generationConfig'] for _s, _t, body in fake.sends]
+    assert [c['max_output_tokens'] for c in configs] == [8192, 8192, 16384]
+    assert all(c['thinkingConfig']['thinkingLevel'] == 'low' and 'response_mime_type' not in c for c in configs)
+
+    # All three are paid for, the failure says where, and the document stays.
+    assert outcome.status == 'failed' and outcome.reason.startswith('full synthesis (call 3): ') and 'incomplete' in outcome.reason
+    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    assert usage['calls'] == 3 and usage['unknown_cost_calls'] == 0 and usage['cost_usd'] > 0 and usage['output_tokens'] > 0
+    assert usage['full_stage'] == {'stage': 'synthesis', 'call': 3, 'chunk': None, 'chunks': None, 'max_output': 16384,
+                                   'finish_reason': 'length', 'output_tokens': usage['full_stage']['output_tokens'],
+                                   'reasoning_tokens': 16344}
+    assert usage['full_stage']['output_tokens'] >= 40 and 'Cut o' not in json.dumps(usage)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
 
 
 def credential_traffic(provider, pristine, repo):
@@ -1680,6 +1717,11 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
     assert not fake.sends and not (replay_dir / 'ledger.json').exists()
     args = manifest(base_case, case)
     assert script.main(['replay', *args]) == 0 and fake.sends
+    # The successful single-pass full baseline asks for low thinking at its usual limit, in Markdown.
+    baseline_config = fake.stage('full')[0][1]['generationConfig']
+    assert len(fake.stage('full')) == 1 and baseline_config['max_output_tokens'] == 16384
+    assert baseline_config['thinkingConfig']['thinkingLevel'] == 'low' and 'response_mime_type' not in baseline_config
+    assert json.loads((replay_dir / 'base' / 'result.json').read_text())['usage']['full_stage']['stage'] == 'single'
     bought = len(fake.sends)
     assert script.main(['replay', *args]) == 0 and len(fake.sends) == bought
 

@@ -475,13 +475,13 @@ class StaleUpdate(Exception):
         self.reason, self.warning = reason, warning
 
 
-def _send(conversation, max_output, session, budget, deadline=None, now=None):
+def _send(conversation, max_output, session, budget, deadline=None, now=None, low_effort=False):
     """Count, bound, reserve and send the conversation's next request. Returns the TurnResult."""
     from repo_radar import llm
     from repo_radar.model_catalog import acceptance_budget, get_caps
     import time
 
-    request = conversation.request(max_output)
+    request = conversation.request(max_output, low_effort=low_effort)
     out = llm.output_budget(conversation.model, max_output)
     counted = session.count_request(request)
     caps = get_caps(conversation.model)
@@ -585,9 +585,16 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     partitioning and synthesis, sent through the counted sender. Never written directly: the caller
     publishes it. `inherited` is the previous document's credential exclusions (document_exclusions)
     and `baseline` its commit when that is still available; a rebuild adds to that protection and
-    never resets it. A Git failure reading the protection raises rather than dropping it."""
+    never resets it. A Git failure reading the protection raises rather than dropping it.
+
+    On Gemini, thinking and the visible answer share the output limit, so every call asks for low thinking
+    in the counted request, leaving more room to answer; that makes truncation less likely, not impossible.
+    A truncated reply is still rejected, with nothing retried. budget.extra['full_stage'] says which call was
+    last attempted and how it ended: set before each send, finished after its settlement."""
     from repo_radar import llm
     from repo_radar.metadata import parse_llm_response, degradation_reasons
+    from repo_radar.metadata_budget import LedgerWriteError
+    from repo_radar.preflight import TokenCountRejected
 
     target_snap = snap.GitSnapshot(repo_path, target)
     base_manifest, changes = None, ()
@@ -599,26 +606,41 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     if not files:
         raise StaleUpdate("no analyzable source")
 
-    def send(prompt, max_output):
+    calls = [0]
+
+    def send(prompt, max_output, stage, chunk=None, chunks=None):
+        calls[0] += 1
+        where = f"full {stage}{f' {chunk}/{chunks}' if chunk else ''} (call {calls[0]})"
+        record = {'stage': stage, 'call': calls[0], 'chunk': chunk, 'chunks': chunks,
+                  'max_output': llm.output_budget(model, max_output)}
+        budget.extra['full_stage'] = record
         conversation = llm.Conversation(model, None)
         conversation.add_user(prompt)
-        turn = _send(conversation, max_output, session, budget)
+        try:
+            turn = _send(conversation, max_output, session, budget, low_effort=True)
+        except StaleUpdate as e:
+            raise StaleUpdate(f"{where}: {e.reason}", warning=e.warning) from None
+        except (llm.InputBudgetUnavailable, llm.IncompleteResponseError, TokenCountRejected, LedgerWriteError):
+            raise   # their own handling and wording
+        except Exception as e:
+            raise StaleUpdate(f"{where}: {type(e).__name__}: {e}") from None
+        record.update(turn.diagnostics or {})
         if turn.status != 'complete':
-            raise StaleUpdate(f"the model's reply was {turn.status}")
+            raise StaleUpdate(f"{where}: the model's reply was {turn.status}")
         return turn.text
 
     if llm.authoritative_partition(session, full_name, files, model) == 'single':
-        text = send(llm._build_full_repo_prompt(full_name, files), llm.FULL_REPO_OUTPUT)
+        text = send(llm._build_full_repo_prompt(full_name, files), llm.FULL_REPO_OUTPUT, 'single')
     else:
         partition = llm.authoritative_chunks(session, full_name, files, model)
         if partition.degraded_reason:
             raise StaleUpdate(partition.degraded_reason)
         chunks = partition.chunks
-        analyses = [send(llm._build_analysis_prompt(full_name, chunk, i, len(chunks)), llm.CHUNK_OUTPUT)
+        analyses = [send(llm._build_analysis_prompt(full_name, chunk, i, len(chunks)), llm.CHUNK_OUTPUT, 'chunk', i, len(chunks))
                     for i, chunk in enumerate(chunks, 1)]
         text, _cost = llm.combine_chunk_analyses(
             full_name, analyses, model=model, session=session,
-            synthesize=lambda prompt, m: (send(prompt, llm.SYNTHESIS_OUTPUT_TOKENS), 0.0, model))
+            synthesize=lambda prompt, m: (send(prompt, llm.SYNTHESIS_OUTPUT_TOKENS, 'synthesis'), 0.0, model))
         if isinstance(text, llm.DegradedSynthesis):
             raise StaleUpdate(text.reason)
     parsed = parse_llm_response(text)
