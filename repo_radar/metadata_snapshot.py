@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from collections import namedtuple
 
 from repo_radar.files import should_include_file
@@ -30,6 +31,7 @@ MAX_LINE_CHARS = 2000                 # longer lines are shortened, with a marke
 MAX_SEARCH_OUTPUT = 4 * 1024 * 1024   # git grep output read for one search
 MAX_SEARCH_PATHS = 2000               # files named to git grep for one path_prefix
 MAX_SEARCH_ARG_BYTES = 64 * 1024      # encoded grep arguments for one search, leaving room for the rest
+DISCOVERY_SECONDS = 20 * 60           # the most a change listing may take when its caller set no deadline
 REGULAR_MODES = frozenset({'100644', '100755'})
 SHA = re.compile(r'[0-9a-f]{40}')   # use fullmatch: re.match with $ would also accept a trailing newline
 _GIT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin'
@@ -51,6 +53,17 @@ class ResourceLimit(Exception):
     with this reason; it never turns into a full rebuild."""
 
 
+class Deadline:
+    """One moment on one clock, shared by everything an attempt does, so no step restarts the allowance."""
+
+    def __init__(self, seconds, clock=time.monotonic):
+        self.clock = clock
+        self.at = clock() + seconds
+
+    def left(self):
+        return self.at - self.clock()
+
+
 def _git_env():
     return {
         'PATH': _GIT_PATH,
@@ -63,12 +76,15 @@ def _git_env():
     }
 
 
-def run_git(repo, args, limit):
+def run_git(repo, args, limit, deadline=None):
     """Run a read-only git command in `repo` and return at most `limit` bytes of its stdout.
 
     Raises GitError on a non-zero exit, or as soon as the output exceeds `limit` (the process is
-    killed rather than buffered).
+    killed rather than buffered). With a `deadline`, a watchdog kills the process when it passes, which
+    interrupts a blocked read or wait, and ResourceLimit is raised with any partial output discarded.
     """
+    if deadline is not None and deadline.left() <= 0:
+        raise ResourceLimit(f"git {args[0]} ran out of time")
     git = shutil.which('git') or '/usr/bin/git'
     cmd = [git, '-C', str(repo), '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=false',
            '-c', 'diff.external=', *args]
@@ -86,19 +102,43 @@ def run_git(repo, args, limit):
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        proc.kill()
+
+    watchdog = None
+    if deadline is not None:
+        watchdog = threading.Timer(max(deadline.left(), 0), expire)
+        watchdog.daemon = True
+        watchdog.start()
     out = bytearray()
     too_large = False
-    while True:
-        chunk = proc.stdout.read(65536)
-        if not chunk:
-            break
-        out.extend(chunk)
-        if len(out) > limit:
-            too_large = True
+    try:
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            out.extend(chunk)
+            if len(out) > limit:
+                too_large = True
+                proc.kill()
+                break
+        proc.wait()
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog.join()
+        if proc.poll() is None:   # an interrupt reached us while it was still running
             proc.kill()
-            break
-    proc.wait()
-    reader.join(timeout=5)
+            proc.wait()
+        reader.join(timeout=5)
+        proc.stdout.close()
+        if not reader.is_alive():
+            proc.stderr.close()
+    if expired.is_set():
+        raise ResourceLimit(f"git {args[0]} ran out of time")
     if too_large:
         raise GitOutputTooLarge(f"git {args[0]} produced more than {limit} bytes")
     if proc.returncode != 0:
@@ -302,12 +342,15 @@ def collector_eligible(entry):
             and should_include_file(entry.path) and entry.size <= COLLECTOR_MAX_BYTES)
 
 
-def changes_between(repo, base, target):
+def changes_between(repo, base, target, deadline=None):
     """Changed paths between two commits, with renames and copies detected (both paths are reported). Copy
     sources include unchanged files, and there's no candidate cutoff: credential exclusions depend on this
-    seeing an edited credential moved within a huge change, or copied from a file that didn't change."""
+    seeing an edited credential moved within a huge change, or copied from a file that didn't change. That
+    search can be long, so it always has a deadline, and running out is a stop (ResourceLimit), never a
+    partial list to build exclusions from."""
     raw = run_git(repo, ['diff-tree', '-r', '-z', '-M', '-C', '--find-copies-harder', '-l0', '--raw', '--no-abbrev',
-                         '--no-commit-id', '--no-ext-diff', base, target], 64 * 1024 * 1024)
+                         '--no-commit-id', '--no-ext-diff', base, target], 64 * 1024 * 1024,
+                  deadline or Deadline(DISCOVERY_SECONDS))
     fields = raw.split(b'\0')
     out = []
     i = 0
@@ -571,20 +614,21 @@ class PageSet:
 
 
 def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, exclusions, spool_dir,
-                  page_bytes=MAX_PAGE_BYTES, spool_bytes=MAX_SPOOL_BYTES, check=lambda: None):
+                  page_bytes=MAX_PAGE_BYTES, spool_bytes=MAX_SPOOL_BYTES, deadline=None):
     """Spool the filtered diff of an update as complete pages in owner-only `spool_dir`.
 
     Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
     submodules, binary files), known lockfiles and generated artifacts, and any single diff larger than
     MAX_FILE_DIFF_BYTES become omission records with path, status and reason instead of bodies, on their
     own pages at the end. Only a Git output-size limit can become an oversized-diff omission; a failed
-    Git read raises. `check` runs before each file, so a deadline can stop the work. Raises ResourceLimit
-    past the spool ceiling or when the disk is full.
+    Git read raises. `deadline` bounds the whole loop and each file's diff. Raises ResourceLimit past the
+    deadline or the spool ceiling, or when the disk is full.
     """
     writer = _PageWriter(spool_dir, base, target, page_bytes, spool_bytes)
     files, omissions = {}, []
     for number, c in enumerate(changes, 1):
-        check()
+        if deadline is not None and deadline.left() <= 0:
+            raise ResourceLimit('preparing the diff ran out of time')
         ref = FileRef(f"f{number}", c.status, c.old_path, c.new_path)
         files[ref.id] = ref
         label = c.new_path or c.old_path
@@ -597,7 +641,8 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
             paths = [p for p in (c.old_path, c.new_path) if p]
             try:
                 text = run_git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '-M', base, target,
-                                      '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES).decode('utf-8', 'replace')
+                                      '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES,
+                               deadline).decode('utf-8', 'replace')
             except GitOutputTooLarge:
                 reason = OVERSIZED_DIFF
             else:

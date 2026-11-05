@@ -105,12 +105,14 @@ def load_pilot(args):
     return pilot, doc
 
 
-def decide(args, doc, repo):
+def decide(args, doc, repo, deadline):
     target = snap.resolve_commit(repo, args.target)
     if target is None or target != args.target:
         fail(f"{args.target} is not a full commit ID in {repo}")
-    decision = im.decide(repo, PILOT_REPO, doc, None, args.model, target, datetime.now())
-    return decision
+    try:
+        return im.decide(repo, PILOT_REPO, doc, None, args.model, target, datetime.now(), deadline=deadline)
+    except snap.ResourceLimit as e:
+        fail(f"listing the changes stopped: {e}")
 
 
 def write_owner_only(path, text):
@@ -278,6 +280,7 @@ def plan_replay(args, manifest, pilot, repo):
                 continue
             require_commit(repo, case['base'], case['id'])
             doc = case_baseline(pilot, manifest, case)
+            deadline = snap.Deadline(im.ATTEMPT_SECONDS)   # one allowance for this case, from before selection
             estimated_from = None
             if doc is None:
                 # Its baseline doesn't exist until the earlier case runs, so its section titles and size
@@ -288,18 +291,21 @@ def plan_replay(args, manifest, pilot, repo):
             else:
                 check_baseline(case, doc)
             decision = None
-            if estimated_from is None:
-                decision = im.decide(repo, PILOT_REPO, doc, None, model, case['target'], datetime.now(),
-                                     full_rebuild_days=case_days(case))
             spool = tempfile.mkdtemp(prefix='plan-pages-', dir=case_dir(pilot, case))
             started = time.monotonic()
             try:
-                prepared = im.prepare_diff(repo, doc, case['base'], case['target'], spool)
+                if estimated_from is None:
+                    decision = im.decide(repo, PILOT_REPO, doc, None, model, case['target'], datetime.now(),
+                                         full_rebuild_days=case_days(case), deadline=deadline)
+                prepared = im.prepare_diff(repo, doc, case['base'], case['target'], spool, deadline)
                 preparation = time.monotonic() - started
                 budget = Budget(model)
-                pipeline = mr.Pipeline(PILOT_REPO, doc, prepared, model, session, budget,
-                                       time.monotonic() + im.ATTEMPT_SECONDS, time.monotonic)
+                pipeline = mr.Pipeline(PILOT_REPO, doc, prepared, model, session, budget, deadline.at, deadline.clock)
                 quote = pipeline.admission()
+            except snap.ResourceLimit as e:
+                fail(f"{case['id']}: {e}; nothing was spent")
+            except im.StaleUpdate as e:
+                fail(f"{case['id']}: {e.reason}; nothing was spent")
             finally:
                 shutil.rmtree(spool, ignore_errors=True)
             rates = budget.rates
@@ -370,22 +376,27 @@ def run_case(manifest, case, doc, repo, directory, ledger):
     started = time.monotonic()
     record = {**result_identity(manifest, case, doc), 'started_at': datetime.now().isoformat()}
     candidate = None
+    deadline = snap.Deadline(im.ATTEMPT_SECONDS)   # for a replay, one allowance from before its selection
     try:
         if baseline:
             decision = im.Decision('full', 'pilot baseline', None, target, None, None, None, None)
             with PreflightSession() as session:
                 candidate = im.run_full(repo, PILOT_REPO, target, model, session, budget, inherited=snap.NO_EXCLUSIONS)
         else:
-            decision = im.decide(repo, PILOT_REPO, doc, None, model, target, datetime.now(), full_rebuild_days=case_days(case))
+            decision = im.decide(repo, PILOT_REPO, doc, None, model, target, datetime.now(), full_rebuild_days=case_days(case),
+                                 deadline=deadline)
             if decision.strategy != 'incremental':
                 raise im.StaleUpdate(f"this case decides {decision.strategy} ({decision.reason}), not a replay; "
                                      f"no fallback is bought")
             with PreflightSession() as session:
                 candidate = im.run_incremental(repo, PILOT_REPO, doc, decision, model, session, budget,
-                                               spool_dir=directory / 'pages', evidence_dir=directory, case=case['id'])
+                                               spool_dir=directory / 'pages', evidence_dir=directory, case=case['id'],
+                                               deadline=deadline)
         text = render_candidate(manifest, case, doc, candidate, 'full' if baseline else 'incremental', decision, target)
     except im.StaleUpdate as e:
         record.update(status='stopped', reason=im.safe_reason(e.reason))
+    except snap.ResourceLimit as e:
+        record.update(status='stopped', reason=im.safe_reason(str(e)))
     except UnsafeHeader as e:
         record.update(status='failed', reason=im.safe_reason(f"the candidate's header is unsafe: {e}"))
     except Exception as e:
@@ -485,7 +496,8 @@ def main(argv):
 def run(args):
     pilot, doc = load_pilot(args)
     repo = Path(args.repo_path).resolve()
-    decision = decide(args, doc, repo)
+    deadline = snap.Deadline(im.ATTEMPT_SECONDS)   # one allowance for this run, from before selection
+    decision = decide(args, doc, repo, deadline)
     ledger = Ledger(pilot / 'ledger.json', CAP_USD, ALLOWANCES)
     print(f"baseline {doc.info['last_commit'][:12]} -> target {args.target[:12]}: {decision.strategy} ({decision.reason})")
     print(f"ledger: ${ledger.spent():.2f} of ${CAP_USD:.2f} spent "
@@ -507,7 +519,8 @@ def run(args):
         with PreflightSession() as session:
             if args.mode == 'incremental':
                 candidate = im.run_incremental(repo, PILOT_REPO, doc, decision, args.model, session, budget,
-                                               spool_dir=pilot / 'pages-incremental', evidence_dir=pilot, case=args.mode)
+                                               spool_dir=pilot / 'pages-incremental', evidence_dir=pilot, case=args.mode,
+                                               deadline=deadline)
             else:
                 candidate = im.run_full(repo, PILOT_REPO, args.target, args.model, session, budget,
                                         baseline=im.document_commit(repo, doc), inherited=im.document_exclusions(doc))
@@ -520,6 +533,8 @@ def run(args):
              im.EXCLUSIONS_KEY: snap.encode_exclusions(candidate.exclusions)})
     except im.StaleUpdate as e:
         record.update(status='stopped', reason=im.safe_reason(e.reason))
+    except snap.ResourceLimit as e:
+        record.update(status='stopped', reason=im.safe_reason(str(e)))
     except UnsafeHeader as e:
         record.update(status='failed', reason=im.safe_reason(f"the candidate's header is unsafe: {e}"))
     except Exception as e:

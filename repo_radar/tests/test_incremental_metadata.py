@@ -1079,6 +1079,69 @@ def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypat
         monkeypatch.setattr(preflight, '_anthropic_count_request', real_count)
         assert session.count_request(plain, timeout=5).authoritative
 
+    # Git that says nothing until it's killed: selection and preparation stop at the attempt's one shared
+    # deadline, the process is reaped, partial output is dropped, and nothing is bought or changed.
+    real_which = shutil.which
+    real_git, spawned = real_which('git'), []
+    real_popen = subprocess.Popen
+
+    def slow_git(word):
+        script = tmp_path / f'git-slow-{word.strip("-")}'
+        script.write_text(f'#!/bin/sh\ncase "$*" in *{word}*) printf partial; exec sleep 30;; esac\nexec {real_git} "$@"\n')
+        script.chmod(0o755)
+        monkeypatch.setattr(snap.shutil, 'which', lambda name: str(script))
+
+    def spy(*args, **kw):
+        spawned.append(real_popen(*args, **kw))
+        return spawned[-1]
+    monkeypatch.setattr(snap.subprocess, 'Popen', spy)
+    provider.sends.clear(); provider.counts.clear()
+    slow_git('diff-tree')
+    started = time.monotonic()
+    with pytest.raises(snap.ResourceLimit, match='ran out of time'):
+        decide(repo, pristine, deadline=snap.Deadline(0.2))
+    assert time.monotonic() - started < 10 and spawned[-1].returncode is not None   # killed and reaped, no 30 s wait
+    monkeypatch.setattr(im, 'ATTEMPT_SECONDS', 0.2)
+    before = len(spawned)
+    with PreflightSession() as session:
+        stopped = update(pristine, repo, session)
+    assert stopped.status == 'skipped' and 'ran out of time' in stopped.reason and all(p.returncode is not None for p in spawned[before:])
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['reason'] == stopped.reason
+    monkeypatch.setattr(im, 'ATTEMPT_SECONDS', 20 * 60)
+    monkeypatch.setattr(snap.shutil, 'which', real_which)
+    decision = decide(repo, pristine)
+    slow_git('--no-textconv')
+    held = Budget(MODEL, cap=12.0, label='incremental')
+    with PreflightSession() as session, pytest.raises(im.StaleUpdate, match='ran out of time') as caught:
+        im.run_incremental(repo.path, FULL, old, decision, MODEL, session, held, deadline=snap.Deadline(0.2))
+    assert caught.value.warning and held.committed() == 0 and spawned[-1].returncode is not None
+    assert not provider.messages() and not provider.counts
+    before = len(spawned)
+    with pytest.raises(snap.ResourceLimit):   # an expired deadline doesn't even start Git
+        snap.run_git(repo.path, ['status'], 1024, snap.Deadline(0))
+    assert len(spawned) == before
+    monkeypatch.setattr(snap.shutil, 'which', real_which)
+    monkeypatch.setattr(snap.subprocess, 'Popen', real_popen)
+
+    # Preparation gets what selection left of the allowance, never a fresh one.
+    now, lefts = [0.0], []
+    real_changes = snap.changes_between
+
+    def timed_changes(repo_path, base, target, deadline=None):
+        lefts.append(deadline.left())
+        now[0] += 700.0
+        return real_changes(repo_path, base, target, deadline)
+    monkeypatch.setattr(snap, 'changes_between', timed_changes)
+    (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
+    provider.count_tokens = 1000
+    with PreflightSession() as session:
+        update(pristine, repo, session, clock=lambda: now[0])
+    monkeypatch.setattr(snap, 'changes_between', real_changes)
+    assert lefts == [pytest.approx(1200.0), pytest.approx(500.0)]
+    provider.count_tokens = lambda body: 900_000 if 'tools' not in body else 1000
+    provider.sends.clear(); provider.counts.clear()
+
     # A wave's requests are checked together, so they can't each pass against the same remaining budget,
     # and a refused wave leaves nothing reserved, in memory or on disk.
     path = tmp_path / 'ledger.json'

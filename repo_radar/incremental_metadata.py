@@ -202,22 +202,22 @@ def _dropped_full_attempt(state, doc, full_rebuild_days):
                                    'finished_at')}
 
 
-def prepare_diff(repo_path, doc, base, target, spool_dir, check=lambda: None):
+def prepare_diff(repo_path, doc, base, target, spool_dir, deadline=None):
     """The pinned snapshots, changes, credential exclusions and spooled pages of an update from `doc`.
     The whole exclusion closure is worked out before any content is read, and every page and tool uses
     that one record."""
     inherited = document_exclusions(doc)
     base_snap = snap.GitSnapshot(repo_path, base)
     target_snap = snap.GitSnapshot(repo_path, target)
-    changes = snap.changes_between(repo_path, base, target)
+    changes = snap.changes_between(repo_path, base, target, deadline)
     exclusions = snap.credential_exclusions(inherited, base_snap.manifest(), target_snap.manifest(), changes)
     pages = snap.prepare_pages(repo_path, base, target, base_snap.manifest(), target_snap.manifest(), changes,
-                               exclusions, spool_dir, check=check)
+                               exclusions, spool_dir, deadline=deadline)
     return PreparedDiff(base_snap, target_snap, changes, exclusions, pages)
 
 
 def decide(repo_path, full_name, doc, state, model, target, now, force=False,
-           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
+           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, deadline=None):
     """Choose 'full', 'incremental' or 'none' for an opted-in repository at commit `target`.
 
     Pure apart from read-only Git: no model calls, token counts or state writes, so dry runs can
@@ -225,8 +225,11 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     unknown full-build time or an unfinished full rebuild still owed means full; `full_rebuild_days`
     since the last full build means full (0 turns this off); an unchanged tree means nothing to do;
     anything else is incremental. How much changed picks the amount of work, never a full rebuild;
-    the fraction changed is only a diagnostic.
+    the fraction changed is only a diagnostic. Listing the changes shares `deadline` with the rest of the
+    attempt; running out raises snap.ResourceLimit rather than selecting anything.
     """
+    deadline = deadline or snap.Deadline(ATTEMPT_SECONDS)
+
     def full(reason, change=None, built=None, adopt=None):
         return Decision('full', reason, None, target, built, None, change, adopt)
 
@@ -256,7 +259,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     if base_snap.tree_id() == target_snap.tree_id():
         return Decision('none', 'no tracked change since the analyzed commit', base, target, built,
                         full_model, None, adopt)
-    changes = snap.changes_between(repo_path, base, target)
+    changes = snap.changes_between(repo_path, base, target, deadline)
     change = snap.change_fraction(base_snap.manifest(), target_snap.manifest(), changes)
     reason = f"{change.fraction:.1%} of the source changed" if change else 'the tracked tree changed'
     return Decision('incremental', reason, base, target, built, full_model, change, adopt)
@@ -513,29 +516,25 @@ def _send(conversation, max_output, session, budget, deadline=None, now=None):
 
 
 def run_incremental(repo_path, full_name, doc, decision, model, session, budget, clock=None, log=None,
-                    spool_dir=None, evidence_dir=None, case=None):
+                    spool_dir=None, evidence_dir=None, case=None, deadline=None):
     """Update `doc` from its analyzed commit to decision.target: map each diff page, merge the notes, edit
     once. Pages spool to an owner-only directory that is removed afterwards, unless the caller names
-    `spool_dir` to keep it as evidence. A resource limit stops the update; it never becomes a full build."""
+    `spool_dir` to keep it as evidence. A resource limit stops the update; it never becomes a full build.
+    `deadline` is the attempt's, set before selection; only a direct caller without one starts a new one."""
     import shutil
     import time
     from repo_radar import incremental_map_reduce as mr
 
-    clock = clock or time.monotonic
-    deadline = clock() + ATTEMPT_SECONDS
-
-    def check():
-        if clock() >= deadline:
-            raise snap.ResourceLimit('preparing the diff ran out of time')
-
+    deadline = deadline or snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)
     spool = spool_dir or tempfile.mkdtemp(prefix='repo-radar-pages-')
     try:
         os.makedirs(spool, mode=0o700, exist_ok=True)
         os.chmod(spool, 0o700)
-        prepared = prepare_diff(repo_path, doc, decision.base, decision.target, spool, check)
+        prepared = prepare_diff(repo_path, doc, decision.base, decision.target, spool, deadline)
         if decision.change is not None:
             budget.extra.update(changed_files=decision.change.changed_files, changed_bytes=decision.change.changed_bytes)
-        return mr.Pipeline(full_name, doc, prepared, model, session, budget, deadline, clock, log, case, evidence_dir).run()
+        return mr.Pipeline(full_name, doc, prepared, model, session, budget, deadline.at, deadline.clock, log, case,
+                           evidence_dir).run()
     except snap.ResourceLimit as e:
         raise StaleUpdate(str(e), warning=True) from None
     except snap.GitError as e:
@@ -740,7 +739,7 @@ def _cleared_setup_failure(state, now):
 
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
-                      missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
+                      missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None):
     """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
@@ -754,6 +753,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     from repo_radar.preflight import TokenCountRejected
 
     started = time.monotonic()
+    deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)   # selection, preparation and sends share it
     now = now or datetime.now()
     full_name = repo_config['full_name']
     decision = budget = attempt = target = None
@@ -787,7 +787,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         if target is None:
             return finish('failed', 'the repository has no commit')
         decision = decide(repo_path, full_name, doc, state, model, target, now, force=force,
-                          full_rebuild_days=full_rebuild_days)
+                          full_rebuild_days=full_rebuild_days, deadline=deadline)
         if decision.adopt:
             state = {**state, 'adoption': decision.adopt}
         if decision.strategy == 'none':
@@ -823,7 +823,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
 
         if decision.strategy == 'incremental':
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
-                                                                budget, log=log)
+                                                                budget, log=log, deadline=deadline)
         else:
             candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
                                                   baseline=document_commit(repo_path, doc), inherited=inherited)
@@ -859,6 +859,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('published', None)
     except StaleUpdate as e:
         return finish('skipped' if e.warning else 'failed', e.reason)
+    except snap.ResourceLimit as e:   # from selection or a full build's discovery: no fallback, no partial list
+        return finish('skipped', str(e))
     except InputBudgetUnavailable as e:
         return finish('skipped', f"token count unavailable: {e}")
     except TokenCountRejected as e:
