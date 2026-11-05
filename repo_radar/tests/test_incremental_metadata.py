@@ -704,8 +704,9 @@ class GeminiFake:
             if request.url.host != 'generativelanguage.googleapis.com':
                 raise httpx.ConnectError(f"not the fake: {request.url}", request=request)
             body = json.loads(request.content)
-            system = body['system_instruction']['parts'][0]['text']
-            stage = 'map' if system.startswith('You read one page') else 'merge' if system.startswith('You merge') else 'edit'
+            system = (body.get('system_instruction') or {'parts': [{'text': ''}]})['parts'][0]['text']
+            stage = ('map' if system.startswith('You read one page') else 'merge' if system.startswith('You merge')
+                     else 'edit' if system else 'full')
             text = ''.join(p.get('text', '') for c in body['contents'] for p in c['parts'])
             with lock:
                 fake.in_flight += 1
@@ -716,7 +717,7 @@ class GeminiFake:
                 out = reply(stage, text)
                 if isinstance(out, httpx.Response):
                     return out
-                part = out if 'functionCall' in out else {"text": json.dumps(out)}
+                part = {"text": out} if isinstance(out, str) else out if 'functionCall' in out else {"text": json.dumps(out)}
                 return httpx.Response(200, json={
                     "candidates": [{"content": {"parts": [part], "role": "model"}, "finishReason": "STOP"}],
                     "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "totalTokenCount": 120}})
@@ -1055,17 +1056,22 @@ def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypat
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'
 
 
-def run_pilot(pilot_dir, repo, baseline_text, mode, target):
-    """Run the pilot script in-process (sockets stay blocked) from `baseline_text`, which is renamed
-    to the pilot repository. Returns (pilot_dir, the results JSON)."""
+def load_pilot():
     import importlib.util
     from pathlib import Path
-    pilot_dir.mkdir(parents=True, exist_ok=True)
-    (pilot_dir / 'baseline.md').write_text(baseline_text.replace(FULL, PILOT_REPO))
     path = Path(__file__).resolve().parents[2] / 'scripts' / 'pilot-incremental-metadata.py'
     spec = importlib.util.spec_from_file_location('pilot_incremental_metadata', path)
     pilot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pilot)
+    return pilot
+
+
+def run_pilot(pilot_dir, repo, baseline_text, mode, target):
+    """Run the pilot script in-process (sockets stay blocked) from `baseline_text`, which is renamed
+    to the pilot repository. Returns (pilot_dir, the results JSON)."""
+    pilot_dir.mkdir(parents=True, exist_ok=True)
+    (pilot_dir / 'baseline.md').write_text(baseline_text.replace(FULL, PILOT_REPO))
+    pilot = load_pilot()
     pilot.main([mode, '--pilot-dir', str(pilot_dir), '--repo-path', str(repo.path), '--target', target,
                 '--model', MODEL])
     return pilot_dir, json.loads((pilot_dir / f'results-{mode}.json').read_text())
@@ -1353,7 +1359,7 @@ def test_every_opted_in_failure_is_reported_and_keeps_the_document(monkeypatch, 
 
 # ── 5. The pilot cap survives failure and restart ───────────────────────────────────────────────
 
-def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
+def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
     path = tmp_path / 'pilot' / 'ledger.json'
     allowances = {'incremental': 8.0, 'full': 24.0}
     ledger = Ledger(path, 40.0, allowances)
@@ -1463,3 +1469,74 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
     assert after.returncode == 0, after.stderr
     assert 'ledger: $1.00 of $40.00 spent' in after.stdout and (pilot_dir / 'pilot.json').exists()
     assert (pilot_dir / 'pilot.lock').exists()
+
+    # A manifest replay: plan buys nothing, replay runs its cases, and an unchanged rerun buys nothing.
+    history = Repo(tmp_path / 'telehealth')
+    for i in range(10):
+        history.write(f'src/m{i}.py', f'# module {i}\nx = 1\n')
+    first = history.commit('a')
+    history.write('src/m1.py', 'y = 2\n')
+    second = history.commit('b')
+    history.write('src/m2.py', 'z = 3\n')
+    third = history.commit('c')
+
+    def replay_reply(stage, text):
+        if stage == 'full':
+            return FULL_REPLY
+        if stage == 'edit':
+            return {'base_document_sha256': re.search(r'base_document_sha256: (\w+)', text).group(1), 'sections': []}
+        return {'changes': [], 'no_summary_change_reason': 'routine'}
+    fake = GeminiFake(monkeypatch, replay_reply)
+    script = load_pilot()
+    replay_dir = tmp_path / 'replay'
+    replay_dir.mkdir()
+    manifest_path = tmp_path / 'manifest.json'
+    base_case = {'id': 'base', 'kind': 'full_baseline', 'target': first}
+    case = {'id': 'one', 'kind': 'replay', 'baseline_from': 'base', 'base': first, 'target': second, 'weekly_trigger': False}
+
+    def manifest(*cases):
+        manifest_path.write_text(json.dumps({'schema': script.MANIFEST_SCHEMA, 'model': GEMINI, 'clone_url': 'https://x/y.git',
+                                             'cache_dir': 'y', 'cases': list(cases)}))
+        return ['--manifest', str(manifest_path), '--pilot-dir', str(replay_dir), '--repo-path', str(history.path)]
+
+    def refused(mode, args, why):
+        capsys.readouterr()
+        before = len(fake.sends)
+        with pytest.raises(SystemExit):
+            script.main([mode, *args])
+        assert why in capsys.readouterr().err and len(fake.sends) == before
+
+    document = tmp_path / 'document.md'
+    document.write_text(legacy_document('cache', second, NOW - timedelta(days=1)).replace(FULL, script.PILOT_REPO))
+    from_file = {'id': 'from-file', 'kind': 'replay', 'baseline_file': str(document), 'base': second, 'target': third}
+    assert script.main(['plan', *manifest(base_case, case, from_file)]) == 0
+    assert not fake.sends and not (replay_dir / 'ledger.json').exists()
+    args = manifest(base_case, case)
+    assert script.main(['replay', *args]) == 0 and fake.sends
+    bought = len(fake.sends)
+    assert script.main(['replay', *args]) == 0 and len(fake.sends) == bought
+
+    # Only plan and replay take a manifest; the single-case modes never run a replay by accident.
+    refused('full', args, 'works only with plan or replay')
+
+    # Two cases can't share a directory: by name, by a case-insensitive name, or through a symlink.
+    later = {'id': 'two', 'kind': 'replay', 'baseline_from': 'one', 'base': second, 'target': third, 'weekly_trigger': False}
+    refused('replay', manifest(base_case, case, {**later, 'output': 'one'}), 'would share the output directory')
+    refused('replay', manifest(base_case, case, {**later, 'output': 'ONE'}), 'would share the output directory')
+    (replay_dir / 'alias').symlink_to(replay_dir / 'one')
+    refused('replay', manifest(base_case, case, {**later, 'output': 'alias'}), 'would share the output directory')
+    (replay_dir / 'away').symlink_to(tmp_path)
+    refused('replay', manifest(base_case, case, {**later, 'output': 'away'}), 'must be a directory directly under')
+
+    # A completed result counts only for exactly what it was built from.
+    refused('replay', manifest(base_case, {**case, 'target': third}), 'different inputs')
+    refused('replay', manifest(base_case, {**case, 'weekly_trigger': True}), 'different inputs')
+    candidate = replay_dir / 'one' / 'candidate.md'
+    good = candidate.read_text()
+    candidate.write_text(good + 'edited afterwards\n')
+    refused('replay', manifest(base_case, case), "isn't the one its result recorded")
+    candidate.write_text(good)
+    result = replay_dir / 'one' / 'result.json'
+    recorded = json.loads(result.read_text())
+    result.write_text(json.dumps({k: v for k, v in recorded.items() if k != 'prompt_version'}))
+    refused('replay', manifest(base_case, case), 'different inputs')

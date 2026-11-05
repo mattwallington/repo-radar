@@ -18,7 +18,7 @@ baseline comes from and, as "output", its own directory under the pilot director
     {"id": "oct27", "kind": "replay", "baseline_from": "oct27-base", "base": "<sha>", "target": "<sha>",
      "weekly_trigger": false, "output": "oct27"},
     {"id": "nov3", "kind": "replay", "baseline_file": "/path/to/document.md", "base": "<sha>", "target": "<sha>",
-     "output": "nov3"}]}
+     "weekly_trigger": false, "output": "nov3"}]}
 A case's baseline must have been built at exactly its "base" commit; a later document is never relabeled
 as a historical one.
 
@@ -181,6 +181,48 @@ def load_manifest(path):
     return manifest
 
 
+def validate_outputs(manifest, pilot):
+    """Every case gets its own directory directly under the pilot directory, on a Mac's case-insensitive
+    disk and through any symlink. Checked before the first case, so a collision can't skip one."""
+    root, seen = pilot.resolve(), {}
+    for case in manifest['cases']:
+        name = case.get('output', case['id'])
+        path = pilot / name
+        resolved = path.resolve()
+        if resolved.parent != root:
+            fail(f"{case['id']}: output {name} must be a directory directly under {root}")
+        if path.exists() and not path.is_dir():
+            fail(f"{case['id']}: output {name} already exists and isn't a directory")
+        key = str(resolved).casefold()
+        if key in seen:
+            fail(f"{case['id']} and {seen[key]} would share the output directory {name}")
+        seen[key] = case['id']
+
+
+def result_identity(manifest, case, doc):
+    """What a completed result must have been built from to count as this case."""
+    replay = case['kind'] == 'replay'
+    return {'case': case['id'], 'kind': case['kind'], 'model': manifest['model'], 'base': case.get('base'),
+            'target': case['target'], 'baseline_sha256': doc.sha256 if doc else None,
+            'prompt_version': mr.PROMPT_VERSION if replay else None,
+            'pipeline_version': im.PIPELINE_VERSION if replay else None,
+            'weekly_trigger': bool(case_days(case)) if replay else None}
+
+
+def verify_completed(manifest, case, doc, done, directory):
+    """Refuse to count a completed result as this case unless it is exactly this case and its candidate is
+    still the one it produced. Missing fields count as different. Nothing is rebuilt or overwritten."""
+    for key, value in result_identity(manifest, case, doc).items():
+        if key not in done or done[key] != value:
+            fail(f"{case['id']} has a completed result for different inputs ({key}: {done.get(key)!r}, not {value!r}); "
+                 f"nothing is bought or overwritten here, so use a fresh pilot directory")
+    candidate = directory / 'candidate.md'
+    if not candidate.is_file() or hashlib.sha256(candidate.read_bytes()).hexdigest() != done.get('candidate_sha256'):
+        fail(f"{case['id']}'s candidate is missing or isn't the one its result recorded; nothing is bought or overwritten")
+    if read_baseline(candidate).info.get('last_commit') != case['target']:
+        fail(f"{case['id']}'s candidate describes another commit; nothing is bought or overwritten")
+
+
 def require_commit(repo, sha, identity):
     if snap.resolve_commit(repo, sha) != sha:
         fail(f"{identity}: {sha} is not a commit in {repo}")
@@ -326,8 +368,7 @@ def run_case(manifest, case, doc, repo, directory, ledger):
     baseline = case['kind'] == 'full_baseline'
     budget = Budget(model, cap=None if baseline else INCREMENTAL_CAP_USD, ledger=ledger, label='baseline' if baseline else 'replay')
     started = time.monotonic()
-    record = {'case': case['id'], 'kind': case['kind'], 'model': model, 'target': target, 'base': case.get('base'),
-              'baseline_sha256': doc.sha256 if doc else None, 'started_at': datetime.now().isoformat()}
+    record = {**result_identity(manifest, case, doc), 'started_at': datetime.now().isoformat()}
     candidate = None
     try:
         if baseline:
@@ -378,14 +419,6 @@ def replay(args, manifest, pilot, repo):
     ledger = Ledger(pilot / 'ledger.json', CAP_USD, REPLAY_ALLOWANCES)
     for case in manifest['cases']:
         directory = case_dir(pilot, case)
-        previous = directory / 'result.json'
-        if previous.exists():
-            done = json.loads(previous.read_text(encoding='utf-8'))
-            if done.get('status') == 'complete':
-                print(f"{case['id']}: already complete; not bought again")
-                continue
-            fail(f"{case['id']} already stopped ({done.get('reason')}); no rerun is bought here, so start a fresh pilot "
-                 f"directory if the budget allows one")
         doc = None
         require_commit(repo, case['target'], case['id'])
         if case['kind'] == 'replay':
@@ -394,6 +427,15 @@ def replay(args, manifest, pilot, repo):
             if doc is None:
                 fail(f"{case['id']}: its baseline case hasn't produced a document")
             check_baseline(case, doc)
+        previous = directory / 'result.json'
+        if previous.exists():
+            done = json.loads(previous.read_text(encoding='utf-8'))
+            if done.get('status') == 'complete':
+                verify_completed(manifest, case, doc, done, directory)
+                print(f"{case['id']}: already complete; not bought again")
+                continue
+            fail(f"{case['id']} already stopped ({done.get('reason')}); no rerun is bought here, so start a fresh pilot "
+                 f"directory if the budget allows one")
         record = run_case(manifest, case, doc, repo, directory, ledger)
         if record['status'] != 'complete':
             print(f"pilot stopped at {case['id']}: {record.get('reason')}", file=sys.stderr)
@@ -415,6 +457,8 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.mode == 'replay' and not args.manifest:
         fail("replay needs --manifest")
+    if args.manifest and args.mode not in ('plan', 'replay'):
+        fail(f"--manifest works only with plan or replay, not {args.mode}")
     if not args.manifest and not (args.target and args.model):
         fail("a single-case run needs --target and --model")
 
@@ -430,6 +474,7 @@ def main(argv):
     try:
         if args.manifest:
             manifest = load_manifest(args.manifest)
+            validate_outputs(manifest, pilot_dir)
             repo = Path(args.repo_path).resolve()
             return (plan_replay if args.mode == 'plan' else replay)(args, manifest, pilot_dir, repo)
         return run(args)
