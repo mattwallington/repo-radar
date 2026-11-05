@@ -303,9 +303,11 @@ def collector_eligible(entry):
 
 
 def changes_between(repo, base, target):
-    """Changed paths between two commits, with renames detected (both paths are reported)."""
-    raw = run_git(repo, ['diff-tree', '-r', '-z', '-M', '--raw', '--no-abbrev', '--no-commit-id',
-                         '--no-ext-diff', base, target], 64 * 1024 * 1024)
+    """Changed paths between two commits, with renames and copies detected (both paths are reported). Copy
+    sources include unchanged files, and there's no candidate cutoff: credential exclusions depend on this
+    seeing an edited credential moved within a huge change, or copied from a file that didn't change."""
+    raw = run_git(repo, ['diff-tree', '-r', '-z', '-M', '-C', '--find-copies-harder', '-l0', '--raw', '--no-abbrev',
+                         '--no-commit-id', '--no-ext-diff', base, target], 64 * 1024 * 1024)
     fields = raw.split(b'\0')
     out = []
     i = 0
@@ -348,7 +350,8 @@ def change_fraction(base_manifest, target_manifest, changes):
 
     changed = set()
     for c in changes:
-        changed.update(p for p in (c.old_path, c.new_path) if p)
+        # A copy's source didn't change.
+        changed.update(p for p in (None if c.status == 'C' else c.old_path, c.new_path) if p)
     changed &= union
     total = sum(weight(p) for p in union)
     moved = sum(weight(p) for p in changed)
@@ -549,7 +552,7 @@ class PageSet:
 
     def read(self, page):
         try:
-            with open(page.path, encoding='utf-8') as handle:
+            with open(page.path, encoding='utf-8', newline='') as handle:   # CRLF stays as it is in the diff
                 return handle.read()
         except OSError as e:
             raise ResourceLimit(f"the page spool could not be read ({e.strerror or type(e).__name__})") from None

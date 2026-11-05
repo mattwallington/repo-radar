@@ -761,6 +761,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     (repo.path / 'lib').mkdir()
     repo.git('mv', 'src/m9.py', 'lib/renamed.py')
+    repo.write('src/crlf.py', 'a = 1\r\nb = 2\r\n')
     for i in range(9):
         repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
     target = repo.commit('rewrite everything and rename one')
@@ -792,6 +793,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     assert len(maps) >= 400 and outcome.usage['diff_pages'] == len(maps)
     assert sorted(int(re.search(r'\[page p(\d+) ', text).group(1)) for text, _b in maps) == list(range(1, len(maps) + 1))
     assert fake.max_in_flight == 4
+    assert any('+b = 2\r\n' in text for text, _b in maps), 'CRLF line endings reach the model as they are'
     assert max(len(text.encode()) for text, _b in maps) <= 2048 + 1024
     assert max(len(text.encode()) for text, _b in merges) <= 66 * 1024 and 2 <= len(edits) <= 4
 
@@ -963,6 +965,68 @@ def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkey
         assert update(pristine, repo, session).status == 'published'
     traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
     assert 'SENTINEL-' not in traffic and '[no matches]' in traffic and 'src/runtime.py' in traffic
+
+
+def credential_traffic(provider, pristine, repo):
+    """One published update, with every map call answered and the editor changing nothing. Returns what
+    went to the provider, counts included, and the published document."""
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [lambda body: answer({'base_document_sha256': doc.sha256, 'sections': []}) if 'tools' in body
+                        else note()] * 50
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'published', outcome
+    return json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts), im.load_document(pristine, 'app-abc1234')
+
+
+def later_edit_stays_withheld(provider, pristine, repo, path):
+    """Across the publication, only the document's record still knows what `path` is."""
+    repo.write(path, (repo.path / path).read_text() + 'export LATER=SENTINEL-LATER\n')
+    repo.write('src/m1.py', 'later = "ordinary source"\n')
+    repo.commit('edit it again')
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    manifest = snap.GitSnapshot(repo.path, doc.info['last_commit']).manifest()
+    protected = im.document_exclusions(doc)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    assert path in protected.paths and manifest[path].oid in protected.oids
+
+
+def test_a_credential_moved_within_a_restructure_past_gits_rename_limit_stays_withheld(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('.envrc', 'export TOKEN=SENTINEL-OLD\n' + ''.join(f'export V{i}={i}\n' for i in range(40)))
+    for i in range(1100):   # under vendor/, so the bulk costs no per-file diffs, yet still counts for rename detection
+        repo.write(f'vendor/old/d{i}.py', f'# old {i}\n' + ''.join(f'val_{i}_{n} = {n}\n' for n in range(6)))
+    base = repo.commit('a credential and a lot of code')
+    (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
+    repo.git('rm', '-rq', 'vendor/old')
+    for i in range(1100):
+        repo.write(f'vendor/new/a{i}.py', f'# unrelated {i}\n' + ''.join(f'other_{i}_{n} = "{n * 7}"\n' for n in range(9)))
+    repo.git('mv', '.envrc', 'src/runtime.py')
+    repo.write('src/runtime.py', (repo.path / 'src/runtime.py').read_text() + 'export Z=SENTINEL-EDIT\n')
+    repo.write('src/m0.py', 'visible = "ordinary source"\n')
+    repo.commit('restructure, moving the credential too')
+    provider = Provider(monkeypatch)
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    assert 'src/runtime.py' in im.document_exclusions(doc).paths
+    later_edit_stays_withheld(provider, pristine, repo, 'src/runtime.py')
+
+
+def test_an_edited_copy_of_an_unchanged_credential_stays_withheld(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    secret = 'export TOKEN=SENTINEL-OLD\n' + ''.join(f'export V{i}={i}\n' for i in range(40))
+    repo.write('.envrc', secret)
+    base = repo.commit('a credential')
+    (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
+    repo.write('src/settings.txt', secret + 'export Z=SENTINEL-EDIT\n')   # .envrc itself doesn't change
+    repo.write('src/m0.py', 'visible = "ordinary source"\n')
+    repo.commit('copy the credential and edit the copy')
+    provider = Provider(monkeypatch)
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    assert 'src/settings.txt' in im.document_exclusions(doc).paths
+    later_edit_stays_withheld(provider, pristine, repo, 'src/settings.txt')
 
 
 def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypatch, tmp_path):
