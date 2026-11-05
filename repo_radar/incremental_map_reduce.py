@@ -11,14 +11,17 @@ for what was already launched, and leaves the previous document in place.
 """
 
 import concurrent.futures
+import contextlib
 import json
+import os
+import tempfile
 import time
 from collections import Counter, namedtuple
 from pathlib import Path
 
 from repo_radar import incremental_metadata as im
 from repo_radar import metadata_snapshot as snap
-from repo_radar.metadata_budget import BudgetError
+from repo_radar.metadata_budget import BudgetError, LedgerWriteError
 
 PROMPT_VERSION = 'incremental-map-reduce/1'
 
@@ -376,8 +379,9 @@ class Pipeline:
     # ---- one wave --------------------------------------------------------------------------------
 
     def _wave(self, items):
-        """Reserve `items` together, send them concurrently and settle every one before returning. Any
-        failure raises only after all of them are accounted for, so no later wave starts."""
+        """Reserve `items` together, send them concurrently and account for every one, whatever else went
+        wrong. Returns (turns, failure): a turn per item, None where its send failed, and the first thing
+        that must stop further work. Accepted siblings are still usable as evidence; _after_wave raises."""
         from repo_radar import llm
         left = self.deadline - self.clock()
         if left <= 5:
@@ -394,17 +398,25 @@ class Pipeline:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WAVE) as pool:
             futures = [pool.submit(send, item) for item in items]
             concurrent.futures.wait(futures)
-        turns, first_error, unknown = [], None, False
+        turns, send_error, storage_error, unknown = [], None, None, False
         for item, reservation, future in zip(items, reservations, futures):
             error = future.exception()
             record = {'stage': item.stage, 'id': item.id, 'counted_tokens': item.tokens, 'max_output': item.output}
             if error is not None:
-                self.budget.fail(reservation)
+                try:
+                    self.budget.fail(reservation)
+                except LedgerWriteError as e:
+                    storage_error = storage_error or e
                 self.calls.append({**record, 'status': 'error', 'error': type(error).__name__})
-                first_error = first_error or error
+                send_error = send_error or error
+                turns.append(None)
                 continue
             turn, seconds = future.result()
-            cost = self.budget.settle(reservation, turn.usage, turn.cost)
+            try:
+                cost = self.budget.settle(reservation, turn.usage, turn.cost)
+            except LedgerWriteError as e:
+                storage_error = storage_error or e
+                cost = e.cost
             unknown = unknown or cost is None
             self.calls.append({**record, 'status': turn.status, 'seconds': round(seconds, 3), 'cost_usd': cost,
                                'input_tokens': turn.usage.input_tokens if turn.usage else None,
@@ -412,12 +424,21 @@ class Pipeline:
             turns.append(turn)
         stages = Counter(call['stage'] for call in self.calls)
         self.budget.extra.update(map_calls=stages['map'], merge_calls=stages['merge'], edit_turns=stages['edit'])
-        if first_error is not None:
-            raise first_error
-        if unknown:
-            raise im.StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
-                                 "any further paid request")
-        return turns
+        failure = send_error or storage_error
+        if failure is None and unknown:
+            failure = im.StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
+                                     "any further paid request")
+        return turns, failure
+
+    def _after_wave(self, failure):
+        """Save what this wave paid for, then stop if anything went wrong. A failed evidence write stops new
+        work too, without hiding the failure that came first."""
+        try:
+            self._save_evidence()
+        except Exception as e:
+            failure = failure or im.StaleUpdate(f"the pilot's evidence could not be saved ({type(e).__name__}: {e})")
+        if failure is not None:
+            raise failure
 
     # ---- map -------------------------------------------------------------------------------------
 
@@ -435,13 +456,21 @@ class Pipeline:
         for start in range(0, len(diff_pages), MAX_WAVE):
             batch = diff_pages[start:start + MAX_WAVE]
             items = [self._map_item(page) for page in batch]
-            turns = self._wave(items)
+            turns, failure = self._wave(items)
             for page, item, turn in zip(batch, items, turns):
-                note, text = self._note_from(item, turn, page.file_ids, MAX_NOTE_BYTES, merged=False)
-                nodes.append(Node(page.id, frozenset({page.id}), frozenset(page.file_ids), note, text))
+                if turn is None:
+                    continue
+                try:
+                    note, text = self._note_from(item, turn, page.file_ids, MAX_NOTE_BYTES, merged=False)
+                except im.StaleUpdate as e:   # the rest of the wave is still valid evidence
+                    failure = failure or e
+                    continue
+                node = Node(page.id, frozenset({page.id}), frozenset(page.file_ids), note, text)
+                nodes.append(node)
+                self.nodes.append(node)
+            self._after_wave(failure)
             done = start + len(batch)
             self.log(f"read {done} of {len(diff_pages)} diff pages", 20 + 50 * done // len(diff_pages))
-        self.nodes.extend(nodes)
         return nodes
 
     # ---- merge -----------------------------------------------------------------------------------
@@ -465,16 +494,22 @@ class Pipeline:
         for start in range(0, len(work), MAX_WAVE):
             batch = work[start:start + MAX_WAVE]
             built = [self._merge_item(level, i, [nodes[n] for n in group]) for i, group in batch]
-            turns = self._wave([item for item, _files in built])
+            turns, failure = self._wave([item for item, _files in built])
             for (i, group), (item, files), turn in zip(batch, built, turns):
-                note, text = self._note_from(item, turn, files, MAX_MERGED_NOTE_BYTES, merged=True)
+                if turn is None:
+                    continue
+                try:
+                    note, text = self._note_from(item, turn, files, MAX_MERGED_NOTE_BYTES, merged=True)
+                except im.StaleUpdate as e:
+                    failure = failure or e
+                    continue
                 # Coverage is the children's pages, whatever the model chose to repeat.
                 pages = frozenset().union(*(nodes[n].pages for n in group))
                 merged[i] = Node(item.id, pages, files, note, text)
+                self.nodes.append(merged[i])
+            self._after_wave(failure)
             self.log(f"merged notes, level {level}", 75)
-        result = [merged[i] if i in merged else nodes[group[0]] for i, group in enumerate(groups)]
-        self.nodes.extend(merged.values())
-        return result
+        return [merged[i] if i in merged else nodes[group[0]] for i, group in enumerate(groups)]
 
     def merge_stage(self, nodes):
         """Merge along the quoted schedule until the notes can go to the editor: within the direct limit, and
@@ -585,7 +620,9 @@ class Pipeline:
             if tokens > limit:
                 raise im.StaleUpdate(f"the next request ({tokens:,} tokens) would not fit the model's input budget")
             self.log(f"editing the summary, turn {number}", 90)
-            turn = self._wave([WaveItem('edit', f"t{number}", request, tokens, out, EDIT_SECONDS)])[0]
+            turns, failure = self._wave([WaveItem('edit', f"t{number}", request, tokens, out, EDIT_SECONDS)])
+            self._after_wave(failure)
+            turn = turns[0]
             if turn.status == 'tool_calls' and offers_tools:
                 self._deliver_tool_results(conversation, tools, turn)
                 continue
@@ -616,9 +653,15 @@ class Pipeline:
                    'omissions': [o._asdict() for o in self.pages.omissions],
                    'pages': [{'id': p.id, 'kind': p.kind, 'files': list(p.file_ids), 'bytes': p.size}
                              for p in self.pages.pages]}
-        path = directory / 'notes.json'
-        path.touch(mode=0o600)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        fd, tmp = tempfile.mkstemp(dir=str(directory), prefix='.notes.', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+            os.replace(tmp, directory / 'notes.json')
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     def run(self):
         try:
@@ -630,6 +673,10 @@ class Pipeline:
             self.log(f"{quote.pages} pages, up to ${quote.total_usd or 0:.2f}", 20)
             nodes = self.merge_stage(self.map_stage())
             self.verify_coverage(nodes)
-            return self.edit_stage(nodes)
-        finally:
-            self._save_evidence()
+            candidate = self.edit_stage(nodes)
+        except BaseException:
+            with contextlib.suppress(Exception):   # the failure that stopped the update is the one to report
+                self._save_evidence()
+            raise
+        self._after_wave(None)
+        return candidate

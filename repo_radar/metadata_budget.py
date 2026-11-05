@@ -14,6 +14,7 @@ atomically with reserve_many before any of that wave is sent, workers only send,
 settles each result once before the next wave. Nothing here is synchronized for other callers.
 """
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -45,6 +46,16 @@ Rates = namedtuple('Rates', 'input output valid_until announced')
 
 class BudgetError(Exception):
     """A request was refused before sending; the attempt stops with this reason."""
+
+
+class LedgerWriteError(Exception):
+    """A result was accounted for in memory but its durable ledger entry couldn't be updated, so that entry
+    stays unresolved and a reopened ledger refuses further purchases. `cost` is the result's cost, if known.
+    This is about storage, not about the bill."""
+
+    def __init__(self, error, cost=None):
+        super().__init__(f"the ledger entry couldn't be updated ({type(error).__name__}: {error}); it stays unresolved")
+        self.cost = cost
 
 
 class PricingUnavailable(BudgetError):
@@ -125,6 +136,7 @@ class Budget:
         self.cost = 0.0            # settled, known
         self.retained = 0.0        # reservations kept because the cost is unknown
         self.unknown_calls = 0
+        self.ledger_write_failures = 0
         self._open = {}            # key -> upper
         self.extra = {}            # attempt facts for the record: changed and read bytes
 
@@ -198,13 +210,21 @@ class Budget:
         if cost is None:
             self.unknown_calls += 1
             self.retained += upper
-            if self.ledger is not None:
-                self.ledger.mark_unknown(reservation.key)
+            self._persist(cost, lambda: self.ledger.mark_unknown(reservation.key))
         else:
             self.cost += cost
-            if self.ledger is not None:
-                self.ledger.settle(reservation.key, cost)
+            self._persist(cost, lambda: self.ledger.settle(reservation.key, cost))
         return cost
+
+    def _persist(self, cost, write):
+        """The result is already accounted for in memory, so a failed write must not be accounted for again."""
+        if self.ledger is None:
+            return
+        try:
+            write()
+        except Exception as e:
+            self.ledger_write_failures += 1
+            raise LedgerWriteError(e, cost) from None
 
     def fail(self, reservation):
         """The send raised after the reservation: whether it was billed is unknown, so keep it."""
@@ -212,17 +232,19 @@ class Budget:
         self.calls += 1
         self.unknown_calls += 1
         self.retained += upper
-        if self.ledger is not None:
-            self.ledger.mark_unknown(reservation.key)
+        self._persist(None, lambda: self.ledger.mark_unknown(reservation.key))
 
     def summary(self):
-        """cost_usd is the total, or None when any call's cost is unknown; known_cost_usd is always the
-        settled subtotal, and retained_reservation_usd what unknown calls keep reserved."""
+        """cost_usd is the total, or None when any call's cost is unknown or any reservation is still open;
+        known_cost_usd is always the settled subtotal, and retained_reservation_usd what unknown calls keep
+        reserved."""
         known = round(self.cost, 6)
         return {'model': self.model, 'calls': self.calls, 'input_tokens': self.input_tokens,
-                'output_tokens': self.output_tokens, 'cost_usd': None if self.unknown_calls else known,
+                'output_tokens': self.output_tokens, 'cost_usd': None if self.unknown_calls or self._open else known,
                 'known_cost_usd': known, 'unknown_cost_calls': self.unknown_calls,
-                'retained_reservation_usd': round(self.retained, 6), **self.extra}
+                'retained_reservation_usd': round(self.retained, 6),
+                'open_reservation_usd': round(sum(self._open.values()), 6),
+                'ledger_write_failures': self.ledger_write_failures, **self.extra}
 
 
 class LockHeld(Exception):
@@ -280,12 +302,17 @@ class Ledger:
 
     def _save(self, data):
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix='.tmp')
-        with os.fdopen(fd, 'w') as handle:
-            json.dump(data, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                json.dump(data, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     @staticmethod
     def _spent(entries, label=None):

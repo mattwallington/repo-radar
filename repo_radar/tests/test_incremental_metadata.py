@@ -21,7 +21,7 @@ import pytest
 from repo_radar import incremental_map_reduce as mr
 from repo_radar import incremental_metadata as im
 from repo_radar import config as repo_config, metadata, metadata_snapshot as snap
-from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, PricingUnavailable
+from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, LedgerWriteError, PricingUnavailable
 from repo_radar.modes import sync as S
 from repo_radar.preflight import PreflightSession
 
@@ -878,14 +878,52 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     budget = Budget(GEMINI, cap=12.0, ledger=Ledger(path, 40.0, allowances), label='replay')
     fake.sends.clear()
     decision = decide(repo, pristine, model=GEMINI)
+    evidence = tmp_path / 'evidence'
     with PreflightSession() as session, pytest.raises(Exception, match='overloaded|UNAVAILABLE|503'):
-        im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c1')
+        im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c1', evidence_dir=evidence)
     assert len(fake.sends) == 4
     reopened = Ledger(path, 40.0, allowances)
     assert reopened.spent() == pytest.approx(budget.cost + budget.retained)
     assert [e['status'] for e in json.loads(path.read_text())['entries']].count('unknown') == 1
     with pytest.raises(BudgetExceeded, match='reconcile'):
         Budget(GEMINI, ledger=reopened, label='replay').reserve({'next': 1}, 1, 1)
+    saved = json.loads((evidence / 'notes.json').read_text())
+    assert {n['id'] for n in saved['notes']} == {'p1', 'p3', 'p4'} and len(saved['calls']) == 4   # paid-for notes survive
+
+    # The ledger can't record the first settlement, and one sibling's note is malformed. Every launched
+    # call is still accounted for once, the bill stays honest, valid notes survive, nothing further runs,
+    # and the entry left unresolved on disk still blocks a reopened ledger.
+    def mostly_fine(stage, text):
+        assert stage == 'map'
+        if '[page p3 ' in text:
+            return {'changes': [{'files': ['f999'], 'what': 'an id it was never given', 'sections': []}]}
+        return {'changes': [], 'no_summary_change_reason': 'routine'}
+    fake = GeminiFake(monkeypatch, mostly_fine)
+    real_settle, failures = Ledger.settle, []
+
+    def flaky_settle(self, key, actual):
+        if not failures:
+            failures.append(key)
+            raise OSError(28, 'No space left on device')
+        return real_settle(self, key, actual)
+    monkeypatch.setattr(Ledger, 'settle', flaky_settle)
+    path = tmp_path / 'ledger-disk-full.json'
+    budget = Budget(GEMINI, cap=12.0, ledger=Ledger(path, 40.0, allowances), label='replay')
+    evidence = tmp_path / 'evidence-disk-full'
+    with PreflightSession() as session, pytest.raises(LedgerWriteError, match='No space left'):
+        im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c2', evidence_dir=evidence)
+    monkeypatch.setattr(Ledger, 'settle', real_settle)
+    usage = budget.summary()
+    assert len(fake.sends) == 4 and {s for s, _t, _b in fake.sends} == {'map'}
+    assert (usage['calls'], usage['unknown_cost_calls'], usage['ledger_write_failures']) == (4, 0, 1)
+    assert usage['open_reservation_usd'] == 0 and usage['known_cost_usd'] > 0 and usage['cost_usd'] == usage['known_cost_usd']
+    saved = json.loads((evidence / 'notes.json').read_text())
+    assert {n['id'] for n in saved['notes']} == {'p1', 'p2', 'p4'} and len(saved['calls']) == 4
+    statuses = [e['status'] for e in json.loads(path.read_text())['entries']]
+    assert sorted(statuses) == ['reserved', 'settled', 'settled', 'settled']
+    with pytest.raises(BudgetExceeded, match='reconcile'):
+        Budget(GEMINI, ledger=Ledger(path, 40.0, allowances), label='replay').reserve({'next': 1}, 1, 1)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
 
 
 def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkeypatch, tmp_path):
