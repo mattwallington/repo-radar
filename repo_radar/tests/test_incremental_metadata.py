@@ -941,6 +941,41 @@ def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypat
     assert im.load_document(pristine, 'app-abc1234').text == old.text
     assert outcome.usage['estimated_total_usd'] > 12
 
+    # Slow counts spend the attempt's time: the last count is clamped to what's left, and an expired
+    # admission buys nothing.
+    class SlowCounts:
+        def __init__(self, inner):
+            self.inner, self.timeouts, self.now = inner, [], 0.0
+
+        def count_request(self, request, timeout=None):
+            self.timeouts.append(timeout)
+            self.now += 500.0
+            return self.inner.count_request(request)
+    provider.count_tokens = 1000
+    with PreflightSession() as session:
+        slow = SlowCounts(session)
+        expired = Budget(MODEL, cap=12.0, label='incremental')
+        with pytest.raises(im.StaleUpdate, match='ran out of time'):
+            im.run_incremental(repo.path, FULL, old, decide(repo, pristine), MODEL, slow, expired, clock=lambda: slow.now)
+    assert len(slow.timeouts) == 3 and slow.timeouts[-1] == pytest.approx(200.0)
+    assert not provider.messages() and expired.committed() == 0 and expired.summary()['calls'] == 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # A count cut short by that deadline returns at once, and doesn't mark the provider as unavailable.
+    import asyncio
+    from repo_radar import preflight
+    real_count = preflight._anthropic_count_request
+
+    async def stuck(request):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(preflight, '_anthropic_count_request', stuck)
+    plain = {'endpoint': 'chat', 'model': MODEL, 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 10}
+    with PreflightSession() as session:
+        cut_short = session.count_request(plain, timeout=0.01)
+        assert cut_short.tokens is None and cut_short.reason == 'TimeoutError'
+        monkeypatch.setattr(preflight, '_anthropic_count_request', real_count)
+        assert session.count_request(plain, timeout=5).authoritative
+
     # A wave's requests are checked together, so they can't each pass against the same remaining budget,
     # and a refused wave leaves nothing reserved, in memory or on disk.
     path = tmp_path / 'ledger.json'

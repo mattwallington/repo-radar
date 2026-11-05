@@ -304,8 +304,9 @@ class PreflightSession:
 
     # ---- complete requests (incremental metadata) -----------------------------------------------
 
-    async def _guarded_request(self, request):
+    async def _guarded_request(self, request, timeout_s=None):
         model = request["model"]
+        limit = self._timeout if timeout_s is None else min(self._timeout, timeout_s)
         async with self._lock:
             caps = get_caps(model)
             if caps is None or caps.count_strategy != "anthropic_api":
@@ -316,11 +317,13 @@ class PreflightSession:
                                                         default=str).encode()).hexdigest())
             if key in self._memo:
                 return self._memo[key]
-            out = await _count_request_once(request, self._timeout)
+            out = await _count_request_once(request, limit)
             if isinstance(out, _Fatal):
                 return out
             if out.authoritative:
                 self._memo[key] = out
+            elif limit < self._timeout and out.reason == "TimeoutError":
+                return out   # the caller's deadline ran out; says nothing about the provider
             else:
                 self._downgraded[model] = out
                 if model not in self._logged:
@@ -329,7 +332,15 @@ class PreflightSession:
                                    "its metadata is skipped for the rest of this sync", model, out.reason)
             return out
 
-    def count_request(self, request):
+    async def _request_within(self, request, timeout_s):
+        """_guarded_request with `timeout_s` bounding all of it, the wait for the session's lock included.
+        Cancellation unwinds through `async with`, so the lock is released and the session stays usable."""
+        try:
+            return await asyncio.wait_for(self._guarded_request(request, timeout_s), timeout_s)
+        except TimeoutError:
+            return PreflightResult(None, False, "TimeoutError")
+
+    def count_request(self, request, timeout=None):
         """Count a complete canonical request (llm.Conversation.request()): instructions, messages,
         tool definitions, earlier replies and tool results, and reasoning items.
 
@@ -337,9 +348,11 @@ class PreflightSession:
         as the send transforms it and counted by Anthropic's Count Tokens API directly, never by a
         local fallback. Unavailability opens this model's breaker as count() does, and a rejected
         count raises TokenCountRejected. Other providers get litellm's local count of the whole
-        envelope plus a conservative framing allowance (authoritative=False, tokens set).
+        envelope plus a conservative framing allowance (authoritative=False, tokens set). `timeout` is the
+        most this one call may take; a count cut short by it doesn't open the breaker.
         """
-        out = self._loop.submit(self._guarded_request(request))
+        out = self._loop.submit(self._guarded_request(request) if timeout is None
+                                else self._request_within(request, timeout))
         if isinstance(out, _Fatal):
             raise out.exc
         return out

@@ -205,7 +205,7 @@ class LocalEstimate:
     """Token estimates for a local-only plan, with no network and no key: the provider's count isn't
     available there, and a paid run counts again before sending anything."""
 
-    def count_request(self, request):
+    def count_request(self, request, timeout=None):
         from types import SimpleNamespace
         size = len(json.dumps(request, ensure_ascii=False).encode('utf-8', 'replace'))
         return SimpleNamespace(tokens=size // LOCAL_BYTES_PER_TOKEN + 1024, authoritative=False, reason='local estimate',
@@ -238,11 +238,19 @@ class Pipeline:
         return {'case': self.case, 'stage': item.stage, 'id': item.id, 'base': self.pages.base,
                 'target': self.pages.target, 'model': self.model, 'prompt': PROMPT_VERSION, 'request': item.request}
 
+    def _time_left(self):
+        left = self.deadline - self.clock()
+        if left <= 0:
+            raise im.StaleUpdate("the attempt ran out of time")
+        return left
+
     def _count(self, request, output, ceiling=None):
         """(counted tokens, the limit this request must fit). An Anthropic model's count is authoritative or
-        nothing, as for every send; the update is skipped rather than sent on an estimate."""
+        nothing, as for every send; the update is skipped rather than sent on an estimate. Counting spends the
+        attempt's time like everything else, so no count starts, or is believed, after the deadline."""
         from repo_radar.model_catalog import acceptance_budget, get_caps
-        counted = self.session.count_request(request)
+        counted = self.session.count_request(request, timeout=self._time_left())
+        self._time_left()
         caps = get_caps(self.model)
         estimated = getattr(counted, 'local_plan', False)
         if caps is not None and caps.count_strategy == 'anthropic_api' and not counted.authoritative and not estimated:
@@ -338,7 +346,9 @@ class Pipeline:
         diff_pages = self.pages.diff_pages
         map_tokens = 0
         for page in diff_pages:
+            self._time_left()
             map_tokens += self._map_item(page).tokens
+        self._time_left()
         request = self._edit_conversation([]).request(EDIT_OUTPUT)
         base_tokens, edit_out, edit_limit = self._edit_output_and_limit(request)
         if base_tokens + edit_out + CONTINUATION_TOKENS > edit_limit:
