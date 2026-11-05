@@ -6,6 +6,7 @@ client (counts). Sockets are blocked, keys are fake, nothing is paid for.
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
+from repo_radar import incremental_map_reduce as mr
 from repo_radar import incremental_metadata as im
 from repo_radar import config as repo_config, metadata, metadata_snapshot as snap
 from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, PricingUnavailable
@@ -688,8 +690,9 @@ class GeminiFake:
                 out = reply(stage, text)
                 if isinstance(out, httpx.Response):
                     return out
+                part = out if 'functionCall' in out else {"text": json.dumps(out)}
                 return httpx.Response(200, json={
-                    "candidates": [{"content": {"parts": [{"text": json.dumps(out)}], "role": "model"}, "finishReason": "STOP"}],
+                    "candidates": [{"content": {"parts": [part], "role": "model"}, "finishReason": "STOP"}],
                     "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "totalTokenCount": 120}})
             finally:
                 with lock:
@@ -713,31 +716,45 @@ def rewrite_files(repo, lines):
     return repo.commit('rewrite everything')
 
 
-def first_file(text):
-    import re
-    return re.search(r'^(f\d+) ', text, re.M).group(1)
+def files_on_page(text):
+    return re.findall(r'^(f\d+) ', text, re.M)
+
+
+def dense(size):
+    """Text of about `size` bytes that counts about one token per two bytes."""
+    return ' '.join(f'{i:x}.' for i in range(size))[:size]
+
+
+def cited_identities(text):
+    """The file-id table in a merge or editor request."""
+    return json.loads(re.search(r'\(status, old_path, new_path\):\n(\{.*\})\n', text).group(1))
 
 
 def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path):
-    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
-    target = rewrite_files(repo, 4200)
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    (repo.path / 'lib').mkdir()
+    repo.git('mv', 'src/m9.py', 'lib/renamed.py')
+    for i in range(9):
+        repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
+    target = repo.commit('rewrite everything and rename one')
     small_pages(monkeypatch)
     old = im.load_document(pristine, 'app-abc1234')
     sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(old))}
     components = sections['## Key Components']
+    answer_patch = {'base_document_sha256': old.sha256,
+                    'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                                  'content': '## Key Components\n- values are rewritten\n'}]}
+    big_read = {'functionCall': {'name': 'read_file', 'args': {'path': 'src/m0.py', 'limit': 2000}}}
 
     def reply(stage, text):
-        import re
-        if stage == 'map':
-            return {'changes': [{'files': [first_file(text)], 'what': 'n' * 2700, 'sections': [components.id]}],
-                    'questions': [], 'no_summary_change_reason': None}
+        if stage == 'map':   # JSON mode doesn't enforce a schema, so optional lists may come back null
+            return {'changes': [{'files': files_on_page(text), 'what': 'n' * 2600, 'sections': [components.id]}],
+                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
         if stage == 'merge':
-            files = sorted(set(re.findall(r'"files":\["(f\d+)"', text)))
-            return {'changes': [{'files': files[:1], 'what': 'm' * 11000, 'sections': [components.id]}],
-                    'questions': ['kept'], 'disagreements': [], 'no_summary_change_reason': None}
-        return {'base_document_sha256': old.sha256,
-                'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
-                              'content': '## Key Components\n- values are rewritten\n'}]}
+            files = sorted(set(re.findall(r'"f\d+"', text.split('Notes to merge', 1)[1])), key=lambda f: int(f[2:-1]))
+            return {'changes': [{'files': [f.strip('"') for f in files], 'what': dense(9000), 'sections': [components.id]}],
+                    'questions': ['kept'], 'disagreements': None, 'no_summary_change_reason': None}
+        return answer_patch if 'last turn' in text else big_read   # read until tools are no longer offered
     fake = GeminiFake(monkeypatch, reply)
     with PreflightSession() as session:
         outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
@@ -746,12 +763,39 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     # Every page was mapped exactly once, at most four at a time, and each request stayed bounded.
     maps, merges, edits = fake.stage('map'), fake.stage('merge'), fake.stage('edit')
     assert len(maps) >= 400 and outcome.usage['diff_pages'] == len(maps)
-    import re
     assert sorted(int(re.search(r'\[page p(\d+) ', text).group(1)) for text, _b in maps) == list(range(1, len(maps) + 1))
     assert fake.max_in_flight == 4
     assert max(len(text.encode()) for text, _b in maps) <= 2048 + 1024
-    assert len(maps) // 16 <= len(merges) <= len(maps) // 10 and max(len(text.encode()) for text, _b in merges) <= 66 * 1024   # more than one level
-    assert len(edits) == 1 and sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
+    assert max(len(text.encode()) for text, _b in merges) <= 66 * 1024 and 2 <= len(edits) <= 4
+
+    # Dense notes force a level their byte total alone wouldn't, and the quote already priced all of it.
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    usage = state['usage']
+    first, second = len(maps) // 16 + 1, (len(maps) // 16 + 1 + 4) // 5
+    assert len(merges) > first + second and len(merges) <= mr.worst_case_merges(len(maps))
+    assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
+    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0 and usage['rate_input_per_mtok'] == 0.75
+
+    # Every merge and editor request names each cited file's real status and paths.
+    changes = snap.changes_between(repo.path, base, target)
+    expected = {f"f{n}": {'status': c.status, 'old_path': c.old_path, 'new_path': c.new_path}
+                for n, c in enumerate(changes, 1)}
+    renamed = next(file_id for file_id, ref in expected.items() if ref['status'] == 'R')
+    assert expected[renamed]['new_path'] == 'lib/renamed.py'
+    for text, _body in (*merges, edits[0]):
+        table = cited_identities(text)
+        assert table and all(table[file_id] == expected[file_id] for file_id in table)
+    assert renamed in cited_identities(edits[0][0])
+
+    # A large read is cut to fit the counted request, within the delivered-bytes cap, and the edit still
+    # publishes; the last turn offers no tools.
+    assert mr.TOOL_TRUNCATED_NOTICE.strip() in json.dumps(edits[-1][1])
+    assert usage['tool_calls'] == len(edits) - 1 and usage['read_bytes'] <= mr.EDIT_TOOL_BYTES
+    assert edits[-1][1]['toolConfig']['functionCallingConfig']['mode'] == 'NONE' and 'last turn' in edits[-1][0]
+    assert 'NONE' not in json.dumps(edits[0][1].get('toolConfig', {}))
+    with PreflightSession() as session:   # each request stayed within the limit it was counted against
+        assert all(session.count_request({'endpoint': 'chat', 'model': GEMINI, 'messages': [
+            {'role': 'user', 'content': text}]}).tokens <= mr.EDIT_INPUT_TOKENS for text, _b in edits)
 
     # The stage options went out on the wire: low effort and JSON for short stages, not for the editor.
     def options(body):
@@ -769,9 +813,14 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     untouched = [s for s in sections.values() if s.id != components.id]
     assert all(s.text in new.text for s in untouched[:-1])
     assert untouched[-1].text.rstrip('\n') in new.text   # rendering normalizes the document's final newlines
-    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
-    assert (usage['map_calls'], usage['merge_calls'], usage['edit_turns']) == (len(maps), len(merges), 1)
-    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0 and usage['rate_input_per_mtok'] == 0.75
+    assert (usage['map_calls'], usage['merge_calls'], usage['edit_turns']) == (len(maps), len(merges), len(edits))
+
+    # Optional lists are still type-checked when present, and unknown ids and required changes still fail.
+    for bad in ({'changes': [], 'questions': 'x', 'no_summary_change_reason': 'r'},
+                {'changes': None, 'no_summary_change_reason': 'r'},
+                {'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None}):
+        with pytest.raises(mr.NoteError):
+            mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
@@ -942,8 +991,9 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
         assert update(pristine, repo, session).status == 'published'
     sends = provider.messages()
     assert len(sends) == 3 and len(provider.sends) == 3
-    # The map call is counted once. The editor is counted without notes for the quote, then per turn.
-    assert len(provider.counts) == 4 and 'tools' not in provider.counts[0]
+    # The map call is counted once. The editor is counted without notes for the quote, with them to check
+    # it fits, then with the tool result's placeholder and with the result itself.
+    assert len(provider.counts) == 5 and 'tools' not in provider.counts[0]
     # The last request is counted exactly as it is sent: tools, the thinking block, the tool result.
     count, send = provider.counts[-1], sends[-1]
     for key in ('messages', 'system', 'tools'):
@@ -954,6 +1004,19 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert state['usage']['calls'] == 3 and state['usage']['cost_usd'] > 0
     assert (state['usage']['map_calls'], state['usage']['merge_calls'], state['usage']['edit_turns']) == (1, 0, 2)
+
+    # Turn four offers no tools: counted and sent as the same final-answer-only request.
+    repo.write('src/m3.py', 'p = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+    read = tool_use('read_file', {'path': 'src/m0.py', 'limit': 3})
+    provider.replies = [note(), read, read, read, answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'published'
+    last = provider.messages()[-1]
+    assert last['tool_choice']['type'] == 'none' and provider.counts[-1]['tool_choice'] == last['tool_choice']
+    assert 'tool_choice' not in provider.messages()[1]
 
     # A tool result that pushes the next request past the input budget stops before that send.
     repo.write('src/m1.py', 'q = 1\n')

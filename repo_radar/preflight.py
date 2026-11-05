@@ -354,7 +354,7 @@ def anthropic_count_body(request):
     model = request["model"]
     resolved, _provider, _key, _base = get_llm_provider(model=model)
     config = AnthropicConfig()
-    openai_params = {k: request[k] for k in ("tools", "max_tokens") if k in request}
+    openai_params = {k: request[k] for k in ("tools", "tool_choice", "max_tokens") if k in request}
     optional = config.map_openai_params(non_default_params=openai_params, optional_params={},
                                         model=resolved, drop_params=False)
     body = config.transform_request(model=resolved, messages=json.loads(json.dumps(request["messages"])),
