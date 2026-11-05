@@ -891,6 +891,17 @@ def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypat
     usage = types.SimpleNamespace(input_tokens=1_000_000, output_tokens=0 + 1)
     assert january.settle(january.reserve({'r': 1}, 1_000_000, 1), usage, 0.75) == pytest.approx(1.5 + 7.5e-6)
     assert Budget(GEMINI, now=datetime(2026, 11, 4, tzinfo=timezone.utc)).price == (0.75e-6, 3.75e-6)
+    # The "latest" alias has the same floor, and a table price above the floor is never lowered.
+    assert Budget('gemini/gemini-flash-latest', now=datetime(2027, 1, 1, tzinfo=timezone.utc)).price == (1.5e-6, 7.5e-6)
+    assert Budget('gemini/gemini-flash-latest', now=datetime(2026, 12, 31, 1, tzinfo=timezone.utc)).rates.announced
+    # Only Gemini's priority and flex rates are left out: no service tier means Standard there, but
+    # OpenAI's means the project's configured tier, which may be priority.
+    import litellm
+    rates = {'input_cost_per_token': 1e-6, 'output_cost_per_token': 2e-6, 'input_cost_per_token_priority': 3e-6,
+             'output_cost_per_token_priority': 6e-6, 'input_cost_per_token_batches': 9e-6}
+    monkeypatch.setitem(litellm.model_cost, 'gpt-synthetic', rates)
+    monkeypatch.setitem(litellm.model_cost, 'gemini/gemini-synthetic', rates)
+    assert Budget('gpt-synthetic').price == (3e-6, 6e-6) and Budget('gemini/gemini-synthetic').price == (1e-6, 2e-6)
 
 
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'

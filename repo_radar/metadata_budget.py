@@ -28,9 +28,12 @@ INCREMENTAL_CAP_USD = 12.0
 
 # Vendor-announced list price rises the pricing table doesn't know yet: model -> (first day of the new
 # price, input, output per token). Google lists Gemini 3.8 Flash at $0.75/$3.75 per million through
-# December 31, 2026, then $1.50/$7.50.
+# December 31, 2026, then $1.50/$7.50. The "latest" alias gets the same floor: it's a floor for the alias,
+# not a promise of which model it will name.
+_GEMINI_3_8_FLASH_JANUARY = (datetime(2027, 1, 1, tzinfo=timezone.utc), 1.50e-6, 7.50e-6)
 ANNOUNCED_PRICE_CHANGES = {
-    'gemini/gemini-3.8-flash': (datetime(2027, 1, 1, tzinfo=timezone.utc), 1.50e-6, 7.50e-6),
+    'gemini/gemini-3.8-flash': _GEMINI_3_8_FLASH_JANUARY,
+    'gemini/gemini-flash-latest': _GEMINI_3_8_FLASH_JANUARY,
 }
 # An attempt that could still be running when a new price starts is priced at the new one.
 _PRICE_CHANGE_MARGIN = timedelta(days=1)
@@ -54,13 +57,16 @@ class BudgetExceeded(BudgetError):
 
 def price_per_token(model):
     """(input, output) USD per token at uncached rates, taking the highest tier this app can be billed
-    at, or None if unknown. Requests are never sent at priority, flex or batch service tiers."""
+    at, or None if unknown. Requests are never sent in batch. They name no service tier, which on Gemini
+    means Standard, so its priority and flex rates don't apply; on OpenAI it means the project's configured
+    tier, which can be any of them, so every other provider keeps those rates in the bound."""
     try:
         import litellm
         info = (litellm.model_cost.get(model) or litellm.model_cost.get(model.split('/', 1)[-1]) or {})
     except Exception:
         return None
-    other_tier = ('batch', 'priority', 'flex')
+    from repo_radar.llm import provider_for_model
+    other_tier = ('batch', 'priority', 'flex') if provider_for_model(model) == 'gemini' else ('batch',)
     inputs = [v for k, v in info.items() if k.startswith('input_cost_per_token') and 'cache' not in k
               and not any(t in k for t in other_tier) and isinstance(v, (int, float))]
     outputs = [v for k, v in info.items() if (k.startswith('output_cost_per_token')
