@@ -865,7 +865,9 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                    'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
                    'policy': SEMANTIC_POLICY, 'model': model, 'started_at': now.isoformat(), 'reason': None,
                    'generation_id': None, 'consecutive_failures': consecutive_failures(state, doc),
-                   FAILURE_STREAK_DOC: doc.sha256 if doc else None}
+                   # A missing document keeps the streak's identity as it keeps the count, so a retry while
+                   # the file is away can't release the hold on it when it comes back.
+                   FAILURE_STREAK_DOC: doc.sha256 if doc else state.get(FAILURE_STREAK_DOC)}
         dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
         if dropped:   # its failure stays on record while the new path runs
             attempt['dropped_full_attempt'] = dropped

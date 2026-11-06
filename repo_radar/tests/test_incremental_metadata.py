@@ -475,11 +475,23 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     held_doc = im.load_document(pristine, 'app-abc1234')
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert im.consecutive_failures(state, None) == 2, 'a missing document is no reason to buy another rebuild'
+    # While the held document is away, a manual retry that fails or is skipped keeps the streak on it, so
+    # when the same document comes back a scheduled sync is still held.
+    (pristine / 'app-abc1234.md').rename(tmp_path / 'held-away.md')
+    provider.replies = [boom]
+    assert dispatched('manual')[1]['status'] == 'failed' and provider.sends and failures() == 3
+    provider.count_tokens = lambda body: httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+    assert dispatched('manual')[1]['status'] == 'skipped' and failures() == 3
+    provider.count_tokens = 1000
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')[im.FAILURE_STREAK_DOC] == held_doc.sha256
+    (tmp_path / 'held-away.md').rename(pristine / 'app-abc1234.md')
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'skipped' and 'held after 3' in event['reason'] and not provider.sends and not provider.counts
     (pristine / 'app-abc1234.md').write_text(held_doc.text + '\nReplaced some other way.\n')
     im.record_failure(pristine, 'app-abc1234', FULL, 'setup broke')
     replaced = im.load_document(pristine, 'app-abc1234')
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
-    assert (state['baseline_doc_sha256'], state['consecutive_failures']) == (replaced.sha256, 2)
+    assert (state['baseline_doc_sha256'], state['consecutive_failures']) == (replaced.sha256, 3)
     assert im.consecutive_failures(state, replaced) == 0
     provider.replies = [boom]
     assert dispatched('scheduled')[1]['status'] == 'failed' and provider.sends and failures() == 1
