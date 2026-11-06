@@ -40,6 +40,7 @@ _REMOVED_TRIGGER = re.compile(r'\d+% of the source changed|\d+ diff pages exceed
 WEEKLY_REASON = 'weekly full rebuild due'
 UNFINISHED_REASON = 'previous full rebuild did not finish'
 HOLD_AFTER_FAILURES = 2            # failed updates in a row before only a person can start another
+FAILURE_STREAK_DOC = 'failure_streak_doc_sha256'   # the document those failures were from
 
 
 def document_path(pristine_dir, cache_name):
@@ -192,10 +193,12 @@ def full_rebuild_unfinished(state, doc, full_rebuild_days=DEFAULT_INCREMENTAL_FU
 
 
 def consecutive_failures(state, doc):
-    """How many updates in a row have failed from exactly this document. A document replaced some other way
-    starts again from none."""
+    """How many updates in a row have failed from exactly this document. The count has its own document
+    identity, because a setup failure rewrites the attempt's baseline hash, even to nothing when the document
+    can't be read, and that says nothing about the count. Only a different document starts it again from none;
+    no document at all doesn't, since a missing file is no reason to buy another rebuild."""
     st = state or {}
-    if st.get('baseline_doc_sha256') != (doc.sha256 if doc else None):
+    if doc is not None and st.get(FAILURE_STREAK_DOC) != doc.sha256:
         return 0
     count = st.get('consecutive_failures')
     return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
@@ -815,6 +818,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             attempt.pop('dropped_full_attempt', None)
             attempt.pop('full_rebuild_origin', None)
             attempt.pop('last_failure_reason', None)
+            attempt.pop(FAILURE_STREAK_DOC, None)
             attempt['consecutive_failures'] = 0
         elif attempt is not None and status == 'failed':
             attempt['consecutive_failures'] += 1
@@ -860,7 +864,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                    'phase': 'update', 'decision_reason': decision.reason, 'base_commit': decision.base,
                    'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
                    'policy': SEMANTIC_POLICY, 'model': model, 'started_at': now.isoformat(), 'reason': None,
-                   'generation_id': None, 'consecutive_failures': consecutive_failures(state, doc)}
+                   'generation_id': None, 'consecutive_failures': consecutive_failures(state, doc),
+                   FAILURE_STREAK_DOC: doc.sha256 if doc else None}
         dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
         if dropped:   # its failure stays on record while the new path runs
             attempt['dropped_full_attempt'] = dropped

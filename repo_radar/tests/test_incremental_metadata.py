@@ -428,6 +428,15 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
     assert 'held after 2 failed updates' in (pristine / 'INDEX.md').read_text()
     assert 'held after 2' in S._dry_run_decision(repo.path, 'app-abc1234', FULL, _sync_args())
+    # A setup failure rewrites the attempt's baseline hash, here to nothing, without detaching the count: once
+    # the document is readable again the sync is still held. Neither makes a model call.
+    (pristine / 'app-abc1234.md').write_bytes(b'\xff' + kept.encode())
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'failed' and not provider.sends and not provider.counts and failures() == 2
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['baseline_doc_sha256'] is None
+    (pristine / 'app-abc1234.md').write_text(kept)
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'skipped' and 'held after 2' in event['reason'] and not provider.sends and not provider.counts
     monkeypatch.setenv('REPO_RADAR_TRIGGER', 'scheduled')
     with PreflightSession() as session:   # a weekly rebuild being due changes nothing
         weekly = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, MODEL, session,
@@ -456,9 +465,24 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     assert dispatched('scheduled')[1]['status'] == 'published' and provider.sends and failures() == 0
     assert doc.info['last_commit'] == target
 
-    # A document replaced some other way starts the count again.
-    im.write_state(pristine, 'app-abc1234', {'consecutive_failures': 5, 'baseline_doc_sha256': 'another document'})
-    assert im.consecutive_failures(metadata.read_attempt_state(pristine, 'app-abc1234'), doc) == 0
+    # A document replaced some other way starts the count again, even when a setup failure has already bound
+    # the attempt's baseline hash to it: the old count must not hold the new document.
+    repo.write('src/m2.py', '# and more\n')
+    repo.commit()
+    for count in (1, 2):
+        provider.replies = [boom]
+        assert dispatched('scheduled')[1]['status'] == 'failed' and failures() == count
+    held_doc = im.load_document(pristine, 'app-abc1234')
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert im.consecutive_failures(state, None) == 2, 'a missing document is no reason to buy another rebuild'
+    (pristine / 'app-abc1234.md').write_text(held_doc.text + '\nReplaced some other way.\n')
+    im.record_failure(pristine, 'app-abc1234', FULL, 'setup broke')
+    replaced = im.load_document(pristine, 'app-abc1234')
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (state['baseline_doc_sha256'], state['consecutive_failures']) == (replaced.sha256, 2)
+    assert im.consecutive_failures(state, replaced) == 0
+    provider.replies = [boom]
+    assert dispatched('scheduled')[1]['status'] == 'failed' and provider.sends and failures() == 1
     monkeypatch.delenv('REPO_RADAR_TRIGGER')
 
     # A requested full rebuild that never published stays due on an unchanged, recent commit: after a
