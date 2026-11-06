@@ -150,13 +150,28 @@ unavailable. The sync's progress view and Activity report the update as failed (
 (a warning, for example an unavailable token count or price, a spending limit, or the spool limit).
 When any call fails, nothing further is started, the calls already launched finish and are accounted
 for, and no partial set of notes is used. A failed incremental update is not followed by an automatic
-full rebuild; the next ordinary sync tries again from the start, spending again. A document too large for
-the editor's request fails before anything is spent, and stays until a weekly or requested rebuild
-replaces it. A full rebuild that fails stays owed for the reason it was first chosen, kept across retries;
+full rebuild; the next ordinary sync tries again from the start, spending again, up to the hold below.
+A document too large for the editor's request fails before anything is spent, and stays until a weekly or
+requested rebuild replaces it. A full rebuild that fails stays owed for the reason it was first chosen, kept across retries;
 an older record that shows only the generic retry reason owes nothing, and the current rules decide.
 
 Attempt records live in `~/repos-pristine/.metadata-state/<cache>.json` (owner-only). Each one holds
 the latest attempt and its usage, never prompts or source.
+
+### The hold after repeated failures
+
+Any update that ends failed, incremental or full, adds one to `consecutive_failures` in its attempt record.
+A skipped update doesn't count, including one superseded by newer work or stopped by a resource or spending
+limit, and a publication resets the count to 0. A document replaced some other way starts again from none.
+
+At 2 failures in a row, a sync started by anything but a person makes no model call for that repository, even
+when a weekly rebuild is due, so a failing full rebuild can't repeat about $20 a day. That covers scheduled and
+catch-up syncs, and `repo-radar sync` from a terminal, which isn't marked as manual. It reports the update as
+skipped, a warning rather than an error: "held after 2 failed updates in a row; a manual sync or a forced
+rebuild retries". The document, the stale mark and the last failure's details all stay, and Activity and `INDEX.md`
+show the hold.
+
+The menu's Sync Now or `repo-radar sync --regenerate-metadata` tries once. If that fails too, the hold continues.
 
 ## Telehealth pilot
 

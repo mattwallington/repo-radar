@@ -39,6 +39,7 @@ _REMOVED_TRIGGER = re.compile(r'\d+% of the source changed|\d+ diff pages exceed
                               r'diff exceeds the incremental size limit|no analyzable source')
 WEEKLY_REASON = 'weekly full rebuild due'
 UNFINISHED_REASON = 'previous full rebuild did not finish'
+HOLD_AFTER_FAILURES = 2            # failed updates in a row before only a person can start another
 
 
 def document_path(pristine_dir, cache_name):
@@ -188,6 +189,26 @@ def full_rebuild_unfinished(state, doc, full_rebuild_days=DEFAULT_INCREMENTAL_FU
     if origin is None or _REMOVED_TRIGGER.fullmatch(origin) or (origin == WEEKLY_REASON and not full_rebuild_days):
         return False
     return st.get('baseline_doc_sha256') == doc.sha256
+
+
+def consecutive_failures(state, doc):
+    """How many updates in a row have failed from exactly this document. A document replaced some other way
+    starts again from none."""
+    st = state or {}
+    if st.get('baseline_doc_sha256') != (doc.sha256 if doc else None):
+        return 0
+    count = st.get('consecutive_failures')
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+
+
+def held_reason(state, doc, force=False, trigger='manual'):
+    """Why this sync may not spend on this repository, or None. After repeated failures only a person starts
+    another try: the menu's Sync Now, or a forced rebuild. Every other trigger is held, so nothing automatic can
+    keep buying the same failure, even when a weekly rebuild is due."""
+    failures = consecutive_failures(state, doc)
+    if force or trigger == 'manual' or failures < HOLD_AFTER_FAILURES:
+        return None
+    return f"held after {failures} failed updates in a row; a manual sync or a forced rebuild retries"
 
 
 def _dropped_full_attempt(state, doc, full_rebuild_days):
@@ -761,12 +782,14 @@ def _cleared_setup_failure(state, now):
 
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
-                      missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None):
+                      missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None,
+                      trigger='manual'):
     """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
     says when the attempt record couldn't be saved. `missing_credential` names the provider key
-    variable when it isn't set; that fails a due update before any count or send."""
+    variable when it isn't set; that fails a due update before any count or send. `trigger` is who started
+    this sync, which decides whether a repository held after repeated failures may try again (held_reason)."""
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
@@ -791,6 +814,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         if attempt is not None and status == 'published':   # discharged
             attempt.pop('dropped_full_attempt', None)
             attempt.pop('full_rebuild_origin', None)
+            attempt.pop('last_failure_reason', None)
+            attempt['consecutive_failures'] = 0
+        elif attempt is not None and status == 'failed':
+            attempt['consecutive_failures'] += 1
+            attempt['last_failure_reason'] = reason
         if attempt is None:
             state_error = record_failure(pristine_dir, cache_name, full_name, reason, target, 'setup', status)
         else:
@@ -818,12 +846,21 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                 write_state(pristine_dir, cache_name, cleared)
             return Outcome('none', 'none', decision.reason, decision.base, target, {}, time.monotonic() - started)
 
+        held = held_reason(state, doc, force, trigger)
+        if held:
+            # Nothing is attempted. The last failure's reason, usage and any full-rebuild debt stay on record.
+            state_error = _try_write_state(pristine_dir, cache_name,
+                                           {**state, 'status': 'skipped', 'reason': held, 'target_commit': target,
+                                            'finished_at': datetime.now().isoformat()})
+            return Outcome('skipped', decision.strategy, held, decision.base, target, {}, time.monotonic() - started,
+                           state_error)
+
         attempt = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
                    'attempt_id': uuid.uuid4().hex, 'status': 'pending', 'strategy': decision.strategy,
                    'phase': 'update', 'decision_reason': decision.reason, 'base_commit': decision.base,
                    'target_commit': target, 'baseline_doc_sha256': doc.sha256 if doc else None,
                    'policy': SEMANTIC_POLICY, 'model': model, 'started_at': now.isoformat(), 'reason': None,
-                   'generation_id': None}
+                   'generation_id': None, 'consecutive_failures': consecutive_failures(state, doc)}
         dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
         if dropped:   # its failure stays on record while the new path runs
             attempt['dropped_full_attempt'] = dropped

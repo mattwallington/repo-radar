@@ -298,11 +298,15 @@ def _dry_run_decision(repo_path, cache_name, full_name, args):
         target = incremental_metadata.snap.resolve_commit(repo_path, 'HEAD')
         if target is None:
             return 'full rebuild (no commit yet)'
+        doc = incremental_metadata.load_document(PRISTINE_DIR, cache_name)
+        state = read_attempt_state(PRISTINE_DIR, cache_name)
+        force = bool(getattr(args, 'regenerate_metadata', False))
         decision = incremental_metadata.decide(
-            repo_path, full_name, incremental_metadata.load_document(PRISTINE_DIR, cache_name),
-            read_attempt_state(PRISTINE_DIR, cache_name), get_ai_model(), target, datetime.now(),
-            force=bool(getattr(args, 'regenerate_metadata', False)),
+            repo_path, full_name, doc, state, get_ai_model(), target, datetime.now(), force=force,
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
+        held = incremental_metadata.held_reason(state, doc, force, resolve_trigger(default='cli'))
+        if held and decision.strategy != 'none':
+            return f"no update ({held})"
         return {'none': 'no update needed', 'incremental': 'incremental update',
                 'full': 'full rebuild'}[decision.strategy] + f" ({decision.reason})"
     except Exception as e:
@@ -335,7 +339,8 @@ def _generate_incremental(task_data, session, args, ctx):
             force=bool(getattr(args, 'regenerate_metadata', False)),
             log=stage,
             missing_credential=env_key if env_key and not os.getenv(env_key) else None,
-            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
+            trigger=resolve_trigger(default='cli'))
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)

@@ -392,6 +392,75 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     config['incremental_metadata_repos'] = ['o/*']
     assert S.sync_mode(_sync_args()) == 1
 
+    # Two failed updates in a row hold a scheduled sync, through the real dispatch and its trigger, with no
+    # model call even when a weekly rebuild is due. A person retries, and only a publication clears it.
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'held')
+    repo.write('src/m0.py', '# changed\n')
+    target = repo.commit()
+    provider = Provider(monkeypatch)
+    kept = (pristine / 'app-abc1234.md').read_text()
+    boom = httpx.Response(500, json={"error": {"message": "boom"}})
+
+    def dispatched(trigger, **flags):
+        monkeypatch.setenv('REPO_RADAR_TRIGGER', trigger)
+        provider.sends.clear(); provider.counts.clear()
+        ctx, events = _ctx()
+        with PreflightSession() as session:
+            S.generate_repo_metadata((REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1), session,
+                                     _sync_args(_incremental_repos=frozenset({FULL}), **flags), ctx)
+        return ctx, [f for name, f in events if name == 'metadata_incremental'][0]
+
+    def failures():
+        return metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures']
+
+    for count in (1, 2):
+        provider.replies = [boom]
+        ctx, event = dispatched('scheduled')
+        assert (event['status'], ctx.stats['errors'], failures()) == ('failed', 1, count) and provider.sends
+    last_usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    for trigger in ('scheduled', 'catchup', 'cli'):
+        ctx, event = dispatched(trigger)
+        assert (event['status'], event['level'], ctx.stats['skipped'], ctx.stats['errors']) == ('skipped', 'warn', 1, 0)
+        assert 'held after 2 failed updates' in event['reason'] and not provider.sends and not provider.counts
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (state['status'], state['usage'], failures()) == ('skipped', last_usage, 2) and state['last_failure_reason']
+    assert (pristine / 'app-abc1234.md').read_text() == kept
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    assert 'held after 2 failed updates' in (pristine / 'INDEX.md').read_text()
+    assert 'held after 2' in S._dry_run_decision(repo.path, 'app-abc1234', FULL, _sync_args())
+    monkeypatch.setenv('REPO_RADAR_TRIGGER', 'scheduled')
+    with PreflightSession() as session:   # a weekly rebuild being due changes nothing
+        weekly = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, MODEL, session,
+                                      now=NOW + timedelta(days=30), trigger='scheduled')
+    assert weekly.status == 'skipped' and weekly.strategy == 'full' and not provider.sends and not provider.counts
+
+    # A manual sync that fails again leaves it held. A forced rebuild also gets through, and a skip doesn't count.
+    provider.replies = [boom]
+    _ctx_manual, event = dispatched('manual')
+    assert event['status'] == 'failed' and provider.sends and failures() == 3
+    assert dispatched('scheduled')[1]['status'] == 'skipped' and not provider.sends
+    provider.count_tokens = lambda body: httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+    assert dispatched('manual')[1]['status'] == 'skipped' and failures() == 3
+    provider.count_tokens = 1000
+    provider.replies = [boom]
+    assert dispatched('scheduled', regenerate_metadata=True)[1]['status'] == 'failed' and provider.sends and failures() == 4
+
+    # The next manual success publishes, resets the count, and scheduled syncs spend again.
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]   # the forced rebuild it still owes
+    assert dispatched('manual')[1]['status'] == 'published' and provider.sends and failures() == 0
+    assert 'last_failure_reason' not in metadata.read_attempt_state(pristine, 'app-abc1234')
+    repo.write('src/m1.py', '# more\n')
+    repo.commit()
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    assert dispatched('scheduled')[1]['status'] == 'published' and provider.sends and failures() == 0
+    assert doc.info['last_commit'] == target
+
+    # A document replaced some other way starts the count again.
+    im.write_state(pristine, 'app-abc1234', {'consecutive_failures': 5, 'baseline_doc_sha256': 'another document'})
+    assert im.consecutive_failures(metadata.read_attempt_state(pristine, 'app-abc1234'), doc) == 0
+    monkeypatch.delenv('REPO_RADAR_TRIGGER')
+
     # A requested full rebuild that never published stays due on an unchanged, recent commit: after a
     # transient count skip, or an interruption after 'committing' but before the replacement. Once
     # the replacement is in place under that generation, it isn't bought again.
@@ -1367,6 +1436,7 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     zero['usage'] = {}
     provider.replies = [zero, answer({'base_document_sha256': doc.sha256, 'sections': []})]
     ctx, events = _ctx()
+    monkeypatch.setenv('REPO_RADAR_TRIGGER', 'manual')   # the failures above would otherwise hold this sync
     with PreflightSession() as session:
         S.generate_repo_metadata((REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1), session,
                                  _sync_args(_incremental_repos=frozenset({FULL})), ctx)
