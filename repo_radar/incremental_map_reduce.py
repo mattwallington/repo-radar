@@ -101,6 +101,14 @@ attributed to a file; don't guess which files it concerns. Files listed as not a
 don't describe what's in them. The document covers: overview, technology stack, architecture, key components,
 API endpoints and interfaces, dependencies (specific service names), database schema, and configuration.
 
+Reconcile every material change in the notes with the whole document, not just the first place it fits:
+update each occurrence it affects across the summary fields, overview, technology stack, components and
+diagrams. When a component moves out of this repository, say it is now an external client or related
+repository rather than a removed capability, and drop claims that only held for it, such as its languages,
+platforms or versions; where a surviving version is unclear, check it with a targeted read. Keep significant
+new runtime components, such as scheduled jobs, monitors and the switches that control them, even when a
+larger feature dominates the notes.
+
 Reply with only this JSON object:
 {"base_document_sha256": "<the hash you were given>",
  "sections": [{"op": "replace", "id": "s3", "expected_sha256": "<that section's hash>", "content": "## Heading\\n..."},
