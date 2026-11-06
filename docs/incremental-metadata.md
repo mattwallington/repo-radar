@@ -80,7 +80,11 @@ omissions. There are no shell, network, host-filesystem or write tools.
    notes, then groups of 5, for as many levels as it takes. A note on its own passes through without a
    call. Each merge request also names the status and paths of the file ids its notes cite. The app tracks
    which pages each note covers and requires every page to be covered exactly once; a model can't change
-   that.
+   that. A note or merged note may cite only the files its request listed. An exact path of one of those
+   files becomes its id; any other citation is dropped and the change kept, possibly with no file. Each
+   call's record and the attempt's usage count those repaired and dropped citations, and when one was
+   dropped the editor and the published coverage note say file attribution is incomplete. Everything
+   else about a note stays strict: its shape, its section ids and its size, before and after the repair.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
    the status and paths of the file ids they cite, and what wasn't analyzed: at most 4 turns, 6 `read_file`
    or `search` calls, 64 KiB of delivered tool results, 65,536 input tokens per request and 16,384 output

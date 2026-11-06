@@ -852,6 +852,11 @@ def cited_identities(text):
     return json.loads(re.search(r'\(status, old_path, new_path\):\n(\{.*\})\n', text).group(1))
 
 
+def paths_on_page(text):
+    """Each listed file's displayed path on a diff page, by id (a rename's new path)."""
+    return {m[0]: m[1].split(' -> ')[-1] for m in re.findall(r'^(f\d+) \S+ (.+)$', text.split('[end of list]')[0], re.M)}
+
+
 def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path):
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     (repo.path / 'lib').mkdir()
@@ -868,17 +873,42 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
                     'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
                                   'content': '## Key Components\n- values are rewritten\n'}]}
     big_read = {'functionCall': {'name': 'read_file', 'args': {'path': 'src/m0.py', 'limit': 2000}}}
+    every_path = {f"f{n}": c.new_path or c.old_path
+                  for n, c in enumerate(snap.changes_between(repo.path, base, target), 1)}
 
+    def outside(ids):   # a real changed file's path that this request wasn't given
+        return next(path for file_id, path in every_path.items() if file_id not in ids)
+
+    # Some replies cite files by path, by something unsupported, or by nothing that can be placed. Exact
+    # paths of the request's own files become their ids; the rest is dropped and the change is kept.
     def reply(stage, text):
         if stage == 'map':   # JSON mode doesn't enforce a schema, so optional lists may come back null
-            return {'changes': [{'files': files_on_page(text), 'what': 'n' * 2600, 'sections': [components.id]}],
-                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            ids, paths = files_on_page(text), paths_on_page(text)
+            files = {'[page p1 ': [paths[ids[0]], *ids[1:]],
+                     '[page p2 ': [*ids, 'src/nowhere.py', outside(ids)]}.get(text[text.index('[page p'):][:9], ids)
+            changes = [{'files': files, 'what': 'n' * 2600, 'sections': [components.id]}]
+            if '[page p3 ' in text:
+                changes.append({'files': ['src/nowhere.py'], 'what': 'UNATTRIBUTED map change', 'sections': []})
+            return {'changes': changes, 'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
         if stage == 'merge':
-            files = sorted(set(re.findall(r'"f\d+"', text.split('Notes to merge', 1)[1])), key=lambda f: int(f[2:-1]))
-            return {'changes': [{'files': [f.strip('"') for f in files], 'what': dense(9000), 'sections': [components.id]}],
-                    'questions': ['kept'], 'disagreements': None, 'no_summary_change_reason': None}
+            notes = text.split('Notes to merge', 1)[1]
+            files = [f.strip('"') for f in sorted(set(re.findall(r'"f\d+"', notes)), key=lambda f: int(f[2:-1]))]
+            changes = [{'files': files, 'what': dense(9000), 'sections': [components.id]}]
+            if '"files":[]' in notes:   # an unattributed change is carried forward as it is
+                changes.append({'files': [], 'what': 'UNATTRIBUTED, carried forward', 'sections': []})
+            if 'UNATTRIBUTED map change' in notes and '"disagreements"' not in notes:   # the first level-1 merge
+                table = cited_identities(text)
+                changes[0]['files'] = [table[files[0]]['new_path'], *files[1:], 'lib/nowhere.py', outside(table)]
+                changes.append({'files': ['f9999'], 'what': 'UNATTRIBUTED merge change', 'sections': []})
+            return {'changes': changes, 'questions': ['kept'], 'disagreements': None, 'no_summary_change_reason': None}
         return answer_patch if 'last turn' in text else big_read   # read until tools are no longer offered
     fake = GeminiFake(monkeypatch, reply)
+    evidence, real_init = tmp_path / 'evidence', mr.Pipeline.__init__
+
+    def keeping_evidence(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        self.evidence_dir = evidence
+    monkeypatch.setattr(mr.Pipeline, '__init__', keeping_evidence)
     with PreflightSession() as session:
         outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
     assert outcome.status == 'published', outcome
@@ -939,12 +969,46 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     assert untouched[-1].text.rstrip('\n') in new.text   # rendering normalizes the document's final newlines
     assert (usage['map_calls'], usage['merge_calls'], usage['edit_turns']) == (len(maps), len(merges), len(edits))
 
-    # Optional lists are still type-checked when present, and unknown ids and required changes still fail.
+    # Repaired citations: an exact path became its own id, nothing unsupported or borrowed got in, and the
+    # unattributed changes reached the editor with the app's warning, which the published note keeps.
+    saved = json.loads((evidence / 'notes.json').read_text())
+    notes = {n['id']: n for n in saved['notes']}
+    page_files = {p['id']: p['files'] for p in saved['pages']}
+    assert notes['p1']['note']['changes'][0]['files'] == page_files['p1']
+    assert notes['p2']['note']['changes'][0]['files'] == page_files['p2']   # the outside path wasn't borrowed
+    assert notes['p3']['note']['changes'][1] == {'files': [], 'what': 'UNATTRIBUTED map change', 'sections': []}
+    first = next(n for n in saved['notes'] if any(c['what'] == 'UNATTRIBUTED merge change' for c in n['note']['changes']))
+    children = {f for i in range(1, 17) for c in notes[f'p{i}']['note']['changes'] for f in c['files']}
+    assert first['id'] == 'l1-g0' and first['note']['changes'][0]['files'] == sorted(children, key=lambda f: int(f[1:]))
+    assert all(set(c['files']) <= set(n['files']) for n in saved['notes'] for c in n['note']['changes'])
+    for text, _body in (*merges, *edits[:1]):
+        assert 'nowhere' not in text and set(cited_identities(text)) <= set(expected)
+    assert 'UNATTRIBUTED' in edits[0][0] and mr.ATTRIBUTION_WARNING in edits[0][0]
+    assert new.info['coverage_note'].startswith(mr.ATTRIBUTION_WARNING)
+    calls = {(c['stage'], c['id']): c for c in saved['calls']}
+    assert (calls[('map', 'p1')]['normalized_file_citations'], calls[('map', 'p2')]['dropped_file_citations'],
+            calls[('map', 'p3')]['dropped_file_citations']) == (1, 2, 1)
+    assert (calls[('merge', 'l1-g0')]['normalized_file_citations'], calls[('merge', 'l1-g0')]['dropped_file_citations']) == (1, 3)
+    for key, total in (('normalized_file_citations', 2), ('dropped_file_citations', 6)):
+        assert usage[key] == sum(c.get(key, 0) for c in saved['calls']) == total
+
+    # Notes stay strict about their shape, sections and size: a wrong or missing field, an empty string, an
+    # unknown section, or a note over its limit as written, even one that dropping citations would shrink.
+    # An unknown file is dropped rather than refused.
+    long_path = 'src/' + 'p' * 400 + '.py'
+    paths = {long_path: 'f1'}
     for bad in ({'changes': [], 'questions': 'x', 'no_summary_change_reason': 'r'},
                 {'changes': None, 'no_summary_change_reason': 'r'},
-                {'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None}):
+                {'changes': [{'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': 'f1', 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': [''], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}], 'no_summary_change_reason': None},
+                {'changes': [{'files': [long_path], 'what': 'w' * 2800, 'sections': []}], 'no_summary_change_reason': None}):
         with pytest.raises(mr.NoteError):
-            mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
+            mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
+    note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
+                                            ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
+    assert note['changes'][0]['files'] == [] and repairs == {'normalized_file_citations': 0, 'dropped_file_citations': 1}
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
@@ -994,7 +1058,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     def mostly_fine(stage, text):
         assert stage == 'map'
         if '[page p3 ' in text:
-            return {'changes': [{'files': ['f999'], 'what': 'an id it was never given', 'sections': []}]}
+            return {'changes': [{'files': [], 'what': 'a section it was never given', 'sections': ['s999']}]}
         return {'changes': [], 'no_summary_change_reason': 'routine'}
     fake = GeminiFake(monkeypatch, mostly_fine)
     real_settle, failures = Ledger.settle, []
