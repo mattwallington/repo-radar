@@ -16,7 +16,8 @@ import threading
 from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
-from repo_radar.config import incremental_metadata_repos
+from repo_radar.config import (DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, incremental_full_rebuild_days,
+                               incremental_metadata_repos)
 from repo_radar import incremental_metadata
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
@@ -297,10 +298,15 @@ def _dry_run_decision(repo_path, cache_name, full_name, args):
         target = incremental_metadata.snap.resolve_commit(repo_path, 'HEAD')
         if target is None:
             return 'full rebuild (no commit yet)'
+        doc = incremental_metadata.load_document(PRISTINE_DIR, cache_name)
+        state = read_attempt_state(PRISTINE_DIR, cache_name)
+        force = bool(getattr(args, 'regenerate_metadata', False))
         decision = incremental_metadata.decide(
-            repo_path, full_name, incremental_metadata.load_document(PRISTINE_DIR, cache_name),
-            read_attempt_state(PRISTINE_DIR, cache_name), get_ai_model(), target, datetime.now(),
-            force=bool(getattr(args, 'regenerate_metadata', False)))
+            repo_path, full_name, doc, state, get_ai_model(), target, datetime.now(), force=force,
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
+        held = incremental_metadata.held_reason(state, doc, force, resolve_trigger(default='cli'))
+        if held and decision.strategy != 'none':
+            return f"no update ({held})"
         return {'none': 'no update needed', 'incremental': 'incremental update',
                 'full': 'full rebuild'}[decision.strategy] + f" ({decision.reason})"
     except Exception as e:
@@ -322,12 +328,19 @@ def _generate_incremental(task_data, session, args, ctx):
                'openai': 'OPENAI_API_KEY'}.get(provider_for_model(model))
     ctx.meta_progress.update(task_id, completed=10, status=f"[{task_color}]checking for changes...[/{task_color}]")
     _incremental_status(args, full_name, short_id, '🔎 checking metadata...', 10, color)
+
+    def stage(message, percent=20):
+        ctx.meta_progress.update(task_id, completed=percent, status=f"[{task_color}]{message}[/{task_color}]")
+        _incremental_status(args, full_name, short_id, f'🔎 {message}', percent, color)
+
     try:
         outcome = incremental_metadata.update_repository(
             PRISTINE_DIR, PRISTINE_DIR / cache_name, cache_name, repo_config, model, session,
             force=bool(getattr(args, 'regenerate_metadata', False)),
-            log=lambda m: ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{m}[/{task_color}]"),
-            missing_credential=env_key if env_key and not os.getenv(env_key) else None)
+            log=stage,
+            missing_credential=env_key if env_key and not os.getenv(env_key) else None,
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
+            trigger=resolve_trigger(default='cli'))
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)
@@ -400,6 +413,9 @@ def _report_incremental(task_data, outcome, model, args, ctx):
             output_tokens=usage.get('output_tokens', 0), cost=cost_text,
             unknown_cost_calls=usage.get('unknown_cost_calls', 0), changed_files=usage.get('changed_files'),
             changed_bytes=usage.get('changed_bytes'), read_bytes=usage.get('read_bytes'),
+            diff_pages=usage.get('diff_pages'), omitted_paths=usage.get('omitted_paths'),
+            map_calls=usage.get('map_calls'), merge_calls=usage.get('merge_calls'), edit_turns=usage.get('edit_turns'),
+            estimated_total_usd=usage.get('estimated_total_usd'),
             elapsed=f"{outcome.elapsed:.1f}s")
     return cost
 
@@ -1445,6 +1461,7 @@ def sync_mode(args):
     # metadata is enabled; with metadata off nothing uses it.
     try:
         args._incremental_repos = incremental_metadata_repos(config)
+        args._incremental_full_rebuild_days = incremental_full_rebuild_days(config)
     except ValueError as e:
         if metadata_capable:
             console.print(f"[red]{e}[/red]")
@@ -1455,6 +1472,7 @@ def sync_mode(args):
             _terminal('blocked', reason='invalid_incremental_metadata_repos')
             return 1
         args._incremental_repos = frozenset()
+        args._incremental_full_rebuild_days = 0
     incremental_repos = args._incremental_repos
     args._incremental_reported = set()
     args._incremental_index_due = False
