@@ -961,7 +961,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     assert 'NONE' not in json.dumps(edits[0][1].get('toolConfig', {}))
     with PreflightSession() as session:   # each request stayed within the limit it was counted against
         assert all(session.count_request({'endpoint': 'chat', 'model': GEMINI, 'messages': [
-            {'role': 'user', 'content': text}]}).tokens <= mr.EDIT_INPUT_TOKENS for text, _b in edits)
+            {'role': 'user', 'content': text}]}).tokens <= mr.EDIT_REQUEST_TOKENS for text, _b in edits)
 
     # The stage options went out on the wire: low effort and JSON for short stages, not for the editor.
     def options(body):
@@ -1021,6 +1021,64 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
                                             ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
     assert note['changes'][0]['files'] == [] and repairs == {'normalized_file_citations': 0, 'dropped_file_citations': 1}
+
+
+def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatch, tmp_path):
+    """The live 1.0.37 failure: turn 1's tool call came back with provider fields (a thought signature)
+    that the next request has to replay, pushing it past the 65,536 preparation budget though the reply
+    reported a few output tokens. Continuations get the 128,000 request ceiling; past that, the update
+    stops before sending, keeps the old summary and counts as a failure."""
+    def attempt(where, signature_bytes):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        repo.write('src/m0.py', 'changed = True\n')
+        target = repo.commit('one change')
+        old = im.load_document(pristine, 'app-abc1234')
+        sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(old))}
+        components = sections['## Key Components']
+        signature = 'S' * signature_bytes
+        read = {'functionCall': {'name': 'read_file', 'args': {'path': 'src/m0.py'}}, 'thoughtSignature': signature}
+        patch = {'base_document_sha256': old.sha256,
+                 'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                               'content': '## Key Components\n- m0 now records a change\n'}]}
+
+        def reply(stage, text):
+            if stage == 'map':
+                return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                        'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            return read if len(fake.stage('edit')) == 1 else patch
+        fake = GeminiFake(monkeypatch, reply)
+        pipelines, real_init = [], mr.Pipeline.__init__
+
+        def keep(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            pipelines.append(self)
+        monkeypatch.setattr(mr.Pipeline, '__init__', keep)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        monkeypatch.setattr(mr.Pipeline, '__init__', real_init)
+        return outcome, fake, pipelines[0], pristine, old, sections, components, signature, target
+
+    # Below the ceiling: the second request goes out with the reply's fields intact, and the edit publishes.
+    outcome, fake, pipeline, pristine, old, sections, components, signature, target = attempt(tmp_path / 'fits', 40_000)
+    assert outcome.status == 'published', outcome
+    edits = fake.stage('edit')
+    counted = {c['id']: c['counted_tokens'] for c in pipeline.calls if c['stage'] == 'edit'}
+    assert len(edits) == 2 and list(counted) == ['t1', 't2']
+    assert counted['t1'] + 16384 + mr.CONTINUATION_TOKENS <= mr.EDIT_PREPARE_TOKENS < counted['t2'] < mr.EDIT_REQUEST_TOKENS
+    assert signature in json.dumps(edits[1][1]) and 'changed = True' in json.dumps(edits[1][1])
+    new = im.load_document(pristine, 'app-abc1234')
+    assert new.info['last_commit'] == target and 'm0 now records a change' in new.text
+    untouched = [s for s in sections.values() if s.id != components.id]
+    assert all(s.text in new.text for s in untouched[:-1]) and untouched[-1].text.rstrip('\n') in new.text
+    usage = outcome.usage
+    assert usage['calls'] == len(fake.sends) == len(pipeline.calls) == usage['map_calls'] + 2 and usage['edit_turns'] == 2
+
+    # Above it: nothing more is sent, the spend stays recorded, and the failure counts once.
+    outcome, fake, pipeline, pristine, old, *_ = attempt(tmp_path / 'over', 70_000)
+    assert outcome.status == 'failed' and 'would not fit its 128,000 token limit' in outcome.reason, outcome
+    assert len(fake.stage('edit')) == 1 and outcome.usage['calls'] == len(fake.sends) and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
@@ -1252,12 +1310,33 @@ def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypat
     old = im.load_document(pristine, 'app-abc1234')
     # Each map request alone is well inside the cap; the whole update isn't.
     provider.count_tokens = lambda body: 900_000 if 'tools' not in body else 1000
+    quoted, real_admission = [], mr.Pipeline.admission
+
+    def admission(self):
+        quoted.append((self, real_admission(self)))
+        return quoted[-1][1]
+    monkeypatch.setattr(mr.Pipeline, 'admission', admission)
     with PreflightSession() as session:
         outcome = update(pristine, repo, session)
     assert outcome.status == 'skipped' and 'limit' in outcome.reason and 'up to $' in outcome.reason
     assert provider.counts and not provider.messages() and outcome.usage['calls'] == 0
     assert im.load_document(pristine, 'app-abc1234').text == old.text
     assert outcome.usage['estimated_total_usd'] > 12
+
+    # The quote prices all four editor turns at the full request ceiling execution allows, not at the
+    # smaller budget the first request is prepared to.
+    from repo_radar import llm
+    from repo_radar.model_catalog import acceptance_budget
+    pipeline, quote = quoted[0]
+    out = {stage: llm.output_budget(MODEL, size) for stage, size in
+           (('map', mr.MAP_OUTPUT), ('merge', mr.MERGE_OUTPUT), ('edit', mr.EDIT_OUTPUT))}
+    ceiling = min(mr.EDIT_REQUEST_TOKENS, acceptance_budget(MODEL, out['edit']))
+    assert ceiling == mr.EDIT_REQUEST_TOKENS > mr.EDIT_PREPARE_TOKENS
+    bound = pipeline.budget.upper_bound
+    assert quote.total_usd == pytest.approx(
+        bound(quote.map_input_tokens, out['map'] * quote.map_calls)
+        + bound(mr.MERGE_INPUT_TOKENS * quote.merge_calls, out['merge'] * quote.merge_calls)
+        + bound(ceiling * mr.EDIT_TURNS, out['edit'] * mr.EDIT_TURNS))
 
     # Slow counts spend the attempt's time: the last count is clamped to what's left, and an expired
     # admission buys nothing.

@@ -38,7 +38,9 @@ MAX_DIRECT_NOTES_BYTES = 96 * 1024  # notes up to this total can go straight to 
 EDIT_TURNS = 4
 EDIT_TOOL_CALLS = 6
 EDIT_TOOL_BYTES = 64 * 1024
-EDIT_INPUT_TOKENS = 65536
+MERGE_INPUT_TOKENS = 65536         # each merge request, at most
+EDIT_PREPARE_TOKENS = 65536        # the editor's first request plus a tool-calling reply and its framing
+EDIT_REQUEST_TOKENS = 128000       # every actual editor request: the first, and each continuation with its history
 EDIT_OUTPUT = 16384
 EDIT_SECONDS = 10 * 60
 CONTINUATION_TOKENS = 512           # framing for tool results and a closing instruction, on top of the reply
@@ -289,9 +291,14 @@ class Pipeline:
             raise im.StaleUpdate("the attempt ran out of time")
         return left
 
+    def _unpaid(self):
+        """A refusal is only a skip while nothing has been sent; after any paid call it is a failure, so the
+        failure streak and its hold still apply."""
+        return self.budget.calls == 0
+
     def _count(self, request, output, ceiling=None):
         """(counted tokens, the limit this request must fit). An Anthropic model's count is authoritative or
-        nothing, as for every send; the update is skipped rather than sent on an estimate. Counting spends the
+        nothing, as for every send; the update is stopped rather than sent on an estimate. Counting spends the
         attempt's time like everything else, so no count starts, or is believed, after the deadline."""
         from repo_radar.model_catalog import acceptance_budget, get_caps
         counted = self.session.count_request(request, timeout=self._time_left())
@@ -299,9 +306,9 @@ class Pipeline:
         caps = get_caps(self.model)
         estimated = getattr(counted, 'local_plan', False)
         if caps is not None and caps.count_strategy == 'anthropic_api' and not counted.authoritative and not estimated:
-            raise im.StaleUpdate(f"token count unavailable ({counted.reason or 'unknown'})", warning=True)
+            raise im.StaleUpdate(f"token count unavailable ({counted.reason or 'unknown'})", warning=self._unpaid())
         if counted.tokens is None:
-            raise im.StaleUpdate("token count unavailable", warning=True)
+            raise im.StaleUpdate("token count unavailable", warning=self._unpaid())
         limit = acceptance_budget(self.model, output)
         return counted.tokens, min(limit, ceiling) if ceiling else limit
 
@@ -395,16 +402,27 @@ class Pipeline:
         return conversation
 
     def _edit_output_and_limit(self, request):
+        """(tokens, output, limit) for an actual editor request: the limit is the 128,000-token request
+        ceiling, or the model's own input budget when that is smaller."""
         from repo_radar import llm
         out = llm.output_budget(self.model, EDIT_OUTPUT)
-        tokens, limit = self._count(request, out, EDIT_INPUT_TOKENS)
+        tokens, limit = self._count(request, out, EDIT_REQUEST_TOKENS)
         return tokens, out, limit
+
+    @staticmethod
+    def _prepared(limit):
+        """The smaller budget the editor's first request is prepared to: merging stops, and turn 1 offers
+        tools, only when that request plus a tool-calling reply fits it. The rest of the request ceiling is
+        room for continuations, whose replayed history (provider fields included) can be much larger than
+        the reply's reported output."""
+        return min(limit, EDIT_PREPARE_TOKENS)
 
     # ---- admission -------------------------------------------------------------------------------
 
     def admission(self):
         """Count every page's envelope and quote the whole update at worst case, before any generation
-        call: the actual map envelopes, the merge tree the note caps imply, and all four editor turns."""
+        call: the actual map envelopes, the merge tree the note caps imply, and all four editor turns, each
+        at the full editor request ceiling that execution allows."""
         from repo_radar import llm
         from repo_radar.model_catalog import acceptance_budget
         diff_pages = self.pages.diff_pages
@@ -415,13 +433,13 @@ class Pipeline:
         self._time_left()
         request = self._edit_conversation([]).request(EDIT_OUTPUT)
         base_tokens, edit_out, edit_limit = self._edit_output_and_limit(request)
-        if base_tokens + edit_out + CONTINUATION_TOKENS > edit_limit:
+        if base_tokens + edit_out + CONTINUATION_TOKENS > self._prepared(edit_limit):
             raise im.StaleUpdate(f"the existing document is too large for the section editor ({base_tokens:,} tokens, "
-                                 f"limit {edit_limit:,}); it is kept as it is")
+                                 f"limit {self._prepared(edit_limit):,}); it is kept as it is")
         merges = worst_case_merges(len(diff_pages))
         map_out = llm.output_budget(self.model, MAP_OUTPUT)
         merge_out = llm.output_budget(self.model, MERGE_OUTPUT)
-        merge_input = min(EDIT_INPUT_TOKENS, acceptance_budget(self.model, merge_out))
+        merge_input = min(MERGE_INPUT_TOKENS, acceptance_budget(self.model, merge_out))
         parts = [self.budget.upper_bound(map_tokens, map_out * len(diff_pages)),
                  self.budget.upper_bound(merge_input * merges, merge_out * merges),
                  self.budget.upper_bound(edit_limit * EDIT_TURNS, edit_out * EDIT_TURNS)]
@@ -451,7 +469,7 @@ class Pipeline:
         try:
             reservations = self.budget.reserve_many([(self._identity(i), i.tokens, i.output) for i in items])
         except BudgetError as e:
-            raise im.StaleUpdate(str(e), warning=True) from None
+            raise im.StaleUpdate(str(e), warning=self._unpaid()) from None
 
         def send(item):
             started = time.monotonic()
@@ -554,7 +572,7 @@ class Pipeline:
                    f"Existing summary sections (id: title):\n{self.titles}\n\n"
                    f"The file ids these notes name (status, old_path, new_path):\n{self._file_identities(children)}\n\n"
                    f"Notes to merge, one per line:\n{listing}")
-        request, tokens, out, limit = self._single_shot(MERGE_SYSTEM, message, MERGE_OUTPUT, EDIT_INPUT_TOKENS)
+        request, tokens, out, limit = self._single_shot(MERGE_SYSTEM, message, MERGE_OUTPUT, MERGE_INPUT_TOKENS)
         if tokens > limit:
             raise im.StaleUpdate(f"a merge of {len(children)} notes ({tokens:,} tokens) would not fit its input limit")
         return WaveItem('merge', f"l{level}-g{index}", request, tokens, out, MERGE_SECONDS), files, self._cited(children)
@@ -592,13 +610,14 @@ class Pipeline:
             total = sum(len(node.text.encode('utf-8')) for node in nodes)
             if total <= MAX_DIRECT_NOTES_BYTES:
                 tokens, out, limit = self._edit_output_and_limit(self._edit_conversation(nodes).request(EDIT_OUTPUT))
-                if tokens + out + CONTINUATION_TOKENS <= limit:
+                prepared = self._prepared(limit)
+                if tokens + out + CONTINUATION_TOKENS <= prepared:
                     return nodes
                 if len(nodes) < 2:
-                    if tokens <= limit:
+                    if tokens <= prepared:
                         return nodes
                     raise im.StaleUpdate(f"the notes and document ({tokens:,} tokens) would not fit the editor's "
-                                         f"{limit:,} token limit")
+                                         f"{prepared:,} token limit")
             level += 1
             nodes = self._merge_level(level, nodes)
 
@@ -685,11 +704,16 @@ class Pipeline:
 
     def _edit_request(self, conversation, number):
         """The next request, and whether it offers tools. It does only while a tool-calling reply and its
-        results would still fit; otherwise the same conversation goes out as a final-answer-only request.
+        results would still fit (the first turn against the smaller preparation budget, later turns against
+        the request ceiling); otherwise the same conversation goes out as a final-answer-only request.
         History holding tool calls has to keep their definitions, so there the model is told not to use them."""
         request = conversation.request(EDIT_OUTPUT)
         tokens, out, limit = self._edit_output_and_limit(request)
-        if number < EDIT_TURNS and tokens + out + CONTINUATION_TOKENS <= limit:
+        room = self._prepared(limit) if number == 1 else limit
+        # With the larger ceiling, the 64 KiB result budget can run out before the tokens do; tools stop
+        # then too, rather than a later call finding no room even for its notice.
+        results_room = EDIT_TOOL_BYTES - self.delivered_bytes >= len(TOOL_MINIMUM_NOTICE.encode('utf-8')) * EDIT_TOOL_CALLS
+        if number < EDIT_TURNS and results_room and tokens + out + CONTINUATION_TOKENS <= room:
             return request, tokens, out, limit, True
         conversation.add_user(FINAL_TURN_MESSAGE)
         request = conversation.request(EDIT_OUTPUT)
@@ -759,7 +783,7 @@ class Pipeline:
             try:
                 self.budget.admit(quote.total_usd)
             except BudgetError as e:
-                raise im.StaleUpdate(str(e), warning=True) from None
+                raise im.StaleUpdate(str(e), warning=self._unpaid()) from None
             self.log(f"{quote.pages} pages, up to ${quote.total_usd or 0:.2f}", 20)
             nodes = self.merge_stage(self.map_stage())
             self.verify_coverage(nodes)

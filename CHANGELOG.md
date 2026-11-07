@@ -18,6 +18,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - **The progress view shows how far a long summary update has got.**
 - **The telehealth pilot can replay historical changes from a manifest,** with a free `plan` mode that reports each case's pages and quote.
 
+### Fixed
+- **A long summary update no longer fails on the editor's second turn.** The editor's first reply can carry hidden data from the model that has to be sent back with the next request, so that request could be much larger than the reply looked, and updates stopped at the 65,536-token limit after paying for every page. The first editor request is still prepared to fit 65,536 tokens, but later requests may now use up to 128,000, and the update's quote before any model call covers that, so it still stays within the $12 limit. A request still too large stops before it is sent, keeps the old summary and counts as a failure.
+
 ## [1.0.36] - 2026-11-04
 
 ### Fixed
