@@ -169,8 +169,10 @@ class Executor:
 
     def count(self, request, output, ceiling=None):
         """(the count, the limit this request must fit). An Anthropic model's count is authoritative or nothing;
-        the attempt stops rather than send on an estimate. Counting spends the attempt's time like everything
-        else, so no count starts, or is believed, after the deadline."""
+        the attempt stops rather than send on an estimate. That is only a skip while nothing has been paid for:
+        after a paid call it is a failure, so the hold after repeated failures stops an automatic sync buying
+        the same work again. Counting spends the attempt's time like everything else, so no count starts, or is
+        believed, after the deadline."""
         from repo_radar.model_catalog import acceptance_budget, get_caps
         counted = self.session.count_request(request, timeout=self.time_left())
         self.time_left()
@@ -920,7 +922,7 @@ class FullBuild:
             return self.executor.prepare(stage, item_id, request, llm.output_budget(self.model, requested),
                                          im.REQUEST_SECONDS, FULL_INPUT_TARGET)
         except im.StaleUpdate as e:
-            raise im.StaleUpdate(f"full {stage}: {e.reason}", warning=e.warning) from None
+            raise im.StaleUpdate(f"full {stage}: {e.reason}", warning=e.warning and self.executor.unpaid()) from None
 
     def _start(self, item, chunk=None, chunks=None):
         """Record the request about to go out, before it is reserved or sent."""
@@ -945,7 +947,7 @@ class FullBuild:
             raise failure
         if isinstance(failure, im.StaleUpdate):
             raise im.StaleUpdate(f"{self.where}: {failure.reason}",
-                                 warning=failure.warning and self.budget.calls == 0) from None
+                                 warning=failure.warning and self.executor.unpaid()) from None
         raise im.StaleUpdate(f"{self.where}: {type(failure).__name__}: {failure}") from None
 
     def progress(self, stage, done, total=None):
@@ -998,14 +1000,11 @@ class FullBuild:
         a little of it stops the build."""
         source, part = file_info.get('source', file_info['path']), file_info.get('part', 1)
         content = file_info['content']
-
-        def piece(text, number):
-            return {'path': f"{source} (part {number})", 'size': len(text), 'content': text, 'source': source,
-                    'part': number}
+        piece = self._part
         lo, hi, keep = 1, len(content) - 1, 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            item = self._chunk_item([piece(content[:mid], part)], index, total)
+            item = self._chunk_item([piece(source, part, content[:mid])], index, total)
             if item.tokens <= item.limit:
                 keep, lo = mid, mid + 1
             else:
@@ -1016,7 +1015,21 @@ class FullBuild:
         line = content.rfind('\n', 0, keep)
         if line >= keep // 2:
             keep = line + 1
-        return piece(content[:keep], part), piece(content[keep:], part + 1)
+        return piece(source, part, content[:keep]), piece(source, part + 1, content[keep:])
+
+    @staticmethod
+    def _part(source, number, text):
+        """One ordered part of a split file, sized in bytes as its header says."""
+        return {'path': f"{source} (part {number})", 'size': len(text.encode('utf-8')), 'content': text,
+                'source': source, 'part': number}
+
+    def _renumber_after(self, queue, source, part):
+        """Move the queued later parts of `source` up one, after its part `part` became two, so labels stay
+        unique and in order. They haven't been counted yet in this pass."""
+        for group in queue:
+            for i, file_info in enumerate(group):
+                if file_info.get('source') == source and file_info['part'] > part:
+                    group[i] = self._part(source, file_info['part'] + 1, file_info['content'])
 
     def _check_chunks(self, chunks):
         """Every selected file, in order and whole, across the chunks' files and parts."""
@@ -1052,6 +1065,7 @@ class FullBuild:
                 changed = True
                 if len(files) == 1:
                     head, rest = self._split_file(files[0], index, total)
+                    self._renumber_after(queue, head['source'], head['part'])
                     done.append([head])
                     queue.insert(0, [rest])
                 else:
@@ -1099,11 +1113,14 @@ class FullBuild:
             if item.tokens > item.limit:
                 raise im.StaleUpdate(f"full synthesis: analysis {nodes[start].id} alone ({item.tokens:,} tokens) "
                                      f"doesn't fit its {item.limit:,} token limit")
-            while end < len(nodes):
-                wider = self._synthesis_item(level, index, nodes[start:end + 1])
-                if wider.tokens > wider.limit:
-                    break
-                item, end = wider, end + 1
+            lo, hi = start + 2, len(nodes)   # the furthest end that still fits, by binary search
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                wider = self._synthesis_item(level, index, nodes[start:mid])
+                if wider.tokens <= wider.limit:
+                    item, end, lo = wider, mid, mid + 1
+                else:
+                    hi = mid - 1
             groups.append(list(range(start, end)))
             self._groups[index] = item
             start = end
