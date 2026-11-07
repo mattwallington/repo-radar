@@ -4,7 +4,7 @@
 
 ### 1. Download & Install
 
-Download the latest release for your Mac from [GitHub Releases](https://github.com/mattwallington/repo-radar/releases):
+Download the latest release for your Mac from [GitHub Releases](https://github.com/ReperioHealth/repo-radar-releases/releases):
 - **Apple Silicon (M1/M2/M3/M4)**: `Repo-Radar-*-arm64.zip`
 - **Intel Mac**: `Repo-Radar-*-x64.zip`
 
@@ -137,12 +137,6 @@ Set via Settings or the `AI_MODEL` environment variable. The Settings dropdown h
 Repo Radar provisions its own Python runtime automatically — you should not need to run `pip install` yourself. If sync is disabled:
 1. Check Settings -> View the error logs for the specific reason (most commonly: no network connection on first launch, or no supported Python 3.10-3.14 interpreter found on the machine).
 2. Resolve the underlying cause (reconnect to the network, install a supported Python) and relaunch the app — runtime setup retries on every launch.
-
-As a last-resort manual fallback only, `menubar/resources/setup.sh` can install the pinned dependencies (`requirements.txt`) into a Python already on your `PATH`:
-```bash
-python3 -m pip install -r requirements.txt
-```
-This is not run by the app and is not required for normal use.
 
 **App doesn't appear in menu bar:**
 - Check Applications -> Repo Radar is running
