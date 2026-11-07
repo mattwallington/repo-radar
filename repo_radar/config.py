@@ -72,11 +72,18 @@ INCREMENTAL_FAILURE_STOP_RANGE = (1, 10)         # whole numbers; 0 is invalid, 
 
 
 def valid_incremental_update_limit(value):
-    """True for a finite JSON number of dollars within range and with at most two decimal places."""
+    """True for a finite JSON number of dollars within range and exactly in whole cents. Bounds come first,
+    so an integer too large for a float is simply out of range."""
     low, high = INCREMENTAL_UPDATE_LIMIT_RANGE
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return low <= value <= high and abs(value * 100 - round(value * 100)) < 1e-6
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    if not low <= value <= high:
+        return False
+    # Whole cents: 99.99 and 1.01 round to themselves, 12.000000001 doesn't. menubar/spending-settings.js
+    # uses the same test (Number(value.toFixed(2)) === value).
+    return isinstance(value, int) or round(value, 2) == value
 
 
 def valid_incremental_failure_stop(value):

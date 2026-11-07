@@ -101,10 +101,26 @@ function persistConfig(config, { reconcileSchedule, save, reconcile }) {
 // saves nothing. A dev build never reconciles the schedule here: saveConfigToFile keeps the stored schedule
 // for dev, so reconciling would only report dev's schedule prohibition as a failed save after the rest of the
 // settings had in fact been saved.
+// When the dev build kept a stored schedule that differs from the one the window sent, the result carries a
+// notice saying so, rather than plain success. `save` reports that as `scheduleKept`.
+const DEV_SCHEDULE_KEPT = 'Saved. The dev build keeps the stored schedule.';
+
 function saveSettings(config, { channel, save, reconcile }) {
   const invalid = validateSpending(config);
   if (invalid) return { ok: false, stage: 'validate', error: invalid.message, field: invalid.field };
-  return persistConfig(config, { reconcileSchedule: channel !== 'dev', save, reconcile });
+  let scheduleKept = false;
+  const recordingSave = (c) => { const r = save(c); scheduleKept = Boolean(r && r.scheduleKept); return r; };
+  const res = persistConfig(config, { reconcileSchedule: channel !== 'dev', save: recordingSave, reconcile });
+  if (res.ok && channel === 'dev' && scheduleKept) res.notice = DEV_SCHEDULE_KEPT;
+  return res;
 }
 
-module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig, saveSettings };
+// Whether two schedules mean the same thing: both off (or absent), or the same fields and values.
+function sameSchedule(a, b) {
+  const off = (s) => !s || typeof s !== 'object' || !s.enabled;
+  if (off(a) && off(b)) return true;
+  const canonical = (s) => JSON.stringify(s, Object.keys(s || {}).sort());
+  return !off(a) && !off(b) && canonical(a) === canonical(b);
+}
+
+module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig, saveSettings, sameSchedule, DEV_SCHEDULE_KEPT };

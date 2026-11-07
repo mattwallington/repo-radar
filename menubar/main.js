@@ -17,7 +17,7 @@ const { detectStableManaged } = require('./runtime/quiesce');
 const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
-const { parseModelLabels, persistConfig, saveSettings } = require('./model-notice');
+const { parseModelLabels, persistConfig, saveSettings, sameSchedule } = require('./model-notice');
 // Activity History (Task 2.3): Electron-free trigger-glue wired into triggerSync()/stop-sync
 // below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
 const activityGlue = require('./activity/trigger-glue');
@@ -2338,6 +2338,7 @@ function saveConfigToFile(config) {
     // has no way to know it shouldn't be touching the shared schedule, so
     // main.js protects it here regardless of what's in the incoming payload.
     let toWrite = config;
+    let scheduleKept = false;
     if (runtimeChannel === 'dev') {
       let onDiskSchedule;
       try {
@@ -2348,6 +2349,7 @@ function saveConfigToFile(config) {
         // No readable on-disk schedule to preserve — fall through with none.
       }
       toWrite = { ...config, schedule: onDiskSchedule };
+      scheduleKept = !sameSchedule(config.schedule, onDiskSchedule);   // Settings says so
     }
 
     // This file holds the GitHub token and every provider API key, so it must be owner-only.
@@ -2358,7 +2360,7 @@ function saveConfigToFile(config) {
     // (Same belt-and-braces treatment as the LaunchAgent writer below.)
     fs.writeFileSync(configFile, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
     fs.chmodSync(configFile, 0o600);
-    return { success: true };
+    return { success: true, scheduleKept };
   } catch (e) {
     console.error('Error saving config:', e);
     return { success: false, error: e.message };
@@ -2602,7 +2604,7 @@ ipcMain.on('save-config', (event, config) => {
       console.error('Failed to update LaunchAgent:', res.schedule.error);
       settingsWindow.webContents.send('config-saved', false, 'Config saved but failed to update schedule: ' + (res.schedule.error || ''));
     } else {
-      settingsWindow.webContents.send('config-saved', res.ok, res.error, res.field);
+      settingsWindow.webContents.send('config-saved', res.ok, res.error, res.field, res.notice);
     }
   }
 

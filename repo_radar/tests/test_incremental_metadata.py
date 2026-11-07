@@ -548,7 +548,9 @@ def test_settings_spending_limits_bound_the_next_sync(monkeypatch, tmp_path, cap
     assert policy({}) == (12.0, 2, ()) and policy(None) == (12.0, 2, ())
     assert policy({'incremental_update_limit_usd': 12.5, 'incremental_failure_stop': 10}) == (12.5, 10, ())
     assert policy({'incremental_update_limit_usd': 1, 'incremental_failure_stop': 1.0})[:2] == (1.0, 1)
-    for bad in (0, 0.5, 100.01, 12.345, -3, True, '12', None, float('nan'), float('inf')):
+    assert policy({'incremental_update_limit_usd': 99.99})[0] == 99.99
+    for bad in (0, 0.5, 100.01, 12.345, 12.000000001, -3, True, '12', None, float('nan'), float('inf'),
+                int('9' * 400)):   # too big for a float: out of range, not an OverflowError that stops the sync
         assert policy({'incremental_update_limit_usd': bad}) == (12.0, 2, ('incremental_update_limit_usd',)), bad
     for bad in (0, 11, 1.5, True, '2', None, float('nan')):
         assert policy({'incremental_failure_stop': bad}) == (12.0, 2, ('incremental_failure_stop',)), bad

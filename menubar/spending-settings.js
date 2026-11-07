@@ -17,9 +17,10 @@ const MESSAGES = {
   [STOP_FIELD]: `Enter a whole number from ${STOP_RANGE[0]} to ${STOP_RANGE[1]}`,
 };
 
+// Exactly whole cents: 99.99 and 1.01 pass, 12.000000001 doesn't. Python's check is round(value, 2) == value.
 function isValidLimit(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= LIMIT_RANGE[0] && value <= LIMIT_RANGE[1] &&
-    Math.abs(value * 100 - Math.round(value * 100)) < 1e-6;
+    Number(value.toFixed(2)) === value;
 }
 
 function isValidStop(value) {

@@ -110,7 +110,7 @@
             <div class="form-group">
                 <label for="incremental-failure-stop">Pause automatic metadata after this many failures in a row</label>
                 <input type="text" inputmode="numeric" id="incremental-failure-stop" class="form-control spending-input" placeholder="2">
-                <small class="form-help">Scheduled syncs stop buying summary updates for a repository that keeps failing; Git fetching carries on. Sync Now still retries, within the limit above. A whole number from 1 to 10.</small>
+                <small class="form-help">Scheduled syncs stop buying summary updates for a repository that keeps failing; Git fetching carries on. Sync Now can still retry; an incremental retry stays within the limit above. A whole number from 1 to 10.</small>
                 <small class="form-help form-error" id="incremental-failure-stop-error" hidden></small>
             </div>
         </div>

@@ -46,17 +46,17 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 // Handle save result
-ipcRenderer.on('config-saved', (event, success, error, field) => {
+ipcRenderer.on('config-saved', (event, success, error, field, notice) => {
     if (!success && SPENDING_INPUTS[field]) {   // main refused a spending value; nothing was written
         showFieldError(field, error);
         return;
     }
     if (success) {
-        showNotification('Settings saved successfully!', 'success');
-        // Close window after a short delay
+        showNotification(notice || 'Settings saved successfully!', 'success');
+        // Close window after a short delay, a little longer when there is a notice to read
         setTimeout(() => {
             window.close();
-        }, 1000);
+        }, notice ? 2500 : 1000);
     } else {
         showNotification(`Error saving settings: ${error}`, 'error');
     }

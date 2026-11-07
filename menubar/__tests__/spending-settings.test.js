@@ -7,7 +7,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const spending = require('../spending-settings');
-const { saveSettings } = require('../model-notice');
+const { saveSettings, sameSchedule, DEV_SCHEDULE_KEPT } = require('../model-notice');
 
 const LIMIT = spending.LIMIT_FIELD;
 const STOP = spending.STOP_FIELD;
@@ -37,19 +37,21 @@ test('typed input is parsed strictly and checked against the bounds', () => {
 });
 
 test('Python enforces the same bounds', () => {
-  const values = [1, 12, 12.5, 100, 0, 0.5, 100.01, 12.345, 2, 10, 11, 1.5];
+  const values = [1, 12, 12.5, 99.99, 1.01, 100, 0, 0.5, 100.01, 12.345, 12.000000001, 2, 10, 11, 1.5];
   const out = execFileSync('python3', ['-c',
     'import sys,json;sys.path.insert(0,".");from repo_radar import config as c;v=json.loads(sys.argv[1]);' +
     'print(json.dumps([[c.valid_incremental_update_limit(x),c.valid_incremental_failure_stop(x)] for x in v]))',
     JSON.stringify(values)], { cwd: path.join(__dirname, '..', '..'), encoding: 'utf8' });
   assert.deepStrictEqual(JSON.parse(out), values.map((v) => [spending.isValidLimit(v), spending.isValidStop(v)]));
+  // Whole cents exactly: two-decimal amounts pass, a value a hair off a cent doesn't.
+  assert.deepStrictEqual([99.99, 1.01, 12.000000001].map(spending.isValidLimit), [true, true, false]);
 });
 
 test('Save writes nothing for an invalid value and a dev save reports truthfully', () => {
   const calls = [];
-  const hooks = (channel) => ({
+  const hooks = (channel, scheduleKept = false) => ({
     channel,
-    save: (config) => { calls.push(['save', config]); return { success: true }; },
+    save: (config) => { calls.push(['save', config]); return { success: true, scheduleKept }; },
     reconcile: () => { calls.push(['reconcile']); return { success: false, error: 'Dev builds cannot install a persistent sync schedule.' }; },
   });
 
@@ -61,6 +63,14 @@ test('Save writes nothing for an invalid value and a dev save reports truthfully
   assert.notStrictEqual(dev.schedule.ok, false, 'a dev save is not reported as a schedule failure');
   assert.deepStrictEqual(calls.map((c) => c[0]), ['save']);
   assert.strictEqual(calls[0][1][LIMIT], 5.25);
+  assert.strictEqual(dev.notice, undefined);
+  // A dev save that kept a stored schedule differing from the window's says so instead of plain success.
+  assert.strictEqual(saveSettings({ [LIMIT]: 12, [STOP]: 2 }, hooks('dev', true)).notice, DEV_SCHEDULE_KEPT);
+  assert.strictEqual(saveSettings({ [LIMIT]: 12, [STOP]: 2 }, hooks('stable', true)).notice, undefined);
+  const daily = { enabled: true, type: 'daily', time: '09:00', interval: 6, days: [] };
+  assert.ok(sameSchedule(daily, { days: [], interval: 6, time: '09:00', type: 'daily', enabled: true }));
+  assert.ok(sameSchedule(undefined, { enabled: false, type: 'daily' }));
+  assert.ok(!sameSchedule({ ...daily, time: '10:00' }, daily) && !sameSchedule(daily, undefined));
 
   calls.length = 0;
   const stable = saveSettings({ [LIMIT]: 12, [STOP]: 2 }, hooks('stable'));
