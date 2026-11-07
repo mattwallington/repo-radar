@@ -730,7 +730,7 @@ class Pipeline:
         for number in range(1, EDIT_TURNS + 1):
             request, tokens, out, limit, offers_tools = self._edit_request(conversation, number)
             if tokens > limit:
-                raise im.StaleUpdate(f"the next request ({tokens:,} tokens) would not fit the model's input budget")
+                raise im.StaleUpdate(f"the next request ({tokens:,} tokens) would not fit its {limit:,} token limit")
             self.log(f"editing the summary, turn {number}", 90)
             turns, failure = self._wave([WaveItem('edit', f"t{number}", request, tokens, out, EDIT_SECONDS)])
             self._after_wave(failure)

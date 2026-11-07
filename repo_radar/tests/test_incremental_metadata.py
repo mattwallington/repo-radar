@@ -1027,8 +1027,9 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     """The live 1.0.37 failure: turn 1's tool call came back with provider fields (a thought signature)
     that the next request has to replay, pushing it past the 65,536 preparation budget though the reply
     reported a few output tokens. Continuations get the 128,000 request ceiling; past that, the update
-    stops before sending, keeps the old summary and counts as a failure."""
-    def attempt(where, signature_bytes):
+    stops before sending, keeps the old summary and counts as a failure. `recount(request, counted, fake)`
+    may replace a count."""
+    def attempt(where, signature_bytes, recount=None):
         repo, _base, pristine = setup_pristine(monkeypatch, where)
         repo.write('src/m0.py', 'changed = True\n')
         target = repo.commit('one change')
@@ -1045,8 +1046,12 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
             if stage == 'map':
                 return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
                         'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
-            return read if len(fake.stage('edit')) == 1 else patch
+            return read if len(fake.stage('edit')) == 1 and 'last turn' not in text else patch
         fake = GeminiFake(monkeypatch, reply)
+        real_count = PreflightSession.count_request
+        if recount:
+            monkeypatch.setattr(PreflightSession, 'count_request', lambda self, request, timeout=None: recount(
+                request, real_count(self, request, timeout=timeout), fake))
         pipelines, real_init = [], mr.Pipeline.__init__
 
         def keep(self, *args, **kwargs):
@@ -1056,6 +1061,7 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
         with PreflightSession() as session:
             outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
         monkeypatch.setattr(mr.Pipeline, '__init__', real_init)
+        monkeypatch.setattr(PreflightSession, 'count_request', real_count)
         return outcome, fake, pipelines[0], pristine, old, sections, components, signature, target
 
     # Below the ceiling: the second request goes out with the reply's fields intact, and the edit publishes.
@@ -1079,6 +1085,23 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     assert len(fake.stage('edit')) == 1 and outcome.usage['calls'] == len(fake.sends) and outcome.usage['known_cost_usd'] > 0
     assert im.load_document(pristine, 'app-abc1234').text == old.text
     assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
+
+    # A count lost after a paid call is a failure too, not a skip that would leave the hold disengaged.
+    def lost(request, counted, fake):
+        return counted._replace(tokens=None) if fake.sends and 'tools' in request else counted
+    outcome, fake, _p, pristine, old, *_ = attempt(tmp_path / 'lost', 0, lost)
+    assert outcome.status == 'failed' and 'token count unavailable' in outcome.reason, outcome
+    assert not fake.stage('edit') and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
+
+    # One note that fits 65,536 tokens but leaves no room for a tool-calling reply: turn 1 answers without tools.
+    def crowded(request, counted, fake):
+        return counted._replace(tokens=60_000) if 'covers_pages' in json.dumps(request) else counted
+    outcome, fake, *_ = attempt(tmp_path / 'crowded', 0, crowded)
+    edits = fake.stage('edit')
+    assert outcome.status == 'published' and len(edits) == 1, outcome
+    assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
