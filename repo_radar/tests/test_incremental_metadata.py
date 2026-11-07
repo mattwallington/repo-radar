@@ -878,6 +878,8 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
         repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
     target = repo.commit('rewrite everything and rename one')
     small_pages(monkeypatch)
+    from repo_radar import metadata_budget   # today's table price, so the quote's date doesn't decide the test
+    monkeypatch.delitem(metadata_budget.ANNOUNCED_PRICE_CHANGES, GEMINI)
     old = im.load_document(pristine, 'app-abc1234')
     sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(old))}
     components = sections['## Key Components']
@@ -940,7 +942,8 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     first, second = len(maps) // 16 + 1, (len(maps) // 16 + 1 + 4) // 5
     assert len(merges) > first + second and len(merges) <= mr.worst_case_merges(len(maps))
     assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
-    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0 and usage['rate_input_per_mtok'] == 0.75
+    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0
+    assert usage['rate_input_per_mtok'] == 0.75
 
     # Every merge and editor request names each cited file's real status and paths.
     changes = snap.changes_between(repo.path, base, target)
@@ -1198,11 +1201,12 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     old = im.load_document(pristine, 'app-abc1234')
     counts = FileCounts(50_000)   # two files to a chunk: five chunks, each counted far below the catalog bound
-    expensive = 10_933_000        # reported prompt tokens: three chunks settle at about $24.60
+    rate_in, rate_out = Budget(GEMINI).price   # the prices this attempt uses, whatever the date
+    expensive = round((8.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $24.60
 
     fake = GeminiFake(monkeypatch, lambda stage, text: gemini_text('## Analysis\nTwo files.\n', expensive))
     outcome = full_build(pristine, repo, counts)
-    per_chunk = expensive * 0.75e-6 + 20 * 3.75e-6
+    per_chunk = expensive * rate_in + 20 * rate_out
     reserve = Budget(GEMINI).upper_bound(1_048_576, 8192)                   # the whole input limit, priced
     assert 3 * per_chunk + reserve > FULL_CAP_USD >= 3 * per_chunk + Budget(GEMINI).upper_bound(101_000, 8192)
 
@@ -1222,6 +1226,50 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     assert outcome.status == 'published', outcome
     assert len(fake.sends) == 6 and outcome.usage['calls'] == 6 and outcome.usage['cost_usd'] < 1
     assert im.load_document(pristine, 'app-abc1234').info['pipeline_version'] == im.PIPELINE_VERSION
+
+
+def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
+    """Once anything has been paid for, a count that stops being available ends the attempt as failed, not
+    skipped, so the failure streak advances and automatic syncs can't keep buying the same work."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    provider = Provider(monkeypatch)
+    down = httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+
+    def text_of(body):
+        content = body['messages'][0]['content']
+        return content if isinstance(content, str) else ''.join(b['text'] for b in content)
+    # A full build in chunks, whose reduction can't be counted once the chunks are bought.
+    provider.count_tokens = lambda body: down if provider.messages() else 21 * len(json.dumps(body['messages']))
+    provider.replies = [lambda body: claude([{"type": "text", "text": f"analysis {len(provider.sends)}"}])] * 20
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session, force=True)
+    sends = provider.messages()
+    assert sends and all('(chunk ' in text_of(b) for b in sends)
+    assert outcome.status == 'failed' and outcome.reason.startswith('full synthesis: token count unavailable'), outcome
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 1 and state['usage']['calls'] == len(sends)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # The same for an incremental update whose editor can't be counted after the paid map call.
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path / 'diff')
+    repo.write('src/m0.py', 'changed = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    provider.count_tokens = lambda body: down if provider.messages() else 1000
+    provider.replies = [note()]
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'failed' and 'token count unavailable' in outcome.reason and len(provider.messages()) == 1
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
+
+    # Before anything is paid for, an unavailable count is still only a skip.
+    provider.sends.clear(); provider.counts.clear()
+    provider.count_tokens = lambda body: down
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'skipped' and not provider.messages()
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
 
 
 def frames(text):
@@ -1282,6 +1330,19 @@ def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_p
         else:
             rebuilt.append((source, content))
     assert rebuilt == expected
+
+    # A part that stops fitting once the chunk total grows is split again, and the later parts move up, so
+    # labels stay unique and in order.
+    class PerCharacter:
+        def count_request(self, request, timeout=None):
+            from repo_radar.preflight import PreflightResult
+            return PreflightResult(74 * len(request['messages'][0]['content']), False, 'local estimate')
+    text = ''.join(f'line_{n:04d} = {n}\n' for n in range(160))[:3000]
+    build = mr.FullBuild(FULL, [{'path': 'src/one.py', 'size': len(text), 'content': text}], GEMINI, PerCharacter(),
+                         Budget(GEMINI))
+    resplit = [f for chunk in build.chunks() for f in chunk.files]
+    assert [f['path'] for f in resplit] == [f'src/one.py (part {n})' for n in range(1, len(resplit) + 1)]
+    assert len(resplit) > 3 and ''.join(f['content'] for f in resplit) == text
     # The one reduction holds every chunk's analysis, in order.
     assert [final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1)] == sorted(
         final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1))

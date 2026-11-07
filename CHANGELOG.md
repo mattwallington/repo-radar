@@ -6,6 +6,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **`incremental_full_rebuild_days` sets how often an opted-in repository gets a full rebuild.** The default is still 7, and 0 turns the age trigger off. A malformed value stops a metadata sync before any work.
+- **The progress view shows how far a long summary update has got.**
+- **The telehealth pilot can replay historical changes from a manifest,** with a free `plan` mode that reports each case's pages and quote.
+
 ### Changed
 - **Opted-in full rebuilds send smaller requests and are capped at $25.** Every full-rebuild request, whether the whole repository, a chunk or the final reduction, now fits 128,000 input tokens. A file too large for one chunk is split into ordered parts rather than cut short, and if a rebuild can't fit or can't finish its reduction, it stops and keeps the old summary instead of summarizing excerpts. Each rebuild attempt stops before a request that could take its spending past $25. On Gemini, whose token counts are local estimates, each request is priced as if it used the model's whole input limit. The cap doesn't apply to repositories that aren't opted in to incremental summaries, and it limits one attempt rather than promising a rebuild finishes within it.
 - **Chunk analyses cover all eight summary subjects.** Each chunk is now asked about architecture, database schema and configuration as well as the overview, technology stack, components, interfaces and dependencies, and to say "not present here" when its files don't cover a subject.
@@ -21,11 +26,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - **Download links point to `ReperioHealth/repo-radar-releases`,** where releases are published.
-
-### Added
-- **`incremental_full_rebuild_days` sets how often an opted-in repository gets a full rebuild.** The default is still 7, and 0 turns the age trigger off. A malformed value stops a metadata sync before any work.
-- **The progress view shows how far a long summary update has got.**
-- **The telehealth pilot can replay historical changes from a manifest,** with a free `plan` mode that reports each case's pages and quote.
 
 ## [1.0.36] - 2026-11-04
 
