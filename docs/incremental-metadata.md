@@ -132,8 +132,21 @@ pass against the same remaining budget. A reply settles its reservation with its
 cost. If the cost isn't known, the whole reservation stays counted and no further request goes out. An
 update uses one set of prices throughout, including Google's announced January 2027 price for Gemini
 3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
-automatic retries, including after a 429 or 503, and no model fallbacks. Full rebuilds follow the
-existing full-generation cost policy: they aren't under the $12 cap.
+automatic retries, including after a 429 or 503, and no model fallbacks.
+
+An opted-in full rebuild runs on the same request executor. Every request, whether the whole repository,
+a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
+lower). The whole repository goes as one request only when it fits; otherwise the source is split into
+chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
+until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
+something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
+document stays, rather than send excerpts. A full rebuild is capped at **$25** per attempt
+(`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
+when its count is only a local estimate, as on Gemini, that worst case is the model's whole input limit.
+A request that could pass the cap stops the rebuild; once anything has been spent, that counts as a failed
+update. The cap bounds what
+one attempt can spend; it doesn't promise a repository can be rebuilt for that much. Repositories that
+aren't opted in keep the legacy full generator, which isn't capped.
 
 On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384

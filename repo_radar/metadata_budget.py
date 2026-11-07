@@ -5,9 +5,11 @@ uncached rates and reserved. A reply settles its reservation with the reported c
 computed from reported usage. When neither is available (a timeout, an error after sending, a reply
 without usage), the whole reservation stays counted as spent: an unknown cost is never zero.
 
-An ordinary incremental attempt has one cap (INCREMENTAL_CAP_USD). Full rebuilds in sync keep the
-existing uncapped cost policy but are still accounted. The telehealth pilot shares one durable Ledger
-across runs.
+An ordinary incremental attempt has one cap (INCREMENTAL_CAP_USD), and a protected full build another
+(FULL_CAP_USD). The full cap is per attempt: it stops a build before a request that could pass it, and is
+no promise that a repository can be fully built for that much. Full builds of repositories that aren't
+opted in to incremental metadata use the legacy generator and aren't capped here. The telehealth pilot
+shares one durable Ledger across runs.
 
 Concurrent requests stay honest because one coordinator is the only writer: it reserves a whole wave
 atomically with reserve_many before any of that wave is sent, workers only send, and the coordinator
@@ -26,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 INCREMENTAL_CAP_USD = 12.0
+FULL_CAP_USD = 25.0
 
 # Vendor-announced list price rises the pricing table doesn't know yet: model -> (first day of the new
 # price, input, output per token). Google lists Gemini 3.8 Flash at $0.75/$3.75 per million through

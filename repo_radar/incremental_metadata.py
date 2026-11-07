@@ -4,7 +4,7 @@ Each document records the commit it was built from. A later sync updates it from
 model summarizes each page of the diff, the notes are merged, and a final editor returns section edits
 that the app validates and applies. A full rebuild still happens weekly, when the model or policy
 changes, or when the baseline cannot be used; it reads the pinned source in chunks of at most 128,000
-input tokens. Both run on the shared summary_pipeline. Every other
+input tokens and is capped at $25 per attempt. Both run on the shared summary_pipeline. Every other
 repository keeps the existing full-generation path unchanged.
 
 A failure never replaces a good document: it stays as it was, and INDEX marks it stale.
@@ -718,7 +718,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
-    from repo_radar.metadata_budget import Budget, INCREMENTAL_CAP_USD
+    from repo_radar.metadata_budget import Budget, FULL_CAP_USD, INCREMENTAL_CAP_USD
     from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
 
@@ -804,7 +804,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
         log(f"{decision.strategy}: {decision.reason}")
 
-        cap = INCREMENTAL_CAP_USD if decision.strategy == 'incremental' else None
+        cap = INCREMENTAL_CAP_USD if decision.strategy == 'incremental' else FULL_CAP_USD
         budget = Budget(model, cap=cap, label=decision.strategy)
         if missing_credential:
             return finish('failed', f"no API key: {missing_credential} is not set")
