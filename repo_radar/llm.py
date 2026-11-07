@@ -347,7 +347,8 @@ def call_llm(model, prompt, max_tokens=8192):
 # cannot drift. No retries, model fallback or SDK retries happen here: one request, one reply.
 
 ToolCall = namedtuple("ToolCall", "id name arguments")
-TurnResult = namedtuple("TurnResult", "status text tool_calls usage cost reply_items")
+# diagnostics: safe facts about how a reply ended (turn_diagnostics), never its text or reasoning.
+TurnResult = namedtuple("TurnResult", "status text tool_calls usage cost reply_items diagnostics", defaults=(None,))
 TurnUsage = namedtuple("TurnUsage", "input_tokens output_tokens")
 
 
@@ -358,6 +359,20 @@ def _plain(item):
     if isinstance(item, dict):
         return {k: v for k, v in item.items() if v is not None}
     return dict(item)
+
+
+def turn_diagnostics(finish, raw_usage):
+    """How a reply ended, in a small fixed shape: the normalized finish reason and the provider's total and
+    reasoning output counts when it reported them. Holds no prompt, answer or reasoning text."""
+    def count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    details = (getattr(raw_usage, 'completion_tokens_details', None) or getattr(raw_usage, 'output_tokens_details', None))
+    total = getattr(raw_usage, 'completion_tokens', None)
+    if total is None:
+        total = getattr(raw_usage, 'output_tokens', None)
+    reason = ''.join(ch for ch in str(finish) if ch.isalnum() or ch in '_-')[:40] if finish else None
+    return {'finish_reason': reason, 'output_tokens': count(total),
+            'reasoning_tokens': count(getattr(details, 'reasoning_tokens', None))}
 
 
 class Conversation:
@@ -393,14 +408,21 @@ class Conversation:
             return [{"type": "function", "function": dict(t)} for t in self.tools]
         return [{"type": "function", **t} for t in self.tools]
 
-    def request(self, max_tokens):
-        """The complete request for the next turn, as plain JSON data."""
+    def request(self, max_tokens, low_effort=False, json_reply=False):
+        """The complete request for the next turn, as plain JSON data. On Gemini, where thinking shares the
+        output limit, a short stage can ask for low reasoning effort and a JSON-only reply; other providers
+        keep their usual options."""
         out = output_budget(self.model, max_tokens)
         if self.endpoint == 'chat':
             system = [{"role": "system", "content": self.system}] if self.system is not None else []
             req = {"endpoint": "chat", "model": self.model, "messages": [*system, *self.items], "max_tokens": out}
             if self.model in CLAUDE_MEDIUM_EFFORT_MODELS:
                 req["output_config"] = {"effort": "medium"}
+            if provider_for_model(self.model) == 'gemini':
+                if low_effort:
+                    req["reasoning_effort"] = "low"
+                if json_reply:
+                    req["response_format"] = {"type": "json_object"}
         else:
             req = {"endpoint": "responses", "model": self.model, "input": list(self.items), "max_output_tokens": out}
             if self.system is not None:
@@ -442,6 +464,8 @@ def call_model_turn(request, timeout):
         usage = (TurnUsage(getattr(raw, 'input_tokens', None), getattr(raw, 'output_tokens', None))
                  if raw is not None else None)
         reply = items
+        incomplete = getattr(response, 'incomplete_details', None)
+        diagnostics = turn_diagnostics(getattr(incomplete, 'reason', None) or getattr(response, 'status', None), raw)
     else:
         if provider == 'anthropic':
             _map_context_window_stop_as_truncation()
@@ -465,10 +489,11 @@ def call_model_turn(request, timeout):
         usage = (TurnUsage(getattr(raw, 'prompt_tokens', None), getattr(raw, 'completion_tokens', None))
                  if raw is not None else None)
         reply = [{"role": "assistant", **_plain(message)}] if message is not None else []
+        diagnostics = turn_diagnostics(finish, raw)
     hidden = getattr(response, '_hidden_params', None)
     cost = hidden.get('response_cost') if isinstance(hidden, dict) else None
     cost = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
-    return TurnResult(status, text, calls, usage, cost, reply)
+    return TurnResult(status, text, calls, usage, cost, reply, diagnostics)
 
 
 def get_chunking_threshold(model):
