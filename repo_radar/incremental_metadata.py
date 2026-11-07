@@ -2,9 +2,10 @@
 
 Each document records the commit it was built from. A later sync updates it from that commit: the
 model summarizes each page of the diff, the notes are merged, and a final editor returns section edits
-that the app validates and applies (incremental_map_reduce). A full rebuild still happens weekly, when
-the model or policy changes, or when the baseline cannot be used. Every other repository keeps the
-existing full-generation path unchanged.
+that the app validates and applies. A full rebuild still happens weekly, when the model or policy
+changes, or when the baseline cannot be used; it reads the pinned source in chunks of at most 128,000
+input tokens. Both run on the shared summary_pipeline. Every other
+repository keeps the existing full-generation path unchanged.
 
 A failure never replaces a good document: it stays as it was, and INDEX marks it stale.
 """
@@ -27,7 +28,7 @@ from repo_radar import metadata_snapshot as snap
 # every opted-in document is rebuilt once under the new policy.
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
 UNKNOWN = 'unknown'
-PIPELINE_VERSION = 'map-reduce/1'  # the update engine; a new one doesn't force a rebuild the way a policy does
+PIPELINE_VERSION = 'summary-pipeline/1'  # the engine; a new one doesn't force a rebuild the way a policy does
 
 Document = namedtuple('Document', 'path text sha256 info body')
 Decision = namedtuple('Decision', 'strategy reason base target full_built_at full_model change adopt')
@@ -481,7 +482,7 @@ def parse_answer(text):
 # ---- talking to the model ----------------------------------------------------------------------------
 
 ATTEMPT_SECONDS = 20 * 60   # one incremental update, from preparing its pages to draining its last call
-REQUEST_SECONDS = 10 * 60
+REQUEST_SECONDS = 10 * 60   # one full-build request; a full build has no attempt deadline
 
 # omitted: (path, reason) for files withheld by the safety policy (credential, binary, symlink...);
 # outside_selection: for full builds, how many tracked files the collector's rules leave out;
@@ -499,46 +500,6 @@ class StaleUpdate(Exception):
         self.reason, self.warning = reason, warning
 
 
-def _send(conversation, max_output, session, budget, deadline=None, now=None, low_effort=False):
-    """Count, bound, reserve and send the conversation's next request. Returns the TurnResult."""
-    from repo_radar import llm
-    from repo_radar.model_catalog import acceptance_budget, get_caps
-    import time
-
-    request = conversation.request(max_output, low_effort=low_effort)
-    out = llm.output_budget(conversation.model, max_output)
-    counted = session.count_request(request)
-    caps = get_caps(conversation.model)
-    if caps is not None and caps.count_strategy == 'anthropic_api' and not counted.authoritative:
-        raise StaleUpdate(f"token count unavailable ({counted.reason or 'unknown'})", warning=True)
-    if counted.tokens is None:
-        raise StaleUpdate("token count unavailable", warning=True)
-    if counted.tokens > acceptance_budget(conversation.model, out):
-        raise StaleUpdate(f"the next request ({counted.tokens:,} tokens) would not fit the model's input budget")
-    timeout = REQUEST_SECONDS
-    if deadline is not None:
-        left = deadline - (now or time.monotonic)()
-        if left <= 5:
-            raise StaleUpdate("the attempt ran out of time")
-        timeout = min(timeout, left)
-    from repo_radar.metadata_budget import BudgetError
-    try:
-        reservation = budget.reserve(request, counted.tokens, out)
-    except BudgetError as e:
-        raise StaleUpdate(str(e), warning=True) from None
-    try:
-        turn = llm.call_model_turn(request, timeout)
-    except Exception:
-        budget.fail(reservation)
-        raise
-    cost = budget.settle(reservation, turn.usage, turn.cost)
-    if cost is None and budget.ledger is not None:
-        # A capped experiment can't keep spending past a reply whose cost it doesn't know.
-        raise StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
-                          "any further paid request (reconcile the ledger first)")
-    return turn
-
-
 def run_incremental(repo_path, full_name, doc, decision, model, session, budget, clock=None, log=None,
                     spool_dir=None, evidence_dir=None, case=None, deadline=None):
     """Update `doc` from its analyzed commit to decision.target: map each diff page, merge the notes, edit
@@ -547,7 +508,7 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
     `deadline` is the attempt's, set before selection; only a direct caller without one starts a new one."""
     import shutil
     import time
-    from repo_radar import incremental_map_reduce as mr
+    from repo_radar import summary_pipeline as mr
 
     deadline = deadline or snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)
     spool = spool_dir or tempfile.mkdtemp(prefix='repo-radar-pages-')
@@ -605,20 +566,18 @@ def pinned_files(snapshot, exclusions):
 
 
 def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited):
-    """A complete document built from the pinned commit with the existing full-generation prompts,
-    partitioning and synthesis, sent through the counted sender. Never written directly: the caller
-    publishes it. `inherited` is the previous document's credential exclusions (document_exclusions)
-    and `baseline` its commit when that is still available; a rebuild adds to that protection and
-    never resets it. A Git failure reading the protection raises rather than dropping it.
+    """A complete document built from the pinned commit by the shared summary pipeline's full adapter
+    (summary_pipeline.FullBuild), with the existing full-generation prompts and output format. Never written
+    directly: the caller publishes it. `inherited` is the previous document's credential exclusions
+    (document_exclusions) and `baseline` its commit when that is still available; a rebuild adds to that
+    protection and never resets it. A Git failure reading the protection raises rather than dropping it.
 
     On Gemini, thinking and the visible answer share the output limit, so every call asks for low thinking
     in the counted request, leaving more room to answer; that makes truncation less likely, not impossible.
     A truncated reply is still rejected, with nothing retried. budget.extra['full_stage'] says which call was
     last attempted and how it ended: set before each send, finished after its settlement."""
-    from repo_radar import llm
+    from repo_radar import summary_pipeline
     from repo_radar.metadata import parse_llm_response, degradation_reasons
-    from repo_radar.metadata_budget import LedgerWriteError
-    from repo_radar.preflight import TokenCountRejected
 
     target_snap = snap.GitSnapshot(repo_path, target)
     base_manifest, changes = None, ()
@@ -629,44 +588,8 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     files, omitted, outside = pinned_files(target_snap, exclusions)
     if not files:
         raise StaleUpdate("no analyzable source")
-
-    calls = [0]
-
-    def send(prompt, max_output, stage, chunk=None, chunks=None):
-        calls[0] += 1
-        where = f"full {stage}{f' {chunk}/{chunks}' if chunk else ''} (call {calls[0]})"
-        record = {'stage': stage, 'call': calls[0], 'chunk': chunk, 'chunks': chunks,
-                  'max_output': llm.output_budget(model, max_output)}
-        budget.extra['full_stage'] = record
-        conversation = llm.Conversation(model, None)
-        conversation.add_user(prompt)
-        try:
-            turn = _send(conversation, max_output, session, budget, low_effort=True)
-        except StaleUpdate as e:
-            raise StaleUpdate(f"{where}: {e.reason}", warning=e.warning) from None
-        except (llm.InputBudgetUnavailable, llm.IncompleteResponseError, TokenCountRejected, LedgerWriteError):
-            raise   # their own handling and wording
-        except Exception as e:
-            raise StaleUpdate(f"{where}: {type(e).__name__}: {e}") from None
-        record.update(turn.diagnostics or {})
-        if turn.status != 'complete':
-            raise StaleUpdate(f"{where}: the model's reply was {turn.status}")
-        return turn.text
-
-    if llm.authoritative_partition(session, full_name, files, model) == 'single':
-        text = send(llm._build_full_repo_prompt(full_name, files), llm.FULL_REPO_OUTPUT, 'single')
-    else:
-        partition = llm.authoritative_chunks(session, full_name, files, model)
-        if partition.degraded_reason:
-            raise StaleUpdate(partition.degraded_reason)
-        chunks = partition.chunks
-        analyses = [send(llm._build_analysis_prompt(full_name, chunk, i, len(chunks)), llm.CHUNK_OUTPUT, 'chunk', i, len(chunks))
-                    for i, chunk in enumerate(chunks, 1)]
-        text, _cost = llm.combine_chunk_analyses(
-            full_name, analyses, model=model, session=session,
-            synthesize=lambda prompt, m: (send(prompt, llm.SYNTHESIS_OUTPUT_TOKENS, 'synthesis'), 0.0, model))
-        if isinstance(text, llm.DegradedSynthesis):
-            raise StaleUpdate(text.reason)
+    budget.extra['pipeline_version'] = PIPELINE_VERSION
+    text = summary_pipeline.FullBuild(full_name, files, model, session, budget).run()
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
     if problems or not parsed['analysis'].strip():
@@ -711,8 +634,7 @@ def _provenance(strategy, model, decision, doc, target, now, coverage_note, omit
     record = {'generation_strategy': strategy, 'generation_model': model, 'configured_model': model,
               'semantic_policy': SEMANTIC_POLICY, 'base_commit': decision.base or 'none', **full,
               'coverage': coverage, EXCLUSIONS_KEY: snap.encode_exclusions(exclusions)}
-    if strategy == 'incremental':
-        record['pipeline_version'] = PIPELINE_VERSION
+    record['pipeline_version'] = PIPELINE_VERSION
     if coverage_note:
         record['coverage_note'] = coverage_note
     return record
@@ -871,8 +793,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
         if dropped:   # its failure stays on record while the new path runs
             attempt['dropped_full_attempt'] = dropped
+        attempt['pipeline_version'] = PIPELINE_VERSION
         if decision.strategy == 'incremental':
-            attempt['pipeline_version'] = PIPELINE_VERSION
             attempt.pop('full_rebuild_origin', None)
         else:   # a retry carries the first reason forward; decision_reason stays the latest, for display
             attempt['full_rebuild_origin'] = (_full_rebuild_origin(state) if decision.reason == UNFINISHED_REASON

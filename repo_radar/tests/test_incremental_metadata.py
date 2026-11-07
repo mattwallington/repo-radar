@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from repo_radar import incremental_map_reduce as mr
+from repo_radar import summary_pipeline as mr
 from repo_radar import incremental_metadata as im
 from repo_radar import config as repo_config, metadata, metadata_snapshot as snap
 from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, LedgerWriteError, PricingUnavailable
@@ -1138,13 +1138,25 @@ def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkey
     assert 'SENTINEL-' not in traffic and '[no matches]' in traffic and 'src/runtime.py' in traffic
 
 
+class FileCounts:
+    """A local counting session (authoritative=False, as for Gemini) whose count is `per_file` tokens for every
+    source file framed in the request plus `base`, so a ten-file repository can stand for a large one."""
+
+    def __init__(self, per_file, base=1000):
+        self.per_file, self.base = per_file, base
+
+    def count_request(self, request, timeout=None):
+        from repo_radar.preflight import PreflightResult
+        return PreflightResult(self.per_file * json.dumps(request).count(' bytes) ===') + self.base, False, 'local estimate')
+
+
+def full_build(pristine, repo, session, model=GEMINI):
+    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW)
+
+
 def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
-    from repo_radar import llm
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     old = im.load_document(pristine, 'app-abc1234')
-    monkeypatch.setattr(llm, 'authoritative_partition', lambda *a: 'chunk')
-    monkeypatch.setattr(llm, 'authoritative_chunks', lambda session, name, files, model: llm.PartitionResult(
-        [files[:5], files[5:]], None))
     cut_off = httpx.Response(200, json={
         "candidates": [{"content": {"parts": [{"text": "## Overview\nCut o"}], "role": "model"}, "finishReason": "MAX_TOKENS"}],
         "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 40, "thoughtsTokenCount": 16344,
@@ -1154,8 +1166,7 @@ def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where
         assert stage == 'full'
         return cut_off if len(fake.sends) == 3 else '## Analysis\nOne chunk.\n'
     fake = GeminiFake(monkeypatch, reply)
-    with PreflightSession() as session:
-        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, force=True, now=NOW)
+    outcome = full_build(pristine, repo, FileCounts(20_000))   # six files fill a chunk, so ten make two
 
     # Low thinking and the unchanged limits on all three requests, with no JSON mode and no retry.
     configs = [body['generationConfig'] for _s, _t, body in fake.sends]
@@ -1171,6 +1182,78 @@ def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where
                                    'reasoning_tokens': 16344}
     assert usage['full_stage']['output_tokens'] >= 40 and 'Cut o' not in json.dumps(usage)
     assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+
+def frames(text):
+    """(path, content) for every file framed in a chunk prompt, read by its stated size."""
+    return [(m.group(1), text[m.end():m.end() + int(m.group(2))])
+            for m in re.finditer(r'^=== (.+?) \((\d+) bytes\) ===\n', text, re.M)]
+
+
+def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_path):
+    from repo_radar import llm
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/big.py', ''.join(f'big_line_{n:04d} = {n}\n' for n in range(500)))   # too big for any one chunk
+    target = repo.commit('a big file')
+    expected = [(f['path'], f['content'])
+                for f in im.pinned_files(snap.GitSnapshot(repo.path, target), snap.NO_EXCLUSIONS)[0]]
+    old = im.load_document(pristine, 'app-abc1234')
+    provider = Provider(monkeypatch)
+
+    def text_of(body):
+        content = body['messages'][0]['content']
+        return content if isinstance(content, str) else ''.join(b['text'] for b in content)
+
+    def run(scale, per_analysis=0):
+        def tokens(body):
+            return scale * len(json.dumps(body['messages'])) + per_analysis * text_of(body).count('--- Analysis Part')
+        provider.count_tokens, provider.sends[:], provider.counts[:] = tokens, [], []
+        provider.replies = [lambda body: claude([{"type": "text", "text": f"analysis of chunk {len(provider.sends)}"
+                                                  if '(chunk ' in text_of(body) else FULL_REPLY}])] * 60
+        with PreflightSession() as session:
+            outcome = update(pristine, repo, session, force=True)
+        return outcome, provider.messages(), [tokens(b) for b in provider.messages()]
+
+    # Below the target the whole repository goes out as one request.
+    outcome, sends, sizes = run(2)
+    assert outcome.status == 'published' and len(sends) == 1 and sizes[0] <= 128_000, outcome
+    assert text_of(sends[0]).startswith('Analyze this repository') and frames(text_of(sends[0])) == expected
+
+    # The same repository counted above the target, though far inside the old 75%-of-window rule, is chunked.
+    single = 21 * len(json.dumps([{'role': 'user', 'content': llm._build_full_repo_prompt(FULL, [
+        {'path': p, 'size': len(c), 'content': c} for p, c in expected])}]))
+    assert 128_000 < single < llm.get_chunking_threshold(MODEL)
+    outcome, sends, sizes = run(21)
+    assert outcome.status == 'published', outcome
+    counted = [c['messages'] for c in provider.counts]
+    assert all(size <= 128_000 for size in sizes) and all(b['messages'] in counted for b in sends)
+    chunks, final = [text_of(b) for b in sends[:-1]], text_of(sends[-1])
+    assert len(chunks) > 3 and all(f"(chunk {i}/{len(chunks)})" in text for i, text in enumerate(chunks, 1))
+    assert all(b['max_tokens'] == 16384 for b in sends)   # this model's floor for chunks, and synthesis's own
+    # Every file, in order and whole; the big one as ordered parts.
+    pieces = [frame for text in chunks for frame in frames(text)]
+    assert [p for p, _c in pieces if 'big.py' in p] == [f'src/big.py (part {n})' for n in range(1, len(
+        [p for p, _c in pieces if 'big.py' in p]) + 1)] and len([p for p, _c in pieces if 'big.py' in p]) > 1
+    rebuilt = []
+    for path, content in pieces:
+        source = path.split(' (part ')[0]
+        if rebuilt and rebuilt[-1][0] == source and ' (part ' in path and not path.endswith('(part 1)'):
+            rebuilt[-1] = (source, rebuilt[-1][1] + content)
+        else:
+            rebuilt.append((source, content))
+    assert rebuilt == expected
+    # The one reduction holds every chunk's analysis, in order.
+    assert [final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1)] == sorted(
+        final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1))
+    assert final.count('--- Analysis Part') == len(chunks)
+
+    # When the reductions can't converge within the depth guard, the build stops; nothing is excerpted.
+    monkeypatch.setattr(llm, 'SYNTHESIS_MAX_DEPTH', 1)
+    current = im.load_document(pristine, 'app-abc1234')
+    outcome, sends, sizes = run(21, per_analysis=30_000)   # two analyses to a reduction
+    assert outcome.status == 'failed' and "still don't fit one request after 1 levels" in outcome.reason
+    assert all(size <= 128_000 for size in sizes) and not any('truncated' in text_of(b) for b in sends)
+    assert im.load_document(pristine, 'app-abc1234').text == current.text != old.text
 
 
 def credential_traffic(provider, pristine, repo):
