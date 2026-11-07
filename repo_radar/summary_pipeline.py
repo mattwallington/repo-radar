@@ -1,13 +1,18 @@
-"""The incremental update engine: one short model call per diff page, bounded merging, one edit pass.
+"""The summary pipeline: how protected full builds and incremental updates send, account for and reduce
+their model work.
 
-Diff size selects the amount of work, not a different strategy. Every page gets one validated note,
-notes are merged in deterministic bounded groups while they are too large to hand over together, and a
-final short conversation turns them into the same section edits apply_patch has always checked. The
-app carries which pages each note covers, so coverage is never whatever IDs a model chose to repeat.
+Both strategies share three things. Executor prepares a complete request (counted exactly as it will be
+sent), reserves a whole wave before any of it goes out, sends it and settles every launched request
+exactly once. map_reduce is the one ordered driver: a request per piece, then levels of reduction until
+the adapter is ready, with the app owning which pieces each result covers. Nothing is retried and no
+provider is switched: any failure stops further work, accounts for what was already launched, and
+leaves the previous document in place.
 
-There is one coordinator. It counts, reserves a whole wave, lets workers send, and settles every result
-before the next wave; workers only send. Nothing is retried. Any failure stops further work, accounts
-for what was already launched, and leaves the previous document in place.
+Two adapters keep what differs. Pipeline updates a document from a Git diff: one short call per diff
+page, JSON notes merged in deterministic bounded groups, and a final short conversation that returns the
+section edits apply_patch checks. FullBuild writes a complete document from pinned source: one request
+when the whole repository fits the protected input target, otherwise ordered chunks whose text analyses
+are reduced into the existing full document format.
 """
 
 import concurrent.futures
@@ -122,11 +127,195 @@ Use "after": "start" to insert before the first section. Replacement and inserte
 Markdown heading. Put only changed values in "fields". If nothing needs to change, return an empty
 "sections" list."""
 
-# One note in the tree: its id, the pages it covers (app-owned), the file ids it may name, its fields.
+# One result in the tree: its id, the pieces it covers (app-owned), the file ids it may name (diff only),
+# its validated note (diff only) and its text.
 Node = namedtuple('Node', 'id pages files note text')
-WaveItem = namedtuple('WaveItem', 'stage id request tokens output seconds')
+# A request ready to send: `tokens` is its counted input, which must fit `limit`; `output` is the output it
+# asks for; `reserve_tokens` is the input its cost reservation prices, which can be more than was counted.
+Prepared = namedtuple('Prepared', 'stage id request tokens limit output seconds reserve_tokens')
 Quote = namedtuple('Quote', 'total_usd map_calls merge_calls edit_turns map_input_tokens edit_base_tokens '
                             'pages diff_pages omission_pages')
+
+
+# ---- sending ---------------------------------------------------------------------------------------
+
+class Executor:
+    """One attempt's only way to send. It counts complete requests, reserves each wave whole before any of
+    it is sent, sends the wave concurrently, and settles every launched request exactly once, even when a
+    sibling fails. A single request is a wave of one.
+
+    `identity(item)` is a request's identity for the no-repeat rule. `deadline` (a clock reading, or None)
+    bounds counting and sending for the whole attempt. With `conservative_cost`, a request whose count isn't
+    authoritative reserves the model's whole input limit, since a local estimate is no bound on a bill."""
+
+    def __init__(self, model, session, budget, identity, deadline=None, clock=None, width=1, conservative_cost=False):
+        self.model, self.session, self.budget, self.identity = model, session, budget, identity
+        self.deadline, self.clock = deadline, clock or time.monotonic
+        self.width, self.conservative_cost = width, conservative_cost
+        self.calls = []          # one record per launched request
+
+    def unpaid(self):
+        """A refusal is only a skip while nothing has been sent; after any paid call it is a failure, so the
+        failure streak and its hold still apply."""
+        return self.budget.calls == 0
+
+    def time_left(self):
+        if self.deadline is None:
+            return None
+        left = self.deadline - self.clock()
+        if left <= 0:
+            raise im.StaleUpdate("the attempt ran out of time")
+        return left
+
+    def count(self, request, output, ceiling=None):
+        """(the count, the limit this request must fit). An Anthropic model's count is authoritative or nothing;
+        the attempt stops rather than send on an estimate. Counting spends the attempt's time like everything
+        else, so no count starts, or is believed, after the deadline."""
+        from repo_radar.model_catalog import acceptance_budget, get_caps
+        counted = self.session.count_request(request, timeout=self.time_left())
+        self.time_left()
+        caps = get_caps(self.model)
+        estimated = getattr(counted, 'local_plan', False)
+        if caps is not None and caps.count_strategy == 'anthropic_api' and not counted.authoritative and not estimated:
+            raise im.StaleUpdate(f"token count unavailable ({counted.reason or 'unknown'})", warning=self.unpaid())
+        if counted.tokens is None:
+            raise im.StaleUpdate("token count unavailable", warning=self.unpaid())
+        limit = acceptance_budget(self.model, output)
+        return counted, min(limit, ceiling) if ceiling else limit
+
+    def prepare(self, stage, item_id, request, output, seconds, ceiling=None):
+        """`request` counted and bounded, ready for a wave. Whether it fits is the caller's to check."""
+        from repo_radar.model_catalog import get_caps
+        counted, limit = self.count(request, output, ceiling)
+        reserve = counted.tokens
+        if self.conservative_cost and not counted.authoritative:
+            caps = get_caps(self.model)
+            if caps is None:
+                raise im.StaleUpdate(f"no input limit is known for {self.model}, so the request can't be bounded",
+                                     warning=self.unpaid())
+            reserve = caps.max_input
+        return Prepared(stage, item_id, request, counted.tokens, limit, output, seconds, reserve)
+
+    def wave(self, items):
+        """Reserve `items` together, send them concurrently and account for every one, whatever else went
+        wrong. Returns (turns, failure): a turn per item, None where it wasn't sent or its send failed, and the
+        first thing that must stop further work. A wave refused before sending is just that failure."""
+        from repo_radar import llm
+        refused = [None] * len(items)
+        try:
+            left = self.time_left()
+        except im.StaleUpdate as e:
+            return refused, e
+        if left is not None and left <= 5:
+            return refused, im.StaleUpdate("the attempt ran out of time")
+        for item in items:   # what was counted is what goes out, so this is the send-boundary check
+            if item.tokens > item.limit:
+                return refused, im.StaleUpdate(f"{item.stage} {item.id} ({item.tokens:,} tokens) would not fit "
+                                               f"its {item.limit:,} token limit")
+        try:
+            reservations = self.budget.reserve_many([(self.identity(i), i.reserve_tokens, i.output) for i in items])
+        except BudgetError as e:
+            return refused, im.StaleUpdate(str(e), warning=self.unpaid())
+
+        def send(item):
+            started = time.monotonic()
+            timeout = item.seconds if left is None else min(item.seconds, left)
+            return llm.call_model_turn(item.request, timeout), time.monotonic() - started
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(self.width, 1)) as pool:
+            futures = [pool.submit(send, item) for item in items]
+            concurrent.futures.wait(futures)
+        turns, send_error, storage_error, unknown = [], None, None, False
+        for item, reservation, future in zip(items, reservations, futures):
+            error = future.exception()
+            record = {'stage': item.stage, 'id': item.id, 'counted_tokens': item.tokens, 'max_output': item.output}
+            if item.reserve_tokens != item.tokens:
+                record['reserved_input_tokens'] = item.reserve_tokens
+            if error is not None:
+                try:
+                    self.budget.fail(reservation)
+                except LedgerWriteError as e:
+                    storage_error = storage_error or e
+                self.calls.append({**record, 'status': 'error', 'error': type(error).__name__})
+                send_error = send_error or error
+                turns.append(None)
+                continue
+            turn, seconds = future.result()
+            try:
+                cost = self.budget.settle(reservation, turn.usage, turn.cost)
+            except LedgerWriteError as e:
+                storage_error = storage_error or e
+                cost = e.cost
+            unknown = unknown or cost is None
+            self.calls.append({**record, 'status': turn.status, 'seconds': round(seconds, 3), 'cost_usd': cost,
+                               'input_tokens': turn.usage.input_tokens if turn.usage else None,
+                               'output_tokens': turn.usage.output_tokens if turn.usage else None})
+            turns.append(turn)
+        failure = send_error or storage_error
+        if failure is None and unknown:
+            failure = im.StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
+                                     "any further paid request")
+        return turns, failure
+
+
+# ---- the one map/reduce driver ---------------------------------------------------------------------
+
+def _settle_wave(adapter, items, accept):
+    """Send `items` as one wave and accept each reply in order. A rejected reply was still paid for, and its
+    siblings' accepted results are kept (in adapter.nodes, as evidence) before the adapter's after_wave sees
+    the first failure and stops."""
+    turns, failure = adapter.executor.wave(items)
+    results = []
+    for index, (item, turn) in enumerate(zip(items, turns)):
+        result = None
+        if turn is not None:
+            try:
+                result = accept(index, item, turn)
+                adapter.nodes.append(result)
+            except im.StaleUpdate as e:
+                failure = failure or e
+        results.append(result)
+    adapter.after_wave(failure)
+    return results
+
+
+def map_reduce(adapter, pieces):
+    """Map every piece, then reduce level by level until adapter.ready(nodes, level).
+
+    Pieces are sent in order, in waves of the executor's width. At each level the adapter's own grouping
+    policy splits the nodes into contiguous groups; each group of two or more becomes one reduction, and a
+    lone node passes through unchanged unless it is the level's only group, which is the final reduction.
+    Coverage belongs to the app: a reduced node covers exactly its children's pieces, whatever the model
+    repeated. A level that doesn't reduce the number of nodes stops the attempt."""
+    width = adapter.executor.width
+    nodes = []
+    for start in range(0, len(pieces), width):
+        batch = pieces[start:start + width]
+        items = [adapter.map_item(piece) for piece in batch]
+        nodes += _settle_wave(adapter, items, lambda i, item, turn: adapter.map_node(batch[i], item, turn))
+        adapter.progress('map', start + len(batch), len(pieces))
+    level = 0
+    while not adapter.ready(nodes, level):
+        level += 1
+        groups = adapter.groups(nodes, level)
+        work = [(i, group) for i, group in enumerate(groups) if len(group) > 1 or len(groups) == 1]
+        reduced = {}
+        for start in range(0, len(work), width):
+            batch = work[start:start + width]
+            items = [adapter.reduce_item(level, i, [nodes[n] for n in group]) for i, group in batch]
+
+            def accept(k, item, turn, batch=batch):
+                children = [nodes[n] for n in batch[k][1]]
+                files, note, text = adapter.reduce_node(item, turn, children)
+                return Node(item.id, frozenset().union(*(child.pages for child in children)), files, note, text)
+            for (i, _group), node in zip(batch, _settle_wave(adapter, items, accept)):
+                reduced[i] = node
+            adapter.progress('reduce', level)
+        merged = [reduced[i] if i in reduced else nodes[group[0]] for i, group in enumerate(groups)]
+        if len(groups) > 1 and len(merged) >= len(nodes):
+            raise im.StaleUpdate(f"{len(nodes)} results could not be grouped any further at level {level}")
+        nodes = merged
+    return nodes
 
 
 class NoteError(ValueError):
@@ -259,18 +448,21 @@ class LocalEstimate:
 
 
 class Pipeline:
+    """The diff adapter: an incremental update of `doc` from its analyzed commit, over prepared diff pages."""
+
     def __init__(self, full_name, doc, prepared, model, session, budget, deadline, clock, log=None, case=None,
                  evidence_dir=None):
         self.full_name, self.doc, self.prepared, self.model = full_name, doc, prepared, model
         self.pages = prepared.pages
-        self.session, self.budget, self.deadline, self.clock = session, budget, deadline, clock
+        self.budget = budget
+        self.executor = Executor(model, session, budget, self._identity, deadline, clock, width=MAX_WAVE)
         self.log = log or (lambda *a, **k: None)
         self.case, self.evidence_dir = case, evidence_dir
         self.sections = im.split_sections(im._analysis_of(doc))
         self.section_ids = [s.id for s in self.sections]
         self.fields = im.current_fields(doc)
         self.titles = '\n'.join(f"{s.id}: {s.text.split(chr(10), 1)[0][:120]}" for s in self.sections)
-        self.calls = []          # one record per sent request, for attempt usage and pilot evidence
+        self.calls = self.executor.calls   # one record per sent request, for attempt usage and pilot evidence
         self.nodes = []          # every accepted note, for pilot evidence
         self.tools_used = 0
         self.delivered_bytes = 0
@@ -285,51 +477,22 @@ class Pipeline:
         return {'case': self.case, 'stage': item.stage, 'id': item.id, 'base': self.pages.base,
                 'target': self.pages.target, 'model': self.model, 'prompt': PROMPT_VERSION, 'request': item.request}
 
-    def _time_left(self):
-        left = self.deadline - self.clock()
-        if left <= 0:
-            raise im.StaleUpdate("the attempt ran out of time")
-        return left
-
-    def _unpaid(self):
-        """A refusal is only a skip while nothing has been sent; after any paid call it is a failure, so the
-        failure streak and its hold still apply."""
-        return self.budget.calls == 0
-
-    def _count(self, request, output, ceiling=None):
-        """(counted tokens, the limit this request must fit). An Anthropic model's count is authoritative or
-        nothing, as for every send; the update is stopped rather than sent on an estimate. Counting spends the
-        attempt's time like everything else, so no count starts, or is believed, after the deadline."""
-        from repo_radar.model_catalog import acceptance_budget, get_caps
-        counted = self.session.count_request(request, timeout=self._time_left())
-        self._time_left()
-        caps = get_caps(self.model)
-        estimated = getattr(counted, 'local_plan', False)
-        if caps is not None and caps.count_strategy == 'anthropic_api' and not counted.authoritative and not estimated:
-            raise im.StaleUpdate(f"token count unavailable ({counted.reason or 'unknown'})", warning=self._unpaid())
-        if counted.tokens is None:
-            raise im.StaleUpdate("token count unavailable", warning=self._unpaid())
-        limit = acceptance_budget(self.model, output)
-        return counted.tokens, min(limit, ceiling) if ceiling else limit
-
-    def _single_shot(self, system, message, output, ceiling=None):
+    def _single_shot(self, stage, item_id, system, message, output, seconds, ceiling=None):
         from repo_radar import llm
         conversation = llm.Conversation(self.model, system)
         conversation.add_user(message)
         request = conversation.request(output, low_effort=True, json_reply=True)
-        out = llm.output_budget(self.model, output)
-        tokens, limit = self._count(request, out, ceiling)
-        return request, tokens, out, limit
+        return self.executor.prepare(stage, item_id, request, llm.output_budget(self.model, output), seconds, ceiling)
 
     def _map_message(self, page):
         return (f"Repository: {self.full_name}\nAnalyzed commit: {self.pages.base}\nNew commit: {self.pages.target}\n\n"
                 f"Existing summary sections (id: title):\n{self.titles}\n\n{self.pages.read(page)}")
 
-    def _map_item(self, page):
-        request, tokens, out, limit = self._single_shot(MAP_SYSTEM, self._map_message(page), MAP_OUTPUT)
-        if tokens > limit:
-            raise im.StaleUpdate(f"page {page.id} ({tokens:,} tokens) would not fit the model's input budget")
-        return WaveItem('map', page.id, request, tokens, out, MAP_SECONDS)
+    def map_item(self, page):
+        item = self._single_shot('map', page.id, MAP_SYSTEM, self._map_message(page), MAP_OUTPUT, MAP_SECONDS)
+        if item.tokens > item.limit:
+            raise im.StaleUpdate(f"page {page.id} ({item.tokens:,} tokens) would not fit the model's input budget")
+        return item
 
     def _omission_text(self):
         """What wasn't analyzed, for the editor: complete counts, and a listing that stays bounded however
@@ -406,8 +569,8 @@ class Pipeline:
         ceiling, or the model's own input budget when that is smaller."""
         from repo_radar import llm
         out = llm.output_budget(self.model, EDIT_OUTPUT)
-        tokens, limit = self._count(request, out, EDIT_REQUEST_TOKENS)
-        return tokens, out, limit
+        counted, limit = self.executor.count(request, out, EDIT_REQUEST_TOKENS)
+        return counted.tokens, out, limit
 
     @staticmethod
     def _prepared(limit):
@@ -428,9 +591,9 @@ class Pipeline:
         diff_pages = self.pages.diff_pages
         map_tokens = 0
         for page in diff_pages:
-            self._time_left()
-            map_tokens += self._map_item(page).tokens
-        self._time_left()
+            self.executor.time_left()
+            map_tokens += self.map_item(page).tokens
+        self.executor.time_left()
         request = self._edit_conversation([]).request(EDIT_OUTPUT)
         base_tokens, edit_out, edit_limit = self._edit_output_and_limit(request)
         if base_tokens + edit_out + CONTINUATION_TOKENS > self._prepared(edit_limit):
@@ -456,63 +619,13 @@ class Pipeline:
             rate_valid_until=rates.valid_until if rates else None)
         return self.quote
 
-    # ---- one wave --------------------------------------------------------------------------------
+    # ---- the driver's hooks -----------------------------------------------------------------------
 
-    def _wave(self, items):
-        """Reserve `items` together, send them concurrently and account for every one, whatever else went
-        wrong. Returns (turns, failure): a turn per item, None where its send failed, and the first thing
-        that must stop further work. Accepted siblings are still usable as evidence; _after_wave raises."""
-        from repo_radar import llm
-        left = self.deadline - self.clock()
-        if left <= 5:
-            raise im.StaleUpdate("the attempt ran out of time")
-        try:
-            reservations = self.budget.reserve_many([(self._identity(i), i.tokens, i.output) for i in items])
-        except BudgetError as e:
-            raise im.StaleUpdate(str(e), warning=self._unpaid()) from None
-
-        def send(item):
-            started = time.monotonic()
-            return llm.call_model_turn(item.request, min(item.seconds, left)), time.monotonic() - started
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WAVE) as pool:
-            futures = [pool.submit(send, item) for item in items]
-            concurrent.futures.wait(futures)
-        turns, send_error, storage_error, unknown = [], None, None, False
-        for item, reservation, future in zip(items, reservations, futures):
-            error = future.exception()
-            record = {'stage': item.stage, 'id': item.id, 'counted_tokens': item.tokens, 'max_output': item.output}
-            if error is not None:
-                try:
-                    self.budget.fail(reservation)
-                except LedgerWriteError as e:
-                    storage_error = storage_error or e
-                self.calls.append({**record, 'status': 'error', 'error': type(error).__name__})
-                send_error = send_error or error
-                turns.append(None)
-                continue
-            turn, seconds = future.result()
-            try:
-                cost = self.budget.settle(reservation, turn.usage, turn.cost)
-            except LedgerWriteError as e:
-                storage_error = storage_error or e
-                cost = e.cost
-            unknown = unknown or cost is None
-            self.calls.append({**record, 'status': turn.status, 'seconds': round(seconds, 3), 'cost_usd': cost,
-                               'input_tokens': turn.usage.input_tokens if turn.usage else None,
-                               'output_tokens': turn.usage.output_tokens if turn.usage else None})
-            turns.append(turn)
-        stages = Counter(call['stage'] for call in self.calls)
-        self.budget.extra.update(map_calls=stages['map'], merge_calls=stages['merge'], edit_turns=stages['edit'])
-        failure = send_error or storage_error
-        if failure is None and unknown:
-            failure = im.StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
-                                     "any further paid request")
-        return turns, failure
-
-    def _after_wave(self, failure):
+    def after_wave(self, failure):
         """Save what this wave paid for, then stop if anything went wrong. A failed evidence write stops new
         work too, without hiding the failure that came first."""
+        stages = Counter(call['stage'] for call in self.calls)
+        self.budget.extra.update(map_calls=stages['map'], merge_calls=stages['merge'], edit_turns=stages['edit'])
         try:
             self._save_evidence()
         except Exception as e:
@@ -520,7 +633,11 @@ class Pipeline:
         if failure is not None:
             raise failure
 
-    # ---- map -------------------------------------------------------------------------------------
+    def progress(self, stage, done, total=None):
+        if stage == 'map':
+            self.log(f"read {done} of {total} diff pages", 20 + 50 * done // total)
+        else:
+            self.log(f"merged notes, level {done}", 75)
 
     def _note_from(self, item, turn, files, limit, merged):
         """An accepted note, citing only `files`. Its repair counts go on its call record and the attempt's
@@ -539,87 +656,47 @@ class Pipeline:
         self.budget.extra.update(self.repairs)
         return note, text
 
-    def map_stage(self):
-        diff_pages = self.pages.diff_pages
-        nodes = []
-        for start in range(0, len(diff_pages), MAX_WAVE):
-            batch = diff_pages[start:start + MAX_WAVE]
-            items = [self._map_item(page) for page in batch]
-            turns, failure = self._wave(items)
-            for page, item, turn in zip(batch, items, turns):
-                if turn is None:
-                    continue
-                try:
-                    note, text = self._note_from(item, turn, page.file_ids, MAX_NOTE_BYTES, merged=False)
-                except im.StaleUpdate as e:   # the rest of the wave is still valid evidence
-                    failure = failure or e
-                    continue
-                node = Node(page.id, frozenset({page.id}), frozenset(page.file_ids), note, text)
-                nodes.append(node)
-                self.nodes.append(node)
-            self._after_wave(failure)
-            done = start + len(batch)
-            self.log(f"read {done} of {len(diff_pages)} diff pages", 20 + 50 * done // len(diff_pages))
-        return nodes
+    def map_node(self, page, item, turn):
+        note, text = self._note_from(item, turn, page.file_ids, MAX_NOTE_BYTES, merged=False)
+        return Node(page.id, frozenset({page.id}), frozenset(page.file_ids), note, text)
 
-    # ---- merge -----------------------------------------------------------------------------------
+    def groups(self, nodes, level):
+        return group_nodes(len(nodes), level)
 
-    def _merge_item(self, level, index, children):
-        """The merge request, the files its children cover, and the only ids it may cite: those in its table."""
-        files = frozenset().union(*(child.files for child in children))
+    def reduce_item(self, level, index, children):
+        """The merge request, which may cite only the file ids in its table."""
         listing = '\n'.join(child.text for child in children)
         message = (f"Repository: {self.full_name}\nAnalyzed commit: {self.pages.base}\nNew commit: {self.pages.target}\n\n"
                    f"Existing summary sections (id: title):\n{self.titles}\n\n"
                    f"The file ids these notes name (status, old_path, new_path):\n{self._file_identities(children)}\n\n"
                    f"Notes to merge, one per line:\n{listing}")
-        request, tokens, out, limit = self._single_shot(MERGE_SYSTEM, message, MERGE_OUTPUT, MERGE_INPUT_TOKENS)
-        if tokens > limit:
-            raise im.StaleUpdate(f"a merge of {len(children)} notes ({tokens:,} tokens) would not fit its input limit")
-        return WaveItem('merge', f"l{level}-g{index}", request, tokens, out, MERGE_SECONDS), files, self._cited(children)
+        item = self._single_shot('merge', f"l{level}-g{index}", MERGE_SYSTEM, message, MERGE_OUTPUT, MERGE_SECONDS,
+                                 MERGE_INPUT_TOKENS)
+        if item.tokens > item.limit:
+            raise im.StaleUpdate(f"a merge of {len(children)} notes ({item.tokens:,} tokens) would not fit its input limit")
+        return item
 
-    def _merge_level(self, level, nodes):
-        groups = group_nodes(len(nodes), level)
-        merged = {}
-        work = [(i, group) for i, group in enumerate(groups) if len(group) > 1]
-        for start in range(0, len(work), MAX_WAVE):
-            batch = work[start:start + MAX_WAVE]
-            built = [self._merge_item(level, i, [nodes[n] for n in group]) for i, group in batch]
-            turns, failure = self._wave([item for item, _files, _cited in built])
-            for (i, group), (item, files, cited), turn in zip(batch, built, turns):
-                if turn is None:
-                    continue
-                try:
-                    note, text = self._note_from(item, turn, cited, MAX_MERGED_NOTE_BYTES, merged=True)
-                except im.StaleUpdate as e:
-                    failure = failure or e
-                    continue
-                # Coverage is the children's pages, whatever the model chose to repeat.
-                pages = frozenset().union(*(nodes[n].pages for n in group))
-                merged[i] = Node(item.id, pages, files, note, text)
-                self.nodes.append(merged[i])
-            self._after_wave(failure)
-            self.log(f"merged notes, level {level}", 75)
-        return [merged[i] if i in merged else nodes[group[0]] for i, group in enumerate(groups)]
+    def reduce_node(self, item, turn, children):
+        note, text = self._note_from(item, turn, self._cited(children), MAX_MERGED_NOTE_BYTES, merged=True)
+        return frozenset().union(*(child.files for child in children)), note, text
 
-    def merge_stage(self, nodes):
-        """Merge along the quoted schedule until the notes can go to the editor: within the direct limit, and
-        with room in its first request for a tool-calling reply. With one note left and no such room, the
-        editor answers without tools if that fits. Each level reduces the count."""
-        level = 0
-        while True:
-            total = sum(len(node.text.encode('utf-8')) for node in nodes)
-            if total <= MAX_DIRECT_NOTES_BYTES:
-                tokens, out, limit = self._edit_output_and_limit(self._edit_conversation(nodes).request(EDIT_OUTPUT))
-                prepared = self._prepared(limit)
-                if tokens + out + CONTINUATION_TOKENS <= prepared:
-                    return nodes
-                if len(nodes) < 2:
-                    if tokens <= prepared:
-                        return nodes
-                    raise im.StaleUpdate(f"the notes and document ({tokens:,} tokens) would not fit the editor's "
-                                         f"{prepared:,} token limit")
-            level += 1
-            nodes = self._merge_level(level, nodes)
+    def ready(self, nodes, level):
+        """Whether the notes can go to the editor: within the direct limit, and with room in its first request
+        for a tool-calling reply. With one note left and no such room, the editor answers without tools if that
+        fits. Merging follows the quoted schedule, and each level reduces the count."""
+        total = sum(len(node.text.encode('utf-8')) for node in nodes)
+        if total > MAX_DIRECT_NOTES_BYTES:
+            return False
+        tokens, out, limit = self._edit_output_and_limit(self._edit_conversation(nodes).request(EDIT_OUTPUT))
+        prepared = self._prepared(limit)
+        if tokens + out + CONTINUATION_TOKENS <= prepared:
+            return True
+        if len(nodes) < 2:
+            if tokens <= prepared:
+                return True
+            raise im.StaleUpdate(f"the notes and document ({tokens:,} tokens) would not fit the editor's "
+                                 f"{prepared:,} token limit")
+        return False
 
     def verify_coverage(self, nodes):
         """Every prepared page is covered exactly once: by a note, or by an app-created omission note."""
@@ -732,8 +809,9 @@ class Pipeline:
             if tokens > limit:
                 raise im.StaleUpdate(f"the next request ({tokens:,} tokens) would not fit its {limit:,} token limit")
             self.log(f"editing the summary, turn {number}", 90)
-            turns, failure = self._wave([WaveItem('edit', f"t{number}", request, tokens, out, EDIT_SECONDS)])
-            self._after_wave(failure)
+            turns, failure = self.executor.wave([Prepared('edit', f"t{number}", request, tokens, limit, out, EDIT_SECONDS,
+                                                          tokens)])
+            self.after_wave(failure)
             turn = turns[0]
             if turn.status == 'tool_calls' and offers_tools:
                 self._deliver_tool_results(conversation, tools, turn)
@@ -783,14 +861,282 @@ class Pipeline:
             try:
                 self.budget.admit(quote.total_usd)
             except BudgetError as e:
-                raise im.StaleUpdate(str(e), warning=self._unpaid()) from None
+                raise im.StaleUpdate(str(e), warning=self.executor.unpaid()) from None
             self.log(f"{quote.pages} pages, up to ${quote.total_usd or 0:.2f}", 20)
-            nodes = self.merge_stage(self.map_stage())
+            nodes = map_reduce(self, self.pages.diff_pages)
             self.verify_coverage(nodes)
             candidate = self.edit_stage(nodes)
         except BaseException:
             with contextlib.suppress(Exception):   # the failure that stopped the update is the one to report
                 self._save_evidence()
             raise
-        self._after_wave(None)
+        self.after_wave(None)
         return candidate
+
+
+# ---- the full adapter ------------------------------------------------------------------------------
+
+# The most input a protected full-build request (whole repository, chunk or reduction) may carry: counted
+# for the complete request, after its output and the model's headroom are set aside. Not raw source.
+FULL_INPUT_TARGET = 128_000
+# A whole-repository prompt longer than this many bytes per token of the target can't fit it, so it is
+# never counted: skipping the count only ever chooses chunks, which is always safe.
+SINGLE_SKIP_BYTES_PER_TOKEN = 8
+
+# One chunk request: its 1-based index, the total, its files (or ordered parts of one) and the request.
+Chunk = namedtuple('Chunk', 'index total files item')
+
+
+class FullBuild:
+    """The full adapter: a complete document for a protected full build, from the pinned files
+    incremental_metadata.pinned_files selected and withheld nothing from.
+
+    Every request (the whole repository, a chunk or a reduction) is counted complete and must fit
+    min(FULL_INPUT_TARGET, the model's acceptance budget). Requests go one at a time through the shared
+    executor, each reserving its worst case against the attempt's cap before it is sent; when the count is
+    only a local estimate, that worst case is the model's whole input limit. Every selected file reaches a
+    chunk whole or as ordered, labelled parts, and every chunk's analysis reaches the final reduction. When
+    something can't fit, a guard runs out or a reply is incomplete, the build stops and nothing is excerpted.
+    budget.extra['full_stage'] says which call was last attempted and how it ended."""
+
+    def __init__(self, full_name, files, model, session, budget, log=None):
+        self.full_name, self.files, self.model, self.budget = full_name, files, model, budget
+        self.executor = Executor(model, session, budget, lambda item: item.request, width=1, conservative_cost=True)
+        self.log = log or (lambda *a, **k: None)
+        self.nodes = []
+        self.sent = 0                # requests started, for saying where a failure happened
+        self.syntheses = 0
+        self.where, self.record = 'full', None
+        self._groups = {}            # the counted reduction requests of the current level, by group index
+
+    # ---- requests --------------------------------------------------------------------------------
+
+    def _prepare(self, stage, item_id, prompt, requested):
+        from repo_radar import llm
+        conversation = llm.Conversation(self.model, None)
+        conversation.add_user(prompt)
+        request = conversation.request(requested, low_effort=True)
+        try:
+            return self.executor.prepare(stage, item_id, request, llm.output_budget(self.model, requested),
+                                         im.REQUEST_SECONDS, FULL_INPUT_TARGET)
+        except im.StaleUpdate as e:
+            raise im.StaleUpdate(f"full {stage}: {e.reason}", warning=e.warning) from None
+
+    def _start(self, item, chunk=None, chunks=None):
+        """Record the request about to go out, before it is reserved or sent."""
+        self.sent += 1
+        self.where = f"full {item.stage}{f' {chunk}/{chunks}' if chunk else ''} (call {self.sent})"
+        self.record = {'stage': item.stage, 'call': self.sent, 'chunk': chunk, 'chunks': chunks, 'max_output': item.output}
+        self.budget.extra['full_stage'] = self.record
+        return item
+
+    def _text(self, turn):
+        self.record.update(turn.diagnostics or {})
+        if turn.status != 'complete':
+            raise im.StaleUpdate(f"the model's reply was {turn.status}")
+        return turn.text
+
+    def after_wave(self, failure):
+        """Stop on any failure, saying which call it was. Spending stops it as a failure, so the usual hold
+        after repeated failures applies; a refusal before anything was paid for is only a skip."""
+        if failure is None:
+            return
+        if isinstance(failure, LedgerWriteError):
+            raise failure
+        if isinstance(failure, im.StaleUpdate):
+            raise im.StaleUpdate(f"{self.where}: {failure.reason}",
+                                 warning=failure.warning and self.budget.calls == 0) from None
+        raise im.StaleUpdate(f"{self.where}: {type(failure).__name__}: {failure}") from None
+
+    def progress(self, stage, done, total=None):
+        if stage == 'map':
+            self.log(f"analyzed {done} of {total} chunks")
+
+    # ---- chunks ----------------------------------------------------------------------------------
+
+    def _chunk_item(self, files, index, total):
+        from repo_radar import llm
+        prompt = llm._build_analysis_prompt(self.full_name, files, index, total)
+        return self._prepare('chunk', f"c{index}", prompt, llm.CHUNK_OUTPUT)
+
+    def _first_packing(self, template):
+        """A starting partition by a local estimate per file, scaled once against the real count of its first
+        chunk so the estimate's bias doesn't make every chunk split. Only a guess: every chunk is counted
+        complete before anything is sent."""
+        from repo_radar import llm
+        sizes = [llm.count_tokens_for_budget(llm._frame_file(f) + '\n', self.model).count for f in self.files]
+
+        def pack(room):
+            chunks, start, used = [], 0, 0
+            for end, size in enumerate(sizes):
+                if end > start and used + size > room:
+                    chunks.append(self.files[start:end])
+                    start, used = end, 0
+                used += size
+            return chunks + [self.files[start:]]
+        room = max(template.limit - template.tokens - 64, 1)
+        chunks = pack(room)
+        probe = self._chunk_item(chunks[0], 1, len(chunks))
+        scale = max(probe.tokens - template.tokens, 1) / max(sum(sizes[:len(chunks[0])]), 1)
+        return pack(room / scale * 0.97) if abs(scale - 1) > 0.03 else chunks
+
+    def _fitting_prefix(self, files, index, total):
+        """The largest prefix of `files`, at least one, whose chunk request fits."""
+        lo, hi, best = 1, len(files) - 1, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            item = self._chunk_item(files[:mid], index, total)
+            if item.tokens <= item.limit:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def _split_file(self, file_info, index, total):
+        """Split a file too large for one chunk into its largest fitting first part and the rest, preferring a
+        line boundary. Nothing is dropped: the parts, in order, are the file. A template with no room for even
+        a little of it stops the build."""
+        source, part = file_info.get('source', file_info['path']), file_info.get('part', 1)
+        content = file_info['content']
+
+        def piece(text, number):
+            return {'path': f"{source} (part {number})", 'size': len(text), 'content': text, 'source': source,
+                    'part': number}
+        lo, hi, keep = 1, len(content) - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            item = self._chunk_item([piece(content[:mid], part)], index, total)
+            if item.tokens <= item.limit:
+                keep, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if keep == 0:
+            raise im.StaleUpdate(f"full chunk: no part of {source} fits a request of {FULL_INPUT_TARGET:,} tokens with "
+                                 f"its prompt")
+        line = content.rfind('\n', 0, keep)
+        if line >= keep // 2:
+            keep = line + 1
+        return piece(content[:keep], part), piece(content[keep:], part + 1)
+
+    def _check_chunks(self, chunks):
+        """Every selected file, in order and whole, across the chunks' files and parts."""
+        rebuilt = []
+        for file_info in (f for chunk in chunks for f in chunk.files):
+            source = file_info.get('source', file_info['path'])
+            if file_info.get('part', 1) > 1 and rebuilt and rebuilt[-1][0] == source:
+                rebuilt[-1] = (source, rebuilt[-1][1] + file_info['content'])
+            else:
+                rebuilt.append((source, file_info['content']))
+        if rebuilt != [(f['path'], f['content']) for f in self.files]:
+            raise im.StaleUpdate("full chunk: the chunks don't hold every selected file in order")
+
+    def chunks(self):
+        """The chunk requests, each counted complete with its real "(chunk i/N)" header. A chunk over the
+        target gives its largest fitting prefix and passes the rest on to the next chunk; a lone file over it
+        is split into parts. Changing the number of chunks changes every header, so the whole set is counted
+        again until one pass changes nothing."""
+        template = self._chunk_item([], 1, 1)
+        if template.tokens > template.limit:
+            raise im.StaleUpdate(f"full chunk: the prompt alone ({template.tokens:,} tokens) doesn't fit its "
+                                 f"{template.limit:,} token limit")
+        groups = self._first_packing(template)
+        for _pass in range(4 * len(self.files) + 8):
+            total, queue, done, items, changed = len(groups), list(groups), [], [], False
+            while queue:
+                files, index = queue.pop(0), len(done) + 1
+                item = self._chunk_item(files, index, total)
+                if item.tokens <= item.limit:
+                    done.append(files)
+                    items.append(item)
+                    continue
+                changed = True
+                if len(files) == 1:
+                    head, rest = self._split_file(files[0], index, total)
+                    done.append([head])
+                    queue.insert(0, [rest])
+                else:
+                    cut = self._fitting_prefix(files, index, total)
+                    done.append(files[:cut])
+                    if queue:
+                        queue[0] = files[cut:] + queue[0]
+                    else:
+                        queue.append(files[cut:])
+                items.append(None)
+            groups = done
+            if not changed:
+                chunks = [Chunk(i, total, files, item) for i, (files, item) in enumerate(zip(done, items), 1)]
+                self._check_chunks(chunks)
+                return chunks
+        raise im.StaleUpdate("full chunk: the chunks never settled into requests that fit")
+
+    # ---- the driver's hooks ----------------------------------------------------------------------
+
+    def map_item(self, chunk):
+        return self._start(chunk.item, chunk.index, chunk.total)
+
+    def map_node(self, chunk, item, turn):
+        return Node(item.id, frozenset({chunk.index}), frozenset(), None, self._text(turn))
+
+    def ready(self, nodes, level):
+        return level > 0 and len(nodes) == 1
+
+    def _synthesis_item(self, level, index, children):
+        from repo_radar import llm
+        prompt = llm._build_synthesis_prompt(self.full_name, [child.text for child in children])
+        return self._prepare('synthesis', f"l{level}-g{index}", prompt, llm.SYNTHESIS_OUTPUT_TOKENS)
+
+    def groups(self, nodes, level):
+        """Contiguous groups, each as many analyses as one complete reduction request can hold. The depth and
+        call guards stop the build rather than excerpt anything."""
+        from repo_radar import llm
+        if level > llm.SYNTHESIS_MAX_DEPTH:
+            raise im.StaleUpdate(f"full synthesis: {len(nodes)} analyses still don't fit one request after "
+                                 f"{llm.SYNTHESIS_MAX_DEPTH} levels")
+        groups, self._groups, start = [], {}, 0
+        while start < len(nodes):
+            index = len(groups)
+            item, end = self._synthesis_item(level, index, nodes[start:start + 1]), start + 1
+            if item.tokens > item.limit:
+                raise im.StaleUpdate(f"full synthesis: analysis {nodes[start].id} alone ({item.tokens:,} tokens) "
+                                     f"doesn't fit its {item.limit:,} token limit")
+            while end < len(nodes):
+                wider = self._synthesis_item(level, index, nodes[start:end + 1])
+                if wider.tokens > wider.limit:
+                    break
+                item, end = wider, end + 1
+            groups.append(list(range(start, end)))
+            self._groups[index] = item
+            start = end
+        if 1 < len(groups) == len(nodes):
+            raise im.StaleUpdate(f"full synthesis: no two of the {len(nodes)} analyses fit one request")
+        calls = 1 if len(groups) == 1 else sum(1 for group in groups if len(group) > 1) + 1
+        if self.syntheses + calls > llm.SYNTHESIS_MAX_CALLS:
+            raise im.StaleUpdate(f"full synthesis: reducing {len(nodes)} analyses would need more than "
+                                 f"{llm.SYNTHESIS_MAX_CALLS} synthesis calls")
+        return groups
+
+    def reduce_item(self, level, index, children):
+        self.syntheses += 1
+        return self._start(self._groups[index])
+
+    def reduce_node(self, item, turn, children):
+        return frozenset(), None, self._text(turn)
+
+    # ---- the whole build -------------------------------------------------------------------------
+
+    def run(self):
+        """The full document's text, in the existing full format."""
+        from repo_radar import llm
+        prompt = llm._build_full_repo_prompt(self.full_name, self.files)
+        if len(prompt.encode('utf-8')) <= SINGLE_SKIP_BYTES_PER_TOKEN * FULL_INPUT_TARGET:
+            item = self._prepare('single', 'single', prompt, llm.FULL_REPO_OUTPUT)
+            if item.tokens <= item.limit:
+                [node] = _settle_wave(self, [self._start(item)],
+                                      lambda _i, _item, turn: Node('single', frozenset(), frozenset(), None, self._text(turn)))
+                return node.text
+        chunks = self.chunks()
+        self.log(f"{len(chunks)} chunks")
+        nodes = map_reduce(self, chunks)
+        if len(nodes) != 1 or nodes[0].pages != frozenset(range(1, len(chunks) + 1)):
+            raise im.StaleUpdate("full synthesis: the result doesn't cover every chunk")
+        return nodes[0].text
