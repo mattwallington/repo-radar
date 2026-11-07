@@ -125,12 +125,12 @@ import pathlib
 import pytest
 
 
-@pytest.mark.parametrize("budget", [1100, 1200, 1600, 2500])
+@pytest.mark.parametrize("budget", [1250, 1350, 1600, 2500])
 def test_every_chunk_real_prompt_fits_even_at_tight_budgets(budget):
     """Component-sum packing under-counts the assembled prompt because tokenizer seams are not
     additive — a chunk that summed under budget can measure over. The repack pass must guarantee
     every REAL (i, N) prompt — actual header included — fits. Tight budgets pack several files per
-    chunk (2/3/5 here), so the seams actually bite (this is the class Codex reproduced at 917 ->
+    chunk (2 to 5 here, above the eight-subject template), so the seams actually bite (this is the class Codex reproduced at 917 ->
     934). Budgets stay above the header reserve + one file so packing isn't forced to singletons."""
     model = "claude-opus-5"
     chunks = llm.chunk_repo_files(_files(50, 8), model, max_tokens=budget, full_name="Org/repo")
