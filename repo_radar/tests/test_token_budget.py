@@ -112,7 +112,12 @@ def test_no_synthesis_prompt_exceeds_the_budget_for_claude_47(monkeypatch):
         seen.append((prompt, m))
         return "QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, m
 
-    llm.combine_chunk_analyses("Org/repo", analyses, model=model, synthesize=synthesize)
+    class LocalSession:   # a local-only count: the plan comes from the budget estimate
+        def count(self, model, prompt, requested_output):
+            from repo_radar.preflight import PreflightResult
+            return PreflightResult(None, False, "local estimate")
+
+    llm.combine_chunk_analyses("Org/repo", analyses, model=model, synthesize=synthesize, session=LocalSession())
     assert seen, "synthesis should have made at least one call"
     for prompt, m in seen:
         got = llm.count_tokens_for_budget(prompt, m).count
