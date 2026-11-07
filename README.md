@@ -21,7 +21,7 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 
 ## Install
 
-Download the latest release from [GitHub Releases](https://github.com/mattwallington/repo-radar/releases):
+Download the latest release from [GitHub Releases](https://github.com/ReperioHealth/repo-radar-releases/releases):
 
 | Mac Type | Download |
 |----------|----------|
@@ -144,7 +144,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ### Preparing a release
 
-Releases publish automatically from GitHub Actions to `ReperioHealth/repo-radar-releases` when `main` or `dev` changes; see "Releasing" in [DEVELOPMENT.md](DEVELOPMENT.md#releasing). Publishing with `release.sh` stays paused, because it still publishes to the old `mattwallington/repo-radar` feed. `./release.sh --help` still works, and `./release.sh --dry-run` still runs every gate in the verified release venv described below and exits successfully without changing anything. A run without `--dry-run` runs the same checks, then stops before changing any file, building, tagging, pushing or publishing.
+Releases publish automatically from GitHub Actions to `ReperioHealth/repo-radar-releases` when `main` or `dev` changes; see "Releasing" in [DEVELOPMENT.md](DEVELOPMENT.md#releasing). `release.sh` no longer publishes. `./release.sh --help` still works, and `./release.sh --dry-run` still runs every gate in the verified release venv described below and exits successfully without changing anything. A run without `--dry-run` runs the same checks, then stops before changing any file, building, tagging, pushing or publishing.
 
 `release.sh` runs its model-lifecycle and model-window gates in a dedicated release venv, never the `python3` on your `PATH`. Before running it, even with `--dry-run`, create that venv from the checked-in lock that matches its Python minor and architecture (`resources/pydeps/cp3<minor>-<arch>.lock`) and point `REPO_RADAR_RELEASE_PYTHON` at its `python`. On an Apple Silicon Mac with Python 3.14:
 
