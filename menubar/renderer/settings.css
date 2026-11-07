@@ -638,3 +638,15 @@ select.form-control {
     align-items: baseline;
     gap: 12px;
 }
+
+.form-control.spending-input {
+    max-width: 400px;
+}
+
+.form-error {
+    color: #c72525;
+}
+
+.form-error[hidden] {
+    display: none;
+}

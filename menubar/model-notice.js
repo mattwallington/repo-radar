@@ -1,5 +1,6 @@
 'use strict';
 const { migrateModel, suggestUpgrade, KNOWN_MODEL_IDS } = require('./model-policy');
+const { validateSpending } = require('./spending-settings');
 
 // A retired id migrates to the newest model of its tier, which never has a suggestion of its own
 // (drift-check.js enforces it), so a notice is either a migration or a suggestion, never both.
@@ -96,4 +97,14 @@ function persistConfig(config, { reconcileSchedule, save, reconcile }) {
   return { ok: true, schedule: { ok: !(!s || s.success === false), error: s && s.error } };
 }
 
-module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig };
+// The Settings window's Save. The spending fields are validated before anything is written, so a bad value
+// saves nothing. A dev build never reconciles the schedule here: saveConfigToFile keeps the stored schedule
+// for dev, so reconciling would only report dev's schedule prohibition as a failed save after the rest of the
+// settings had in fact been saved.
+function saveSettings(config, { channel, save, reconcile }) {
+  const invalid = validateSpending(config);
+  if (invalid) return { ok: false, stage: 'validate', error: invalid.message, field: invalid.field };
+  return persistConfig(config, { reconcileSchedule: channel !== 'dev', save, reconcile });
+}
+
+module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig, saveSettings };

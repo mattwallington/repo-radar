@@ -17,7 +17,7 @@ const { detectStableManaged } = require('./runtime/quiesce');
 const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
-const { parseModelLabels, persistConfig } = require('./model-notice');
+const { parseModelLabels, persistConfig, saveSettings } = require('./model-notice');
 // Activity History (Task 2.3): Electron-free trigger-glue wired into triggerSync()/stop-sync
 // below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
 const activityGlue = require('./activity/trigger-glue');
@@ -2591,8 +2591,10 @@ ipcMain.on('save-config', (event, config) => {
   // Unified save+reconcile primitive (shared with the model-notice finalize path), but the
   // Settings reply semantics are preserved EXACTLY as before this refactor: a schedule-only
   // failure still surfaces INLINE in the Settings window as config-saved(false, ...) rather than
-  // flipping to success + a separate tray warning.
-  const res = persistConfig(config, { reconcileSchedule: true, save: saveConfigToFile, reconcile: updateLaunchAgent });
+  // flipping to success + a separate tray warning. saveSettings refuses invalid spending values before
+  // writing anything (the field comes back so Settings can focus it) and skips schedule reconciliation
+  // for a dev save, whose schedule saveConfigToFile leaves as stored.
+  const res = saveSettings(config, { channel: runtimeChannel, save: saveConfigToFile, reconcile: updateLaunchAgent });
   const scheduleFailed = res.ok && res.schedule && res.schedule.ok === false;
 
   if (settingsWindow && !settingsWindow.isDestroyed()) {
@@ -2600,7 +2602,7 @@ ipcMain.on('save-config', (event, config) => {
       console.error('Failed to update LaunchAgent:', res.schedule.error);
       settingsWindow.webContents.send('config-saved', false, 'Config saved but failed to update schedule: ' + (res.schedule.error || ''));
     } else {
-      settingsWindow.webContents.send('config-saved', res.ok, res.error);
+      settingsWindow.webContents.send('config-saved', res.ok, res.error, res.field);
     }
   }
 
