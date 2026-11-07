@@ -6,19 +6,22 @@ client (counts). Sockets are blocked, keys are fake, nothing is paid for.
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import threading
+import time
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 
+from repo_radar import incremental_map_reduce as mr
 from repo_radar import incremental_metadata as im
-from repo_radar import metadata, metadata_snapshot as snap
-from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, PricingUnavailable
+from repo_radar import config as repo_config, metadata, metadata_snapshot as snap
+from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, LedgerWriteError, PricingUnavailable
 from repo_radar.modes import sync as S
 from repo_radar.preflight import PreflightSession
 
@@ -89,6 +92,19 @@ def tool_use(name, args, call_id='toolu_1'):
 
 def answer(obj):
     return claude([{"type": "text", "text": json.dumps(obj)}])
+
+
+def note(reason='no effect on the summary'):
+    """A map call's reply for one diff page."""
+    return answer({'changes': [], 'questions': [], 'no_summary_change_reason': reason})
+
+
+def spooled_pages(repo, base, target, base_snap, target_snap, changes, exclusions, tmp_path):
+    """The filtered pages of an update: (the text of every page, the paths recorded as omitted)."""
+    import tempfile
+    pages = snap.prepare_pages(repo.path, base, target, base_snap.manifest(), target_snap.manifest(), changes, exclusions,
+                               tempfile.mkdtemp(dir=tmp_path))
+    return ''.join(pages.read(p) for p in pages.diff_pages), {path for path, _why in pages.omitted}
 
 
 class Repo:
@@ -173,10 +189,10 @@ def setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=1), files
     return repo, base, pristine
 
 
-def decide(repo, pristine, now=NOW, model=MODEL, force=False):
+def decide(repo, pristine, now=NOW, model=MODEL, force=False, **kw):
     doc = im.load_document(pristine, 'app-abc1234')
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
-    return im.decide(repo.path, FULL, doc, state, model, snap.resolve_commit(repo.path, 'HEAD'), now, force=force)
+    return im.decide(repo.path, FULL, doc, state, model, snap.resolve_commit(repo.path, 'HEAD'), now, force=force, **kw)
 
 
 REPO_CONFIG = {'full_name': FULL, 'clone_url': 'https://github.com/o/app.git'}
@@ -273,17 +289,59 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
         for p in paths:
             repo.write(p, (repo.path / p).read_text().replace('x = 1', 'x = 2', 1))
 
-    # One small change is incremental; exactly 20% stays incremental; more than 20% is full.
+    # How much changed never selects a full rebuild; the fraction is only a diagnostic.
     edit_in_place(['src/m0.py'])
     repo.commit()
     assert decide(repo, pristine).strategy == 'incremental'
-    edit_in_place(['src/m1.py'])
+    edit_in_place([f'src/m{i}.py' for i in range(1, 9)])
     repo.commit()
     d = decide(repo, pristine)
-    assert (d.change.file_fraction, d.change.byte_fraction, d.strategy) == (0.2, 0.2, 'incremental')
-    edit_in_place(['src/m2.py'])
-    repo.commit()
-    assert decide(repo, pristine).strategy == 'full'
+    assert (d.change.file_fraction, d.strategy) == (0.9, 'incremental')
+
+    # An unfinished full rebuild chosen only by a removed size rule isn't owed, and its failure stays on
+    # record while the new path runs; a requested one still is.
+    doc = im.load_document(pristine, 'app-abc1234')
+    for reason, due in (('35 diff pages exceeds 8', False), ('31% of the source changed', False),
+                        ('diff exceeds the incremental size limit', False), ('regeneration requested', True)):
+        im.write_state(pristine, 'app-abc1234', {'strategy': 'full', 'status': 'failed', 'decision_reason': reason,
+                                                 'baseline_doc_sha256': doc.sha256, 'reason': 'turn limit',
+                                                 'adoption': d.adopt})
+        assert decide(repo, pristine).strategy == ('full' if due else 'incremental'), reason
+    Provider(monkeypatch).replies = []
+    im.write_state(pristine, 'app-abc1234', {'strategy': 'full', 'status': 'failed', 'reason': 'turn limit',
+                                             'decision_reason': '35 diff pages exceeds 8',
+                                             'baseline_doc_sha256': doc.sha256, 'adoption': d.adopt})
+    with PreflightSession() as session:
+        kept = update(pristine, repo, session)
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (kept.strategy, state['dropped_full_attempt']['reason']) == ('incremental', 'turn limit')
+    assert state['pipeline_version'] == im.PIPELINE_VERSION and 'full_rebuild_origin' not in state
+
+    # Its origin survives retries, whose own reason is generic. A size-triggered retry from 1.0.36 has no
+    # recoverable origin, so it owes nothing and the current rules decide; a forced one stays owed.
+    generic = {'strategy': 'full', 'status': 'failed', 'decision_reason': im.UNFINISHED_REASON,
+               'baseline_doc_sha256': doc.sha256, 'adoption': d.adopt}
+    for extra, due in (({}, False), ({'full_rebuild_origin': '35 diff pages exceeds 8'}, False),
+                       ({'full_rebuild_origin': 'regeneration requested'}, True)):
+        im.write_state(pristine, 'app-abc1234', {**generic, **extra})
+        assert decide(repo, pristine).strategy == ('full' if due else 'incremental'), extra
+    im.write_state(pristine, 'app-abc1234', {**generic, 'full_rebuild_origin': im.WEEKLY_REASON})
+    assert decide(repo, pristine).reason == im.UNFINISHED_REASON
+    assert decide(repo, pristine, full_rebuild_days=0).strategy == 'incremental'
+
+    # Consecutive real failures: the weekly origin survives a retry, and a setup failure keeps it on record.
+    (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
+    later = NOW + timedelta(days=8)
+    for reason in (im.WEEKLY_REASON, im.UNFINISHED_REASON):
+        with PreflightSession() as session:
+            failed = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, MODEL, session, now=later)
+        state = metadata.read_attempt_state(pristine, 'app-abc1234')
+        assert failed.status == 'failed' and state['decision_reason'] == reason
+        assert state['full_rebuild_origin'] == im.WEEKLY_REASON
+    im.record_failure(pristine, 'app-abc1234', FULL, 'setup broke')
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['full_rebuild_origin'] == im.WEEKLY_REASON
+    assert decide(repo, pristine, full_rebuild_days=0).strategy == 'incremental'
+    (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
 
     # A deletion and a file crossing the 100 KiB ceiling both count as changed eligible source.
     repo.git('reset', '-q', '--hard', base)
@@ -297,6 +355,14 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     repo.git('reset', '-q', '--hard', base)
     assert decide(repo, pristine, now=NOW + timedelta(days=5, hours=23)).strategy == 'none'
     assert decide(repo, pristine, now=NOW + timedelta(days=6)).reason == 'weekly full rebuild due'
+    # The setting: another age, or 0 for none, which also drops a weekly rebuild that didn't finish.
+    assert decide(repo, pristine, now=NOW + timedelta(days=2), full_rebuild_days=3).reason == 'weekly full rebuild due'
+    assert decide(repo, pristine, now=NOW + timedelta(days=400), full_rebuild_days=0).strategy == 'none'
+    assert repo_config.incremental_full_rebuild_days({}) == 7
+    assert repo_config.incremental_full_rebuild_days({'incremental_full_rebuild_days': 0}) == 0
+    for bad in (-1, True, '7', 1.5):
+        with pytest.raises(ValueError):
+            repo_config.incremental_full_rebuild_days({'incremental_full_rebuild_days': bad})
     assert decide(repo, pristine, force=True).strategy == 'full'
     metadata_state = {'adoption': decide(repo, pristine).adopt}
     im.write_state(pristine, 'app-abc1234', metadata_state)
@@ -315,16 +381,121 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
 
     # A normal sync takes the real dispatch: fetch, decide, update incrementally, publish, index.
     doc = im.load_document(pristine, 'app-abc1234')
-    provider.replies = [answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    provider.replies = [note(), answer({'base_document_sha256': doc.sha256, 'sections': []})]
     assert S.sync_mode(_sync_args()) == 0
     new = im.load_document(pristine, 'app-abc1234')
     assert new.info['last_commit'] == repo.git('rev-parse', 'origin/main') and new.info['generation_strategy'] == 'incremental'
-    assert len(provider.messages()) == 1
+    assert len(provider.messages()) == 2
     assert 'stale' not in (pristine / 'INDEX.md').read_text()
 
     # A malformed opt-in list is refused before any work.
     config['incremental_metadata_repos'] = ['o/*']
     assert S.sync_mode(_sync_args()) == 1
+
+    # Two failed updates in a row hold a scheduled sync, through the real dispatch and its trigger, with no
+    # model call even when a weekly rebuild is due. A person retries, and only a publication clears it.
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'held')
+    repo.write('src/m0.py', '# changed\n')
+    target = repo.commit()
+    provider = Provider(monkeypatch)
+    kept = (pristine / 'app-abc1234.md').read_text()
+    boom = httpx.Response(500, json={"error": {"message": "boom"}})
+
+    def dispatched(trigger, **flags):
+        monkeypatch.setenv('REPO_RADAR_TRIGGER', trigger)
+        provider.sends.clear(); provider.counts.clear()
+        ctx, events = _ctx()
+        with PreflightSession() as session:
+            S.generate_repo_metadata((REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1), session,
+                                     _sync_args(_incremental_repos=frozenset({FULL}), **flags), ctx)
+        return ctx, [f for name, f in events if name == 'metadata_incremental'][0]
+
+    def failures():
+        return metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures']
+
+    for count in (1, 2):
+        provider.replies = [boom]
+        ctx, event = dispatched('scheduled')
+        assert (event['status'], ctx.stats['errors'], failures()) == ('failed', 1, count) and provider.sends
+    last_usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    for trigger in ('scheduled', 'catchup', 'cli'):
+        ctx, event = dispatched(trigger)
+        assert (event['status'], event['level'], ctx.stats['skipped'], ctx.stats['errors']) == ('skipped', 'warn', 1, 0)
+        assert 'held after 2 failed updates' in event['reason'] and not provider.sends and not provider.counts
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (state['status'], state['usage'], failures()) == ('skipped', last_usage, 2) and state['last_failure_reason']
+    assert (pristine / 'app-abc1234.md').read_text() == kept
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    assert 'held after 2 failed updates' in (pristine / 'INDEX.md').read_text()
+    assert 'held after 2' in S._dry_run_decision(repo.path, 'app-abc1234', FULL, _sync_args())
+    # A setup failure rewrites the attempt's baseline hash, here to nothing, without detaching the count: once
+    # the document is readable again the sync is still held. Neither makes a model call.
+    (pristine / 'app-abc1234.md').write_bytes(b'\xff' + kept.encode())
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'failed' and not provider.sends and not provider.counts and failures() == 2
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['baseline_doc_sha256'] is None
+    (pristine / 'app-abc1234.md').write_text(kept)
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'skipped' and 'held after 2' in event['reason'] and not provider.sends and not provider.counts
+    monkeypatch.setenv('REPO_RADAR_TRIGGER', 'scheduled')
+    with PreflightSession() as session:   # a weekly rebuild being due changes nothing
+        weekly = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, MODEL, session,
+                                      now=NOW + timedelta(days=30), trigger='scheduled')
+    assert weekly.status == 'skipped' and weekly.strategy == 'full' and not provider.sends and not provider.counts
+
+    # A manual sync that fails again leaves it held. A forced rebuild also gets through, and a skip doesn't count.
+    provider.replies = [boom]
+    _ctx_manual, event = dispatched('manual')
+    assert event['status'] == 'failed' and provider.sends and failures() == 3
+    assert dispatched('scheduled')[1]['status'] == 'skipped' and not provider.sends
+    provider.count_tokens = lambda body: httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+    assert dispatched('manual')[1]['status'] == 'skipped' and failures() == 3
+    provider.count_tokens = 1000
+    provider.replies = [boom]
+    assert dispatched('scheduled', regenerate_metadata=True)[1]['status'] == 'failed' and provider.sends and failures() == 4
+
+    # The next manual success publishes, resets the count, and scheduled syncs spend again.
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]   # the forced rebuild it still owes
+    assert dispatched('manual')[1]['status'] == 'published' and provider.sends and failures() == 0
+    assert 'last_failure_reason' not in metadata.read_attempt_state(pristine, 'app-abc1234')
+    repo.write('src/m1.py', '# more\n')
+    repo.commit()
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    assert dispatched('scheduled')[1]['status'] == 'published' and provider.sends and failures() == 0
+    assert doc.info['last_commit'] == target
+
+    # A document replaced some other way starts the count again, even when a setup failure has already bound
+    # the attempt's baseline hash to it: the old count must not hold the new document.
+    repo.write('src/m2.py', '# and more\n')
+    repo.commit()
+    for count in (1, 2):
+        provider.replies = [boom]
+        assert dispatched('scheduled')[1]['status'] == 'failed' and failures() == count
+    held_doc = im.load_document(pristine, 'app-abc1234')
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert im.consecutive_failures(state, None) == 2, 'a missing document is no reason to buy another rebuild'
+    # While the held document is away, a manual retry that fails or is skipped keeps the streak on it, so
+    # when the same document comes back a scheduled sync is still held.
+    (pristine / 'app-abc1234.md').rename(tmp_path / 'held-away.md')
+    provider.replies = [boom]
+    assert dispatched('manual')[1]['status'] == 'failed' and provider.sends and failures() == 3
+    provider.count_tokens = lambda body: httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+    assert dispatched('manual')[1]['status'] == 'skipped' and failures() == 3
+    provider.count_tokens = 1000
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')[im.FAILURE_STREAK_DOC] == held_doc.sha256
+    (tmp_path / 'held-away.md').rename(pristine / 'app-abc1234.md')
+    ctx, event = dispatched('scheduled')
+    assert event['status'] == 'skipped' and 'held after 3' in event['reason'] and not provider.sends and not provider.counts
+    (pristine / 'app-abc1234.md').write_text(held_doc.text + '\nReplaced some other way.\n')
+    im.record_failure(pristine, 'app-abc1234', FULL, 'setup broke')
+    replaced = im.load_document(pristine, 'app-abc1234')
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (state['baseline_doc_sha256'], state['consecutive_failures']) == (replaced.sha256, 3)
+    assert im.consecutive_failures(state, replaced) == 0
+    provider.replies = [boom]
+    assert dispatched('scheduled')[1]['status'] == 'failed' and provider.sends and failures() == 1
+    monkeypatch.delenv('REPO_RADAR_TRIGGER')
 
     # A requested full rebuild that never published stays due on an unchanged, recent commit: after a
     # transient count skip, or an interruption after 'committing' but before the replacement. Once
@@ -352,6 +523,7 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     with PreflightSession() as session, pytest.raises(KeyboardInterrupt):
         update(pristine, repo, session)
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['full_rebuild_origin'] == 'regeneration requested', 'still owed after more than one failure'
     assert state['status'] == 'committing' and state['generation_id'] == im.load_document(pristine, 'app-abc1234').info['generation_id']
     assert im.document_exclusions(im.load_document(pristine, 'app-abc1234')) == snap.NO_EXCLUSIONS   # committed with it
     assert decide(repo, pristine).strategy == 'none'
@@ -389,7 +561,7 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     repo.write('src/m0.py', 'DIRTY WORKTREE\n')  # never seen: reads come from the pinned blobs
 
     base_snap, target_snap = snap.GitSnapshot(repo.path, base), snap.GitSnapshot(repo.path, target)
-    tools = snap.SnapshotTools(base_snap, target_snap, ['page'], snap.NO_EXCLUSIONS)
+    tools = snap.SnapshotTools(base_snap, target_snap, snap.NO_EXCLUSIONS)
     assert 'DIRTY' not in tools.run('read_file', json.dumps({'path': 'src/m0.py', 'limit': 2}))
     for path in ('../etc/passwd', '/etc/passwd', 'src/../.env'):
         assert 'is not a tracked file' in tools.run('read_file', json.dumps({'path': path}))
@@ -410,8 +582,7 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     long_dir.mkdir()
     for i in range(3):
         (long_dir / (f'fichier-{i}-' + 'é' * 60 + '.py')).write_text('haystack\n')
-    wide = snap.SnapshotTools(base_snap, snap.GitSnapshot(repo.path, repo.commit('wide names')), ['page'],
-                              snap.NO_EXCLUSIONS)
+    wide = snap.SnapshotTools(base_snap, snap.GitSnapshot(repo.path, repo.commit('wide names')), snap.NO_EXCLUSIONS)
     monkeypatch.setattr(snap, 'MAX_SEARCH_ARG_BYTES', 300)
     spawned = []
     real_run_git = snap.run_git
@@ -431,7 +602,7 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     doc = im.load_document(pristine, 'app-abc1234')
     sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(doc))}
     overview, components, schema = sections['## Overview'], sections['## Key Components'], sections['## Database Schema']
-    provider.replies = [lambda body: answer({
+    provider.replies = [note(), lambda body: answer({
         'base_document_sha256': doc.sha256,
         'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
                       'content': '## Key Components\n- src/m0.py: the entry point\n- src/helpers.py: helpers (renamed from src/m1.py)\n'},
@@ -462,15 +633,15 @@ def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):
     stale = im.split_sections(im._analysis_of(new))[1]
     sent = len(provider.messages())
     with PreflightSession() as session:
-        provider.replies = [answer({'base_document_sha256': new.sha256, 'sections': [
+        provider.replies = [note(), answer({'base_document_sha256': new.sha256, 'sections': [
             {'op': 'replace', 'id': stale.id, 'expected_sha256': '0' * 16, 'content': '## Key Components\nwrong\n'}]})]
         failed = update(pristine, repo, session)
         assert failed.status == 'failed' and 'expected_sha256' in failed.reason and not provider.replies
         assert im.load_document(pristine, 'app-abc1234').text == new.text
-        provider.replies = [answer({'base_document_sha256': new.sha256, 'sections': [
+        provider.replies = [note(), answer({'base_document_sha256': new.sha256, 'sections': [
             {'op': 'delete', 'id': 'x\n' * 3000, 'expected_sha256': stale.sha256}]})]
         huge = update(pristine, repo, session)
-        assert not provider.replies and len(provider.messages()) == sent + 2
+        assert not provider.replies and len(provider.messages()) == sent + 4
     saved = metadata.read_attempt_state(pristine, 'app-abc1234')['reason']
     assert huge.status == 'failed' and len(huge.reason) <= 240 and saved == huge.reason and '\n' not in saved
     assert im.load_document(pristine, 'app-abc1234').text == new.text
@@ -501,6 +672,8 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     with PreflightSession() as session:
         outcome = update(pristine, repo, session, force=True)
     assert outcome.status == 'published', outcome
+    assert provider.messages()[0]['output_config'] == {'effort': 'medium'}   # other providers keep their options
+    assert 'reasoning_effort' not in provider.messages()[0]
     traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
     assert 'SENTINEL' not in traffic, 'no credential or binary content reaches the provider'
     assert 'safe source' in traffic and 'EXAMPLE_VAR=' in traffic
@@ -518,16 +691,15 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     base_snap, target_snap = snap.GitSnapshot(repo.path, doc.info['last_commit']), snap.GitSnapshot(repo.path, target)
     changes = snap.changes_between(repo.path, doc.info['last_commit'], target)
     effective = snap.credential_exclusions(im.document_exclusions(doc), base_snap.manifest(), target_snap.manifest(), changes)
-    tools = snap.SnapshotTools(base_snap, target_snap, ['p'], effective)
+    tools = snap.SnapshotTools(base_snap, target_snap, effective)
     for path in [p for p in secrets if p != '.envrc'] + ['src/runtime.py']:
         assert 'unavailable: credential file' in tools.run('read_file', json.dumps({'path': path}))
     assert 'unavailable: binary file' in tools.run('read_file', '{"path": "src/blob.py"}')
     assert 'unavailable' not in tools.run('read_file', '{"path": "src/__init__.py"}')
     assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
-    pages, omitted = snap.build_diff(repo.path, doc.info['last_commit'], target, base_snap.manifest(),
-                                     target_snap.manifest(), changes, effective)
-    assert 'SENTINEL' not in ''.join(pages)
-    assert {p for p, _why in omitted} == {'.env.production.sh', 'src/runtime.py'}
+    pages, omitted = spooled_pages(repo, doc.info['last_commit'], target, base_snap, target_snap, changes, effective, tmp_path)
+    assert 'SENTINEL' not in pages
+    assert omitted == {'.env.production.sh', 'src/runtime.py'}
 
     def full_rebuild_traffic():
         provider.sends.clear(); provider.counts.clear()
@@ -554,7 +726,7 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
 
     # C, from the newly published B document: the protected file is edited and moved, and A's old
     # .env.production.sh bytes, known now only from the inherited record, reappear under another name.
-    # The incremental diff, reads, search and listing, the pilot's full caller and a published
+    # The incremental pages, reads and search, the pilot's full caller and a published
     # incremental update all keep them withheld, and the record grows.
     repo.git('mv', 'src/runtime.py', 'src/settings.py')
     repo.write('src/settings.py', (repo.path / 'src/settings.py').read_text() + 'export Z=SENTINEL-RC-C\n')
@@ -566,13 +738,12 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     effective = snap.credential_exclusions(im.document_exclusions(again), b_snap.manifest(), c_snap.manifest(), changes)
     assert {'src/settings.py', 'src/copy.py'} <= effective.paths and protected.paths <= effective.paths
     assert c_snap.manifest()['src/settings.py'].oid in effective.oids
-    pages, omitted = snap.build_diff(repo.path, target, target_c, b_snap.manifest(), c_snap.manifest(), changes, effective)
-    assert 'SENTINEL' not in ''.join(pages) and {p for p, _why in omitted} == {'src/settings.py', 'src/copy.py'}
-    tools = snap.SnapshotTools(b_snap, c_snap, pages, effective)
+    pages, omitted = spooled_pages(repo, target, target_c, b_snap, c_snap, changes, effective, tmp_path)
+    assert 'SENTINEL' not in pages and omitted == {'src/settings.py', 'src/copy.py'}
+    tools = snap.SnapshotTools(b_snap, c_snap, effective)
     for args in ({'path': 'src/settings.py'}, {'path': 'src/copy.py'}, {'path': 'src/runtime.py', 'version': 'base'}):
         assert 'unavailable: credential file' in tools.run('read_file', json.dumps(args))
     assert tools.run('search', '{"literal": "SENTINEL"}') == '[no matches]'
-    assert 'unavailable: credential file' in tools.run('list_paths', '{"prefix": "src/settings"}')
 
     provider.sends.clear(); provider.counts.clear()
     provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
@@ -585,6 +756,7 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     assert im.document_exclusions(pilot_doc) == effective
 
     provider.sends.clear(); provider.counts.clear()
+    # Every changed path here is withheld, so there is no page to map: only the editor is called.
     provider.replies = [tool_use('read_file', {'path': 'src/settings.py'}),
                         answer({'base_document_sha256': again.sha256, 'sections': []})]
     with PreflightSession() as session:
@@ -620,67 +792,628 @@ def test_one_exclusion_policy_for_full_builds_tools_and_diffs(monkeypatch, tmp_p
     assert not provider.sends and not provider.counts
 
 
-def test_a_diff_too_long_to_read_goes_straight_to_a_full_rebuild(monkeypatch, tmp_path):
-    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
-    repo.write('src/m0.py', '# edited\n')
-    target = repo.commit('a change below the 20% threshold')
-    small = decide(repo, pristine)
-    assert small.strategy == 'incremental'
+# ── The map, merge and edit engine ───────────────────────────────────────────────────────────────
 
-    def too_large(*_args):
-        raise snap.DiffTooLarge('too large')
-    monkeypatch.setattr(snap, 'build_diff', too_large)
-    assert decide(repo, pristine)[:2] == ('full', 'diff exceeds the incremental size limit')
+GEMINI = 'gemini/gemini-3.8-flash'
 
-    def git_failed(*_args):
-        raise snap.GitError('broken')
-    monkeypatch.setattr(snap, 'build_diff', git_failed)
-    with pytest.raises(snap.GitError):   # only the size signal selects a full rebuild
-        decide(repo, pristine)
 
-    monkeypatch.setattr(snap, 'build_diff', lambda *_args: (['page'] * 35, []))
-    provider = Provider(monkeypatch)
+class GeminiFake:
+    """A concurrent fake Gemini at the HTTP transport. `reply(stage, text)` answers each send with JSON
+    to return as the model's text, or an httpx.Response. Records every send and the most requests seen
+    in flight at once."""
 
-    # A direct caller holding an older decision stops without sending anything.
-    with PreflightSession() as session, pytest.raises(im.StaleUpdate, match='35 diff pages exceeds 8'):
-        im.run_incremental(repo.path, FULL, im.load_document(pristine, 'app-abc1234'), small, MODEL, session,
-                           Budget(MODEL, cap=8, label='incremental'))
-    assert not provider.sends and not provider.counts
+    def __init__(self, monkeypatch, reply):
+        self.sends, self.max_in_flight, self.in_flight = [], 0, 0
+        lock = threading.Lock()
+        fake = self
 
-    # The planner chooses the full rebuild up front, with nothing counted or sent first.
-    def no_incremental(*_args, **_kw):
-        raise AssertionError('the incremental runner was entered')
+        def handle(transport, request):
+            if request.url.host != 'generativelanguage.googleapis.com':
+                raise httpx.ConnectError(f"not the fake: {request.url}", request=request)
+            body = json.loads(request.content)
+            system = (body.get('system_instruction') or {'parts': [{'text': ''}]})['parts'][0]['text']
+            stage = ('map' if system.startswith('You read one page') else 'merge' if system.startswith('You merge')
+                     else 'edit' if system else 'full')
+            text = ''.join(p.get('text', '') for c in body['contents'] for p in c['parts'])
+            with lock:
+                fake.in_flight += 1
+                fake.max_in_flight = max(fake.max_in_flight, fake.in_flight)
+                fake.sends.append((stage, text, body))
+            time.sleep(0.005)
+            try:
+                out = reply(stage, text)
+                if isinstance(out, httpx.Response):
+                    return out
+                part = {"text": out} if isinstance(out, str) else out if 'functionCall' in out else {"text": json.dumps(out)}
+                return httpx.Response(200, json={
+                    "candidates": [{"content": {"parts": [part], "role": "model"}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "totalTokenCount": 120}})
+            finally:
+                with lock:
+                    fake.in_flight -= 1
 
-    def full_runs_first(*args, **kw):
-        assert not provider.sends and not provider.counts
-        return im.run_full(*args, **kw)
-    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
-    logged = []
+        monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', handle)
+
+    def stage(self, stage):
+        return [(text, body) for s, text, body in self.sends if s == stage]
+
+
+def small_pages(monkeypatch, size=2048):
+    """Real pages, just smaller, so a diff of many pages stays cheap to build."""
+    real = snap.prepare_pages
+    monkeypatch.setattr(snap, 'prepare_pages', lambda *a, **k: real(*a, page_bytes=size, **k))
+
+
+def rewrite_files(repo, lines):
+    for i in range(10):
+        repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(lines)))
+    return repo.commit('rewrite everything')
+
+
+def files_on_page(text):
+    return re.findall(r'^(f\d+) ', text, re.M)
+
+
+def dense(size):
+    """Text of about `size` bytes that counts about one token per two bytes."""
+    return ' '.join(f'{i:x}.' for i in range(size))[:size]
+
+
+def cited_identities(text):
+    """The file-id table in a merge or editor request."""
+    return json.loads(re.search(r'\(status, old_path, new_path\):\n(\{.*\})\n', text).group(1))
+
+
+def paths_on_page(text):
+    """Each listed file's displayed path on a diff page, by id (a rename's new path)."""
+    return {m[0]: m[1].split(' -> ')[-1] for m in re.findall(r'^(f\d+) \S+ (.+)$', text.split('[end of list]')[0], re.M)}
+
+
+def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path):
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    (repo.path / 'lib').mkdir()
+    repo.git('mv', 'src/m9.py', 'lib/renamed.py')
+    repo.write('src/crlf.py', 'a = 1\r\nb = 2\r\n')
+    for i in range(9):
+        repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
+    target = repo.commit('rewrite everything and rename one')
+    small_pages(monkeypatch)
+    old = im.load_document(pristine, 'app-abc1234')
+    sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(old))}
+    components = sections['## Key Components']
+    answer_patch = {'base_document_sha256': old.sha256,
+                    'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                                  'content': '## Key Components\n- values are rewritten\n'}]}
+    big_read = {'functionCall': {'name': 'read_file', 'args': {'path': 'src/m0.py', 'limit': 2000}}}
+    every_path = {f"f{n}": c.new_path or c.old_path
+                  for n, c in enumerate(snap.changes_between(repo.path, base, target), 1)}
+
+    def outside(ids):   # a real changed file's path that this request wasn't given
+        return next(path for file_id, path in every_path.items() if file_id not in ids)
+
+    # Some replies cite files by path, by something unsupported, or by nothing that can be placed. Exact
+    # paths of the request's own files become their ids; the rest is dropped and the change is kept.
+    def reply(stage, text):
+        if stage == 'map':   # JSON mode doesn't enforce a schema, so optional lists may come back null
+            ids, paths = files_on_page(text), paths_on_page(text)
+            files = {'[page p1 ': [paths[ids[0]], *ids[1:]],
+                     '[page p2 ': [*ids, 'src/nowhere.py', outside(ids)]}.get(text[text.index('[page p'):][:9], ids)
+            changes = [{'files': files, 'what': 'n' * 2600, 'sections': [components.id]}]
+            if '[page p3 ' in text:
+                changes.append({'files': ['src/nowhere.py'], 'what': 'UNATTRIBUTED map change', 'sections': []})
+            return {'changes': changes, 'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+        if stage == 'merge':
+            notes = text.split('Notes to merge', 1)[1]
+            files = [f.strip('"') for f in sorted(set(re.findall(r'"f\d+"', notes)), key=lambda f: int(f[2:-1]))]
+            changes = [{'files': files, 'what': dense(9000), 'sections': [components.id]}]
+            if '"files":[]' in notes:   # an unattributed change is carried forward as it is
+                changes.append({'files': [], 'what': 'UNATTRIBUTED, carried forward', 'sections': []})
+            if 'UNATTRIBUTED map change' in notes and '"disagreements"' not in notes:   # the first level-1 merge
+                table = cited_identities(text)
+                changes[0]['files'] = [table[files[0]]['new_path'], *files[1:], 'lib/nowhere.py', outside(table)]
+                changes.append({'files': ['f9999'], 'what': 'UNATTRIBUTED merge change', 'sections': []})
+            return {'changes': changes, 'questions': ['kept'], 'disagreements': None, 'no_summary_change_reason': None}
+        return answer_patch if 'last turn' in text else big_read   # read until tools are no longer offered
+    fake = GeminiFake(monkeypatch, reply)
+    evidence, real_init = tmp_path / 'evidence', mr.Pipeline.__init__
+
+    def keeping_evidence(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        self.evidence_dir = evidence
+    monkeypatch.setattr(mr.Pipeline, '__init__', keeping_evidence)
     with PreflightSession() as session:
-        outcome = update(pristine, repo, session, run_incremental_fn=no_incremental, run_full_fn=full_runs_first,
-                         log=logged.append)
-    assert (outcome.status, outcome.strategy) == ('published', 'full'), outcome
-    assert logged == ['full: 35 diff pages exceeds 8']
-    assert metadata.read_attempt_state(pristine, 'app-abc1234')['decision_reason'] == '35 diff pages exceeds 8'
-    assert provider.messages() and not provider.replies
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+    assert outcome.status == 'published', outcome
+
+    # Every page was mapped exactly once, at most four at a time, and each request stayed bounded.
+    maps, merges, edits = fake.stage('map'), fake.stage('merge'), fake.stage('edit')
+    assert len(maps) >= 400 and outcome.usage['diff_pages'] == len(maps)
+    assert sorted(int(re.search(r'\[page p(\d+) ', text).group(1)) for text, _b in maps) == list(range(1, len(maps) + 1))
+    assert fake.max_in_flight == 4
+    assert any('+b = 2\r\n' in text for text, _b in maps), 'CRLF line endings reach the model as they are'
+    assert max(len(text.encode()) for text, _b in maps) <= 2048 + 1024
+    assert max(len(text.encode()) for text, _b in merges) <= 66 * 1024 and 2 <= len(edits) <= 4
+
+    # Dense notes force a level their byte total alone wouldn't, and the quote already priced all of it.
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    usage = state['usage']
+    first, second = len(maps) // 16 + 1, (len(maps) // 16 + 1 + 4) // 5
+    assert len(merges) > first + second and len(merges) <= mr.worst_case_merges(len(maps))
+    assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
+    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0 and usage['rate_input_per_mtok'] == 0.75
+
+    # Every merge and editor request names each cited file's real status and paths.
+    changes = snap.changes_between(repo.path, base, target)
+    expected = {f"f{n}": {'status': c.status, 'old_path': c.old_path, 'new_path': c.new_path}
+                for n, c in enumerate(changes, 1)}
+    renamed = next(file_id for file_id, ref in expected.items() if ref['status'] == 'R')
+    assert expected[renamed]['new_path'] == 'lib/renamed.py'
+    for text, _body in (*merges, edits[0]):
+        table = cited_identities(text)
+        assert table and all(table[file_id] == expected[file_id] for file_id in table)
+    assert renamed in cited_identities(edits[0][0])
+
+    # A large read is cut to fit the counted request, within the delivered-bytes cap, and the edit still
+    # publishes; the last turn offers no tools.
+    assert mr.TOOL_TRUNCATED_NOTICE.strip() in json.dumps(edits[-1][1])
+    assert usage['tool_calls'] == len(edits) - 1 and usage['read_bytes'] <= mr.EDIT_TOOL_BYTES
+    assert edits[-1][1]['toolConfig']['functionCallingConfig']['mode'] == 'NONE' and 'last turn' in edits[-1][0]
+    assert 'NONE' not in json.dumps(edits[0][1].get('toolConfig', {}))
+    with PreflightSession() as session:   # each request stayed within the limit it was counted against
+        assert all(session.count_request({'endpoint': 'chat', 'model': GEMINI, 'messages': [
+            {'role': 'user', 'content': text}]}).tokens <= mr.EDIT_INPUT_TOKENS for text, _b in edits)
+
+    # The stage options went out on the wire: low effort and JSON for short stages, not for the editor.
+    def options(body):
+        config = body['generationConfig']
+        return config['max_output_tokens'], config.get('thinkingConfig', {}).get('thinkingLevel'), config.get('response_mime_type')
+    assert {options(b) for _t, b in maps} == {(2048, 'low', 'application/json')}
+    assert {options(b) for _t, b in merges} == {(4096, 'low', 'application/json')}
+    limit, level, mime = options(edits[0][1])
+    assert (limit, mime) == (16384, None) and level != 'low'
+
+    # The real patch and publication ran: the right commit, and untouched sections keep their bytes.
+    new = im.load_document(pristine, 'app-abc1234')
+    assert (new.info['last_commit'], new.info['generation_strategy']) == (target, 'incremental')
+    assert new.info['pipeline_version'] == im.PIPELINE_VERSION and 'values are rewritten' in new.text
+    untouched = [s for s in sections.values() if s.id != components.id]
+    assert all(s.text in new.text for s in untouched[:-1])
+    assert untouched[-1].text.rstrip('\n') in new.text   # rendering normalizes the document's final newlines
+    assert (usage['map_calls'], usage['merge_calls'], usage['edit_turns']) == (len(maps), len(merges), len(edits))
+
+    # Repaired citations: an exact path became its own id, nothing unsupported or borrowed got in, and the
+    # unattributed changes reached the editor with the app's warning, which the published note keeps.
+    saved = json.loads((evidence / 'notes.json').read_text())
+    notes = {n['id']: n for n in saved['notes']}
+    page_files = {p['id']: p['files'] for p in saved['pages']}
+    assert notes['p1']['note']['changes'][0]['files'] == page_files['p1']
+    assert notes['p2']['note']['changes'][0]['files'] == page_files['p2']   # the outside path wasn't borrowed
+    assert notes['p3']['note']['changes'][1] == {'files': [], 'what': 'UNATTRIBUTED map change', 'sections': []}
+    first = next(n for n in saved['notes'] if any(c['what'] == 'UNATTRIBUTED merge change' for c in n['note']['changes']))
+    children = {f for i in range(1, 17) for c in notes[f'p{i}']['note']['changes'] for f in c['files']}
+    assert first['id'] == 'l1-g0' and first['note']['changes'][0]['files'] == sorted(children, key=lambda f: int(f[1:]))
+    assert all(set(c['files']) <= set(n['files']) for n in saved['notes'] for c in n['note']['changes'])
+    for text, _body in (*merges, *edits[:1]):
+        assert 'nowhere' not in text and set(cited_identities(text)) <= set(expected)
+    assert 'UNATTRIBUTED' in edits[0][0] and mr.ATTRIBUTION_WARNING in edits[0][0]
+    assert new.info['coverage_note'].startswith(mr.ATTRIBUTION_WARNING)
+    calls = {(c['stage'], c['id']): c for c in saved['calls']}
+    assert (calls[('map', 'p1')]['normalized_file_citations'], calls[('map', 'p2')]['dropped_file_citations'],
+            calls[('map', 'p3')]['dropped_file_citations']) == (1, 2, 1)
+    assert (calls[('merge', 'l1-g0')]['normalized_file_citations'], calls[('merge', 'l1-g0')]['dropped_file_citations']) == (1, 3)
+    for key, total in (('normalized_file_citations', 2), ('dropped_file_citations', 6)):
+        assert usage[key] == sum(c.get(key, 0) for c in saved['calls']) == total
+
+    # Notes stay strict about their shape, sections and size: a wrong or missing field, an empty string, an
+    # unknown section, or a note over its limit as written, even one that dropping citations would shrink.
+    # An unknown file is dropped rather than refused.
+    long_path = 'src/' + 'p' * 400 + '.py'
+    paths = {long_path: 'f1'}
+    for bad in ({'changes': [], 'questions': 'x', 'no_summary_change_reason': 'r'},
+                {'changes': None, 'no_summary_change_reason': 'r'},
+                {'changes': [{'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': 'f1', 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': [''], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
+                {'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}], 'no_summary_change_reason': None},
+                {'changes': [{'files': [long_path], 'what': 'w' * 2800, 'sections': []}], 'no_summary_change_reason': None}):
+        with pytest.raises(mr.NoteError):
+            mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
+    note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
+                                            ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
+    assert note['changes'][0]['files'] == [] and repairs == {'normalized_file_citations': 0, 'dropped_file_citations': 1}
+
+
+def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    target = rewrite_files(repo, 80)
+    small_pages(monkeypatch, 4096)
+    old = im.load_document(pristine, 'app-abc1234')
+
+    def reply(stage, text):
+        assert stage == 'map'
+        if '[page p2 ' in text:
+            return httpx.Response(503, json={"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+        return {'changes': [], 'no_summary_change_reason': 'routine'}
+    fake = GeminiFake(monkeypatch, reply)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+
+    # The wave drained, the next never started, and nothing went on to a merge, an edit or publication.
+    assert outcome.status == 'failed' and len(fake.sends) == 4 and {s for s, _t, _b in fake.sends} == {'map'}
+    assert outcome.usage['diff_pages'] > 4 and outcome.usage['calls'] == 4 and outcome.usage['unknown_cost_calls'] == 1
+    assert outcome.usage['known_cost_usd'] > 0 and outcome.usage['retained_reservation_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    assert f"stale: analyzed {base[:7]}, update to {target[:7]}" in (pristine / 'INDEX.md').read_text()
+
+    # With a durable ledger the failed request's reservation stays, and a reopened ledger refuses more.
+    allowances = {'replay': 16.0}
+    path = tmp_path / 'ledger.json'
+    budget = Budget(GEMINI, cap=12.0, ledger=Ledger(path, 40.0, allowances), label='replay')
+    fake.sends.clear()
+    decision = decide(repo, pristine, model=GEMINI)
+    evidence = tmp_path / 'evidence'
+    with PreflightSession() as session, pytest.raises(Exception, match='overloaded|UNAVAILABLE|503'):
+        im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c1', evidence_dir=evidence)
+    assert len(fake.sends) == 4
+    reopened = Ledger(path, 40.0, allowances)
+    assert reopened.spent() == pytest.approx(budget.cost + budget.retained)
+    assert [e['status'] for e in json.loads(path.read_text())['entries']].count('unknown') == 1
+    with pytest.raises(BudgetExceeded, match='reconcile'):
+        Budget(GEMINI, ledger=reopened, label='replay').reserve({'next': 1}, 1, 1)
+    saved = json.loads((evidence / 'notes.json').read_text())
+    assert {n['id'] for n in saved['notes']} == {'p1', 'p3', 'p4'} and len(saved['calls']) == 4   # paid-for notes survive
+
+    # The ledger can't record the first settlement, and one sibling's note is malformed. Every launched
+    # call is still accounted for once, the bill stays honest, valid notes survive, nothing further runs,
+    # and the entry left unresolved on disk still blocks a reopened ledger.
+    def mostly_fine(stage, text):
+        assert stage == 'map'
+        if '[page p3 ' in text:
+            return {'changes': [{'files': [], 'what': 'a section it was never given', 'sections': ['s999']}]}
+        return {'changes': [], 'no_summary_change_reason': 'routine'}
+    fake = GeminiFake(monkeypatch, mostly_fine)
+    real_settle, failures = Ledger.settle, []
+
+    def flaky_settle(self, key, actual):
+        if not failures:
+            failures.append(key)
+            raise OSError(28, 'No space left on device')
+        return real_settle(self, key, actual)
+    monkeypatch.setattr(Ledger, 'settle', flaky_settle)
+    path = tmp_path / 'ledger-disk-full.json'
+    budget = Budget(GEMINI, cap=12.0, ledger=Ledger(path, 40.0, allowances), label='replay')
+    evidence = tmp_path / 'evidence-disk-full'
+    with PreflightSession() as session, pytest.raises(LedgerWriteError, match='No space left'):
+        im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c2', evidence_dir=evidence)
+    monkeypatch.setattr(Ledger, 'settle', real_settle)
+    usage = budget.summary()
+    assert len(fake.sends) == 4 and {s for s, _t, _b in fake.sends} == {'map'}
+    assert (usage['calls'], usage['unknown_cost_calls'], usage['ledger_write_failures']) == (4, 0, 1)
+    assert usage['open_reservation_usd'] == 0 and usage['known_cost_usd'] > 0 and usage['cost_usd'] == usage['known_cost_usd']
+    saved = json.loads((evidence / 'notes.json').read_text())
+    assert {n['id'] for n in saved['notes']} == {'p1', 'p2', 'p4'} and len(saved['calls']) == 4
+    statuses = [e['status'] for e in json.loads(path.read_text())['entries']]
+    assert sorted(statuses) == ['reserved', 'settled', 'settled', 'settled']
+    with pytest.raises(BudgetExceeded, match='reconcile'):
+        Budget(GEMINI, ledger=Ledger(path, 40.0, allowances), label='replay').reserve({'next': 1}, 1, 1)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+
+def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, files=20)
+    repo.write('.envrc', 'export A=SENTINEL-RC\n' + ''.join(f'export V{i}={i}\n' for i in range(20)))
+    repo.commit('a credential')
+    provider = Provider(monkeypatch)
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, force=True).status == 'published'
+
+    # Renamed and edited in one commit: this update sees it arrive under an ordinary name.
+    repo.git('mv', '.envrc', 'src/runtime.py')
+    repo.write('src/runtime.py', (repo.path / 'src/runtime.py').read_text() + 'export Z=SENTINEL-EDIT\n')
+    repo.write('src/m0.py', 'visible = "ordinary source"\n')
+    repo.commit('move the credential and edit it')
+    published = im.load_document(pristine, 'app-abc1234')
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [note(), tool_use('read_file', {'path': 'src/runtime.py'}),
+                        answer({'base_document_sha256': published.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'published'
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL' not in traffic and 'unavailable: credential file' in traffic and 'ordinary source' in traffic
+
+    # In a later update, across that publication, only the document's record still knows what it is.
+    repo.write('src/runtime.py', (repo.path / 'src/runtime.py').read_text() + 'export Y=SENTINEL-LATER\n')
+    repo.write('src/m1.py', 'more = "ordinary source"\n')
+    repo.commit('edit it again')
+    published = im.load_document(pristine, 'app-abc1234')
+    assert 'src/runtime.py' in im.document_exclusions(published).paths
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [note(), tool_use('search', {'literal': 'SENTINEL'}),
+                        answer({'base_document_sha256': published.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'published'
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL-' not in traffic and '[no matches]' in traffic and 'src/runtime.py' in traffic
+
+
+def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
+    from repo_radar import llm
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    monkeypatch.setattr(llm, 'authoritative_partition', lambda *a: 'chunk')
+    monkeypatch.setattr(llm, 'authoritative_chunks', lambda session, name, files, model: llm.PartitionResult(
+        [files[:5], files[5:]], None))
+    cut_off = httpx.Response(200, json={
+        "candidates": [{"content": {"parts": [{"text": "## Overview\nCut o"}], "role": "model"}, "finishReason": "MAX_TOKENS"}],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 40, "thoughtsTokenCount": 16344,
+                          "totalTokenCount": 16484}})
+
+    def reply(stage, text):
+        assert stage == 'full'
+        return cut_off if len(fake.sends) == 3 else '## Analysis\nOne chunk.\n'
+    fake = GeminiFake(monkeypatch, reply)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, force=True, now=NOW)
+
+    # Low thinking and the unchanged limits on all three requests, with no JSON mode and no retry.
+    configs = [body['generationConfig'] for _s, _t, body in fake.sends]
+    assert [c['max_output_tokens'] for c in configs] == [8192, 8192, 16384]
+    assert all(c['thinkingConfig']['thinkingLevel'] == 'low' and 'response_mime_type' not in c for c in configs)
+
+    # All three are paid for, the failure says where, and the document stays.
+    assert outcome.status == 'failed' and outcome.reason.startswith('full synthesis (call 3): ') and 'incomplete' in outcome.reason
+    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    assert usage['calls'] == 3 and usage['unknown_cost_calls'] == 0 and usage['cost_usd'] > 0 and usage['output_tokens'] > 0
+    assert usage['full_stage'] == {'stage': 'synthesis', 'call': 3, 'chunk': None, 'chunks': None, 'max_output': 16384,
+                                   'finish_reason': 'length', 'output_tokens': usage['full_stage']['output_tokens'],
+                                   'reasoning_tokens': 16344}
+    assert usage['full_stage']['output_tokens'] >= 40 and 'Cut o' not in json.dumps(usage)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+
+def credential_traffic(provider, pristine, repo):
+    """One published update, with every map call answered and the editor changing nothing. Returns what
+    went to the provider, counts included, and the published document."""
     doc = im.load_document(pristine, 'app-abc1234')
-    assert doc.info['generation_strategy'] == 'full' and doc.info['last_commit'] == target
+    provider.sends.clear(); provider.counts.clear()
+    provider.replies = [lambda body: answer({'base_document_sha256': doc.sha256, 'sections': []}) if 'tools' in body
+                        else note()] * 50
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'published', outcome
+    return json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts), im.load_document(pristine, 'app-abc1234')
+
+
+def later_edit_stays_withheld(provider, pristine, repo, path):
+    """Across the publication, only the document's record still knows what `path` is."""
+    repo.write(path, (repo.path / path).read_text() + 'export LATER=SENTINEL-LATER\n')
+    repo.write('src/m1.py', 'later = "ordinary source"\n')
+    repo.commit('edit it again')
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    manifest = snap.GitSnapshot(repo.path, doc.info['last_commit']).manifest()
+    protected = im.document_exclusions(doc)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    assert path in protected.paths and manifest[path].oid in protected.oids
+
+
+def test_a_credential_moved_within_a_restructure_past_gits_rename_limit_stays_withheld(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('.envrc', 'export TOKEN=SENTINEL-OLD\n' + ''.join(f'export V{i}={i}\n' for i in range(40)))
+    for i in range(1100):   # under vendor/, so the bulk costs no per-file diffs, yet still counts for rename detection
+        repo.write(f'vendor/old/d{i}.py', f'# old {i}\n' + ''.join(f'val_{i}_{n} = {n}\n' for n in range(6)))
+    base = repo.commit('a credential and a lot of code')
+    (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
+    repo.git('rm', '-rq', 'vendor/old')
+    for i in range(1100):
+        repo.write(f'vendor/new/a{i}.py', f'# unrelated {i}\n' + ''.join(f'other_{i}_{n} = "{n * 7}"\n' for n in range(9)))
+    repo.git('mv', '.envrc', 'src/runtime.py')
+    repo.write('src/runtime.py', (repo.path / 'src/runtime.py').read_text() + 'export Z=SENTINEL-EDIT\n')
+    repo.write('src/m0.py', 'visible = "ordinary source"\n')
+    repo.commit('restructure, moving the credential too')
+    provider = Provider(monkeypatch)
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    assert 'src/runtime.py' in im.document_exclusions(doc).paths
+    later_edit_stays_withheld(provider, pristine, repo, 'src/runtime.py')
+
+
+def test_an_edited_copy_of_an_unchanged_credential_stays_withheld(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    secret = 'export TOKEN=SENTINEL-OLD\n' + ''.join(f'export V{i}={i}\n' for i in range(40))
+    repo.write('.envrc', secret)
+    ordinary = ''.join(f'def handler_{i}():\n    return {i}\n' for i in range(30))
+    repo.write('src/common.py', ordinary)
+    base = repo.commit('a credential')
+    (pristine / 'app-abc1234.md').write_text(legacy_document('app-abc1234', base, NOW - timedelta(days=1)))
+    repo.write('src/settings.txt', secret + 'export Z=SENTINEL-EDIT\n')   # .envrc itself doesn't change
+    repo.write('src/m0.py', 'visible = "ordinary source"\n')
+    # An ordinary copy whose source also changed: its diff shows the copy alone, and the source's change once.
+    repo.write('src/common.py', ordinary + 'SOURCE_ONLY_CHANGE = 1\n')
+    repo.write('src/common_copy.py', ordinary + 'COPY_ONLY_CHANGE = 2\n')
+    target = repo.commit('copy the credential and edit the copy')
+    changes = snap.changes_between(repo.path, base, target)
+    assert ('C', 'src/common.py', 'src/common_copy.py') in [tuple(c) for c in changes]
+    provider = Provider(monkeypatch)
+    traffic, doc = credential_traffic(provider, pristine, repo)
+    assert 'SENTINEL' not in traffic and 'ordinary source' in traffic
+    maps = json.dumps([b for b in provider.messages() if 'tools' not in b])
+    assert maps.count('SOURCE_ONLY_CHANGE') == 1 and maps.count('COPY_ONLY_CHANGE') == 1
+    assert 'src/settings.txt' in im.document_exclusions(doc).paths
+    later_edit_stays_withheld(provider, pristine, repo, 'src/settings.txt')
+
+
+def test_a_quote_over_the_cap_sends_nothing_and_waves_reserve_together(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    rewrite_files(repo, 80)
+    small_pages(monkeypatch, 4096)
+    provider = Provider(monkeypatch)
+    old = im.load_document(pristine, 'app-abc1234')
+    # Each map request alone is well inside the cap; the whole update isn't.
+    provider.count_tokens = lambda body: 900_000 if 'tools' not in body else 1000
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'skipped' and 'limit' in outcome.reason and 'up to $' in outcome.reason
+    assert provider.counts and not provider.messages() and outcome.usage['calls'] == 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert outcome.usage['estimated_total_usd'] > 12
+
+    # Slow counts spend the attempt's time: the last count is clamped to what's left, and an expired
+    # admission buys nothing.
+    class SlowCounts:
+        def __init__(self, inner):
+            self.inner, self.timeouts, self.now = inner, [], 0.0
+
+        def count_request(self, request, timeout=None):
+            self.timeouts.append(timeout)
+            self.now += 500.0
+            return self.inner.count_request(request)
+    provider.count_tokens = 1000
+    with PreflightSession() as session:
+        slow = SlowCounts(session)
+        expired = Budget(MODEL, cap=12.0, label='incremental')
+        with pytest.raises(im.StaleUpdate, match='ran out of time'):
+            im.run_incremental(repo.path, FULL, old, decide(repo, pristine), MODEL, slow, expired, clock=lambda: slow.now)
+    assert len(slow.timeouts) == 3 and slow.timeouts[-1] == pytest.approx(200.0)
+    assert not provider.messages() and expired.committed() == 0 and expired.summary()['calls'] == 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # A count cut short by that deadline returns at once, and doesn't mark the provider as unavailable.
+    import asyncio
+    from repo_radar import preflight
+    real_count = preflight._anthropic_count_request
+
+    async def stuck(request):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(preflight, '_anthropic_count_request', stuck)
+    plain = {'endpoint': 'chat', 'model': MODEL, 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 10}
+    with PreflightSession() as session:
+        cut_short = session.count_request(plain, timeout=0.01)
+        assert cut_short.tokens is None and cut_short.reason == 'TimeoutError'
+        monkeypatch.setattr(preflight, '_anthropic_count_request', real_count)
+        assert session.count_request(plain, timeout=5).authoritative
+
+    # Git that says nothing until it's killed: selection and preparation stop at the attempt's one shared
+    # deadline, the process is reaped, partial output is dropped, and nothing is bought or changed.
+    real_which = shutil.which
+    real_git, spawned = real_which('git'), []
+    real_popen = subprocess.Popen
+
+    def slow_git(word):
+        script = tmp_path / f'git-slow-{word.strip("-")}'
+        script.write_text(f'#!/bin/sh\ncase "$*" in *{word}*) printf partial; exec sleep 30;; esac\nexec {real_git} "$@"\n')
+        script.chmod(0o755)
+        monkeypatch.setattr(snap.shutil, 'which', lambda name: str(script))
+
+    def spy(*args, **kw):
+        spawned.append(real_popen(*args, **kw))
+        return spawned[-1]
+    monkeypatch.setattr(snap.subprocess, 'Popen', spy)
+    provider.sends.clear(); provider.counts.clear()
+    slow_git('diff-tree')
+    started = time.monotonic()
+    with pytest.raises(snap.ResourceLimit, match='ran out of time'):
+        decide(repo, pristine, deadline=snap.Deadline(0.2))
+    assert time.monotonic() - started < 10 and spawned[-1].returncode is not None   # killed and reaped, no 30 s wait
+    monkeypatch.setattr(im, 'ATTEMPT_SECONDS', 0.2)
+    before = len(spawned)
+    with PreflightSession() as session:
+        stopped = update(pristine, repo, session)
+    assert stopped.status == 'skipped' and 'ran out of time' in stopped.reason and all(p.returncode is not None for p in spawned[before:])
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['reason'] == stopped.reason
+    monkeypatch.setattr(im, 'ATTEMPT_SECONDS', 20 * 60)
+    monkeypatch.setattr(snap.shutil, 'which', real_which)
+    decision = decide(repo, pristine)
+    slow_git('--no-textconv')
+    held = Budget(MODEL, cap=12.0, label='incremental')
+    with PreflightSession() as session, pytest.raises(im.StaleUpdate, match='ran out of time') as caught:
+        im.run_incremental(repo.path, FULL, old, decision, MODEL, session, held, deadline=snap.Deadline(0.2))
+    assert caught.value.warning and held.committed() == 0 and spawned[-1].returncode is not None
+    assert not provider.messages() and not provider.counts
+    before = len(spawned)
+    with pytest.raises(snap.ResourceLimit):   # an expired deadline doesn't even start Git
+        snap.run_git(repo.path, ['status'], 1024, snap.Deadline(0))
+    assert len(spawned) == before
+    monkeypatch.setattr(snap.shutil, 'which', real_which)
+    monkeypatch.setattr(snap.subprocess, 'Popen', real_popen)
+
+    # Preparation gets what selection left of the allowance, never a fresh one.
+    now, lefts = [0.0], []
+    real_changes = snap.changes_between
+
+    def timed_changes(repo_path, base, target, deadline=None):
+        lefts.append(deadline.left())
+        now[0] += 700.0
+        return real_changes(repo_path, base, target, deadline)
+    monkeypatch.setattr(snap, 'changes_between', timed_changes)
+    (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
+    provider.count_tokens = 1000
+    with PreflightSession() as session:
+        update(pristine, repo, session, clock=lambda: now[0])
+    monkeypatch.setattr(snap, 'changes_between', real_changes)
+    assert lefts == [pytest.approx(1200.0), pytest.approx(500.0)]
+    provider.count_tokens = lambda body: 900_000 if 'tools' not in body else 1000
+    provider.sends.clear(); provider.counts.clear()
+
+    # A wave's requests are checked together, so they can't each pass against the same remaining budget,
+    # and a refused wave leaves nothing reserved, in memory or on disk.
+    path = tmp_path / 'ledger.json'
+    budget = Budget(MODEL, cap=1.0, ledger=Ledger(path, 40.0, {'replay': 16.0}), label='replay')
+    each = (0, 40_000)   # $0.40
+    with pytest.raises(BudgetExceeded, match='next 3 requests'):
+        budget.reserve_many([({'r': i}, *each) for i in range(3)])
+    assert budget.committed() == 0 and not json.loads(path.read_text())['entries']
+    with pytest.raises(BudgetExceeded, match='appears twice'):
+        budget.reserve_many([({'r': 1}, *each), ({'r': 1}, *each)])
+    held = budget.reserve_many([({'r': i}, *each) for i in range(2)])
+    assert budget.committed() == pytest.approx(0.8) and len(json.loads(path.read_text())['entries']) == 2
+    for reservation in held:
+        budget.settle(reservation, types.SimpleNamespace(input_tokens=1, output_tokens=1), 0.1)
+    budget.admit(0.7)
+    with pytest.raises(BudgetExceeded, match='limit'):
+        budget.admit(0.9)
+    assert len(json.loads(path.read_text())['entries']) == 2   # admission isn't a charge
+
+    # The rate snapshot follows the announced January price, and a reply is charged at least that.
+    january = Budget(GEMINI, now=datetime(2027, 1, 1, tzinfo=timezone.utc))
+    assert january.price == (1.5e-6, 7.5e-6)
+    usage = types.SimpleNamespace(input_tokens=1_000_000, output_tokens=0 + 1)
+    assert january.settle(january.reserve({'r': 1}, 1_000_000, 1), usage, 0.75) == pytest.approx(1.5 + 7.5e-6)
+    assert Budget(GEMINI, now=datetime(2026, 11, 4, tzinfo=timezone.utc)).price == (0.75e-6, 3.75e-6)
+    # The "latest" alias has the same floor, and a table price above the floor is never lowered.
+    assert Budget('gemini/gemini-flash-latest', now=datetime(2027, 1, 1, tzinfo=timezone.utc)).price == (1.5e-6, 7.5e-6)
+    assert Budget('gemini/gemini-flash-latest', now=datetime(2026, 12, 31, 1, tzinfo=timezone.utc)).rates.announced
+    # Only Gemini's priority and flex rates are left out: no service tier means Standard there, but
+    # OpenAI's means the project's configured tier, which may be priority.
+    import litellm
+    rates = {'input_cost_per_token': 1e-6, 'output_cost_per_token': 2e-6, 'input_cost_per_token_priority': 3e-6,
+             'output_cost_per_token_priority': 6e-6, 'input_cost_per_token_batches': 9e-6}
+    monkeypatch.setitem(litellm.model_cost, 'gpt-synthetic', rates)
+    monkeypatch.setitem(litellm.model_cost, 'gemini/gemini-synthetic', rates)
+    assert Budget('gpt-synthetic').price == (3e-6, 6e-6) and Budget('gemini/gemini-synthetic').price == (1e-6, 2e-6)
 
 
 PILOT_REPO = 'ReperioHealth/reperio-telehealth'
 
 
-def run_pilot(pilot_dir, repo, baseline_text, mode, target):
-    """Run the pilot script in-process (sockets stay blocked) from `baseline_text`, which is renamed
-    to the pilot repository. Returns (pilot_dir, the results JSON)."""
+def load_pilot():
     import importlib.util
     from pathlib import Path
-    pilot_dir.mkdir(parents=True, exist_ok=True)
-    (pilot_dir / 'baseline.md').write_text(baseline_text.replace(FULL, PILOT_REPO))
     path = Path(__file__).resolve().parents[2] / 'scripts' / 'pilot-incremental-metadata.py'
     spec = importlib.util.spec_from_file_location('pilot_incremental_metadata', path)
     pilot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pilot)
+    return pilot
+
+
+def run_pilot(pilot_dir, repo, baseline_text, mode, target):
+    """Run the pilot script in-process (sockets stay blocked) from `baseline_text`, which is renamed
+    to the pilot repository. Returns (pilot_dir, the results JSON)."""
+    pilot_dir.mkdir(parents=True, exist_ok=True)
+    (pilot_dir / 'baseline.md').write_text(baseline_text.replace(FULL, PILOT_REPO))
+    pilot = load_pilot()
     pilot.main([mode, '--pilot-dir', str(pilot_dir), '--repo-path', str(repo.path), '--target', target,
                 '--model', MODEL])
     return pilot_dir, json.loads((pilot_dir / f'results-{mode}.json').read_text())
@@ -694,40 +1427,88 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     repo.commit()
     provider = Provider(monkeypatch)
     doc = im.load_document(pristine, 'app-abc1234')
-    provider.replies = [tool_use('read_file', {'path': 'src/m0.py', 'limit': 3}),
+    provider.replies = [note(), tool_use('read_file', {'path': 'src/m0.py', 'limit': 3}),
                         answer({'base_document_sha256': doc.sha256, 'sections': []})]
     # A stray request through the same transport (here a model-map GET) fails locally: no reply
     # consumed, nothing recorded, and the next real request still gets the intended reply.
     with pytest.raises(httpx.ConnectError), httpx.Client() as client:
         client.get('https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json')
-    assert len(provider.replies) == 2 and not provider.sends
+    assert len(provider.replies) == 3 and not provider.sends
     with PreflightSession() as session:
         assert update(pristine, repo, session).status == 'published'
     sends = provider.messages()
-    assert len(sends) == 2 and len(provider.counts) == 2 and len(provider.sends) == 2
-    # The second request is counted exactly as it is sent: tools, the thinking block, the tool result.
-    count, send = provider.counts[1], sends[1]
+    assert len(sends) == 3 and len(provider.sends) == 3
+    # The map call is counted once. The editor is counted without notes for the quote, with them to check
+    # it fits, then with the tool result's placeholder and with the result itself.
+    assert len(provider.counts) == 5 and 'tools' not in provider.counts[0]
+    # The last request is counted exactly as it is sent: tools, the thinking block, the tool result.
+    count, send = provider.counts[-1], sends[-1]
     for key in ('messages', 'system', 'tools'):
         assert count[key] == send[key], key
     assert {t['name'] for t in count['tools']} == {s['name'] for s in snap.TOOL_SPECS}
     assert any(b.get('type') == 'thinking' for m in count['messages'] for b in m['content'] if isinstance(b, dict))
     assert any(b.get('type') == 'tool_result' for m in count['messages'] for b in m['content'] if isinstance(b, dict))
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
-    assert state['usage']['calls'] == 2 and state['usage']['cost_usd'] > 0
+    assert state['usage']['calls'] == 3 and state['usage']['cost_usd'] > 0
+    assert (state['usage']['map_calls'], state['usage']['merge_calls'], state['usage']['edit_turns']) == (1, 0, 2)
+
+    # Turn four offers no tools: counted and sent as the same final-answer-only request.
+    repo.write('src/m3.py', 'p = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+    read = tool_use('read_file', {'path': 'src/m0.py', 'limit': 3})
+    provider.replies = [note(), read, read, read, answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'published'
+    last = provider.messages()[-1]
+    assert last['tool_choice']['type'] == 'none' and provider.counts[-1]['tool_choice'] == last['tool_choice']
+    assert 'tool_choice' not in provider.messages()[1]
+
+    # A batch of more reads than the budget allows: results are cut, then replaced by notices, and none
+    # is ever blank. A batch that couldn't hold even the minimum notices stops rather than send blanks.
+    repo.write('src/big.py', 'filler_line = "x" * 20\n' * 3000)
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+
+    def read_batch(count):
+        calls = [{"type": "tool_use", "id": f"toolu_{i}", "name": "read_file", "input": {"path": "src/big.py", "limit": 2000}}
+                 for i in range(count)]
+        return claude([{"type": "thinking", "thinking": "plan", "signature": "sig"}, *calls], stop='tool_use')
+    # The new file's diff takes two pages.
+    provider.replies = [note(), note(), read_batch(9), answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    with PreflightSession() as session:
+        batch = update(pristine, repo, session)
+    assert batch.status == 'published', batch
+    delivered = [b['content'] for m in provider.messages()[-1]['messages'] if isinstance(m['content'], list)
+                 for b in m['content'] if b.get('type') == 'tool_result']
+    texts = [c if isinstance(c, str) else c[0]['text'] for c in delivered]
+    assert len(texts) == 9 and all(texts) and batch.usage['read_bytes'] == sum(len(t.encode()) for t in texts)
+    assert batch.usage['read_bytes'] <= mr.EDIT_TOOL_BYTES and 'budget is used up' in texts[5] and 'limit of 6' in texts[8]
+    repo.write('src/m2.py', 'r = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), read_batch(mr.EDIT_TOOL_BYTES // len(mr.TOOL_MINIMUM_NOTICE) + 1)]
+    with PreflightSession() as session:
+        overflow = update(pristine, repo, session)
+    assert overflow.status == 'failed' and 'resource limit' in overflow.reason and len(provider.messages()) == 2
+    assert im.load_document(pristine, 'app-abc1234').sha256 == doc.sha256
 
     # A tool result that pushes the next request past the input budget stops before that send.
     repo.write('src/m1.py', 'q = 1\n')
     repo.commit()
     provider.sends.clear(); provider.counts.clear()
     doc = im.load_document(pristine, 'app-abc1234')
-    provider.replies = [tool_use('read_file', {'path': 'src/m0.py'}),
+    provider.replies = [note(), tool_use('read_file', {'path': 'src/m0.py'}),
                         answer({'base_document_sha256': doc.sha256, 'sections': []})]
     provider.count_tokens = lambda body: 2_000_000 if any(
         isinstance(b, dict) and b.get('type') == 'tool_result' for m in body['messages'] for b in m['content']) else 1000
     with PreflightSession() as session:
         outcome = update(pristine, repo, session)
     assert outcome.status == 'failed' and 'would not fit' in outcome.reason
-    assert len(provider.messages()) == 1
+    assert len(provider.messages()) == 2
 
     # No authoritative count (the endpoint is down): no local fallback, no send.
     provider.sends.clear(); provider.counts.clear()
@@ -739,27 +1520,28 @@ def test_complete_requests_are_counted_and_charged(monkeypatch, tmp_path):
     # An incomplete final reply is charged once and never retried or published.
     provider.sends.clear(); provider.counts.clear()
     provider.count_tokens = 1000
-    provider.replies = [claude([{"type": "text", "text": '{"base_document_sha256": "'}], stop='max_tokens')]
+    provider.replies = [note(), claude([{"type": "text", "text": '{"base_document_sha256": "'}], stop='max_tokens')]
     with PreflightSession() as session:
         outcome = update(pristine, repo, session)
     assert outcome.status == 'failed' and 'incomplete' in outcome.reason
-    assert len(provider.messages()) == 1 and outcome.usage['calls'] == 1 and outcome.usage['cost_usd'] > 0
+    assert len(provider.messages()) == 2 and outcome.usage['calls'] == 2 and outcome.usage['cost_usd'] > 0
     assert im.load_document(pristine, 'app-abc1234').sha256 == doc.sha256
 
-    # Without a ledger an unreliable-usage reply keeps its reservation and the total is shown as unknown.
+    # An unreliable-usage reply keeps its reservation, the total is shown as unknown, and nothing more is sent.
     repo.write('src/m2.py', 'w = 4\n')
     repo.commit()
     provider.sends.clear(); provider.counts.clear()
     doc = im.load_document(pristine, 'app-abc1234')
-    zero = tool_use('read_diff', {'page': 1})
+    zero = note()
     zero['usage'] = {}
     provider.replies = [zero, answer({'base_document_sha256': doc.sha256, 'sections': []})]
     ctx, events = _ctx()
+    monkeypatch.setenv('REPO_RADAR_TRIGGER', 'manual')   # the failures above would otherwise hold this sync
     with PreflightSession() as session:
         S.generate_repo_metadata((REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1), session,
                                  _sync_args(_incremental_repos=frozenset({FULL})), ctx)
-    assert ctx.stats['metadata_generated'] == 1 and ctx.stats['unknown_cost_calls'] == 1
-    assert any(e[0] == 'progress' and e[1] and 'cost unknown (known subtotal $' in e[1] for e in events)
+    assert ctx.stats['metadata_generated'] == 0 and ctx.stats['unknown_cost_calls'] == 1
+    assert len(provider.messages()) == 1 and im.load_document(pristine, 'app-abc1234').sha256 == doc.sha256
     logged = [f for name, f in events if name == 'metadata_incremental']
     assert logged[0]['cost'].startswith('cost unknown') and logged[0]['unknown_cost_calls'] == 1
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
@@ -820,9 +1602,9 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
     if failure in unsafe:
         good = answer({'base_document_sha256': old.sha256, 'sections': [], **unsafe[failure]})
     provider.replies = {'generation_error': [httpx.Response(500, json={"error": {"message": "boom"}})],
-                        'parse_failure': [claude([{"type": "text", "text": "Here is my update!"}])],
+                        'parse_failure': [note(), claude([{"type": "text", "text": "Here is my update!"}])],
                         'full_degraded': [claude([{"type": "text", "text": "A repository. No markers here."}])],
-                        'repository_moved': [moved]}.get(failure, [good])
+                        'repository_moved': [note(), moved]}.get(failure, [note(), good])
     interrupt = KeyboardInterrupt('stopped')
     real_atomic = metadata.write_text_atomic
     if failure == 'interrupt_before_replace':
@@ -951,7 +1733,7 @@ def test_every_opted_in_failure_is_reported_and_keeps_the_document(monkeypatch, 
 
 # ── 5. The pilot cap survives failure and restart ───────────────────────────────────────────────
 
-def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
+def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
     path = tmp_path / 'pilot' / 'ledger.json'
     allowances = {'incremental': 8.0, 'full': 24.0}
     ledger = Ledger(path, 40.0, allowances)
@@ -1002,7 +1784,7 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
         ledger_path = tmp_path / f'pilot-usage-{len(raw_usage)}' / 'ledger.json'
         budget = Budget(MODEL, ledger=Ledger(ledger_path, 40.0, allowances), label='incremental')
         provider.sends.clear()
-        reply = tool_use('read_diff', {'page': 1})
+        reply = note()
         reply['usage'] = raw_usage
         provider.replies = [reply, answer({'base_document_sha256': doc.sha256, 'sections': []})]
         with PreflightSession() as session:
@@ -1061,3 +1843,79 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path):
     assert after.returncode == 0, after.stderr
     assert 'ledger: $1.00 of $40.00 spent' in after.stdout and (pilot_dir / 'pilot.json').exists()
     assert (pilot_dir / 'pilot.lock').exists()
+
+    # A manifest replay: plan buys nothing, replay runs its cases, and an unchanged rerun buys nothing.
+    history = Repo(tmp_path / 'telehealth')
+    for i in range(10):
+        history.write(f'src/m{i}.py', f'# module {i}\nx = 1\n')
+    first = history.commit('a')
+    history.write('src/m1.py', 'y = 2\n')
+    second = history.commit('b')
+    history.write('src/m2.py', 'z = 3\n')
+    third = history.commit('c')
+
+    def replay_reply(stage, text):
+        if stage == 'full':
+            return FULL_REPLY
+        if stage == 'edit':
+            return {'base_document_sha256': re.search(r'base_document_sha256: (\w+)', text).group(1), 'sections': []}
+        return {'changes': [], 'no_summary_change_reason': 'routine'}
+    fake = GeminiFake(monkeypatch, replay_reply)
+    script = load_pilot()
+    replay_dir = tmp_path / 'replay'
+    replay_dir.mkdir()
+    manifest_path = tmp_path / 'manifest.json'
+    base_case = {'id': 'base', 'kind': 'full_baseline', 'target': first}
+    case = {'id': 'one', 'kind': 'replay', 'baseline_from': 'base', 'base': first, 'target': second, 'weekly_trigger': False}
+
+    def manifest(*cases):
+        manifest_path.write_text(json.dumps({'schema': script.MANIFEST_SCHEMA, 'model': GEMINI, 'clone_url': 'https://x/y.git',
+                                             'cache_dir': 'y', 'cases': list(cases)}))
+        return ['--manifest', str(manifest_path), '--pilot-dir', str(replay_dir), '--repo-path', str(history.path)]
+
+    def refused(mode, args, why):
+        capsys.readouterr()
+        before = len(fake.sends)
+        with pytest.raises(SystemExit):
+            script.main([mode, *args])
+        assert why in capsys.readouterr().err and len(fake.sends) == before
+
+    document = tmp_path / 'document.md'
+    document.write_text(legacy_document('cache', second, NOW - timedelta(days=1)).replace(FULL, script.PILOT_REPO))
+    from_file = {'id': 'from-file', 'kind': 'replay', 'baseline_file': str(document), 'base': second, 'target': third}
+    assert script.main(['plan', *manifest(base_case, case, from_file)]) == 0
+    assert not fake.sends and not (replay_dir / 'ledger.json').exists()
+    args = manifest(base_case, case)
+    assert script.main(['replay', *args]) == 0 and fake.sends
+    # The successful single-pass full baseline asks for low thinking at its usual limit, in Markdown.
+    baseline_config = fake.stage('full')[0][1]['generationConfig']
+    assert len(fake.stage('full')) == 1 and baseline_config['max_output_tokens'] == 16384
+    assert baseline_config['thinkingConfig']['thinkingLevel'] == 'low' and 'response_mime_type' not in baseline_config
+    assert json.loads((replay_dir / 'base' / 'result.json').read_text())['usage']['full_stage']['stage'] == 'single'
+    bought = len(fake.sends)
+    assert script.main(['replay', *args]) == 0 and len(fake.sends) == bought
+
+    # Only plan and replay take a manifest; the single-case modes never run a replay by accident.
+    refused('full', args, 'works only with plan or replay')
+
+    # Two cases can't share a directory: by name, by a case-insensitive name, or through a symlink.
+    later = {'id': 'two', 'kind': 'replay', 'baseline_from': 'one', 'base': second, 'target': third, 'weekly_trigger': False}
+    refused('replay', manifest(base_case, case, {**later, 'output': 'one'}), 'would share the output directory')
+    refused('replay', manifest(base_case, case, {**later, 'output': 'ONE'}), 'would share the output directory')
+    (replay_dir / 'alias').symlink_to(replay_dir / 'one')
+    refused('replay', manifest(base_case, case, {**later, 'output': 'alias'}), 'would share the output directory')
+    (replay_dir / 'away').symlink_to(tmp_path)
+    refused('replay', manifest(base_case, case, {**later, 'output': 'away'}), 'must be a directory directly under')
+
+    # A completed result counts only for exactly what it was built from.
+    refused('replay', manifest(base_case, {**case, 'target': third}), 'different inputs')
+    refused('replay', manifest(base_case, {**case, 'weekly_trigger': True}), 'different inputs')
+    candidate = replay_dir / 'one' / 'candidate.md'
+    good = candidate.read_text()
+    candidate.write_text(good + 'edited afterwards\n')
+    refused('replay', manifest(base_case, case), "isn't the one its result recorded")
+    candidate.write_text(good)
+    result = replay_dir / 'one' / 'result.json'
+    recorded = json.loads(result.read_text())
+    result.write_text(json.dumps({k: v for k, v in recorded.items() if k != 'prompt_version'}))
+    refused('replay', manifest(base_case, case), 'different inputs')
