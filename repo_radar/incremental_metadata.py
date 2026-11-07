@@ -18,7 +18,7 @@ from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from repo_radar.config import DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
+from repo_radar.config import DEFAULT_INCREMENTAL_FAILURE_STOP, DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
 from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, parse_frontmatter, read_attempt_state,
                                  _parse_status_of)
 from repo_radar import metadata_snapshot as snap
@@ -39,7 +39,8 @@ _REMOVED_TRIGGER = re.compile(r'\d+% of the source changed|\d+ diff pages exceed
                               r'diff exceeds the incremental size limit|no analyzable source')
 WEEKLY_REASON = 'weekly full rebuild due'
 UNFINISHED_REASON = 'previous full rebuild did not finish'
-HOLD_AFTER_FAILURES = 2            # failed updates in a row before only a person can start another
+# Failed updates in a row before only a person can start another, unless Settings chose another number.
+HOLD_AFTER_FAILURES = DEFAULT_INCREMENTAL_FAILURE_STOP
 FAILURE_STREAK_DOC = 'failure_streak_doc_sha256'   # the document those failures were from
 
 
@@ -204,12 +205,13 @@ def consecutive_failures(state, doc):
     return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
 
 
-def held_reason(state, doc, force=False, trigger='manual'):
-    """Why this sync may not spend on this repository, or None. After repeated failures only a person starts
-    another try: the menu's Sync Now, or a forced rebuild. Every other trigger is held, so nothing automatic can
-    keep buying the same failure, even when a weekly rebuild is due."""
+def held_reason(state, doc, force=False, trigger='manual', threshold=HOLD_AFTER_FAILURES):
+    """Why this sync may not spend on this repository, or None. After `threshold` failures in a row only a
+    person starts another try: the menu's Sync Now, or a forced rebuild. Every other trigger is held, so nothing
+    automatic can keep buying the same failure, even when a weekly rebuild is due. The count is compared with
+    the threshold this sync loaded, so raising it can release a hold and lowering it can hold sooner."""
     failures = consecutive_failures(state, doc)
-    if force or trigger == 'manual' or failures < HOLD_AFTER_FAILURES:
+    if force or trigger == 'manual' or failures < threshold:
         return None
     return f"held after {failures} failed updates in a row; a manual sync or a forced rebuild retries"
 
@@ -786,16 +788,19 @@ def _cleared_setup_failure(state, now):
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
                       missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None,
-                      trigger='manual'):
+                      trigger='manual', update_limit_usd=None, failure_stop=None):
     """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
     says when the attempt record couldn't be saved. `missing_credential` names the provider key
     variable when it isn't set; that fails a due update before any count or send. `trigger` is who started
-    this sync, which decides whether a repository held after repeated failures may try again (held_reason)."""
+    this sync, which decides whether a repository held after repeated failures may try again (held_reason).
+    `update_limit_usd` caps one incremental update and `failure_stop` is the hold threshold, both from Settings;
+    a missing or invalid value means the default ($12 and 2), never no limit."""
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
+    from repo_radar.config import valid_incremental_failure_stop, valid_incremental_update_limit
     from repo_radar.metadata_budget import Budget, INCREMENTAL_CAP_USD
     from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
@@ -806,8 +811,12 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     full_name = repo_config['full_name']
     decision = budget = attempt = target = None
     committed = False
+    update_limit = float(update_limit_usd) if valid_incremental_update_limit(update_limit_usd) else INCREMENTAL_CAP_USD
+    failure_stop = int(failure_stop) if valid_incremental_failure_stop(failure_stop) else HOLD_AFTER_FAILURES
 
-    def finish(status, reason):
+    def finish(status, reason, counts=True):
+        """`counts=False` is for a known setup failure before anything is sent: it is reported as failed, but
+        the streak keeps its count, its last counted failure and any full-rebuild debt."""
         reason = safe_reason(reason)
         after = None
         if committed and status != 'published':
@@ -820,7 +829,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             attempt.pop('last_failure_reason', None)
             attempt.pop(FAILURE_STREAK_DOC, None)
             attempt['consecutive_failures'] = 0
-        elif attempt is not None and status == 'failed':
+        elif attempt is not None and status == 'failed' and counts:
             attempt['consecutive_failures'] += 1
             attempt['last_failure_reason'] = reason
         if attempt is None:
@@ -850,7 +859,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                 write_state(pristine_dir, cache_name, cleared)
             return Outcome('none', 'none', decision.reason, decision.base, target, {}, time.monotonic() - started)
 
-        held = held_reason(state, doc, force, trigger)
+        held = held_reason(state, doc, force, trigger, failure_stop)
         if held:
             # Nothing is attempted. The last failure's reason, usage and any full-rebuild debt stay on record.
             state_error = _try_write_state(pristine_dir, cache_name,
@@ -882,10 +891,10 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
         log(f"{decision.strategy}: {decision.reason}")
 
-        cap = INCREMENTAL_CAP_USD if decision.strategy == 'incremental' else None
+        cap = update_limit if decision.strategy == 'incremental' else None
         budget = Budget(model, cap=cap, label=decision.strategy)
-        if missing_credential:
-            return finish('failed', f"no API key: {missing_credential} is not set")
+        if missing_credential:   # setup, not a bought failure: it doesn't move the streak toward a hold
+            return finish('failed', f"no API key: {missing_credential} is not set", counts=False)
 
         if decision.strategy == 'incremental':
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
