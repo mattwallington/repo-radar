@@ -1296,6 +1296,13 @@ class FileCounts:
         return PreflightResult(self.per_file * json.dumps(request).count(' bytes) ===') + self.base, False, 'local estimate')
 
 
+def gemini_text(text, prompt_tokens=100, finish='STOP'):
+    return httpx.Response(200, json={
+        "candidates": [{"content": {"parts": [{"text": text}], "role": "model"}, "finishReason": finish}],
+        "usageMetadata": {"promptTokenCount": prompt_tokens, "candidatesTokenCount": 20,
+                          "totalTokenCount": prompt_tokens + 20}})
+
+
 def full_build(pristine, repo, session, model=GEMINI):
     return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW)
 
@@ -1328,6 +1335,39 @@ def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where
                                    'reasoning_tokens': 16344}
     assert usage['full_stage']['output_tokens'] >= 40 and 'Cut o' not in json.dumps(usage)
     assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+
+def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch, tmp_path):
+    """Each request reserves the catalog's whole input limit when its count is only a local estimate, so the
+    cap holds against the bill, not against the estimate."""
+    from repo_radar.metadata_budget import FULL_CAP_USD
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    counts = FileCounts(50_000)   # two files to a chunk: five chunks, each counted far below the catalog bound
+    expensive = 10_933_000        # reported prompt tokens: three chunks settle at about $24.60
+
+    fake = GeminiFake(monkeypatch, lambda stage, text: gemini_text('## Analysis\nTwo files.\n', expensive))
+    outcome = full_build(pristine, repo, counts)
+    per_chunk = expensive * 0.75e-6 + 20 * 3.75e-6
+    reserve = Budget(GEMINI).upper_bound(1_048_576, 8192)                   # the whole input limit, priced
+    assert 3 * per_chunk + reserve > FULL_CAP_USD >= 3 * per_chunk + Budget(GEMINI).upper_bound(101_000, 8192)
+
+    # Three chunks were sent and settled once each; the fourth was refused before sending, and says why.
+    assert len(fake.sends) == 3 and {s for s, _t, _b in fake.sends} == {'full'}
+    assert outcome.status == 'failed' and outcome.reason.startswith('full chunk 4/5 (call 4): ')
+    assert '$25.00 limit' in outcome.reason
+    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    assert (usage['calls'], usage['unknown_cost_calls'], usage['retained_reservation_usd'], usage['open_reservation_usd']) == (3, 0, 0, 0)
+    assert usage['known_cost_usd'] == usage['cost_usd'] == pytest.approx(3 * per_chunk, rel=1e-6)
+    assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # Cheap replies: the same build finishes under the cap, with every chunk and one reduction.
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
+    outcome = full_build(pristine, repo, counts)
+    assert outcome.status == 'published', outcome
+    assert len(fake.sends) == 6 and outcome.usage['calls'] == 6 and outcome.usage['cost_usd'] < 1
+    assert im.load_document(pristine, 'app-abc1234').info['pipeline_version'] == im.PIPELINE_VERSION
 
 
 def frames(text):
