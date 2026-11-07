@@ -1,25 +1,49 @@
-"""Hierarchical synthesis: bounded prompts, full coverage, explicit last-resort truncation."""
+"""Hierarchical synthesis (the legacy full generator's): bounded prompts, full coverage, explicit
+last-resort truncation. Every case drives the supported API: an explicit counting session and the
+caller's own synthesis callback."""
 import pytest
 
 import repo_radar.llm as llm
+from repo_radar.preflight import PreflightResult
+
+
+class LocalSession:
+    """The counting session as a local-only provider (Gemini) gives it: never authoritative, so the
+    driver plans from its own local estimate."""
+
+    def count(self, model, prompt, requested_output):
+        return PreflightResult(None, False, "local estimate")
+
+
+class TokenSession:
+    """An authoritative session that counts with the local tokenizer."""
+
+    def count(self, model, prompt, requested_output):
+        return PreflightResult(llm.count_tokens_accurate(prompt, "claude-opus-5"), True)
+
+
+def combine(full_name, analyses, synthesize, model="claude-opus-5", session=None, **kw):
+    return llm.combine_chunk_analyses(full_name, analyses, model=model, synthesize=synthesize,
+                                      session=session or LocalSession(), **kw)
+
+
+def parts_of(prompt):
+    """The analyses a synthesis prompt carries, in order."""
+    return [p.split("\n", 1)[1].rstrip("\n") for p in prompt.split("\n--- Analysis Part ")[1:]]
 
 
 @pytest.fixture
-def recorder(monkeypatch):
-    """Capture every synthesis call instead of hitting an API.
+def recorder():
+    """Capture every synthesis prompt instead of hitting an API.
 
     Each call returns a short stand-in, so batches genuinely shrink between rounds the way a
     real summarising model would.
     """
-    calls = []
-
-    def fake_synthesize(full_name, analyses, model=None):
-        calls.append(list(analyses))
-        return f"SUMMARY[{len(analyses)} parts]", 0.01, (model or "claude-opus-5")
-
-    monkeypatch.setattr(llm, "_synthesize_once", fake_synthesize)
-    monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
-    return calls
+    def synthesize(prompt, model):
+        synthesize.calls.append(prompt)
+        return f"SUMMARY[{len(parts_of(prompt))} parts]", 0.01, model
+    synthesize.calls = []
+    return synthesize
 
 
 def _tokens(text):
@@ -27,8 +51,8 @@ def _tokens(text):
 
 
 def test_single_small_analysis_is_one_call(recorder):
-    text, cost = llm.combine_chunk_analyses("org/repo", ["a short analysis"])
-    assert len(recorder) == 1
+    text, cost = combine("org/repo", ["a short analysis"], recorder)
+    assert len(recorder.calls) == 1
     assert cost == pytest.approx(0.01)
 
 
@@ -40,12 +64,11 @@ def test_no_prompt_ever_exceeds_the_budget(recorder, monkeypatch):
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
     analyses = ["word " * 4_000 for _ in range(40)]  # far beyond one request
 
-    llm.combine_chunk_analyses("org/big", analyses)
+    combine("org/big", analyses, recorder)
 
-    assert recorder, "no synthesis happened"
-    for batch in recorder:
-        prompt = llm._build_synthesis_prompt("org/big", batch)
-        budget = llm._synthesis_budget("org/big", "claude-opus-5")
+    assert recorder.calls, "no synthesis happened"
+    budget = llm._synthesis_budget("org/big", "claude-opus-5")
+    for prompt in recorder.calls:
         assert _tokens(prompt) <= budget, (
             f"prompt of {_tokens(prompt)} tokens exceeds the {budget} budget")
 
@@ -55,9 +78,9 @@ def test_every_analysis_reaches_the_synthesis(recorder, monkeypatch):
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
     analyses = [f"UNIQUE_MARKER_{i} " + "word " * 2_000 for i in range(25)]
 
-    llm.combine_chunk_analyses("org/big", analyses)
+    combine("org/big", analyses, recorder)
 
-    seen = " ".join(part for batch in recorder for part in batch)
+    seen = " ".join(recorder.calls)
     for i in range(25):
         assert f"UNIQUE_MARKER_{i}" in seen, f"analysis {i} never reached a synthesis call"
 
@@ -66,66 +89,59 @@ def test_chunk_order_is_preserved(recorder, monkeypatch):
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
     analyses = [f"MARK{i:02d} " + "word " * 2_000 for i in range(20)]
 
-    llm.combine_chunk_analyses("org/big", analyses)
+    combine("org/big", analyses, recorder)
 
-    first_round = [p for p in recorder[0]]
-    positions = [int(p.split()[0].removeprefix("MARK")) for p in first_round]
-    assert positions == sorted(positions), "batching must keep contiguous, in-order runs"
+    positions = [int(p.split()[0].removeprefix("MARK")) for p in parts_of(recorder.calls[0])]
+    assert len(positions) > 1 and positions == sorted(positions), "batching must keep contiguous, in-order runs"
 
 
 def test_cost_is_aggregated_across_every_round(recorder, monkeypatch):
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
     analyses = ["word " * 4_000 for _ in range(40)]
 
-    _, cost = llm.combine_chunk_analyses("org/big", analyses)
+    _, cost = combine("org/big", analyses, recorder)
 
-    assert cost == pytest.approx(0.01 * len(recorder)), "every call must be billed"
-    assert len(recorder) > 1, "this fixture should require multiple rounds"
+    assert cost == pytest.approx(0.01 * len(recorder.calls)), "every call must be billed"
+    assert len(recorder.calls) > 1, "this fixture should require multiple rounds"
 
 
 def test_recursion_reduces_to_a_single_final_call(recorder, monkeypatch):
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
     analyses = ["word " * 4_000 for _ in range(40)]
 
-    llm.combine_chunk_analyses("org/big", analyses)
+    text, _ = combine("org/big", analyses, recorder)
 
-    assert len(recorder[-1]) >= 1
-    assert len(recorder) >= 2, "expected at least one map round plus a final reduce"
+    assert text == f"SUMMARY[{len(parts_of(recorder.calls[-1]))} parts]"
+    assert len(recorder.calls) >= 2, "expected at least one map round plus a final reduce"
 
 
-def test_single_oversized_analysis_falls_back_to_truncation(monkeypatch, capsys):
+def test_single_oversized_analysis_falls_back_to_truncation(monkeypatch):
     """One analysis bigger than a whole request has nothing to be combined with."""
+    monkeypatch.setattr(llm, "acceptance_budget", lambda model, output: 40_000)
     calls = []
 
-    def fake_synthesize(full_name, analyses, model=None):
-        calls.append(list(analyses))
-        return "SUMMARY", 0.01, (model or "claude-opus-5")
+    def synthesize(prompt, model):
+        calls.append(prompt)
+        return "SUMMARY", 0.01, model
 
-    monkeypatch.setattr(llm, "_synthesize_once", fake_synthesize)
-    monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
-    monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 40_000)
-
-    llm.combine_chunk_analyses("org/one", ["word " * 60_000])
+    combine("org/one", ["word " * 60_000], synthesize, session=TokenSession())
 
     assert len(calls) == 1
-    assert "truncated by repo-radar" in calls[0][0]
-    assert "truncating" in capsys.readouterr().out.lower(), "truncation must be announced"
+    assert "truncated: ~" in calls[0], "the truncation is marked in what the model reads"
+    assert _tokens(calls[0]) <= 40_000
 
 
 def test_depth_guard_stops_runaway_recursion(monkeypatch, capsys):
     """A model that never shrinks its input must not recurse forever."""
     calls = []
 
-    def stubborn(full_name, analyses):
-        calls.append(list(analyses))
-        return " ".join(analyses)  # returns everything it was given — zero reduction
+    def stubborn(prompt, model):
+        calls.append(prompt)
+        return " ".join(parts_of(prompt)), 0.01, model  # returns everything it was given — zero reduction
 
-    monkeypatch.setattr(llm, "_synthesize_once",
-                        lambda fn, a, m=None: (stubborn(fn, a), 0.01, m or "claude-opus-5"))
-    monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 50_000)
 
-    text, cost = llm.combine_chunk_analyses("org/big", ["word " * 4_000 for _ in range(30)])
+    text, cost = combine("org/big", ["word " * 4_000 for _ in range(30)], stubborn)
 
     assert text, "must still return a result"
     assert len(calls) <= llm.SYNTHESIS_MAX_CALLS + 1
@@ -135,21 +151,19 @@ def test_depth_guard_stops_runaway_recursion(monkeypatch, capsys):
 
 def test_call_budget_is_respected(monkeypatch):
     calls = []
-    monkeypatch.setattr(llm, "_synthesize_once",
-                        lambda fn, a, m=None: (calls.append(list(a)),
-                                               ("S", 0.01, m or "claude-opus-5"))[1])
-    monkeypatch.setattr(llm, "get_ai_model", lambda: "claude-opus-5")
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda model: 30_000)
 
-    llm.combine_chunk_analyses("org/big", ["word " * 3_000 for _ in range(60)], max_calls=6)
+    combine("org/big", ["word " * 3_000 for _ in range(60)],
+            lambda prompt, model: (calls.append(prompt), ("S", 0.01, model))[1], max_calls=6)
 
     # A true ceiling: the final reduction is reserved, not spent on top of the map rounds.
     assert len(calls) <= 6, f"exceeded the call ceiling: {len(calls)} calls"
 
 
-def test_empty_input_is_handled():
-    assert llm.combine_chunk_analyses("org/repo", []) == ("", 0.0)
-    assert llm.combine_chunk_analyses("org/repo", ["", "   ", None]) == ("", 0.0)
+def test_empty_input_is_handled(recorder):
+    assert combine("org/repo", [], recorder) == ("", 0.0)
+    assert combine("org/repo", ["", "   ", None], recorder) == ("", 0.0)
+    assert not recorder.calls
 
 
 def test_batching_preserves_contiguity_and_budget():
@@ -191,8 +205,7 @@ def test_injected_synthesize_is_used_and_receives_the_model():
         used.append((prompt, model))
         return "SUMMARY", 0.02, model
 
-    text, cost = llm.combine_chunk_analyses(
-        "org/repo", ["a short analysis"], model="claude-sonnet-5", synthesize=injected)
+    text, cost = combine("org/repo", ["a short analysis"], injected, model="claude-sonnet-5")
 
     assert text == "SUMMARY" and cost == pytest.approx(0.02)
     assert used and used[0][1] == "claude-sonnet-5", "the chosen model must be threaded through"
@@ -206,6 +219,7 @@ def test_budget_follows_a_model_fallback(monkeypatch):
     """
     windows = {"big-model": 100_000, "small-model": 60_000}
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: windows.get(m, 20_000))
+    monkeypatch.setattr(llm, "acceptance_budget", lambda m, out: 10**9)   # fictional models; counts are local
 
     seen = []
 
@@ -213,9 +227,7 @@ def test_budget_follows_a_model_fallback(monkeypatch):
         seen.append((model, llm.count_tokens_accurate(prompt, "small-model")))
         return "SUMMARY " + "word " * 200, 0.01, "small-model"  # served by the fallback
 
-    llm.combine_chunk_analyses(
-        "org/repo", ["word " * 3_000 for _ in range(40)],
-        model="big-model", synthesize=falls_back)
+    combine("org/repo", ["word " * 3_000 for _ in range(40)], falls_back, model="big-model")
 
     assert len(seen) > 1, "expected more than one call for this fixture"
     later_budget = llm._synthesis_budget("org/repo", "small-model")
@@ -254,6 +266,7 @@ def test_budget_is_sized_for_the_smallest_model_in_the_fallback_chain(monkeypatc
     """
     windows = {"big": 400_000, "small": 60_000}
     monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: windows.get(m, 60_000))
+    monkeypatch.setattr(llm, "acceptance_budget", lambda m, out: 10**9)   # fictional models; counts are local
     monkeypatch.setattr(llm, "get_fallback_model",
                         lambda m: "small" if m == "big" else None)
 
@@ -264,8 +277,7 @@ def test_budget_is_sized_for_the_smallest_model_in_the_fallback_chain(monkeypatc
         seen.append(llm.count_tokens_accurate(prompt, "small"))
         return "SUMMARY " + "word " * 100, 0.01, "small"
 
-    llm.combine_chunk_analyses("org/repo", ["word " * 4_000 for _ in range(30)],
-                               model="big", synthesize=falls_back_on_the_first_call)
+    combine("org/repo", ["word " * 4_000 for _ in range(30)], falls_back_on_the_first_call, model="big")
 
     small_budget = llm._synthesis_budget("org/repo", "small")
     assert seen, "no calls made"
@@ -294,10 +306,10 @@ def test_max_calls_is_enforced_after_rebatching(monkeypatch):
             return max(40_000 - int(m.split("-")[1]) * 3_000, 20_000)
         return 60_000
     monkeypatch.setattr(llm, "get_chunking_threshold", threshold)
+    monkeypatch.setattr(llm, "acceptance_budget", lambda m, out: 10**9)   # fictional models; counts are local
     monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
 
-    llm.combine_chunk_analyses("org/repo", ["word " * 1_500 for _ in range(80)],
-                               model="start", max_calls=5, synthesize=shrinking)
+    combine("org/repo", ["word " * 1_500 for _ in range(80)], shrinking, model="start", max_calls=5)
 
     assert len(calls) <= 5, f"ceiling of 5 overrun with {len(calls)} calls"
 
@@ -317,8 +329,7 @@ def test_truncation_paths_produce_a_prompt_that_actually_fits(monkeypatch):
         sent.append(llm.count_tokens_accurate(prompt, "claude-opus-5"))
         return " ".join(["word"] * 5_000), 0.01, model  # never shrinks -> forces the guards
 
-    llm.combine_chunk_analyses("org/repo", ["word " * 2_000 for _ in range(40)],
-                               model="claude-opus-5", max_depth=1, synthesize=record)
+    combine("org/repo", ["word " * 2_000 for _ in range(40)], record, max_depth=1)
 
     budget = llm._synthesis_budget("org/repo", "claude-opus-5")
     assert sent, "no calls made"
@@ -374,32 +385,12 @@ def test_driver_never_emits_an_over_budget_prompt_under_any_guard(monkeypatch):
         sent.append(llm.count_tokens_accurate(prompt, "claude-opus-5"))
         return "word " * 5_000, 0.01, model
 
-    text, _ = llm.combine_chunk_analyses(
-        "org/repo", ["word " * 400 for _ in range(300)],
-        model="claude-opus-5", synthesize=never_shrinks)
+    text, _ = combine("org/repo", ["word " * 400 for _ in range(300)], never_shrinks)
 
     budget = llm._synthesis_budget("org/repo", "claude-opus-5")
     assert text, "must still return something"
     for tokens in sent:
         assert tokens <= budget, f"emitted a {tokens}-token prompt over the {budget} budget"
-
-
-def test_local_degraded_analysis_is_returned_without_calling(monkeypatch):
-    """The no-request path returns a placeholder the metadata parser will flag as degraded."""
-    monkeypatch.setattr(llm, "get_chunking_threshold", lambda m: llm.SYNTHESIS_OUTPUT_TOKENS + 5)
-    monkeypatch.setattr(llm, "get_fallback_model", lambda m: None)
-    calls = []
-
-    def must_not_be_called(prompt, model):
-        calls.append(1)
-        return "SUMMARY", 0.01, model
-
-    # Budget floors at overhead + 1000, so force the impossible case directly.
-    trimmed = llm._truncate_all_to_fit("org/repo", ["word " * 50 for _ in range(500)],
-                                       12, "claude-opus-5")
-    assert trimmed == []
-    assert not calls
-    assert "could not be completed" in llm._local_degraded_analysis("org/repo", 500)
 
 
 # ── fourth review round: the collapse must not drop parts ────────────────────────────
@@ -450,8 +441,7 @@ def test_driver_never_drops_parts_silently(monkeypatch):
 
     parts = 120
     analyses = [f"UNIQUE_{i} " + "word " * 400 for i in range(parts)]
-    llm.combine_chunk_analyses("org/repo", analyses,
-                               model="claude-opus-5", synthesize=never_shrinks)
+    combine("org/repo", analyses, never_shrinks)
 
     if sent:
         final = sent[-1]
