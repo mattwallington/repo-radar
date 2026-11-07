@@ -662,23 +662,29 @@ def _frame_file(file_info):
 
 
 def _build_analysis_prompt(full_name, chunk, chunk_num, total_chunks):
-    """The assembled chunk-analysis prompt. Shared by the chunker (to budget the finished prompt)
-    and analyze_repo_chunk (to send it), so the budgeted text and the sent text can never drift."""
+    """The assembled chunk-analysis prompt. Shared by the chunkers (to count the finished prompt)
+    and the senders, so the counted text and the sent text can never drift. It asks about the same
+    eight subjects the final document covers."""
     combined_content = "\n".join(_frame_file(f) for f in chunk)
     chunk_info = f" (chunk {chunk_num}/{total_chunks})" if total_chunks > 1 else ""
     return f"""Analyze this portion of the repository and provide analysis.
 
 Repository: {full_name}{chunk_info}
 
-Analyze these files and provide:
+Report what these files show about each of these subjects:
 
 1. **Overview**: What functionality is covered in these files?
 2. **Technology Stack**: Languages, frameworks, and libraries used.
-3. **Key Components**: Important files and what they do.
-4. **API Endpoints/Interfaces**: Any APIs, exported functions, or public interfaces.
-5. **Dependencies**: External services, databases, or systems referenced (list specific service names).
+3. **Architecture**: Structure, layers and patterns visible in these files.
+4. **Key Components**: Important files and what they do.
+5. **API Endpoints/Interfaces**: Any APIs, exported functions, or public interfaces.
+6. **Dependencies**: External services, databases, or systems referenced (list specific service names).
+7. **Database Schema**: Tables, models, migrations or queries that show how data is stored.
+8. **Configuration**: Environment variables, configuration files and settings.
 
-Be specific and technical. Focus on what's present in these files.
+These files are only part of the repository, so they may say nothing about some subjects. Report only
+facts these files support, and write "not present here" for a subject they don't cover. Be specific
+and technical.
 
 Repository files:
 

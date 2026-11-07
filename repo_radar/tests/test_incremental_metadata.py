@@ -1442,6 +1442,20 @@ def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_p
     assert im.load_document(pristine, 'app-abc1234').text == current.text != old.text
 
 
+def test_full_chunk_requests_ask_for_all_eight_subjects(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\n')
+    assert full_build(pristine, repo, FileCounts(50_000)).status == 'published'
+    chunk_text, chunk = fake.sends[0][1], fake.sends[0][2]
+    for n, subject in enumerate(('Overview', 'Technology Stack', 'Architecture', 'Key Components', 'API Endpoints/Interfaces',
+                                 'Dependencies', 'Database Schema', 'Configuration'), 1):
+        assert f"{n}. **{subject}**" in chunk_text
+    assert 'not present here' in chunk_text and '(chunk 1/5)' in chunk_text
+    configs = [body['generationConfig'] for _s, _t, body in fake.sends]
+    assert [c['max_output_tokens'] for c in configs] == [8192] * 5 + [16384]
+    assert all(c['thinkingConfig']['thinkingLevel'] == 'low' for c in configs) and chunk['generationConfig'] == configs[0]
+
+
 def credential_traffic(provider, pristine, repo):
     """One published update, with every map call answered and the editor changing nothing. Returns what
     went to the provider, counts included, and the published document."""
