@@ -1,11 +1,13 @@
-"""Incremental metadata for opted-in repositories (config `incremental_metadata_repos`).
+"""Metadata for every repository: one decision, one worker, one publication path.
 
-Each document records the commit it was built from. A later sync updates it from that commit: the
-model summarizes each page of the diff, the notes are merged, and a final editor returns section edits
-that the app validates and applies. A full rebuild still happens weekly, when the model or policy
-changes, or when the baseline cannot be used; it reads the pinned source in chunks of at most 128,000
-input tokens and is capped at $40 per attempt. Both run on the shared summary_pipeline. Every other
-repository keeps the existing full-generation path unchanged.
+Each document records the commit it was built from. For a repository opted in to incremental updates
+(config `incremental_metadata_repos`), a later sync updates it from that commit: the model summarizes
+each page of the diff, the notes are merged, and a final editor returns section edits that the app
+validates and applies. A full rebuild happens weekly, when the model or policy changes, or when the
+baseline cannot be used. Every other repository is full-only: rebuilt in full when its tracked tree
+changes, with no weekly rebuild. A full rebuild reads the pinned source in requests of at most 128,000
+input tokens and is capped at $40 per attempt (a full-only one at its own estimate). Both run on the
+shared summary_pipeline.
 
 A failure never replaces a good document: it stays as it was, and INDEX marks it stale.
 """

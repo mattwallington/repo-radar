@@ -576,19 +576,9 @@ Repository files:
 """
 
 
-# The "(chunk i/N)" header is the only text that varies with the (evolving) chunk count, and BPE
-# token counts are NOT monotonic in the numerals — a real "(chunk 531/531)" tokenizes to MORE
-# tokens than a wider "(chunk 999999/999999)". So no synthetic numeral can upper-bound the header.
-# Instead we pack the header-LESS content against `threshold - reserve` and reserve a length-based
-# token allowance for whatever real header the final split yields: token_count never exceeds
-# char_count for a BPE tokenizer, so an allowance >= the widest header substring's character length
-# bounds the substring's own cost, plus a small empirical margin for seam retokenization. No
-# fixpoint over N is needed.
-
-
-# Guards for hierarchical synthesis. Coverage is the priority — every chunk reaches the final
-# report — so these bound the work rather than dropping input; hitting them degrades to an
-# explicit, warned truncation instead of silently analysing part of the repository.
+# Guards for the full adapter's hierarchical synthesis (summary_pipeline.FullBuild). Coverage is the
+# priority, so these bound the work rather than dropping input: every chunk reaches the final reduction,
+# and when a guard runs out the build stops and the document stays, with nothing excerpted or truncated.
 SYNTHESIS_MAX_DEPTH = 4
 SYNTHESIS_MAX_CALLS = 32
 SYNTHESIS_OUTPUT_TOKENS = 16384
