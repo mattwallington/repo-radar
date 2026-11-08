@@ -232,16 +232,6 @@ class Budget:
         """Reserve the worst-case cost of `request` before it is sent, or raise BudgetError."""
         return self.reserve_many([(request, input_tokens, max_output)])[0]
 
-    def reserve_send(self, model, request, input_tokens, max_output, margin=1.0):
-        """Reserve one legacy send to `model`, which may be a fallback with its own rates, at `margin` times
-        its uncached worst case."""
-        rates = rate_snapshot(model, self.now)
-        if rates is None:
-            raise PricingUnavailable(f"no price is known for {model}, so the request can't be bounded")
-        price = (rates.input, rates.output, rates.announced)
-        upper = (input_tokens * price[0] + max_output * price[1]) * margin
-        return self._reserve([request], [upper], price)[0]
-
     def reserve_many(self, items):
         """Reserve one wave at once: `items` are (request, input_tokens, max_output). Either every request
         is reserved and persisted, or none is and BudgetError says why. The cap applies to the wave's
@@ -340,8 +330,8 @@ class Budget:
 
     def refuse(self, reservation):
         """The provider refused the send without charging for it (a rate limit, or a server error that reported
-        no usage): its reservation goes back to the attempt, so an authorized retry or fallback still fits. A
-        durable pilot ledger, which has no such state, keeps it as unknown."""
+        no usage): its reservation goes back to the attempt. A durable pilot ledger, which has no such state,
+        keeps it as unknown."""
         upper = self._open.pop(reservation.key, 0.0)
         self.calls += 1
         if self.ledger is not None:

@@ -766,7 +766,6 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     from repo_radar.metadata import write_text_atomic, render_metadata_document
     from repo_radar.config import valid_incremental_failure_stop, valid_incremental_update_limit
     from repo_radar.metadata_budget import Budget, FULL_CAP_USD, INCREMENTAL_CAP_USD
-    from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
     from repo_radar.spending import SpendingError, SpendingStopped, WeeklyCapRefused
 
@@ -916,11 +915,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('failed', f"spending record: {e}", counts=bool(budget and budget.calls))
     except snap.ResourceLimit as e:   # from selection or a full build's discovery: no fallback, no partial list
         return finish('skipped', str(e))
-    except InputBudgetUnavailable as e:
-        return finish('skipped', f"token count unavailable: {e}")
     except TokenCountRejected as e:
-        return finish('failed', str(e))
-    except IncompleteResponseError as e:
         return finish('failed', str(e))
     except snap.GitError as e:
         return finish('failed', f"git: {e}")

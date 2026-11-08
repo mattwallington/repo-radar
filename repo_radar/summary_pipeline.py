@@ -263,7 +263,7 @@ class Executor:
             if item.reserve_tokens != item.tokens:
                 record['reserved_input_tokens'] = item.reserve_tokens
             if error is not None:
-                try:   # the same money rule as legacy sends; it never makes this a retry or a skip
+                try:   # the one money rule for a failed send; it never makes this a retry or a skip
                     llm.account_failed_send(self.budget, reservation, error)
                 except LedgerWriteError as e:
                     storage_error = storage_error or e
