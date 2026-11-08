@@ -4,7 +4,7 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.0.39] - 2026-11-08
+## [1.0.40] - 2026-11-08
 
 ### Added
 - **A weekly spending limit, on by default at $75.** Before any model call, each summary update or rebuild is admitted for the most it could spend, against what is left this week for stable and dev builds together. An update that doesn't fit is skipped and the current summary is kept; it doesn't count as a failure. Settings can change the amount ($1 to $1,000) or turn the limit off, which still records spending. Settings also shows this week's recorded spend, what is reserved or uncertain, and what is left. Weeks reset on Monday 00:00 UTC, and the first one starts with the first sync on this version. Stopping a sync releases what its updates didn't use, except requests already sent. Older builds aren't limited and their spending isn't counted, so both apps need this version.
