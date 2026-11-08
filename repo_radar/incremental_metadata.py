@@ -607,6 +607,9 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     if not files:
         raise StaleUpdate("no analyzable source")
     budget.extra['pipeline_version'] = PIPELINE_VERSION
+    # Ready to send: admit the whole protected full allowance against the weekly cap before the first call.
+    from repo_radar.metadata_budget import FULL_CAP_USD
+    budget.acquire(FULL_CAP_USD)
     text = summary_pipeline.FullBuild(full_name, files, model, session, budget).run()
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
@@ -726,7 +729,7 @@ def _cleared_setup_failure(state, now):
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
                       missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None,
-                      trigger='manual', update_limit_usd=None, failure_stop=None):
+                      trigger='manual', update_limit_usd=None, failure_stop=None, spending=None):
     """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
@@ -734,7 +737,9 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     variable when it isn't set; that fails a due update before any count or send. `trigger` is who started
     this sync, which decides whether a repository held after repeated failures may try again (held_reason).
     `update_limit_usd` caps one incremental update and `failure_stop` is the hold threshold, both from Settings;
-    a missing or invalid value means the default ($12 and 2), never no limit."""
+    a missing or invalid value means the default ($12 and 2), never no limit. `spending` is a normal sync's
+    production spending context (repo_radar.spending.Spending): the attempt's whole allowance is admitted
+    against the weekly cap before its first send and closed when it ends. Without it, nothing is recorded."""
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
@@ -742,6 +747,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     from repo_radar.metadata_budget import Budget, FULL_CAP_USD, INCREMENTAL_CAP_USD
     from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
+    from repo_radar.spending import SpendingError, WeeklyCapRefused
 
     started = time.monotonic()
     deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)   # selection, preparation and sends share it
@@ -757,6 +763,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         the streak keeps its count, its last counted failure and any full-rebuild debt."""
         reason = safe_reason(reason)
         after = None
+        closing = budget.close_spending() if budget else None   # known charges stay; the unused rest is released
         if committed and status != 'published':
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
@@ -777,6 +784,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             state_error = _try_write_state(pristine_dir, cache_name, attempt)
         if after:
             state_error = safe_reason(f"after publishing: {after}" + (f"; {state_error}" if state_error else ''))
+        if closing:
+            state_error = safe_reason(closing + (f"; {state_error}" if state_error else ''))
         return Outcome(status, decision.strategy if decision else None, reason, decision.base if decision else None,
                        target, usage, time.monotonic() - started, state_error)
 
@@ -830,7 +839,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         log(f"{decision.strategy}: {decision.reason}")
 
         cap = update_limit if decision.strategy == 'incremental' else FULL_CAP_USD
-        budget = Budget(model, cap=cap, label=decision.strategy)
+        budget = Budget(model, cap=cap, label=decision.strategy, spending=spending, owner=full_name)
         if missing_credential:   # setup, not a bought failure: it doesn't move the streak toward a hold
             return finish('failed', f"no API key: {missing_credential} is not set", counts=False)
 
@@ -872,6 +881,12 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('published', None)
     except StaleUpdate as e:
         return finish('skipped' if e.warning else 'failed', e.reason)
+    except WeeklyCapRefused as e:
+        # Only admission refuses, before any send: the previous document, failure count, last counted failure
+        # and any full-rebuild obligation all stay. No retry, fallback or other strategy follows.
+        return finish('skipped', str(e))
+    except SpendingError as e:   # an accounting problem, never a refusal; before any send it isn't a bought failure
+        return finish('failed', f"spending record: {e}", counts=bool(budget and budget.calls))
     except snap.ResourceLimit as e:   # from selection or a full build's discovery: no fallback, no partial list
         return finish('skipped', str(e))
     except InputBudgetUnavailable as e:
@@ -884,3 +899,6 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('failed', f"git: {e}")
     except Exception as e:  # a provider, transport or storage error; its type and a bounded message
         return finish('failed', f"{type(e).__name__}: {e}")
+    finally:   # an interrupt that skipped finish still closes the allowance (closing twice changes nothing)
+        if budget is not None:
+            budget.close_spending()

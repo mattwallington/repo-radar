@@ -17,7 +17,8 @@ from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
 from repo_radar.config import (DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, incremental_full_rebuild_days,
-                               incremental_metadata_repos, incremental_spending_policy)
+                               incremental_metadata_repos, incremental_spending_policy,
+                               weekly_spending_policy)
 from repo_radar import incremental_metadata
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
@@ -33,6 +34,9 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
     authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
     InputBudgetUnavailable, IncompleteResponseError, is_transient_server_error)
 from repo_radar.preflight import PreflightSession
+from repo_radar.metadata_budget import (Budget, BudgetError, LedgerWriteError, LEGACY_MARGIN, FULL_CAP_USD,
+                                        legacy_allowance)
+from repo_radar.spending import Spending, SpendingError, WeeklyCapRefused, policy_from_config
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
@@ -348,7 +352,8 @@ def _generate_incremental(task_data, session, args, ctx):
             missing_credential=env_key if env_key and not os.getenv(env_key) else None,
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
             trigger=resolve_trigger(default='cli'),
-            update_limit_usd=_incremental_policy(args)[0], failure_stop=_incremental_policy(args)[1])
+            update_limit_usd=_incremental_policy(args)[0], failure_stop=_incremental_policy(args)[1],
+            spending=getattr(args, '_spending', None))
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)
@@ -442,6 +447,30 @@ def _record_incremental_git_failure(args, full_name, cache_name, step, sync_logg
                           reason=f"{step} failed", state_error=state_error)
 
 
+def _admit_legacy_attempt(session, full_name, model, args, prompts, chunked):
+    """The legacy attempt's Budget, admitted against the weekly cap before its first send.
+
+    Its allowance is one estimate (metadata_budget.legacy_allowance): every prepared prompt's input plus its
+    maximum output and, when chunked, every synthesis call the bounded synthesis may make at its complete
+    input and output ceilings, with a 25% margin and at most $40. That allowance is the attempt's hard limit
+    for every send, retry and fallback; nothing is topped up once sending starts. Raises WeeklyCapRefused."""
+    from repo_radar.llm import (output_budget, legacy_request_tokens, _synthesis_budget, SYNTHESIS_MAX_CALLS,
+                                SYNTHESIS_OUTPUT_TOKENS)
+    try:
+        requests = []
+        for prompt, requested in prompts:
+            output = output_budget(model, requested)
+            requests.append((legacy_request_tokens(session, model, prompt, output)[0], output))
+        synthesis = ((SYNTHESIS_MAX_CALLS, _synthesis_budget(full_name, model),
+                      output_budget(model, SYNTHESIS_OUTPUT_TOKENS)) if chunked else None)
+        allowance = legacy_allowance(model, requests, synthesis)
+    except (InputBudgetUnavailable, ValueError, TypeError):
+        allowance = FULL_CAP_USD   # an estimate that can't be computed; never permission to send unpriced
+    budget = Budget(model, label='legacy', spending=getattr(args, '_spending', None), owner=full_name)
+    budget.acquire(allowance)
+    return budget
+
+
 def generate_repo_metadata(task_data, session, args, ctx):
     """Generate metadata for a single repo with progress updates."""
     repo_config, cache_name, commit_hash, short_id, color, _ = task_data
@@ -468,7 +497,12 @@ def generate_repo_metadata(task_data, session, args, ctx):
             'color': color
         }, args.status_server)
 
-    total_api_cost = 0.0
+    # One accounting total for the whole attempt: every send's recorded cost, including incomplete replies.
+    budget = None
+
+    def spent():
+        return budget.cost if budget is not None else 0.0
+
     try:
         # Custom metadata generation with progress updates
         if args.dry_run:
@@ -548,7 +582,7 @@ def generate_repo_metadata(task_data, session, args, ctx):
             """Persist ONE degraded metadata record and stop. Recording the CURRENT commit
             stops the repo being retried forever; parse_status=degraded keeps it visible in
             INDEX. Any cost already spent (chunk-analysis sends + combine) stays in
-            total_api_cost and is still accounted below."""
+            the attempt's budget and is still accounted below."""
             degraded_content = f"""---
 repo_name: {full_name.split('/')[-1]}
 full_name: {full_name}
@@ -601,6 +635,10 @@ _Metadata generation degraded before completion: {reason}_
                 _finish_degraded(_partition.degraded_reason)
                 return
             chunks = _partition.chunks
+            budget = _admit_legacy_attempt(
+                session, full_name, model, args,
+                [(_build_analysis_prompt(full_name, chunk, i, len(chunks)), 8192) for i, chunk in enumerate(chunks, 1)],
+                chunked=True)
             expected_chunks = len(chunks)
             ctx.meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
 
@@ -655,9 +693,8 @@ _Metadata generation degraded before completion: {reason}_
                         prompt = _build_analysis_prompt(full_name, chunk, i, len(chunks))
 
                         analysis, api_cost, response = call_llm(
-                            current_model, prompt, max_tokens=8192
+                            current_model, prompt, max_tokens=8192, budget=budget, session=session
                         )
-                        total_api_cost += api_cost
 
                         # Update rate limit tracker
                         rate_limit_tracker.update_from_response(response)
@@ -672,8 +709,8 @@ _Metadata generation degraded before completion: {reason}_
                         # Success! Break out of retry loop
                         break
 
-                    except IncompleteResponseError:
-                        raise  # a rejected reply, not a rate limit: no retry or fallback
+                    except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
+                        raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
                     except Exception as e:
                         import traceback
                         error_str = str(e)
@@ -763,17 +800,16 @@ _Metadata generation degraded before completion: {reason}_
                     returns the model actually used so the caller can re-budget when a
                     fallback has a smaller context window.
                     """
-                    nonlocal current_model_combine, total_api_cost
+                    nonlocal current_model_combine
                     for attempt in range(max_retries):
                         try:
                             text, cost, resp = call_llm(
-                                current_model_combine, prompt, max_tokens=16384
+                                current_model_combine, prompt, max_tokens=16384, budget=budget, session=session
                             )
-                            total_api_cost += cost
                             rate_limit_tracker.update_from_response(resp)
                             return text, cost, current_model_combine
-                        except IncompleteResponseError:
-                            raise  # a rejected reply, not a rate limit: no retry or fallback
+                        except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
+                            raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
                         except Exception as exc:
                             if is_transient_server_error(exc):
                                 if attempt == max_retries - 1:
@@ -820,8 +856,8 @@ _Metadata generation degraded before completion: {reason}_
                         # Success! Break out of retry loop
                         break
 
-                    except IncompleteResponseError:
-                        raise  # a rejected reply, not a rate limit: no retry or fallback
+                    except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
+                        raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
                     except Exception as e:
                         error_str = str(e)
                         error_type = type(e).__name__
@@ -860,7 +896,7 @@ _Metadata generation degraded before completion: {reason}_
                 analysis_model = current_model_combine
                 if isinstance(analysis, DegradedSynthesis):
                     # Seam (d2): the per-chunk analysis sends already happened and their cost
-                    # is already in total_api_cost, including completed synthesis calls; it could not be
+                    # is already in the attempt's budget, including completed synthesis calls; it could not be
                     # reduced to fit, so make NO final synthesis send and persist a degraded
                     # record at the current commit.
                     _finish_degraded(analysis.reason)
@@ -874,6 +910,8 @@ _Metadata generation degraded before completion: {reason}_
             base_wait = 3
             analysis = None
             current_model = get_ai_model()
+            budget = _admit_legacy_attempt(session, full_name, model, args,
+                                           [(_build_full_repo_prompt(full_name, files), 16384)], chunked=False)
 
             for retry in range(max_retries):
                 try:
@@ -884,15 +922,12 @@ _Metadata generation degraded before completion: {reason}_
 
                     ctx.meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
 
-                    # Authoritatively COUNT the exact full-repo payload before sending it
-                    # (memoized in production, since authoritative_partition already counted
-                    # this same prompt). Not a gate here — the single-vs-chunk decision was
-                    # already made above; this keeps the guarantee that every send was counted.
-                    session.count(current_model, prompt, 16384)
+                    # call_llm counts the exact payload with the session before sending it (memoized in
+                    # production, since authoritative_partition already counted this same prompt) and
+                    # reserves it inside the attempt's allowance, so every send was counted.
                     analysis, single_cost, response = call_llm(
-                        current_model, prompt, max_tokens=16384
+                        current_model, prompt, max_tokens=16384, budget=budget, session=session
                     )
-                    total_api_cost += single_cost
                     analysis_model = current_model  # may be a fallback after a retry
 
                     # Update rate limit tracker
@@ -916,8 +951,8 @@ _Metadata generation degraded before completion: {reason}_
                     # Success! Break out of retry loop
                     break
 
-                except IncompleteResponseError:
-                    raise  # a rejected reply, not a rate limit: no retry or fallback
+                except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
+                    raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
                 except Exception as e:
                     error_str = str(e)
                     error_type = type(e).__name__
@@ -1067,13 +1102,13 @@ parse_status: {parse_status}
         except Exception:
             pass
 
-        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ generated (${total_api_cost:.4f})[/{task_color}]")
+        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ generated (${spent():.4f})[/{task_color}]")
 
         # Send status update to UI
         if hasattr(args, 'status_server') and args.status_server:
             send_status_update('progress', {
                 'repo': full_name, 'short_name': short_id,
-                'status': f'✓ metadata complete (${total_api_cost:.4f})',
+                'status': f'✓ metadata complete (${spent():.4f})',
                 'percent': 100,
                 'color': color
             }, args.status_server)
@@ -1085,10 +1120,29 @@ parse_status: {parse_status}
             ctx.sync_logger.event(
                 "metadata_generated",
                 repo=full_name,
-                cost=f"${total_api_cost:.4f}",
+                cost=f"${spent():.4f}",
             )
 
-        return total_api_cost
+        return spent()
+
+    except WeeklyCapRefused as e:
+        # Only admission refuses, before any send: nothing is written, so the previous metadata and its commit
+        # stay and a later sync tries again. Not an error, a retry, a fallback or a degraded record.
+        ctx.meta_progress.update(task_id, completed=100, status="[yellow]\u26a0 skipped: weekly spending limit[/yellow]")
+        if hasattr(args, 'status_server') and args.status_server:
+            send_status_update('progress', {
+                'repo': full_name, 'short_name': short_id,
+                'status': '\u26a0 metadata skipped: weekly spending limit',
+                'percent': 100,
+                'color': 'yellow'
+            }, args.status_server)
+        with ctx.stats_lock:
+            ctx.stats['skipped'] = ctx.stats.get('skipped', 0) + 1
+        if ctx.sync_logger:
+            ctx.sync_logger.event("metadata_skipped",
+                                  level=_activity_level("metadata_skipped", is_degraded=True),
+                                  repo=full_name, reason=str(e), cost=f"${spent():.4f}")
+        return spent()
 
     except InputBudgetUnavailable as e:
         # Claude's token count was unavailable, so the prompt's size is unverified. Skip rather than
@@ -1107,8 +1161,8 @@ parse_status: {parse_status}
         if ctx.sync_logger:
             ctx.sync_logger.event("metadata_skipped",
                                   level=_activity_level("metadata_skipped", is_degraded=True),
-                                  repo=full_name, reason=str(e), cost=f"${total_api_cost:.4f}")
-        return total_api_cost
+                                  repo=full_name, reason=str(e), cost=f"${spent():.4f}")
+        return spent()
 
     except Exception as e:
         import traceback
@@ -1118,8 +1172,21 @@ parse_status: {parse_status}
         stack_trace = traceback.format_exc()
 
         # Show more descriptive error for common issues. The type comes first: a rejected reply's
-        # message can contain "429" (its character count) without being a rate limit.
-        if isinstance(e, IncompleteResponseError):
+        # message can contain "429" (its character count) without being a rate limit, and so can a
+        # spending message's dollar amounts.
+        if isinstance(e, (BudgetError, LedgerWriteError, SpendingError)):
+            short_msg = ("Spending limit reached" if isinstance(e, BudgetError) else "Spending record error")
+            detailed_msg = f"""ERROR: {short_msg}
+Repository: {full_name}
+Model: {get_ai_model()}
+Error Type: {error_type}
+
+Details:
+{full_error}
+
+The previous metadata was kept. Requests already sent stay counted at their recorded or
+reserved cost; no further request was sent for this repository."""
+        elif isinstance(e, IncompleteResponseError):
             short_msg = "Incomplete response from model"
             detailed_msg = f"""ERROR: Incomplete Response
 Repository: {full_name}
@@ -1227,14 +1294,18 @@ Stack Trace:
                 repo=full_name,
                 error_type=error_type,
                 detail=full_error,
-                cost=f"${total_api_cost:.4f}",
+                cost=f"${spent():.4f}",
             )
 
-        return total_api_cost
+        return spent()
     finally:
-        # Completed calls count even when later requests or local processing fail.
+        # Completed calls count even when later requests or local processing fail, once each.
         with ctx.stats_lock:
-            ctx.stats['api_cost'] += total_api_cost
+            ctx.stats['api_cost'] += spent()
+            if budget is not None and budget.unknown_calls:
+                ctx.stats['unknown_cost_calls'] = ctx.stats.get('unknown_cost_calls', 0) + budget.unknown_calls
+        if budget is not None:
+            budget.close_spending()   # known charges stay; the rest of its allowance is released
 
 
 def sync_mode(args):
@@ -1487,6 +1558,17 @@ def sync_mode(args):
     args._incremental_policy = (limit_usd, failure_stop)
     for field in invalid_fields:
         console.print(f"[yellow]Warning: {field} in the config is invalid; using its default[/yellow]")
+    # The weekly spending record every generation attempt in this sync is admitted against. Its settings
+    # are read again at each admission; here they're only checked so an invalid value is reported once.
+    for field in weekly_spending_policy(config)[2]:
+        console.print(f"[yellow]Warning: {field} in the config is invalid; using its default[/yellow]")
+    args._spending = None
+    if metadata_capable and not args.dry_run:
+        args._spending = Spending(resolve_channel(), policy=lambda: policy_from_config(load_config()))
+        try:
+            args._spending.initialize()   # the first normal sync starts the first period
+        except SpendingError as e:
+            console.print(f"[yellow]Warning: spending record unavailable ({e}); metadata updates won't be sent[/yellow]")
     incremental_repos = args._incremental_repos
     args._incremental_reported = set()
     args._incremental_index_due = False

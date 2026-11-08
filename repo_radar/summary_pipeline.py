@@ -917,6 +917,9 @@ class Pipeline:
                 self.budget.admit(quote.total_usd)
             except BudgetError as e:
                 raise im.StaleUpdate(str(e), warning=self.executor.unpaid()) from None
+            # The weekly hold is this same whole quote, which also becomes the attempt's hard limit. A
+            # refusal (spending.WeeklyCapRefused) propagates as itself: a skip with nothing sent.
+            self.budget.acquire(quote.total_usd)
             self.log(f"{quote.pages} pages, up to ${quote.total_usd or 0:.2f}", 20)
             nodes = map_reduce(self, self.pages.diff_pages)
             self.verify_coverage(nodes)

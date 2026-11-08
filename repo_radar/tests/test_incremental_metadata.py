@@ -1420,8 +1420,9 @@ def gemini_text(text, prompt_tokens=100, finish='STOP'):
                           "totalTokenCount": prompt_tokens + 20}})
 
 
-def full_build(pristine, repo, session, model=GEMINI):
-    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW)
+def full_build(pristine, repo, session, model=GEMINI, **kw):
+    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW,
+                                **kw)
 
 
 def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
@@ -1462,7 +1463,7 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     old = im.load_document(pristine, 'app-abc1234')
     counts = FileCounts(50_000)   # two files to a chunk: five chunks, each counted far below the catalog bound
     rate_in, rate_out = Budget(GEMINI).price   # the prices this attempt uses, whatever the date
-    expensive = round((8.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $24.60
+    expensive = round((13.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $39.60
 
     fake = GeminiFake(monkeypatch, lambda stage, text: gemini_text('## Analysis\nTwo files.\n', expensive))
     outcome = full_build(pristine, repo, counts)
@@ -1473,19 +1474,42 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     # Three chunks were sent and settled once each; the fourth was refused before sending, and says why.
     assert len(fake.sends) == 3 and {s for s, _t, _b in fake.sends} == {'full'}
     assert outcome.status == 'failed' and outcome.reason.startswith('full chunk 4/5 (call 4): ')
-    assert '$25.00 limit' in outcome.reason
+    assert '$40.00 limit' in outcome.reason
     usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
     assert (usage['calls'], usage['unknown_cost_calls'], usage['retained_reservation_usd'], usage['open_reservation_usd']) == (3, 0, 0, 0)
     assert usage['known_cost_usd'] == usage['cost_usd'] == pytest.approx(3 * per_chunk, rel=1e-6)
+    assert usage['known_cost_usd'] > 25   # past the old $25 cap: the second and third chunks are now bought
     assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
     assert im.load_document(pristine, 'app-abc1234').text == old.text
 
-    # Cheap replies: the same build finishes under the cap, with every chunk and one reduction.
+    # Cheap replies, in a normal sync's weekly record: the same build finishes under the cap, with every chunk
+    # and one reduction. It was admitted for the whole $40, recorded each reply once inside that hold, and
+    # closing released the rest.
+    from repo_radar import spending as sp
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
-    outcome = full_build(pristine, repo, counts)
+    outcome = full_build(pristine, repo, counts, spending=record)
     assert outcome.status == 'published', outcome
     assert len(fake.sends) == 6 and outcome.usage['calls'] == 6 and outcome.usage['cost_usd'] < 1
     assert im.load_document(pristine, 'app-abc1234').info['pipeline_version'] == im.PIPELINE_VERSION
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert (attempt['allowance'], attempt['status'], len(attempt['sends'])) == (40_000_000, 'closed', 6)
+    week = sp.summary(record.store, record.policy)
+    assert week['recorded_usd'] == pytest.approx(outcome.usage['cost_usd'], abs=1e-5) and week['reserved_usd'] == 0
+
+    # With less than $40 left this week the next full build isn't admitted: nothing is sent, the document,
+    # its failure count and last counted failure stay, and it says what it needed and what remains.
+    published = im.load_document(pristine, 'app-abc1234').text
+    before = metadata.read_attempt_state(pristine, 'app-abc1234')
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY)
+    tight = sp.Spending('dev', store=record.store, policy=lambda: (True, 39.99 + week['recorded_usd']))
+    outcome = full_build(pristine, repo, counts, spending=tight)
+    assert outcome.status == 'skipped' and fake.sends == [] and outcome.usage['calls'] == 0
+    assert outcome.reason.startswith('Weekly spending limit: this update needs up to $40.00; $39.99 remains until ')
+    after = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert after['consecutive_failures'] == before['consecutive_failures']
+    assert after.get('last_failure_reason') == before.get('last_failure_reason')
+    assert im.load_document(pristine, 'app-abc1234').text == published
 
 
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):

@@ -275,7 +275,17 @@ def _map_context_window_stop_as_truncation():
     _FINISH_REASON_MAP.setdefault("model_context_window_exceeded", "length")
 
 
-def call_llm(model, prompt, max_tokens=8192):
+def legacy_request_tokens(session, model, prompt, max_output):
+    """(input tokens, exact) for one legacy prompt: the provider's authoritative count when the session has
+    one (memoized, so counting again costs nothing), else the local count, which callers price with a margin."""
+    if session is not None:
+        counted = session.count(model, prompt, max_output)
+        if counted.authoritative and isinstance(counted.tokens, int) and counted.tokens > 0:
+            return counted.tokens, True
+    return count_tokens_accurate(prompt, model), False
+
+
+def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
     """Call an LLM and return (text, api_cost, raw_response).
 
     Transparently routes between ``litellm.completion`` (Chat Completions,
@@ -285,6 +295,12 @@ def call_llm(model, prompt, max_tokens=8192):
     Callers get back a single string of generated text, the dollar cost if
     litellm reports it, and the raw response object so they can still feed
     it to ``rate_limit_tracker.update_from_response``.
+
+    With `budget` (the legacy attempt's metadata_budget.Budget), the send is counted with `session` and
+    reserved inside the attempt's allowance at this model's own rates before it goes out, and its cost is
+    recorded straight after transport, before any text is read or an incomplete reply rejected; api_cost is
+    then that recorded cost (0.0 when unknown, which keeps its whole reservation). SDK retries are off: every
+    retry or fallback is the caller's, and reserved again.
     """
     import litellm
 
@@ -292,13 +308,43 @@ def call_llm(model, prompt, max_tokens=8192):
     # Name the provider explicitly: litellm otherwise infers it from its downloaded model map, and
     # when that fetch fails its bundled map doesn't know newer ids such as gpt-6.1-terra.
     provider = provider_for_model(model)
-    if _needs_responses_api(model):
-        response = litellm.responses(
-            model=model,
-            input=prompt,
-            max_output_tokens=max_tokens,
-            custom_llm_provider=provider,
-        )
+    responses_api = _needs_responses_api(model)
+    reservation = None
+    if budget is not None:
+        from repo_radar.metadata_budget import LEGACY_MARGIN
+        tokens, exact = legacy_request_tokens(session, model, prompt, max_tokens)
+        reservation = budget.reserve_send(model, {'model': model, 'prompt': prompt, 'max_tokens': max_tokens},
+                                          tokens, max_tokens, margin=1.0 if exact else LEGACY_MARGIN)
+    try:
+        if responses_api:
+            response = litellm.responses(model=model, input=prompt, max_output_tokens=max_tokens,
+                                         custom_llm_provider=provider, max_retries=0)
+        else:
+            extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
+            if provider == 'anthropic':
+                _map_context_window_stop_as_truncation()
+            response = litellm.completion(model=model, messages=_completion_messages(prompt), max_tokens=max_tokens,
+                                          custom_llm_provider=provider, num_retries=0, max_retries=0, **extra)
+    except BaseException:
+        if reservation is not None:
+            from repo_radar.metadata_budget import LedgerWriteError
+            try:
+                budget.fail(reservation)   # sent, so it may have been billed: its whole bound stays
+            except LedgerWriteError:
+                pass                       # the hold is now broken and refuses any further send
+        raise
+
+    hidden = getattr(response, '_hidden_params', None)
+    reported = hidden.get('response_cost') if isinstance(hidden, dict) else None
+    api_cost = reported or 0.0
+    if reservation is not None:
+        raw = getattr(response, 'usage', None)
+        usage = (TurnUsage(getattr(raw, 'input_tokens', None), getattr(raw, 'output_tokens', None)) if responses_api
+                 else TurnUsage(getattr(raw, 'prompt_tokens', None), getattr(raw, 'completion_tokens', None))
+                 ) if raw is not None else None
+        api_cost = budget.settle(reservation, usage, reported) or 0.0
+
+    if responses_api:
         # Prefer the convenience attribute; fall back to manual extraction.
         text = getattr(response, 'output_text', None)
         if not text:
@@ -307,16 +353,6 @@ def call_llm(model, prompt, max_tokens=8192):
             except (AttributeError, IndexError, TypeError):
                 text = ''
     else:
-        extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
-        if provider == 'anthropic':
-            _map_context_window_stop_as_truncation()
-        response = litellm.completion(
-            model=model,
-            messages=_completion_messages(prompt),
-            max_tokens=max_tokens,
-            custom_llm_provider=provider,
-            **extra,
-        )
         try:
             text = response.choices[0].message.content or ''
         except (AttributeError, IndexError):
@@ -329,11 +365,6 @@ def call_llm(model, prompt, max_tokens=8192):
                 raise IncompleteResponseError(
                     f"{model} returned an incomplete response (finish_reason={finish!r}, "
                     f"{len(text)} characters of text); not using it")
-
-    api_cost = 0.0
-    hidden = getattr(response, '_hidden_params', None)
-    if isinstance(hidden, dict):
-        api_cost = hidden.get('response_cost') or 0.0
 
     return text, api_cost, response
 
