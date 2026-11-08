@@ -1088,7 +1088,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
             mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
     note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
                                             ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
-    assert note['changes'][0]['files'] == [] and repairs == {'normalized_file_citations': 0, 'dropped_file_citations': 1}
+    assert note['changes'][0]['files'] == [] and repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_file_citations': 1}
 
 
 def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatch, tmp_path):
@@ -1170,6 +1170,66 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     edits = fake.stage('edit')
     assert outcome.status == 'published' and len(edits) == 1, outcome
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
+
+
+def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkeypatch, tmp_path):
+    """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
+    whole update failed. Now that change is dropped and counted; the note's other change still lands."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    repo.commit('one change')
+    old = im.load_document(pristine, 'app-abc1234')
+    components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+    patch = {'base_document_sha256': old.sha256,
+             'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                           'content': '## Key Components\n- m0 now records a change\n'}]}
+
+    def reply(stage, text):
+        if stage == 'map':
+            files = files_on_page(text)
+            return {'changes': [{'files': files, 'what': 'm0 records a change', 'sections': components.id},
+                                {'files': files, 'what': 'UNPLACED change', 'sections': ['', 'unknown-id']}],
+                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+        return patch
+    fake = GeminiFake(monkeypatch, reply)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+    assert outcome.status == 'published', outcome
+    editor = fake.stage('edit')[0][0]
+    assert 'm0 records a change' in editor and 'UNPLACED' not in editor and mr.SECTION_WARNING in editor
+    usage = outcome.usage
+    assert (usage['normalized_sections'], usage['dropped_sections'], usage['dropped_changes']) == (1, 2, 1)
+    new = im.load_document(pristine, 'app-abc1234')
+    assert 'm0 now records a change' in new.text and mr.SECTION_WARNING in new.info['coverage_note']
+
+
+def test_a_resource_limit_after_paid_map_calls_is_a_failure(monkeypatch, tmp_path):
+    """A spool read that fails mid-run, after map waves were bought, fails the update and moves the streak;
+    the same limit before anything is sent is still a skip."""
+    small_pages(monkeypatch, 4096)
+    real_read = snap.PageSet.read
+
+    def attempt(where, after_sends):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        rewrite_files(repo, 80)
+        old = im.load_document(pristine, 'app-abc1234')
+        fake = GeminiFake(monkeypatch, lambda stage, text: {'changes': [], 'questions': None, 'new_sections': None,
+                                                             'no_summary_change_reason': 'no effect on the summary'})
+
+        def read(self, page):
+            if fake.sends or not after_sends:
+                raise snap.ResourceLimit("the page spool could not be read")
+            return real_read(self, page)
+        monkeypatch.setattr(snap.PageSet, 'read', read)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        assert im.load_document(pristine, 'app-abc1234').text == old.text
+        return outcome, fake, metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures']
+
+    outcome, fake, streak = attempt(tmp_path / 'paid', True)
+    assert outcome.status == 'failed' and 'spool' in outcome.reason and fake.sends and streak == 1, outcome
+    outcome, fake, streak = attempt(tmp_path / 'unpaid', False)
+    assert outcome.status == 'skipped' and not fake.sends and streak == 0, outcome
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):

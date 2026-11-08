@@ -506,7 +506,8 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
                     spool_dir=None, evidence_dir=None, case=None, deadline=None):
     """Update `doc` from its analyzed commit to decision.target: map each diff page, merge the notes, edit
     once. Pages spool to an owner-only directory that is removed afterwards, unless the caller names
-    `spool_dir` to keep it as evidence. A resource limit stops the update; it never becomes a full build.
+    `spool_dir` to keep it as evidence. A resource limit stops the update; it never becomes a full build. It
+    is a skip only while nothing has been paid for; after a paid call it is a failure.
     `deadline` is the attempt's, set before selection; only a direct caller without one starts a new one."""
     import shutil
     import time
@@ -523,7 +524,7 @@ def run_incremental(repo_path, full_name, doc, decision, model, session, budget,
         return mr.Pipeline(full_name, doc, prepared, model, session, budget, deadline.at, deadline.clock, log, case,
                            evidence_dir).run()
     except snap.ResourceLimit as e:
-        raise StaleUpdate(str(e), warning=True) from None
+        raise StaleUpdate(str(e), warning=mr.unpaid(budget)) from None
     except snap.GitError as e:
         raise StaleUpdate(str(e)) from None
     finally:

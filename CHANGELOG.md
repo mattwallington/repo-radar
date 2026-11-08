@@ -17,6 +17,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - **Download links point to `ReperioHealth/repo-radar-releases`,** where releases are published.
+- **One malformed note no longer fails a whole summary update.** A page's note that named summary sections it wasn't given used to stop the update after its pages had been paid for. Those references are now dropped, along with any change left with no section; the rest of the note is used, the drops are counted in the attempt's usage, and the coverage note says so. A resource limit hit after paid calls, such as an unreadable page spool, now counts as a failed update rather than a skip.
 
 ## [1.0.38] - 2026-11-08
 

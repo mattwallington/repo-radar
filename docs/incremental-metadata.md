@@ -83,8 +83,13 @@ omissions. There are no shell, network, host-filesystem or write tools.
    that. A note or merged note may cite only the files its request listed. An exact path of one of those
    files becomes its id; any other citation is dropped and the change kept, possibly with no file. Each
    call's record and the attempt's usage count those repaired and dropped citations, and when one was
-   dropped the editor and the published coverage note say file attribution is incomplete. Everything
-   else about a note stays strict: its shape, its section ids and its size, before and after the repair.
+   dropped the editor and the published coverage note say file attribution is incomplete. Section ids
+   are repaired the same way: a single id becomes a list, an id the request wasn't given (or a blank or
+   non-string) is dropped, and a change whose sections were all dropped is dropped with them, so one
+   malformed change doesn't fail the update. Those repairs are counted too (`normalized_sections`,
+   `dropped_sections`, `dropped_changes`), and the editor and the coverage note say when any were dropped.
+   Everything else about a note stays strict: its shape and its size, before and after the repairs, and a
+   note left with nothing is refused.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
    the status and paths of the file ids they cite, and what wasn't analyzed: at most 4 turns, 6 `read_file`
    or `search` calls, 64 KiB of delivered tool results and 16,384 output tokens. Its first request is
@@ -168,7 +173,8 @@ the document it started from is unchanged, and the repository is still at the sa
 `INDEX.md` marks such a document stale and names the analyzed revision, the attempted revision and
 the reason. An opted-in repository that has never had a document is listed as having metadata
 unavailable. The sync's progress view and Activity report the update as failed (an error) or skipped
-(a warning, for example an unavailable token count or price, a spending limit, or the spool limit).
+(a warning, for example an unavailable token count or price, a spending limit, or the spool limit). Such a
+stop is a skip only while nothing has been paid for; once any call has been sent, it is a failure.
 When any call fails, nothing further is started, the calls already launched finish and are accounted
 for, and no partial set of notes is used. A failed incremental update is not followed by an automatic
 full rebuild; the next ordinary sync tries again from the start, spending again, up to the hold below.
