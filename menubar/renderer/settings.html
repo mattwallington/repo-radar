@@ -156,17 +156,19 @@
                     <label for="schedule-time">Time</label>
                     <input type="time" id="schedule-time" class="form-control" value="09:00">
                     <small class="form-help">Sync will run once per day at this time</small>
+                    <small class="form-help form-error" id="schedule-time-error" hidden></small>
                 </div>
                 
                 <div class="form-group" id="hourly-options" style="display: none;">
                     <label for="schedule-interval">Interval (hours)</label>
                     <input type="number" id="schedule-interval" class="form-control" min="1" max="24" value="6">
                     <small class="form-help">Sync will run every N hours</small>
+                    <small class="form-help form-error" id="schedule-interval-error" hidden></small>
                 </div>
                 
                 <div class="form-group" id="weekly-options" style="display: none;">
                     <label>Days of week</label>
-                    <div class="days-selector">
+                    <div class="days-selector" id="schedule-days">
                         <label class="day-checkbox">
                             <input type="checkbox" value="1" class="schedule-day">
                             <span>Mon</span>
@@ -198,6 +200,8 @@
                     </div>
                     <input type="time" id="schedule-weekly-time" class="form-control" value="09:00" style="margin-top: 8px;">
                     <small class="form-help">Sync on selected days at this time</small>
+                    <small class="form-help form-error" id="schedule-days-error" hidden></small>
+                    <small class="form-help form-error" id="schedule-weekly-time-error" hidden></small>
                 </div>
             </div>
         </div>
