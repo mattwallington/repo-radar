@@ -24,7 +24,6 @@ from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_
                                  run_mode, write_receipt)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
-from repo_radar.files import should_include_file
 from repo_radar.llm import get_ai_model, provider_for_model
 from repo_radar.preflight import PreflightSession
 from repo_radar.spending import Spending, SpendingError, policy_from_config, stop_on_sigterm
