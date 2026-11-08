@@ -573,8 +573,10 @@ def pinned_files(snapshot, exclusions):
     outside_selection counts tracked files the collector's extension and size rules leave out.
     """
     files, omitted, outside = [], [], 0
-    for path, entry in sorted(snapshot.manifest().items()):
-        if not snap.collector_eligible(entry):
+    manifest = snapshot.manifest()
+    roots = snap.build_roots(manifest)
+    for path, entry in sorted(manifest.items()):
+        if not snap.collector_eligible(entry, roots):
             outside += 1
             continue
         reason = snap.omission_reason(entry, exclusions)

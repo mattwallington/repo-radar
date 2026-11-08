@@ -19,7 +19,7 @@ import threading
 import time
 from collections import namedtuple
 
-from repo_radar.files import should_include_file
+from repo_radar.files import should_include_file, under_build_output
 
 COLLECTOR_MAX_BYTES = 100 * 1024     # files.collect_repo_files skips files larger than this
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
@@ -335,11 +335,11 @@ class GitSnapshot:
         return run_git(self.repo, ['cat-file', 'blob', entry.oid], limit)
 
 
-def collector_eligible(entry):
-    """Whether today's full-generation collector would include this file (path rules and its
+def collector_eligible(entry, roots=frozenset({''})):
+    """Whether the full collector includes this file (path rules, with `roots` the build roots, and its
     100 KiB ceiling). Only regular files count: the pinned reader never follows symlinks."""
     return (entry is not None and entry.mode in REGULAR_MODES
-            and should_include_file(entry.path) and entry.size <= COLLECTOR_MAX_BYTES)
+            and should_include_file(entry.path, roots) and entry.size <= COLLECTOR_MAX_BYTES)
 
 
 def changes_between(repo, base, target, deadline=None):
@@ -379,11 +379,13 @@ def change_fraction(base_manifest, target_manifest, changes):
     a modified file counts once. A change counts both paths of a rename. Returns None when no file is
     eligible at either commit (nothing to analyze incrementally).
     """
-    def eligible_size(entry):
-        return entry.size if collector_eligible(entry) else None
+    roots = build_roots(base_manifest, target_manifest)
 
-    union = {p for p, e in base_manifest.items() if collector_eligible(e)}
-    union |= {p for p, e in target_manifest.items() if collector_eligible(e)}
+    def eligible_size(entry):
+        return entry.size if collector_eligible(entry, roots) else None
+
+    union = {p for p, e in base_manifest.items() if collector_eligible(e, roots)}
+    union |= {p for p, e in target_manifest.items() if collector_eligible(e, roots)}
     if not union:
         return None
 
@@ -436,9 +438,8 @@ LOCKFILE_NAMES = frozenset({
     'mix.lock', 'pubspec.lock', 'podfile.lock', 'flake.lock', 'packages.lock.json', 'gradle.lockfile',
 })
 GENERATED_DIRS = frozenset({'node_modules', '.next', '.nuxt', '__pycache__', 'pods', '.gradle', '.terraform'})
-# Names a real source folder can have too (an insurance `coverage` module, say): generated only at a build
-# root, which is the repository root or a folder holding one of BUILD_MANIFESTS.
-BUILD_ROOT_DIRS = frozenset({'vendor', 'dist', 'coverage'})
+# `vendor`, `dist` and `coverage` are generated only at a build root (files.under_build_output), which is
+# the repository root or a folder holding one of BUILD_MANIFESTS.
 BUILD_MANIFESTS = frozenset({'package.json', 'go.mod', 'composer.json', 'gemfile', 'pyproject.toml', 'setup.py',
                              'cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'mix.exs', 'pubspec.yaml'})
 GENERATED_SUFFIXES = ('.min.js', '.min.css', '.js.map', '.css.map', '.pb.go', '_pb2.py')
@@ -467,7 +468,7 @@ def generated_reason(path, roots=frozenset({''})):
     if parts[-1] in LOCKFILE_NAMES:
         return 'lockfile'
     if (any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES)
-            or any(part in BUILD_ROOT_DIRS and '/'.join(parts[:i]) in roots for i, part in enumerate(parts[:-1]))):
+            or under_build_output(path, roots)):
         return 'generated or vendored'
     return None
 

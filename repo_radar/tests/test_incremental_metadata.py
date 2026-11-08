@@ -1600,8 +1600,9 @@ def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch
 
 
 def test_vendor_dist_and_coverage_are_generated_only_at_a_build_root():
-    """A source folder named like a build output (an insurance `coverage` module) is analyzed; the same name
-    at the repository root or beside a build manifest is still treated as generated."""
+    """A source folder named like a build output (an insurance `coverage` module) is analyzed, by incremental
+    updates and full builds alike; the same name at the repository root or beside a build manifest is still
+    treated as generated."""
     roots = snap.build_roots({'web-app/package.json': None, 'mobile-api/go.mod': None}, {'README.md': None})
     generated = ['coverage/lcov.info', 'dist/app.js', 'web-app/dist/main.js', 'mobile-api/vendor/x/y.go',
                  'src/node_modules/a.js', 'Web-App/Coverage/index.html']
@@ -1609,6 +1610,10 @@ def test_vendor_dist_and_coverage_are_generated_only_at_a_build_root():
     assert all(snap.generated_reason(p, roots) == 'generated or vendored' for p in generated)
     assert all(snap.generated_reason(p, roots) is None for p in analyzed)
     assert snap.generated_reason('yarn.lock', roots) == 'lockfile'
+    # Full builds' collector uses the same rule: the coverage module is summarized, build output isn't.
+    from repo_radar.files import should_include_file
+    assert ([should_include_file(p, roots) for p in ('mobile-api/internal/coverage/plan.go', 'web-app/dist/main.js')]
+            == [True, False])
 
 
 def test_full_only_pinned_plan(monkeypatch, tmp_path):
