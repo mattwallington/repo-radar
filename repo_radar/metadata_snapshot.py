@@ -435,8 +435,12 @@ LOCKFILE_NAMES = frozenset({
     'composer.lock', 'gemfile.lock', 'cargo.lock', 'poetry.lock', 'pipfile.lock', 'uv.lock', 'pdm.lock', 'go.sum',
     'mix.lock', 'pubspec.lock', 'podfile.lock', 'flake.lock', 'packages.lock.json', 'gradle.lockfile',
 })
-GENERATED_DIRS = frozenset({'node_modules', 'vendor', 'dist', '.next', '.nuxt', '__pycache__', 'pods', '.gradle',
-                            '.terraform', 'coverage'})
+GENERATED_DIRS = frozenset({'node_modules', '.next', '.nuxt', '__pycache__', 'pods', '.gradle', '.terraform'})
+# Names a real source folder can have too (an insurance `coverage` module, say): generated only at a build
+# root, which is the repository root or a folder holding one of BUILD_MANIFESTS.
+BUILD_ROOT_DIRS = frozenset({'vendor', 'dist', 'coverage'})
+BUILD_MANIFESTS = frozenset({'package.json', 'go.mod', 'composer.json', 'gemfile', 'pyproject.toml', 'setup.py',
+                             'cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'mix.exs', 'pubspec.yaml'})
 GENERATED_SUFFIXES = ('.min.js', '.min.css', '.js.map', '.css.map', '.pb.go', '_pb2.py')
 OVERSIZED_DIFF = 'diff larger than 2 MiB'
 
@@ -445,12 +449,25 @@ Omission = namedtuple('Omission', 'file_id status path reason')
 Page = namedtuple('Page', 'id kind file_ids path size')   # kind: 'diff', or 'omissions' (no model call)
 
 
-def generated_reason(path):
-    """Why a changed path's body isn't worth a model's attention, or None for ordinary files."""
+def build_roots(*manifests):
+    """The lowercased folders that hold a build manifest in any of `manifests`, plus the repository root ('')."""
+    roots = {''}
+    for manifest in manifests:
+        for path in manifest or ():
+            folder, _, name = path.lower().rpartition('/')
+            if name in BUILD_MANIFESTS:
+                roots.add(folder)
+    return roots
+
+
+def generated_reason(path, roots=frozenset({''})):
+    """Why a changed path's body isn't worth a model's attention, or None for ordinary files. `roots` are the
+    build roots (build_roots) where a `vendor`, `dist` or `coverage` folder counts as generated."""
     parts = path.lower().split('/')
     if parts[-1] in LOCKFILE_NAMES:
         return 'lockfile'
-    if any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES):
+    if (any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES)
+            or any(part in BUILD_ROOT_DIRS and '/'.join(parts[:i]) in roots for i, part in enumerate(parts[:-1]))):
         return 'generated or vendored'
     return None
 
@@ -626,6 +643,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
     """
     writer = _PageWriter(spool_dir, base, target, page_bytes, spool_bytes)
     files, omissions = {}, []
+    roots = build_roots(base_manifest, target_manifest)
     for number, c in enumerate(changes, 1):
         if deadline is not None and deadline.left() <= 0:
             raise ResourceLimit('preparing the diff ran out of time')
@@ -635,7 +653,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
         entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
                                target_manifest.get(c.new_path) if c.new_path else None) if e]
         reasons = {omission_reason(e, exclusions) for e in entries} - {None}
-        reason = sorted(reasons)[0] if reasons else generated_reason(label)
+        reason = sorted(reasons)[0] if reasons else generated_reason(label, roots)
         text = None
         if reason is None:
             # A copy's source has its own record if it changed, so its diff isn't repeated here.

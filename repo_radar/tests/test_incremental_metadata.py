@@ -1599,6 +1599,18 @@ def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch
     assert sp.summary(stopping.store, stopping.policy)['recorded_usd'] == pytest.approx(outcome.usage['known_cost_usd'], abs=1e-5)
 
 
+def test_vendor_dist_and_coverage_are_generated_only_at_a_build_root():
+    """A source folder named like a build output (an insurance `coverage` module) is analyzed; the same name
+    at the repository root or beside a build manifest is still treated as generated."""
+    roots = snap.build_roots({'web-app/package.json': None, 'mobile-api/go.mod': None}, {'README.md': None})
+    generated = ['coverage/lcov.info', 'dist/app.js', 'web-app/dist/main.js', 'mobile-api/vendor/x/y.go',
+                 'src/node_modules/a.js', 'Web-App/Coverage/index.html']
+    analyzed = ['mobile-api/internal/coverage/plan.go', 'web-app/src/coverage/rules.ts', 'docs/dist/notes.md']
+    assert all(snap.generated_reason(p, roots) == 'generated or vendored' for p in generated)
+    assert all(snap.generated_reason(p, roots) is None for p in analyzed)
+    assert snap.generated_reason('yarn.lock', roots) == 'lockfile'
+
+
 def test_full_only_pinned_plan(monkeypatch, tmp_path):
     """The free plan check for full-only repositories: the real decision, pinned collection, FullBuild.prepare
     and allowance, with a deterministic local count and no transport. Selection is full and lists no diff; only

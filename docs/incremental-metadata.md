@@ -68,10 +68,11 @@ omissions. There are no shell, network, host-filesystem or write tools.
    or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
    files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
    which need no model call. They're listed as not analyzed, never described as analyzed source.
-   Generated or vendored means an explicit list: a directory named `node_modules`, `vendor`, `dist`,
-   `.next`, `.nuxt`, `__pycache__`, `Pods`, `.gradle`, `.terraform` or `coverage` at any depth, or a name
-   ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go` or `_pb2.py`. A real source directory
-   with one of those names is listed as not analyzed too.
+   Generated or vendored means an explicit list: a directory named `node_modules`, `.next`, `.nuxt`,
+   `__pycache__`, `Pods`, `.gradle` or `.terraform` at any depth; a `vendor`, `dist` or `coverage` directory
+   at a build root (the repository root, or a folder holding a build manifest such as `package.json`,
+   `go.mod` or `pyproject.toml`); or a name ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go`
+   or `_pb2.py`. A source folder named `coverage` deeper in the tree, such as `src/coverage/`, is analyzed.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
