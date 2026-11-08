@@ -178,9 +178,11 @@ chunk, counted and fitted. That costs nothing but counting, comes before the wee
 exactly what's then sent. An opted-in repository's rebuild is admitted for $40. A full-only rebuild is
 admitted for its own estimate: the prepared requests' counted input and maximum output and, for chunks, a
 reduction at the adapter's input ceiling and output limit for at most one call fewer than the chunks (and
-no more than 32), at uncached list prices with a 25% margin. That is floored at the largest single
-reservation the plan can make, since a local count reserves the model's whole input limit and a small
-repository's estimate can be cents, and is at most $40 (also $40 when the estimate can't be computed, which
+no more than 32), at uncached list prices with a 25% margin. The requests go one at a time, each
+reservation on top of what the earlier ones cost, so that is floored at the whole sequence's worst case:
+every request's estimate except the largest-reserving one's, with the same margin, plus that request's
+whole reservation. A local count reserves the model's whole input limit, and a small repository's estimate
+can be cents. The allowance is at most $40 (also $40 when the estimate can't be computed, which
 never authorizes a send without a price). The admitted amount is the attempt's hard limit and is recorded
 in attempt usage as `admitted_usd`; a later request that can't fit stops the attempt, with no top-up,
 retry or switch to a diff.

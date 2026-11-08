@@ -134,23 +134,28 @@ def full_allowance(rates, requests, synthesis=None):
     `requests` are the prepared sends as (counted input tokens, max output, reserved input tokens): the one
     whole-repository request, or every chunk. `synthesis` is (calls, input ceiling, max output, reserved input
     tokens) for the reduction a chunked build may still need, priced at its call bound and complete input and
-    output ceilings, since how much of it runs isn't known yet. The estimate is ESTIMATE_MARGIN times that
-    total, floored at the largest single reservation any of those sends makes (a local count reserves the
-    model's whole input limit, which can be far more than a small repository's estimate), rounded up to a
-    microdollar and at most FULL_CAP_USD: min(40, max(1.25 * estimate, largest send)). Without rates or counts
-    it is FULL_CAP_USD, which never authorizes an unpriced send. An app-side estimate, not a bill bound."""
+    output ceilings, since how much of it runs isn't known yet.
+
+    The sends go one at a time and each reservation sits on top of what the earlier ones cost, so the floor is
+    the sequence's worst case: every send's estimate except the largest-reserving one's, with the same margin
+    (a local count can undercount), plus that reservation in full (a local count reserves the model's whole
+    input limit, far more than a small repository's estimate). The allowance is
+    max(ESTIMATE_MARGIN * estimate, ESTIMATE_MARGIN * (estimate - its estimate) + its reservation), rounded up
+    to a microdollar and at most FULL_CAP_USD. Without rates or counts it is FULL_CAP_USD, which never authorizes
+    an unpriced send. An app-side estimate, not a bill bound."""
     if rates is None or not requests or any(tokens is None for tokens, _output, _reserve in requests):
         return FULL_CAP_USD
 
     def cost(tokens, output):
         return tokens * rates.input + output * rates.output
-    total = sum(cost(tokens, output) for tokens, output, _reserve in requests)
-    largest = max(cost(reserve, output) for _tokens, output, reserve in requests)
+    sends = [(cost(tokens, output), cost(reserve, output)) for tokens, output, reserve in requests]
     if synthesis:
         calls, tokens, output, reserve = synthesis
-        total += calls * cost(tokens, output)
-        largest = max(largest, cost(reserve, output))
-    return min(FULL_CAP_USD, math.ceil(round(max(total * ESTIMATE_MARGIN, largest) * 1e6, 3)) / 1e6)
+        sends += [(cost(tokens, output), cost(reserve, output))] * calls
+    total = sum(estimate for estimate, _reserved in sends)
+    largest = max(sends, key=lambda send: send[1])
+    floor = (total - largest[0]) * ESTIMATE_MARGIN + largest[1]
+    return min(FULL_CAP_USD, math.ceil(round(max(total * ESTIMATE_MARGIN, floor) * 1e6, 3)) / 1e6)
 
 
 def request_key(label, request):

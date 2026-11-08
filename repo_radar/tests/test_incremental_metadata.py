@@ -1741,6 +1741,29 @@ def test_full_only_rebuilds_admit_their_estimate_and_hold_after_failures(monkeyp
     assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 2
 
 
+@pytest.mark.parametrize('per_file,output_tokens,chunks', [(15_000, 3_000, 2), (26_000, 8_192, 3)])
+def test_a_chunked_full_only_plan_fits_its_whole_send_sequence(monkeypatch, tmp_path, per_file, output_tokens, chunks):
+    """On a local-count model every chunk and the synthesis reserve the model's whole input limit, and each
+    reservation sits on top of what earlier sends cost. The allowance covers that sequence, so a small chunked
+    plan with realistic replies publishes instead of paying for its chunks and failing (review round 1)."""
+    from repo_radar import spending as sp
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n' + 'x = 1\n' * 100)
+    repo.commit('one change')
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+
+    def reply(stage, text):   # each reply reports 120,000 prompt tokens and `output_tokens` out
+        data = gemini_text(FULL_REPLY if 'Please synthesize' in text else '## Analysis\nSome files.\n', 120_000).json()
+        data['usageMetadata'].update(candidatesTokenCount=output_tokens, totalTokenCount=120_000 + output_tokens)
+        return httpx.Response(200, json=data)
+    fake = GeminiFake(monkeypatch, reply)
+    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(per_file),
+                                   now=NOW, allow_incremental=False, spending=record, trigger='schedule')
+    assert outcome.status == 'published', outcome
+    assert len(fake.sends) == chunks + 1 and outcome.usage['calls'] == chunks + 1
+    assert outcome.usage['known_cost_usd'] < outcome.usage['admitted_usd'] < 40
+
+
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
     """Once anything has been paid for, a count that stops being available ends the attempt as failed, not
     skipped, so the failure streak advances and automatic syncs can't keep buying the same work."""

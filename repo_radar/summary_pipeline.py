@@ -1227,8 +1227,8 @@ class FullBuild:
         """What a full-only attempt is admitted for (metadata_budget.full_allowance): the plan's counted
         requests and, for chunks, the bounded synthesis at this adapter's input ceiling and output limit, with
         at most one reduction fewer than the chunks (and no more than the synthesis call guard). Floored at the
-        largest single reservation the plan can make, so an attempt is never admitted for less than its first
-        or any one send needs; when counts are local estimates, that is the model's whole input limit."""
+        send sequence's worst case, so the largest reservation still fits on top of every other send's cost;
+        when counts are local estimates, each reservation is the model's whole input limit."""
         from repo_radar import llm
         from repo_radar.metadata_budget import full_allowance
         from repo_radar.model_catalog import acceptance_budget, get_caps
