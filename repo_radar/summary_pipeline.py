@@ -252,8 +252,8 @@ class Executor:
             if item.reserve_tokens != item.tokens:
                 record['reserved_input_tokens'] = item.reserve_tokens
             if error is not None:
-                try:
-                    self.budget.fail(reservation)
+                try:   # the same money rule as legacy sends; it never makes this a retry or a skip
+                    (self.budget.refuse if llm.refused_without_charge(error) else self.budget.fail)(reservation)
                 except LedgerWriteError as e:
                     storage_error = storage_error or e
                 self.calls.append({**record, 'status': 'error', 'error': type(error).__name__})

@@ -275,17 +275,43 @@ def _map_context_window_stop_as_truncation():
     _FINISH_REASON_MAP.setdefault("model_context_window_exceeded", "length")
 
 
+# Statuses that mean the provider turned the request away before doing billable work: a rate limit, and
+# service unavailable or overloaded. 500, 502 and 504 aren't among them: a gateway can fail after the model ran.
+_UNPAID_STATUSES = frozenset({429, 503, 529})
+_UNPAID_PROVIDER_STATUSES = frozenset({'RESOURCE_EXHAUSTED', 'UNAVAILABLE', 'OVERLOADED'})
+_UNPAID_TYPES = frozenset({'RateLimitError', 'ServiceUnavailableError'})
+_MAYBE_PROCESSED_TYPES = frozenset({'Timeout', 'TimeoutError', 'APITimeoutError', 'ReadTimeout', 'APIConnectionError',
+                                    'ConnectionError', 'RemoteProtocolError'})
+
+
 def refused_without_charge(error):
-    """True for a provider refusal that bills nothing: a rate limit (429) or a transient server error (5xx),
-    raised with no usage. A timeout, a dropped connection or anything else may have been processed, so it
-    isn't one. Decided from the error's type and status, never from digits in its message."""
+    """True only on positive evidence that the provider refused a send without charging for it, so its
+    reservation can go back to the attempt: a typed or structured 429, a 503 or 529, or Gemini's structured
+    RESOURCE_EXHAUSTED, UNAVAILABLE or OVERLOADED. Structured evidence the other way wins over a permissive
+    class name: any other status (500, 502 and 504 included), a timeout or dropped connection, or reported
+    usage or cost. Digits in the message never count. Whether to retry is a separate question
+    (is_transient_server_error); this only decides money, for both senders."""
     names = {cls.__name__ for cls in type(error).__mro__}
-    if 'RateLimitError' in names:
-        return True
+    if names & _MAYBE_PROCESSED_TYPES:
+        return False
     response = getattr(error, 'response', None)
-    if 429 in (getattr(error, 'status_code', None), getattr(response, 'status_code', None)):
-        return True
-    return is_transient_server_error(error)
+    if getattr(error, 'usage', None) is not None or getattr(response, 'usage', None) is not None:
+        return False
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else {}
+    detail = detail if isinstance(detail, dict) else {}
+    if detail.get('usage') is not None or (isinstance(body, dict) and body.get('usage') is not None):
+        return False
+    signals = [getattr(error, 'status_code', None), getattr(response, 'status_code', None),
+               getattr(error, 'status', None), getattr(error, 'code', None), detail.get('code'), detail.get('status')]
+    numbers = {int(s) for s in signals if isinstance(s, (int, str)) and not isinstance(s, bool)
+               and str(s).isdigit() and 100 <= int(s) <= 599}
+    named = {s for s in signals if isinstance(s, str) and not s.isdigit()}
+    if numbers:
+        return numbers <= _UNPAID_STATUSES and not (named - _UNPAID_PROVIDER_STATUSES)
+    if named:
+        return named <= _UNPAID_PROVIDER_STATUSES
+    return bool(names & _UNPAID_TYPES)
 
 
 def legacy_request_tokens(session, model, prompt, max_output):

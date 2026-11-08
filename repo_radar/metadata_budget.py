@@ -3,7 +3,8 @@
 Before every send, the next request's input plus its maximum output (thinking included) is priced at
 uncached rates and reserved. A reply settles its reservation with the reported cost, or the cost
 computed from reported usage. When neither is available (a timeout, an error after sending, a reply
-without usage), the whole reservation stays counted as spent: an unknown cost is never zero.
+without usage), the whole reservation stays counted as spent: an unknown cost is never zero. A send the
+provider positively refused without charging (llm.refused_without_charge) gives its reservation back.
 
 An ordinary incremental attempt has one cap (INCREMENTAL_CAP_USD), and a protected full build another
 (FULL_CAP_USD). The full cap is per attempt: it stops a build before a request that could pass it, and is

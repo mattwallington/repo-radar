@@ -1301,7 +1301,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     def reply(stage, text):
         assert stage == 'map'
         if '[page p2 ' in text:
-            return httpx.Response(503, json={"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+            return httpx.Response(500, json={"error": {"message": "internal", "status": "INTERNAL"}})
         return {'changes': [], 'no_summary_change_reason': 'routine'}
     fake = GeminiFake(monkeypatch, reply)
     with PreflightSession() as session:
@@ -1322,7 +1322,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     fake.sends.clear()
     decision = decide(repo, pristine, model=GEMINI)
     evidence = tmp_path / 'evidence'
-    with PreflightSession() as session, pytest.raises(Exception, match='overloaded|UNAVAILABLE|503'):
+    with PreflightSession() as session, pytest.raises(Exception, match='internal|INTERNAL|500'):
         im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c1', evidence_dir=evidence)
     assert len(fake.sends) == 4
     reopened = Ledger(path, 40.0, allowances)
@@ -1516,6 +1516,27 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     assert after['consecutive_failures'] == before['consecutive_failures']
     assert after.get('last_failure_reason') == before.get('last_failure_reason')
     assert im.load_document(pristine, 'app-abc1234').text == published
+
+
+def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch, tmp_path):
+    """The protected executor uses the same money rule as legacy sends: a typed 429 was refused without
+    charge, so its reservation goes back and closing releases the whole $40. The attempt still fails, with
+    the one transport call and no retry, fallback or weekly-cap skip."""
+    from repo_radar import spending as sp
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    limited = httpx.Response(429, json={'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED', 'message': 'quota'}},
+                             request=httpx.Request('POST', 'https://x'))
+    fake = GeminiFake(monkeypatch, lambda stage, text: limited)
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+    outcome = full_build(pristine, repo, FileCounts(10), spending=record)
+    assert outcome.status == 'failed' and len(fake.sends) == 1, outcome
+    assert (outcome.usage['calls'], outcome.usage['refused_calls'], outcome.usage['unknown_cost_calls']) == (1, 1, 0)
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert attempt['status'] == 'closed' and [s['status'] for s in attempt['sends'].values()] == ['released']
+    week = sp.summary(record.store, record.policy)
+    assert (week['recorded_usd'], week['reserved_usd'], week['available_usd']) == (0, 0, 75)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
 
 
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
