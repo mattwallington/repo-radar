@@ -2687,3 +2687,18 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
     recorded = json.loads(result.read_text())
     result.write_text(json.dumps({k: v for k, v in recorded.items() if k != 'prompt_version'}))
     refused('replay', manifest(base_case, case), 'different inputs')
+
+
+def test_a_cut_tool_result_keeps_its_notice_inside_its_byte_allotment():
+    # Counted tokens that barely notice the notice (a dense result, a cheap ASCII notice): the cut used to
+    # land the notice a few dozen bytes past the result's allotment.
+    class Conversation:
+        def request(self, _out):
+            return item['content']
+
+    def counted(request):
+        return len(request.replace(mr.TOOL_TRUNCATED_NOTICE, '').encode()), 0, 385 + mr.CONTINUATION_TOKENS + 13
+    pipeline = types.SimpleNamespace(_edit_output_and_limit=counted, _notice=mr.Pipeline._notice)
+    item = {'content': mr.TOOL_MINIMUM_NOTICE}
+    text = mr.Pipeline._fit_tool_result(pipeline, Conversation(), item, 'x' * 400, 400)
+    assert text.endswith(mr.TOOL_TRUNCATED_NOTICE) and len(text.encode()) <= 400

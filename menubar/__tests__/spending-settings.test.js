@@ -164,3 +164,19 @@ test('Save and reopen, and the readout shows the same totals Python enforces', a
   const lying = (_p, _a, _o, done) => done(null, JSON.stringify({ status: 'ready', enabled: true, cap_usd: 75 }));
   assert.deepStrictEqual(await readSpendingSummary(runner, { run: lying }), { status: 'unavailable' });
 });
+
+test('an enabled schedule the LaunchAgent cannot run is refused on its own field', () => {
+  const { parseIntervalInput, validateSchedule, savedSchedule } = require('../schedule-settings');
+  const at = (s) => (validateSchedule({ enabled: true, days: [1], time: '09:00', ...s }) || {}).input || null;
+  assert.strictEqual(at({ type: 'daily' }), null);
+  assert.strictEqual(at({ type: 'daily', time: '' }), 'schedule-time');            // used to become 09:00
+  assert.strictEqual(at({ type: 'weekly', days: [] }), 'schedule-days');
+  assert.strictEqual(at({ type: 'weekly', time: '' }), 'schedule-weekly-time');
+  for (const ok of ['1', '6', '24']) assert.strictEqual(at({ type: 'hourly', interval: parseIntervalInput(ok) }), null, ok);
+  for (const bad of ['', '0', '25', '-3', '2.5', 'six']) {
+    assert.strictEqual(at({ type: 'hourly', interval: parseIntervalInput(bad) }), 'schedule-interval', bad);
+  }
+  assert.strictEqual(validateSchedule({ enabled: false, type: 'weekly', days: [], time: '' }), null);
+  // A cleared interval behind Daily is never checked, and is saved as 6 rather than null.
+  assert.strictEqual(savedSchedule({ enabled: true, type: 'daily', time: '09:00', interval: parseIntervalInput('') }).interval, 6);
+});

@@ -16,6 +16,10 @@ in flight keep their bounds, since the provider may still charge for them (stop_
 
 Periods: the first runs from activation (the first normal sync using this ledger) to the next Monday
 00:00 UTC, later ones Monday to Monday UTC. Every charge belongs to the period its attempt was admitted in.
+Only the current and previous four periods are kept: each admission drops closed attempts from older
+periods, which nothing reads, so the file stays small however long the app runs. The ledger trusts the
+system clock to say which period is current: a clock set back further than that margin finds a period
+whose closed attempts are gone and under-counts it.
 
 Amounts are integer microdollars, rounded up. The ledger stores attempt and send identifiers, the channel,
 repository name, model, times and amounts only: never prompts, replies, credentials or configuration.
@@ -120,6 +124,14 @@ def committed(attempt):
     known charges and every unresolved bound."""
     used = _known(attempt) + _uncertain(attempt)
     return max(attempt['allowance'], used) if attempt['status'] == 'open' else used
+
+
+def compact(data, period_start):
+    """Drop closed attempts admitted more than four weeks before `period_start`. The extra weeks are margin
+    for a clock set back; open ones stay, since a running process may still write to its hold."""
+    cutoff = period_start - timedelta(days=28)
+    data['attempts'] = {k: a for k, a in data['attempts'].items()
+                        if a['status'] == 'open' or _utc(a['period_start']) >= cutoff}
 
 
 def _valid(data):
@@ -328,6 +340,7 @@ class Spending:
                 data = self.store.ready(now)
                 enabled, cap_usd = self.policy()
                 start, end = period_of(_utc(data['activated_at']), now)
+                compact(data, start)
                 used = sum(committed(a) for a in data['attempts'].values() if _utc(a['period_start']) == start)
                 if enabled and used + amount > to_micro(cap_usd):
                     raise WeeklyCapRefused(to_usd(amount), to_usd(max(0, to_micro(cap_usd) - used)), end)
