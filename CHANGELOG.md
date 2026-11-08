@@ -4,7 +4,7 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.0.37] - 2026-11-07
 
 ### Changed
 - **Incremental summaries now scale to any diff.** The model used to read a whole diff within 16 turns, which made long diffs fail expensively. Now each page of the diff gets one short model call, the notes are merged when there are too many to hand over, and one short conversation edits the summary. A large change is no longer a reason for a full rebuild: the 20%, eight-page and 16 MiB rules are gone. Lockfiles, generated files and diffs over 2 MiB are listed as not analyzed rather than summarized. Any failure keeps the previous summary, with no retries and no automatic full rebuild. A note that cites a file by its path, or cites one it wasn't shown, no longer stops the update: the path becomes the file's id, anything else is dropped, and the summary says when file attribution is incomplete. A full rebuild left unfinished only because of a removed rule is no longer owed.
