@@ -5,6 +5,7 @@
 
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const INTERVAL_RANGE = [1, 24];
+const DEFAULT_INTERVAL = 6;
 
 // Whole hours typed in the interval field, or NaN.
 function parseIntervalInput(text) {
@@ -34,4 +35,10 @@ function validateSchedule(schedule) {
   return null;
 }
 
-module.exports = { parseIntervalInput, validateSchedule, INTERVAL_RANGE };
+// The schedule as written once validateSchedule passed. An interval that isn't a whole number then belongs
+// to a frequency nothing runs (hidden, or the schedule is off), and is stored as the default 6, never null.
+function savedSchedule(schedule) {
+  return { ...schedule, interval: Number.isInteger(schedule.interval) ? schedule.interval : DEFAULT_INTERVAL };
+}
+
+module.exports = { parseIntervalInput, validateSchedule, savedSchedule, INTERVAL_RANGE };

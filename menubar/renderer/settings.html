@@ -168,7 +168,7 @@
                 
                 <div class="form-group" id="weekly-options" style="display: none;">
                     <label>Days of week</label>
-                    <div class="days-selector" id="schedule-days">
+                    <div class="days-selector" id="schedule-days" role="group" aria-label="Days of week" aria-describedby="schedule-days-error">
                         <label class="day-checkbox">
                             <input type="checkbox" value="1" class="schedule-day">
                             <span>Mon</span>
@@ -198,9 +198,9 @@
                             <span>Sun</span>
                         </label>
                     </div>
+                    <small class="form-help form-error" id="schedule-days-error" hidden></small>
                     <input type="time" id="schedule-weekly-time" class="form-control" value="09:00" style="margin-top: 8px;">
                     <small class="form-help">Sync on selected days at this time</small>
-                    <small class="form-help form-error" id="schedule-days-error" hidden></small>
                     <small class="form-help form-error" id="schedule-weekly-time-error" hidden></small>
                 </div>
             </div>

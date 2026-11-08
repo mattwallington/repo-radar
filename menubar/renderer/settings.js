@@ -6,7 +6,7 @@ let configData = null;
 const { ipcRenderer } = require('electron');
 const { providerForModel, migrateModel, DEFAULT_MODEL, KNOWN_MODEL_IDS } = require('../model-policy');
 const spending = require('../spending-settings');
-const { parseIntervalInput, validateSchedule } = require('../schedule-settings');
+const { parseIntervalInput, validateSchedule, savedSchedule } = require('../schedule-settings');
 
 // Settings input id for each spending config field.
 const SPENDING_INPUTS = {
@@ -460,11 +460,13 @@ function showNotification(message, type) {
 
 // Schedule enable toggle
 document.getElementById('schedule-enabled').addEventListener('change', (e) => {
+    clearFieldErrors();
     toggleScheduleOptions(e.target.checked);
 });
 
 // Schedule type change
 document.getElementById('schedule-type').addEventListener('change', (e) => {
+    clearFieldErrors();
     updateScheduleTypeVisibility(e.target.value);
 });
 
@@ -533,7 +535,6 @@ document.getElementById('save-btn').addEventListener('click', () => {
         showInputError(badSchedule.input, badSchedule.message);
         return;
     }
-    if (!schedule.enabled && !Number.isInteger(schedule.interval)) schedule.interval = 6;   // unused while off
     Object.assign(configData, spendingValues);
 
     // Update API keys and model
@@ -544,7 +545,7 @@ document.getElementById('save-btn').addEventListener('click', () => {
     const sel = document.getElementById('ai-model');
     configData.ai_model = migrateModel(sel.value || DEFAULT_MODEL);
     
-    configData.schedule = schedule;
+    configData.schedule = savedSchedule(schedule);
     
     // Update last_configured
     configData.last_configured = new Date().toISOString();
