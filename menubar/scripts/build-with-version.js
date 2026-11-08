@@ -42,9 +42,9 @@ const buildInfo = {
     buildDate: buildDate,
     buildTimestamp: Date.now(),
     // Runtime channel (consumed by runtime/paths.resolveChannel, which fails closed
-    // on a missing/invalid channel -> no runtime -> no sync). Default 'stable';
-    // release.sh overrides to 'dev' for dev-channel builds. REPO_RADAR_CHANNEL lets a
-    // local `npm run build:version` produce a dev build-info when needed.
+    // on a missing/invalid channel -> no runtime -> no sync). Default 'stable'.
+    // Release builds write their own build-info.json (build-local.sh); REPO_RADAR_CHANNEL
+    // lets a local `npm run build:version` produce a dev build-info when needed.
     channel: process.env.REPO_RADAR_CHANNEL === 'dev' ? 'dev' : 'stable'
 };
 

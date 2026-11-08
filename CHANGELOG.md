@@ -4,6 +4,22 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.39] - 2026-11-08
+
+### Changed
+- **Opted-in full rebuilds send smaller requests and are capped at $25.** Every full-rebuild request, whether the whole repository, a chunk or the final reduction, now fits 128,000 input tokens. A file too large for one chunk is split into ordered parts rather than cut short, and if a rebuild can't fit or can't finish its reduction, it stops and keeps the old summary instead of summarizing excerpts. Each rebuild attempt stops before a request that could take its spending past $25. On Gemini, whose token counts are local estimates, each request is priced as if it used the model's whole input limit. The cap doesn't apply to repositories that aren't opted in to incremental summaries, and it limits one attempt rather than promising a rebuild finishes within it.
+- **Chunk analyses cover all eight summary subjects.** Each chunk is now asked about architecture, database schema and configuration as well as the overview, technology stack, components, interfaces and dependencies, and to say "not present here" when its files don't cover a subject.
+- **Incremental updates keep 1.0.38's editor fix on the shared pipeline.** The editor's first request is still prepared to fit 65,536 tokens and later requests may use up to 128,000, the quote covers that, and a request refused after anything was paid for counts as a failure.
+
+### Removed
+- **The unused manual installer (`setup.sh`) is gone** from the app bundle and the setup guide. The app provisions its own Python runtime, as before.
+- **`release.sh` no longer carries its old publishing steps.** Releases publish from GitHub Actions; the script still runs its gates, and its `--dry-run` works as before.
+
+### Fixed
+- **Download links point to `ReperioHealth/repo-radar-releases`,** where releases are published.
+- **One malformed note no longer fails a whole summary update.** A page's note that named summary sections it wasn't given used to stop the update after its pages had been paid for. Those references are now dropped, along with any change left with no section; the rest of the note is used, the drops are counted in the attempt's usage, and the coverage note says so. A resource limit hit after paid calls, such as an unreadable page spool, now counts as a failed update rather than a skip.
+- **The editor's answer is no longer refused for how it's wrapped.** A paid update could stop with "the answer is not a JSON object" when the model put its edits in a code fence or added a few words around them. One JSON object in the reply is now taken as the answer and checked as before; a reply with none, or with several, is still refused. A one-note update's tool-free request also asks Gemini for JSON. When an answer is refused, the start of the reply, with secrets redacted, is kept in the attempt's record so the failure can be diagnosed.
+
 ## [1.0.38] - 2026-11-08
 
 ### Added

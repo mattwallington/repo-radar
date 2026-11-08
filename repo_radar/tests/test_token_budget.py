@@ -112,7 +112,12 @@ def test_no_synthesis_prompt_exceeds_the_budget_for_claude_47(monkeypatch):
         seen.append((prompt, m))
         return "QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, m
 
-    llm.combine_chunk_analyses("Org/repo", analyses, model=model, synthesize=synthesize)
+    class LocalSession:   # a local-only count: the plan comes from the budget estimate
+        def count(self, model, prompt, requested_output):
+            from repo_radar.preflight import PreflightResult
+            return PreflightResult(None, False, "local estimate")
+
+    llm.combine_chunk_analyses("Org/repo", analyses, model=model, synthesize=synthesize, session=LocalSession())
     assert seen, "synthesis should have made at least one call"
     for prompt, m in seen:
         got = llm.count_tokens_for_budget(prompt, m).count
@@ -125,12 +130,12 @@ import pathlib
 import pytest
 
 
-@pytest.mark.parametrize("budget", [1100, 1200, 1600, 2500])
+@pytest.mark.parametrize("budget", [1250, 1350, 1600, 2500])
 def test_every_chunk_real_prompt_fits_even_at_tight_budgets(budget):
     """Component-sum packing under-counts the assembled prompt because tokenizer seams are not
     additive — a chunk that summed under budget can measure over. The repack pass must guarantee
     every REAL (i, N) prompt — actual header included — fits. Tight budgets pack several files per
-    chunk (2/3/5 here), so the seams actually bite (this is the class Codex reproduced at 917 ->
+    chunk (2 to 5 here, above the eight-subject template), so the seams actually bite (this is the class Codex reproduced at 917 ->
     934). Budgets stay above the header reserve + one file so packing isn't forced to singletons."""
     model = "claude-opus-5"
     chunks = llm.chunk_repo_files(_files(50, 8), model, max_tokens=budget, full_name="Org/repo")

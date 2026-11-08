@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-from repo_radar import incremental_map_reduce as mr
+from repo_radar import summary_pipeline as mr
 from repo_radar import incremental_metadata as im
 from repo_radar import config as repo_config, metadata, metadata_snapshot as snap
 from repo_radar.metadata_budget import Budget, BudgetExceeded, Ledger, LedgerWriteError, PricingUnavailable
@@ -943,6 +943,8 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
         repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
     target = repo.commit('rewrite everything and rename one')
     small_pages(monkeypatch)
+    from repo_radar import metadata_budget   # today's table price, so the quote's date doesn't decide the test
+    monkeypatch.delitem(metadata_budget.ANNOUNCED_PRICE_CHANGES, GEMINI)
     old = im.load_document(pristine, 'app-abc1234')
     sections = {s.text.split('\n', 1)[0]: s for s in im.split_sections(im._analysis_of(old))}
     components = sections['## Key Components']
@@ -1005,7 +1007,8 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     first, second = len(maps) // 16 + 1, (len(maps) // 16 + 1 + 4) // 5
     assert len(merges) > first + second and len(merges) <= mr.worst_case_merges(len(maps))
     assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
-    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0 and usage['rate_input_per_mtok'] == 0.75
+    assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0
+    assert usage['rate_input_per_mtok'] == 0.75
 
     # Every merge and editor request names each cited file's real status and paths.
     changes = snap.changes_between(repo.path, base, target)
@@ -1085,7 +1088,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
             mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
     note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
                                             ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
-    assert note['changes'][0]['files'] == [] and repairs == {'normalized_file_citations': 0, 'dropped_file_citations': 1}
+    assert note['changes'][0]['files'] == [] and repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_file_citations': 1}
 
 
 def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatch, tmp_path):
@@ -1167,6 +1170,120 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     edits = fake.stage('edit')
     assert outcome.status == 'published' and len(edits) == 1, outcome
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
+
+
+def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkeypatch, tmp_path):
+    """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
+    whole update failed. Now that change is dropped and counted; the note's other change still lands."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    repo.commit('one change')
+    old = im.load_document(pristine, 'app-abc1234')
+    components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+    patch = {'base_document_sha256': old.sha256,
+             'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                           'content': '## Key Components\n- m0 now records a change\n'}]}
+
+    def reply(stage, text):
+        if stage == 'map':
+            files = files_on_page(text)
+            return {'changes': [{'files': files, 'what': 'm0 records a change', 'sections': components.id},
+                                {'files': files, 'what': 'UNPLACED change', 'sections': ['', 'unknown-id']}],
+                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+        return patch
+    fake = GeminiFake(monkeypatch, reply)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+    assert outcome.status == 'published', outcome
+    editor = fake.stage('edit')[0][0]
+    assert 'm0 records a change' in editor and 'UNPLACED' not in editor and mr.SECTION_WARNING in editor
+    usage = outcome.usage
+    assert (usage['normalized_sections'], usage['dropped_sections'], usage['dropped_changes']) == (1, 2, 1)
+    new = im.load_document(pristine, 'app-abc1234')
+    assert 'm0 now records a change' in new.text and mr.SECTION_WARNING in new.info['coverage_note']
+
+
+def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monkeypatch, tmp_path):
+    """Pilot run 3: a paid update stopped on 'the answer is not a JSON object'. One object in a fence, or
+    among a few words, is the answer; with none (or two) the reply is refused after the spend, and the start
+    of it is kept, redacted, in the attempt's record. A final turn with no tools also asks Gemini for JSON,
+    and the request counted is the one sent."""
+    def attempt(where, answer, crowd):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+        old = im.load_document(pristine, 'app-abc1234')
+        components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+        patch = {'base_document_sha256': old.sha256,
+                 'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                               'content': '## Key Components\n- m0 now records a change\n'}]}
+
+        def reply(stage, text):
+            if stage == 'map':
+                return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                        'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            return answer(patch)
+        fake = GeminiFake(monkeypatch, reply)
+        counted, real_count = [], PreflightSession.count_request
+
+        def count(self, request, timeout=None):   # one note that leaves no room for tools, when crowded
+            result = real_count(self, request, timeout=timeout)
+            counted.append(request)
+            return result._replace(tokens=60_000) if crowd and 'covers_pages' in json.dumps(request) else result
+        monkeypatch.setattr(PreflightSession, 'count_request', count)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        return outcome, fake, counted, pristine, old
+
+    fenced = lambda patch: f"Here are the edits:\n```JSON\n{json.dumps(patch, indent=2)}\n```\nThat's all."
+    outcome, fake, counted, pristine, _old = attempt(tmp_path / 'fenced', fenced, crowd=True)
+    assert outcome.status == 'published', outcome
+    assert 'm0 now records a change' in im.load_document(pristine, 'app-abc1234').text
+    (_text, body), = fake.stage('edit')
+    assert 'tools' not in body and body['generationConfig']['response_mime_type'] == 'application/json'
+    assert counted[-1]['response_format'] == {'type': 'json_object'} and 'tools' not in counted[-1]
+
+    prose = lambda patch: "I reviewed every note and the summary needs no edits. (key test-not-a-key, AIza" + 'x' * 30 + ")"
+    outcome, fake, _counted, pristine, old = attempt(tmp_path / 'prose', prose, crowd=False)
+    assert outcome.status == 'failed' and 'not a JSON object' in outcome.reason and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    saved = state['usage']['rejected_reply']
+    assert state['consecutive_failures'] == 1 and saved['call'] == 'edit t1'
+    assert saved['text'].startswith('I reviewed every note') and 'test-not-a-key' not in saved['text'] and 'AIzax' not in saved['text']
+
+    two = json.dumps({'a': 1}) + ' or ' + json.dumps({'b': 2})
+    with pytest.raises(im.PatchError, match='2 JSON objects'):
+        im.parse_answer(two)
+
+
+def test_a_resource_limit_after_paid_map_calls_is_a_failure(monkeypatch, tmp_path):
+    """A spool read that fails mid-run, after map waves were bought, fails the update and moves the streak;
+    the same limit before anything is sent is still a skip."""
+    small_pages(monkeypatch, 4096)
+    real_read = snap.PageSet.read
+
+    def attempt(where, after_sends):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        rewrite_files(repo, 80)
+        old = im.load_document(pristine, 'app-abc1234')
+        fake = GeminiFake(monkeypatch, lambda stage, text: {'changes': [], 'questions': None, 'new_sections': None,
+                                                             'no_summary_change_reason': 'no effect on the summary'})
+
+        def read(self, page):
+            if fake.sends or not after_sends:
+                raise snap.ResourceLimit("the page spool could not be read")
+            return real_read(self, page)
+        monkeypatch.setattr(snap.PageSet, 'read', read)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        assert im.load_document(pristine, 'app-abc1234').text == old.text
+        return outcome, fake, metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures']
+
+    outcome, fake, streak = attempt(tmp_path / 'paid', True)
+    assert outcome.status == 'failed' and 'spool' in outcome.reason and fake.sends and streak == 1, outcome
+    outcome, fake, streak = attempt(tmp_path / 'unpaid', False)
+    assert outcome.status == 'skipped' and not fake.sends and streak == 0, outcome
 
 
 def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkeypatch, tmp_path):
@@ -1284,13 +1401,32 @@ def test_a_credential_renamed_and_edited_never_reaches_a_map_call_or_tool(monkey
     assert 'SENTINEL-' not in traffic and '[no matches]' in traffic and 'src/runtime.py' in traffic
 
 
+class FileCounts:
+    """A local counting session (authoritative=False, as for Gemini) whose count is `per_file` tokens for every
+    source file framed in the request plus `base`, so a ten-file repository can stand for a large one."""
+
+    def __init__(self, per_file, base=1000):
+        self.per_file, self.base = per_file, base
+
+    def count_request(self, request, timeout=None):
+        from repo_radar.preflight import PreflightResult
+        return PreflightResult(self.per_file * json.dumps(request).count(' bytes) ===') + self.base, False, 'local estimate')
+
+
+def gemini_text(text, prompt_tokens=100, finish='STOP'):
+    return httpx.Response(200, json={
+        "candidates": [{"content": {"parts": [{"text": text}], "role": "model"}, "finishReason": finish}],
+        "usageMetadata": {"promptTokenCount": prompt_tokens, "candidatesTokenCount": 20,
+                          "totalTokenCount": prompt_tokens + 20}})
+
+
+def full_build(pristine, repo, session, model=GEMINI):
+    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW)
+
+
 def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
-    from repo_radar import llm
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     old = im.load_document(pristine, 'app-abc1234')
-    monkeypatch.setattr(llm, 'authoritative_partition', lambda *a: 'chunk')
-    monkeypatch.setattr(llm, 'authoritative_chunks', lambda session, name, files, model: llm.PartitionResult(
-        [files[:5], files[5:]], None))
     cut_off = httpx.Response(200, json={
         "candidates": [{"content": {"parts": [{"text": "## Overview\nCut o"}], "role": "model"}, "finishReason": "MAX_TOKENS"}],
         "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 40, "thoughtsTokenCount": 16344,
@@ -1300,8 +1436,7 @@ def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where
         assert stage == 'full'
         return cut_off if len(fake.sends) == 3 else '## Analysis\nOne chunk.\n'
     fake = GeminiFake(monkeypatch, reply)
-    with PreflightSession() as session:
-        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, force=True, now=NOW)
+    outcome = full_build(pristine, repo, FileCounts(20_000))   # six files fill a chunk, so ten make two
 
     # Low thinking and the unchanged limits on all three requests, with no JSON mode and no retry.
     configs = [body['generationConfig'] for _s, _t, body in fake.sends]
@@ -1317,6 +1452,183 @@ def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where
                                    'reasoning_tokens': 16344}
     assert usage['full_stage']['output_tokens'] >= 40 and 'Cut o' not in json.dumps(usage)
     assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+
+def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch, tmp_path):
+    """Each request reserves the catalog's whole input limit when its count is only a local estimate, so the
+    cap holds against the bill, not against the estimate."""
+    from repo_radar.metadata_budget import FULL_CAP_USD
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    counts = FileCounts(50_000)   # two files to a chunk: five chunks, each counted far below the catalog bound
+    rate_in, rate_out = Budget(GEMINI).price   # the prices this attempt uses, whatever the date
+    expensive = round((8.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $24.60
+
+    fake = GeminiFake(monkeypatch, lambda stage, text: gemini_text('## Analysis\nTwo files.\n', expensive))
+    outcome = full_build(pristine, repo, counts)
+    per_chunk = expensive * rate_in + 20 * rate_out
+    reserve = Budget(GEMINI).upper_bound(1_048_576, 8192)                   # the whole input limit, priced
+    assert 3 * per_chunk + reserve > FULL_CAP_USD >= 3 * per_chunk + Budget(GEMINI).upper_bound(101_000, 8192)
+
+    # Three chunks were sent and settled once each; the fourth was refused before sending, and says why.
+    assert len(fake.sends) == 3 and {s for s, _t, _b in fake.sends} == {'full'}
+    assert outcome.status == 'failed' and outcome.reason.startswith('full chunk 4/5 (call 4): ')
+    assert '$25.00 limit' in outcome.reason
+    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    assert (usage['calls'], usage['unknown_cost_calls'], usage['retained_reservation_usd'], usage['open_reservation_usd']) == (3, 0, 0, 0)
+    assert usage['known_cost_usd'] == usage['cost_usd'] == pytest.approx(3 * per_chunk, rel=1e-6)
+    assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # Cheap replies: the same build finishes under the cap, with every chunk and one reduction.
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
+    outcome = full_build(pristine, repo, counts)
+    assert outcome.status == 'published', outcome
+    assert len(fake.sends) == 6 and outcome.usage['calls'] == 6 and outcome.usage['cost_usd'] < 1
+    assert im.load_document(pristine, 'app-abc1234').info['pipeline_version'] == im.PIPELINE_VERSION
+
+
+def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
+    """Once anything has been paid for, a count that stops being available ends the attempt as failed, not
+    skipped, so the failure streak advances and automatic syncs can't keep buying the same work."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    provider = Provider(monkeypatch)
+    down = httpx.Response(503, json={}, request=httpx.Request('POST', 'https://x'))
+
+    def text_of(body):
+        content = body['messages'][0]['content']
+        return content if isinstance(content, str) else ''.join(b['text'] for b in content)
+    # A full build in chunks, whose reduction can't be counted once the chunks are bought.
+    provider.count_tokens = lambda body: down if provider.messages() else 21 * len(json.dumps(body['messages']))
+    provider.replies = [lambda body: claude([{"type": "text", "text": f"analysis {len(provider.sends)}"}])] * 20
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session, force=True)
+    sends = provider.messages()
+    assert sends and all('(chunk ' in text_of(b) for b in sends)
+    assert outcome.status == 'failed' and outcome.reason.startswith('full synthesis: token count unavailable'), outcome
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 1 and state['usage']['calls'] == len(sends)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # The same for an incremental update whose editor can't be counted after the paid map call.
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path / 'diff')
+    repo.write('src/m0.py', 'changed = 1\n')
+    repo.commit()
+    provider.sends.clear(); provider.counts.clear()
+    provider.count_tokens = lambda body: down if provider.messages() else 1000
+    provider.replies = [note()]
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'failed' and 'token count unavailable' in outcome.reason and len(provider.messages()) == 1
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
+
+    # Before anything is paid for, an unavailable count is still only a skip.
+    provider.sends.clear(); provider.counts.clear()
+    provider.count_tokens = lambda body: down
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session)
+    assert outcome.status == 'skipped' and not provider.messages()
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 1
+
+
+def frames(text):
+    """(path, content) for every file framed in a chunk prompt, read by its stated size."""
+    return [(m.group(1), text[m.end():m.end() + int(m.group(2))])
+            for m in re.finditer(r'^=== (.+?) \((\d+) bytes\) ===\n', text, re.M)]
+
+
+def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_path):
+    from repo_radar import llm
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/big.py', ''.join(f'big_line_{n:04d} = {n}\n' for n in range(500)))   # too big for any one chunk
+    target = repo.commit('a big file')
+    expected = [(f['path'], f['content'])
+                for f in im.pinned_files(snap.GitSnapshot(repo.path, target), snap.NO_EXCLUSIONS)[0]]
+    old = im.load_document(pristine, 'app-abc1234')
+    provider = Provider(monkeypatch)
+
+    def text_of(body):
+        content = body['messages'][0]['content']
+        return content if isinstance(content, str) else ''.join(b['text'] for b in content)
+
+    def run(scale, per_analysis=0):
+        def tokens(body):
+            return scale * len(json.dumps(body['messages'])) + per_analysis * text_of(body).count('--- Analysis Part')
+        provider.count_tokens, provider.sends[:], provider.counts[:] = tokens, [], []
+        provider.replies = [lambda body: claude([{"type": "text", "text": f"analysis of chunk {len(provider.sends)}"
+                                                  if '(chunk ' in text_of(body) else FULL_REPLY}])] * 60
+        with PreflightSession() as session:
+            outcome = update(pristine, repo, session, force=True)
+        return outcome, provider.messages(), [tokens(b) for b in provider.messages()]
+
+    # Below the target the whole repository goes out as one request.
+    outcome, sends, sizes = run(2)
+    assert outcome.status == 'published' and len(sends) == 1 and sizes[0] <= 128_000, outcome
+    assert text_of(sends[0]).startswith('Analyze this repository') and frames(text_of(sends[0])) == expected
+
+    # The same repository counted above the target, though far inside the old 75%-of-window rule, is chunked.
+    single = 21 * len(json.dumps([{'role': 'user', 'content': llm._build_full_repo_prompt(FULL, [
+        {'path': p, 'size': len(c), 'content': c} for p, c in expected])}]))
+    assert 128_000 < single < llm.get_chunking_threshold(MODEL)
+    outcome, sends, sizes = run(21)
+    assert outcome.status == 'published', outcome
+    counted = [c['messages'] for c in provider.counts]
+    assert all(size <= 128_000 for size in sizes) and all(b['messages'] in counted for b in sends)
+    chunks, final = [text_of(b) for b in sends[:-1]], text_of(sends[-1])
+    assert len(chunks) > 3 and all(f"(chunk {i}/{len(chunks)})" in text for i, text in enumerate(chunks, 1))
+    assert all(b['max_tokens'] == 16384 for b in sends)   # this model's floor for chunks, and synthesis's own
+    # Every file, in order and whole; the big one as ordered parts.
+    pieces = [frame for text in chunks for frame in frames(text)]
+    assert [p for p, _c in pieces if 'big.py' in p] == [f'src/big.py (part {n})' for n in range(1, len(
+        [p for p, _c in pieces if 'big.py' in p]) + 1)] and len([p for p, _c in pieces if 'big.py' in p]) > 1
+    rebuilt = []
+    for path, content in pieces:
+        source = path.split(' (part ')[0]
+        if rebuilt and rebuilt[-1][0] == source and ' (part ' in path and not path.endswith('(part 1)'):
+            rebuilt[-1] = (source, rebuilt[-1][1] + content)
+        else:
+            rebuilt.append((source, content))
+    assert rebuilt == expected
+
+    # A part that stops fitting once the chunk total grows is split again, and the later parts move up, so
+    # labels stay unique and in order.
+    class PerCharacter:
+        def count_request(self, request, timeout=None):
+            from repo_radar.preflight import PreflightResult
+            return PreflightResult(74 * len(request['messages'][0]['content']), False, 'local estimate')
+    text = ''.join(f'line_{n:04d} = {n}\n' for n in range(160))[:3000]
+    build = mr.FullBuild(FULL, [{'path': 'src/one.py', 'size': len(text), 'content': text}], GEMINI, PerCharacter(),
+                         Budget(GEMINI))
+    resplit = [f for chunk in build.chunks() for f in chunk.files]
+    assert [f['path'] for f in resplit] == [f'src/one.py (part {n})' for n in range(1, len(resplit) + 1)]
+    assert len(resplit) > 3 and ''.join(f['content'] for f in resplit) == text
+    # The one reduction holds every chunk's analysis, in order.
+    assert [final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1)] == sorted(
+        final.index(f"analysis of chunk {i}") for i in range(1, len(chunks) + 1))
+    assert final.count('--- Analysis Part') == len(chunks)
+
+    # When the reductions can't converge within the depth guard, the build stops; nothing is excerpted.
+    monkeypatch.setattr(llm, 'SYNTHESIS_MAX_DEPTH', 1)
+    current = im.load_document(pristine, 'app-abc1234')
+    outcome, sends, sizes = run(21, per_analysis=30_000)   # two analyses to a reduction
+    assert outcome.status == 'failed' and "still don't fit one request after 1 levels" in outcome.reason
+    assert all(size <= 128_000 for size in sizes) and not any('truncated' in text_of(b) for b in sends)
+    assert im.load_document(pristine, 'app-abc1234').text == current.text != old.text
+
+
+def test_full_chunk_requests_ask_for_all_eight_subjects(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\n')
+    assert full_build(pristine, repo, FileCounts(50_000)).status == 'published'
+    chunk_text, chunk = fake.sends[0][1], fake.sends[0][2]
+    for n, subject in enumerate(('Overview', 'Technology Stack', 'Architecture', 'Key Components', 'API Endpoints/Interfaces',
+                                 'Dependencies', 'Database Schema', 'Configuration'), 1):
+        assert f"{n}. **{subject}**" in chunk_text
+    assert 'not present here' in chunk_text and '(chunk 1/5)' in chunk_text
+    configs = [body['generationConfig'] for _s, _t, body in fake.sends]
+    assert [c['max_output_tokens'] for c in configs] == [8192] * 5 + [16384]
+    assert all(c['thinkingConfig']['thinkingLevel'] == 'low' for c in configs) and chunk['generationConfig'] == configs[0]
 
 
 def credential_traffic(provider, pristine, repo):

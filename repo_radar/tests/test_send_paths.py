@@ -424,10 +424,10 @@ def test_rejected_reply_is_not_retried_as_a_rate_limit(monkeypatch, tmp_path, st
     assert (tmp_path / "repo.md").read_text() == previous         # previous metadata and commit kept
 
 
-@pytest.mark.parametrize("stage", ["single", "chunk", "synthesis", "helper_chunk", "helper_synthesis"])
+@pytest.mark.parametrize("stage", ["single", "chunk", "synthesis"])
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, tmp_path, stage, exhausted):
-    """All five request boundaries retry the same payload; synthesis never replays a completed batch.
+    """All three request boundaries retry the same payload; synthesis never replays a completed batch.
     A 429 in the 503's diagnostic also exercises the outer combine catch's precedence."""
     import repo_radar.modes.sync as sync, repo_radar.llm as llm
     model = "gemini/gemini-3.8-flash"
@@ -447,7 +447,7 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
     ev, failed_payloads, completed, errors = [], [], [], []
     failure = RuntimeError("Gemini HTTP 503 UNAVAILABLE (request 429)")
     failure.status_code = 503
-    limit = 3 if stage.startswith("helper_") else 5
+    limit = 5
 
     if stage == "single" and not exhausted:
         from litellm import APIConnectionError
@@ -494,31 +494,19 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
         def event(self, *a, **kw): pass
         def error(self, name, **kw): errors.append((name, kw))
 
-    if stage.startswith("helper_"):
-        def run():
-            if stage == "helper_chunk":
-                return llm.analyze_repo_chunk("o/r", _files(1), 1, 1)
-            return llm._synthesize_once("o/r", ["A"], model)
-        if exhausted:
-            with pytest.raises(RuntimeError) as raised:
-                run()
-            assert raised.value is failure
-        else:
-            run()
-    else:
-        ctx = _fake_ctx()._replace(sync_logger=_Logger())
-        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
-                                    _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
-        assert ctx.stats["errors"] == int(exhausted)
-        assert ctx.stats["metadata_generated"] == int(not exhausted)
-        if exhausted:
-            assert [(n, f["error_type"], f["detail"]) for n, f in errors] == [
-                ("metadata_failed", "RuntimeError", str(failure))]
+    ctx = _fake_ctx()._replace(sync_logger=_Logger())
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
+                                _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
+    assert ctx.stats["errors"] == int(exhausted)
+    assert ctx.stats["metadata_generated"] == int(not exhausted)
+    if exhausted:
+        assert [(n, f["error_type"], f["detail"]) for n, f in errors] == [
+            ("metadata_failed", "RuntimeError", str(failure))]
 
     attempts = limit if exhausted else 2
     assert len(failed_payloads) == attempts
     assert len(set(failed_payloads)) == 1 and failed_payloads[0][0] == model
-    base = 2 if stage.startswith("helper_") else 3
+    base = 3
     # Between failing sends are only the site's existing exponential backoff sleeps.
     assert ev[:2 * attempts - 1] == [v for i in range(attempts)
                                                    for v in (["send", base ** (i + 1)] if i < attempts - 1 else ["send"])]
