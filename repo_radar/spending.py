@@ -296,8 +296,18 @@ class Spending:
         self.channel, self.store, self.policy = channel, store or Store(), policy
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.lock = threading.Lock()
-        self.stopping = False
+        # Set the moment Stop arrives, before any lock is waited for: admission, reservation and dispatch all
+        # check it, so nothing new starts while the cleanup waits for a transaction to finish.
+        self.stop_requested = threading.Event()
         self.holds = set()
+
+    @property
+    def stopping(self):
+        return self.stop_requested.is_set()
+
+    def request_stop(self):
+        """Stop new work now; safe from a signal handler, since it waits for nothing."""
+        self.stop_requested.set()
 
     def initialize(self):
         """Start the first period now unless this storage already holds a ledger."""
@@ -308,6 +318,8 @@ class Spending:
         """Admit one attempt's whole allowance before its first send, or raise WeeklyCapRefused. Admission and
         registration happen together, so a Stop either closes the new hold or refuses it before any send."""
         amount = to_micro(amount_usd)
+        if self.stopping:
+            raise SpendingStopped("the sync is stopping")
         with self.lock:
             if self.stopping:
                 raise SpendingStopped("the sync is stopping")
@@ -330,10 +342,11 @@ class Spending:
         return hold
 
     def stop(self):
-        """Stop first, then close every hold this process owns with the ordinary close. Returns the problems,
-        if any; a hold that couldn't be closed keeps its whole durable allowance."""
+        """Stop first, then close every hold this process owns with the ordinary close, which also records every
+        reply already handed over (Hold.note). Returns the problems, if any; a hold that couldn't be closed keeps
+        its whole durable allowance."""
+        self.request_stop()
         with self.lock:
-            self.stopping = True
             problems = []
             for hold in list(self.holds):
                 try:
@@ -500,6 +513,7 @@ def stop_on_sigterm(spending, wait_seconds=0.7, exit=None):
                       file=sys.stderr, flush=True)
 
         def handle(signum, _frame):
+            spending.request_stop()   # first, before the cleanup waits for any lock
             worker = threading.Thread(target=cleanup, name='spending-stop', daemon=True)
             worker.start()
             worker.join(wait_seconds)

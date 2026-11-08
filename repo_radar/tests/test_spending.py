@@ -291,3 +291,54 @@ def test_stop_records_a_finished_protected_reply_whose_sibling_is_still_waiting(
     with pytest.raises(sp.WeeklyCapRefused):
         context(root).admit('o/s', 'm', 'full', 40)
 
+
+def test_stop_is_requested_before_the_cleanup_waits_for_a_transaction(tmp_path, monkeypatch):
+    """SIGTERM while a reservation's ledger transaction is still writing: the production handler marks the
+    stop at once, so the reserved send can't be dispatched and nothing new is admitted, though the cleanup
+    is still waiting for that transaction's lock. The cleanup then closes the attempt."""
+    import signal
+    import threading
+    from repo_radar.metadata_budget import Budget
+    root = tmp_path / 'spending'
+    record = context(root)
+    budget = Budget('claude-sonnet-5', label='full', spending=record, owner='o/r')
+    budget.acquire(40)
+
+    writing, finish = threading.Event(), threading.Event()
+    real_save = sp.Store.save
+
+    def slow_save(self, data):
+        if not finish.is_set():
+            writing.set()
+            finish.wait(10)   # the reservation's transaction, still holding the accounting lock
+        return real_save(self, data)
+    monkeypatch.setattr(sp.Store, 'save', slow_save)
+    outcome = {}
+
+    def reserve_then_dispatch():
+        budget.reserve({'r': 1}, 500_000, 0)
+        try:
+            budget.check_dispatch()
+            outcome['dispatched'] = True
+        except sp.SpendingStopped:
+            outcome['dispatched'] = False
+    worker = threading.Thread(target=reserve_then_dispatch)
+    worker.start()
+    assert writing.wait(10)
+
+    exits = []
+    with sp.stop_on_sigterm(record, wait_seconds=0.2, exit=exits.append):
+        signal.raise_signal(signal.SIGTERM)
+        assert exits == [143] and record.stopping   # marked at once; the cleanup is still waiting for the lock
+        with pytest.raises(sp.SpendingStopped):
+            record.admit('o/s', 'm', 'full', 1)
+        finish.set()
+        worker.join(10)
+    assert outcome == {'dispatched': False}
+    for _ in range(100):   # the cleanup thread closes the attempt once the transaction lets go
+        [attempt] = json.loads((root / sp.LEDGER_NAME).read_text())['attempts'].values()
+        if attempt['status'] == 'closed':
+            break
+        threading.Event().wait(0.05)
+    assert attempt['status'] == 'closed'
+    assert sp.summary(sp.Store(root), lambda: (True, 75.0))['available_usd'] == 74
