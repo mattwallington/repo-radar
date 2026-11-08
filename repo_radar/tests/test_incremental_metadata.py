@@ -541,6 +541,71 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     assert 'stale: analyzed' in (pristine / 'INDEX.md').read_text() and 'fetch failed' in (pristine / 'INDEX.md').read_text()
 
 
+def test_settings_spending_limits_bound_the_next_sync(monkeypatch, tmp_path, capsys):
+    """The Settings update limit and failure stop are read by the next sync. Bad values fall back to $12 and
+    2, never to no limit, and a missing API key fails visibly without moving the streak toward a hold."""
+    policy = repo_config.incremental_spending_policy
+    assert policy({}) == (12.0, 2, ()) and policy(None) == (12.0, 2, ())
+    assert policy({'incremental_update_limit_usd': 12.5, 'incremental_failure_stop': 10}) == (12.5, 10, ())
+    assert policy({'incremental_update_limit_usd': 1, 'incremental_failure_stop': 1.0})[:2] == (1.0, 1)
+    assert policy({'incremental_update_limit_usd': 99.99})[0] == 99.99
+    for bad in (0, 0.5, 100.01, 12.345, 12.000000001, -3, True, '12', None, float('nan'), float('inf'),
+                int('9' * 400)):   # too big for a float: out of range, not an OverflowError that stops the sync
+        assert policy({'incremental_update_limit_usd': bad}) == (12.0, 2, ('incremental_update_limit_usd',)), bad
+    for bad in (0, 11, 1.5, True, '2', None, float('nan')):
+        assert policy({'incremental_failure_stop': bad}) == (12.0, 2, ('incremental_failure_stop',)), bad
+
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    provider = Provider(monkeypatch)
+    _origin, config, events = sync_fixture(monkeypatch, tmp_path, repo)
+    kept = (pristine / 'app-abc1234.md').read_text()
+
+    def synced():
+        provider.sends.clear(); provider.counts.clear(); events.clear()
+        S.sync_mode(_sync_args())
+        return [f for name, f in events if name == 'metadata_incremental'][-1]
+
+    def failures():
+        return metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures']
+
+    # A saved $1 limit refuses this update's quote before any generation call and keeps the document.
+    provider.count_tokens = lambda body: 150_000 if 'tools' not in body else 1000
+    config['incremental_update_limit_usd'] = 1
+    event = synced()
+    assert event['status'] == 'skipped' and '$1.00 limit' in event['reason']
+    assert provider.counts and not provider.messages() and (pristine / 'app-abc1234.md').read_text() == kept
+    # Invalid or zero falls back to $12 with a warning naming only the field: this quote now fits, so it sends.
+    config['incremental_update_limit_usd'] = 0
+    doc = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [httpx.Response(500, json={"error": {"message": "boom"}})]
+    event = synced()
+    assert event['status'] == 'failed' and provider.messages() and failures() == 1
+    out = capsys.readouterr().out
+    assert 'Warning: incremental_update_limit_usd in the config is invalid; using its default' in ' '.join(out.split())
+
+    # A failure stop of 1 holds the next automatic sync with zero calls; raising it to 3 releases it.
+    config['incremental_failure_stop'] = 1
+    event = synced()
+    assert event['status'] == 'skipped' and 'held after 1 failed update' in event['reason']
+    assert not provider.sends and not provider.counts
+    assert 'held after 1' in S._dry_run_decision(repo.path, 'app-abc1234', FULL,
+                                                  _sync_args(_incremental_policy=(12.0, 1)))
+    # A missing API key fails visibly before any count or send and doesn't advance the streak.
+    config['incremental_failure_stop'] = 3
+    last = metadata.read_attempt_state(pristine, 'app-abc1234')['last_failure_reason']
+    monkeypatch.delenv('ANTHROPIC_API_KEY')
+    event = synced()
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert event['status'] == 'failed' and 'no API key' in event['reason'] and not provider.sends and not provider.counts
+    assert (state['consecutive_failures'], state['last_failure_reason']) == (1, last)
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'test-not-a-key')
+    # The higher limit, read by the next sync, lets the update through and it publishes.
+    config['incremental_update_limit_usd'] = 50
+    provider.replies = [note(), answer({'base_document_sha256': doc.sha256, 'sections': []})]
+    event = synced()
+    assert event['status'] == 'published' and len(provider.messages()) == 2 and failures() == 0
+
+
 # ── 2. Pinned reads and section edits ────────────────────────────────────────────────────────────
 
 def test_pinned_reads_confined_tools_and_section_edits(monkeypatch, tmp_path):

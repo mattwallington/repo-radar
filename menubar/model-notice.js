@@ -1,5 +1,6 @@
 'use strict';
 const { migrateModel, suggestUpgrade, KNOWN_MODEL_IDS } = require('./model-policy');
+const { validateSpending } = require('./spending-settings');
 
 // A retired id migrates to the newest model of its tier, which never has a suggestion of its own
 // (drift-check.js enforces it), so a notice is either a migration or a suggestion, never both.
@@ -96,4 +97,30 @@ function persistConfig(config, { reconcileSchedule, save, reconcile }) {
   return { ok: true, schedule: { ok: !(!s || s.success === false), error: s && s.error } };
 }
 
-module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig };
+// The Settings window's Save. The spending fields are validated before anything is written, so a bad value
+// saves nothing. A dev build never reconciles the schedule here: saveConfigToFile keeps the stored schedule
+// for dev, so reconciling would only report dev's schedule prohibition as a failed save after the rest of the
+// settings had in fact been saved.
+// When the dev build kept a stored schedule that differs from the one the window sent, the result carries a
+// notice saying so, rather than plain success. `save` reports that as `scheduleKept`.
+const DEV_SCHEDULE_KEPT = 'Saved. The dev build keeps the stored schedule.';
+
+function saveSettings(config, { channel, save, reconcile }) {
+  const invalid = validateSpending(config);
+  if (invalid) return { ok: false, stage: 'validate', error: invalid.message, field: invalid.field };
+  let scheduleKept = false;
+  const recordingSave = (c) => { const r = save(c); scheduleKept = Boolean(r && r.scheduleKept); return r; };
+  const res = persistConfig(config, { reconcileSchedule: channel !== 'dev', save: recordingSave, reconcile });
+  if (res.ok && channel === 'dev' && scheduleKept) res.notice = DEV_SCHEDULE_KEPT;
+  return res;
+}
+
+// Whether two schedules mean the same thing: both off (or absent), or the same fields and values.
+function sameSchedule(a, b) {
+  const off = (s) => !s || typeof s !== 'object' || !s.enabled;
+  if (off(a) && off(b)) return true;
+  const canonical = (s) => JSON.stringify(s, Object.keys(s || {}).sort());
+  return !off(a) && !off(b) && canonical(a) === canonical(b);
+}
+
+module.exports = { computeModelNotice, noticeSignature, parseModelLabels, humanizeModelId, renderNoticeText, resolveNoticeAction, planFinalize, persistConfig, saveSettings, sameSchedule, DEV_SCHEDULE_KEPT };

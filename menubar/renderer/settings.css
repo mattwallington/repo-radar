@@ -638,3 +638,16 @@ select.form-control {
     align-items: baseline;
     gap: 12px;
 }
+
+.form-control.spending-input {
+    max-width: 400px;
+}
+
+.form-error {
+    font-size: 12px;
+    color: #f48771;   /* the app's error text tone, as in the Activity window */
+}
+
+.form-error[hidden] {
+    display: none;
+}

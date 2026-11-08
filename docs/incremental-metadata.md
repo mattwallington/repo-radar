@@ -118,8 +118,9 @@ starts the record from the commits it can see.
 
 Before the first generation call, the whole update is quoted at worst case and uncached prices: the
 counted request for every page, the merge schedule all the way down to one note, each at its full input
-limit, and all four editing turns. A quote over **$12** (`INCREMENTAL_CAP_USD`), an unknown price or a
-request that can't fit stops the update before anything is sent. A larger diff never turns into an
+limit, and all four editing turns. A quote over the update limit, an unknown price or a request that can't
+fit stops the update before anything is sent. The limit is **$12** by default (`INCREMENTAL_CAP_USD`); Settings
+can set it from $1 to $100 (`incremental_update_limit_usd`), and a missing or invalid value means $12. A larger diff never turns into an
 uncapped full rebuild. Gemini is priced at its Standard tier, which is what a request naming no tier gets.
 Other providers keep their priority and flex rates in the bound, because such a request can run on the
 project's configured tier.
@@ -136,7 +137,7 @@ cost. If the cost isn't known, the whole reservation stays counted and no furthe
 update uses one set of prices throughout, including Google's announced January 2027 price for Gemini
 3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
 automatic retries, including after a 429 or 503, and no model fallbacks. Full rebuilds follow the
-existing full-generation cost policy: they aren't under the $12 cap.
+existing full-generation cost policy: they aren't under the incremental update limit.
 
 On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
@@ -167,11 +168,14 @@ the latest attempt and its usage, never prompts or source.
 
 ### The hold after repeated failures
 
-Any update that ends failed, incremental or full, adds one to `consecutive_failures` in its attempt record.
+Any update that ends failed, incremental or full, adds one to `consecutive_failures` in its attempt record,
+except a failure because the provider's API key isn't set: that is reported as failed but leaves the count
+as it was.
 A skipped update doesn't count, including one superseded by newer work or stopped by a resource or spending
 limit, and a publication resets the count to 0. A document replaced some other way starts again from none.
 
-At 2 failures in a row, a sync started by anything but a person makes no model call for that repository, even
+At 2 failures in a row by default (Settings can choose 1 to 10, `incremental_failure_stop`; a missing or
+invalid value means 2), a sync started by anything but a person makes no model call for that repository, even
 when a weekly rebuild is due, so a failing full rebuild can't repeat about $20 a day. That covers scheduled and
 catch-up syncs, and `repo-radar sync` from a terminal, which isn't marked as manual. It reports the update as
 skipped, a warning rather than an error: "held after 2 failed updates in a row; a manual sync or a forced

@@ -98,7 +98,23 @@
                 <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Chunk size is ~75% of context (1M → ~785K, 200K → ~150K). OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
             </div>
         </div>
-        
+
+        <div class="section">
+            <h2>Spending</h2>
+            <div class="form-group">
+                <label for="incremental-update-limit">Incremental update limit (USD)</label>
+                <input type="text" inputmode="decimal" id="incremental-update-limit" class="form-control spending-input" placeholder="12">
+                <small class="form-help">The most one incremental summary update may cost, for repositories opted in to incremental metadata. An update quoted above this is skipped before any model call and the current summary is kept. $1 to $100. Full rebuilds have their own policy.<span id="rebuild-interval-text"></span></small>
+                <small class="form-help form-error" id="incremental-update-limit-error" hidden></small>
+            </div>
+            <div class="form-group">
+                <label for="incremental-failure-stop">Pause automatic metadata after this many failures in a row</label>
+                <input type="text" inputmode="numeric" id="incremental-failure-stop" class="form-control spending-input" placeholder="2">
+                <small class="form-help">Scheduled syncs stop buying summary updates for a repository that keeps failing; Git fetching carries on. Sync Now can still retry; an incremental retry stays within the limit above. A whole number from 1 to 10.</small>
+                <small class="form-help form-error" id="incremental-failure-stop-error" hidden></small>
+            </div>
+        </div>
+
         <div class="section">
             <h2>Automatic Sync Schedule</h2>
             <div class="form-group">

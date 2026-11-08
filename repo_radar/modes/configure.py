@@ -262,8 +262,10 @@ def configure_mode(args):
         print(f"{YELLOW}No repositories selected{RESET}")
         return 0
 
-    # Save configuration
+    # Save configuration. Everything else already in the file (API keys, model, schedule, the Settings
+    # spending limits, ...) is kept: this wizard only chooses repositories.
     config = {
+        **(existing_config if isinstance(existing_config, dict) else {}),
         'github_token': github_token,
         'repositories': all_selected_repos,
         'last_configured': datetime.now().isoformat()

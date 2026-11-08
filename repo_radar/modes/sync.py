@@ -17,7 +17,7 @@ from collections import namedtuple
 
 from repo_radar.config import load_config, save_config, load_cache_index, save_cache_index, get_cache_name, PRISTINE_DIR, CONFIG_DIR, CACHE_INDEX_FILE
 from repo_radar.config import (DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, incremental_full_rebuild_days,
-                               incremental_metadata_repos)
+                               incremental_metadata_repos, incremental_spending_policy)
 from repo_radar import incremental_metadata
 from repo_radar import VERSION as REPO_RADAR_VERSION
 from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_for_schedule,
@@ -304,13 +304,20 @@ def _dry_run_decision(repo_path, cache_name, full_name, args):
         decision = incremental_metadata.decide(
             repo_path, full_name, doc, state, get_ai_model(), target, datetime.now(), force=force,
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
-        held = incremental_metadata.held_reason(state, doc, force, resolve_trigger(default='cli'))
+        held = incremental_metadata.held_reason(state, doc, force, resolve_trigger(default='cli'),
+                                                _incremental_policy(args)[1])
         if held and decision.strategy != 'none':
             return f"no update ({held})"
         return {'none': 'no update needed', 'incremental': 'incremental update',
                 'full': 'full rebuild'}[decision.strategy] + f" ({decision.reason})"
     except Exception as e:
         return f"undetermined ({type(e).__name__})"
+
+
+def _incremental_policy(args):
+    """(update limit USD, failure stop) this sync loaded from Settings; the defaults when it loaded none."""
+    policy = getattr(args, '_incremental_policy', None)
+    return policy if isinstance(policy, tuple) and len(policy) == 2 else incremental_spending_policy(None)[:2]
 
 
 def _generate_incremental(task_data, session, args, ctx):
@@ -340,7 +347,8 @@ def _generate_incremental(task_data, session, args, ctx):
             log=stage,
             missing_credential=env_key if env_key and not os.getenv(env_key) else None,
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
-            trigger=resolve_trigger(default='cli'))
+            trigger=resolve_trigger(default='cli'),
+            update_limit_usd=_incremental_policy(args)[0], failure_stop=_incremental_policy(args)[1])
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)
@@ -1473,6 +1481,12 @@ def sync_mode(args):
             return 1
         args._incremental_repos = frozenset()
         args._incremental_full_rebuild_days = 0
+    # The Settings spending limits, captured once for this whole sync. An invalid value falls back to its
+    # default with a warning naming only the field, never to no limit.
+    limit_usd, failure_stop, invalid_fields = incremental_spending_policy(config)
+    args._incremental_policy = (limit_usd, failure_stop)
+    for field in invalid_fields:
+        console.print(f"[yellow]Warning: {field} in the config is invalid; using its default[/yellow]")
     incremental_repos = args._incremental_repos
     args._incremental_reported = set()
     args._incremental_index_due = False
