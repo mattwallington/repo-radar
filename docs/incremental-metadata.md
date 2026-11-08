@@ -154,13 +154,59 @@ lower). The whole repository goes as one request only when it fits; otherwise th
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
 until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
 something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
-document stays, rather than send excerpts. A full rebuild is capped at **$25** per attempt
+document stays, rather than send excerpts. A full rebuild is capped at **$40** per attempt
 (`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
 when its count is only a local estimate, as on Gemini, that worst case is the model's whole input limit.
 A request that could pass the cap stops the rebuild; once anything has been spent, that counts as a failed
 update. The cap bounds what
-one attempt can spend; it doesn't promise a repository can be rebuilt for that much. Repositories that
-aren't opted in keep the legacy full generator, which isn't capped.
+one attempt can spend; it doesn't promise a repository can be rebuilt for that much.
+
+Repositories that aren't opted in keep the legacy full generator, with its collection, prompts, chunking,
+retries and model fallbacks, but each attempt now has one allowance, estimated before its first send: every
+prepared prompt's input plus its maximum output and, for a chunked build, every synthesis call the bounded
+synthesis may still make (its 32-call ceiling at its complete input and output ceilings), at uncached list
+prices with a 25% margin, and at most $40 (`$40` too when the estimate can't be computed). Every send,
+retry and fallback is counted and reserved inside that allowance at the serving model's own prices, its
+cost is recorded as soon as the reply arrives (an incomplete reply included), and the SDK's own retries are
+off. A send whose cost is unknown, a rate-limited one included, keeps its whole reservation, so a single-call
+repository usually has no room left for a retry; a send the allowance can't cover isn't made and the attempt
+fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
+
+### The weekly spending limit
+
+Every generation attempt in a normal sync, incremental, protected full or legacy, is admitted against a
+weekly limit before its first send: **$75** by default, on unless Settings turns it off (`weekly_spend_cap_enabled`,
+`weekly_spend_cap_usd`, $1 to $1,000). The record lives in `~/.config/repo-radar/spending/`, owner-only, and
+is shared by stable and dev builds and every repository root. It holds attempt and send identifiers, the
+channel, repository, model, times and amounts, never prompts, replies, credentials or settings.
+
+- **What an attempt holds.** A diff update holds its whole quote, a protected full rebuild $40, and a legacy
+  attempt its estimate. That hold is also the attempt's hard limit: nothing is topped up once sending starts.
+  An attempt is admitted only if the week's committed money (recorded charges, unknown-cost reservations and
+  every running attempt's whole hold) plus its own hold fits the limit.
+- **A refusal** is a skip before any send: the previous summary, the failure count, the last failure and any
+  owed full rebuild stay, with no retry, fallback or other strategy. The reason says what the update needed
+  and what remains until the week resets.
+- **During and after an attempt.** Each send is recorded inside the hold before it goes out and its cost as
+  soon as the reply arrives. When the attempt ends, however it ends, its known charges and unresolved
+  reservations stay and the rest of its hold is released. A cost above its reservation is recorded in full
+  and stops further sends. A crashed sync's hold stays counted; nothing expires with time, and there is no
+  reset button.
+- **Weeks.** The first period runs from the first sync that uses the record to the next Monday 00:00 UTC, with
+  nothing estimated for earlier spending; later ones run Monday to Monday UTC. A charge belongs to the week
+  its attempt was admitted in, even if it finishes after Monday. Settings are read again at each admission, so
+  lowering the limit affects new attempts only.
+- **Turned off,** nothing is refused for the week, but every charge is still recorded and each attempt keeps
+  its own limit.
+- **A record that can't be trusted** (it existed and is now missing, damaged or not owner-only) is
+  unavailable: nothing is admitted until it is fixed, and it is never recreated at $0.
+
+Settings shows the week's recorded spend, what is reserved or uncertain and what is available, from the same
+aggregation admission uses. Before the first sync it says tracking starts with the next sync; when the record
+can't be read it says the spend is unavailable, never $0.
+
+Combined enforcement needs both the stable and the dev app on a build that uses this record: an older build
+neither checks nor records spending. The record doesn't estimate what older builds spent.
 
 On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
