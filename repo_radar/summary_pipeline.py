@@ -1008,7 +1008,8 @@ class FullBuild:
         after repeated failures applies; a refusal before anything was paid for is only a skip."""
         if failure is None:
             return
-        if isinstance(failure, LedgerWriteError):
+        from repo_radar.spending import SpendingStopped
+        if isinstance(failure, (LedgerWriteError, SpendingStopped)):
             raise failure
         if isinstance(failure, im.StaleUpdate):
             raise im.StaleUpdate(f"{self.where}: {failure.reason}",

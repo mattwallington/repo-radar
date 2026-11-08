@@ -198,8 +198,10 @@ channel, repository, model, times and amounts, never prompts, replies, credentia
   If a cost can't be written at once it is kept and written by the next update to the record or the close, and
   that attempt sends nothing more.
 - **Stop.** The Stop button during summary generation stops new updates and sends, closes this sync's open
-  holds and ends the sync at once: the unused part of each hold is released, but a request already in flight
-  keeps its whole reservation, because the provider may still charge for it. A sync killed outright, a power
+  holds and ends the sync at once: the unused part of each hold is released, a reply that has already come
+  back is recorded at its charge, and a request still in flight keeps its whole reservation, because the
+  provider may still charge for it. An update stopped between two requests is skipped, not counted as a
+  failure. A sync killed outright, a power
   loss or a record that can't be written leaves the whole hold counted. Nothing expires with time, and there
   is no reset button.
 - **Weeks.** The first period runs from the first sync that uses the record to the next Monday 00:00 UTC, with

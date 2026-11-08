@@ -36,7 +36,8 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
 from repo_radar.preflight import PreflightSession
 from repo_radar.metadata_budget import (Budget, BudgetError, LedgerWriteError, LEGACY_MARGIN, FULL_CAP_USD,
                                         legacy_allowance)
-from repo_radar.spending import Spending, SpendingError, WeeklyCapRefused, policy_from_config, stop_on_sigterm
+from repo_radar.spending import (Spending, SpendingError, SpendingStopped, WeeklyCapRefused, policy_from_config,
+                                 stop_on_sigterm)
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
@@ -1126,14 +1127,16 @@ parse_status: {parse_status}
 
         return spent()
 
-    except WeeklyCapRefused as e:
-        # Only admission refuses, before any send: nothing is written, so the previous metadata and its commit
-        # stay and a later sync tries again. Not an error, a retry, a fallback or a degraded record.
-        ctx.meta_progress.update(task_id, completed=100, status="[yellow]\u26a0 skipped: weekly spending limit[/yellow]")
+    except (WeeklyCapRefused, SpendingStopped) as e:
+        # Only admission refuses, before any send, and a Stop between sends is an interruption: nothing is
+        # written, so the previous metadata and its commit stay and a later sync tries again. Not an error, a
+        # retry, a fallback or a degraded record.
+        why = 'sync stopped' if isinstance(e, SpendingStopped) else 'weekly spending limit'
+        ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]\u26a0 skipped: {why}[/yellow]")
         if hasattr(args, 'status_server') and args.status_server:
             send_status_update('progress', {
                 'repo': full_name, 'short_name': short_id,
-                'status': '\u26a0 metadata skipped: weekly spending limit',
+                'status': f'\u26a0 metadata skipped: {why}',
                 'percent': 100,
                 'color': 'yellow'
             }, args.status_server)

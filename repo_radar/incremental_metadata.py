@@ -747,7 +747,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     from repo_radar.metadata_budget import Budget, FULL_CAP_USD, INCREMENTAL_CAP_USD
     from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
-    from repo_radar.spending import SpendingError, WeeklyCapRefused
+    from repo_radar.spending import SpendingError, SpendingStopped, WeeklyCapRefused
 
     started = time.monotonic()
     deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)   # selection, preparation and sends share it
@@ -881,6 +881,9 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('published', None)
     except StaleUpdate as e:
         return finish('skipped' if e.warning else 'failed', e.reason)
+    except SpendingStopped:
+        # Stop arrived between sends: an interruption like any other Stop, not a failure that moves the streak.
+        return finish('skipped', 'the sync was stopped')
     except WeeklyCapRefused as e:
         # Only admission refuses, before any send: the previous document, failure count, last counted failure
         # and any full-rebuild obligation all stay. No retry, fallback or other strategy follows.

@@ -1547,6 +1547,22 @@ def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch
     assert (week['recorded_usd'], week['reserved_usd'], week['available_usd']) == (0, 0, 75)
     assert im.load_document(pristine, 'app-abc1234').text == old.text
 
+    # A Stop landing between two sends is an interruption, not a failure: the update ends skipped, the failure
+    # count doesn't move, and the reply that did come back is recorded.
+    before = metadata.read_attempt_state(pristine, 'app-abc1234')
+    stopping = sp.Spending('stable', store=sp.Store(tmp_path / 'stopped'), policy=lambda: (True, 75.0))
+
+    def first_then_stop(stage, text):
+        stopping.request_stop()   # what the Stop handler does first
+        return '## Analysis\nTwo files.\n'
+    fake = GeminiFake(monkeypatch, first_then_stop)
+    outcome = full_build(pristine, repo, FileCounts(50_000), spending=stopping)
+    assert outcome.status == 'skipped' and outcome.reason == 'the sync was stopped' and len(fake.sends) == 1, outcome
+    after = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert after['consecutive_failures'] == before['consecutive_failures']
+    assert after.get('last_failure_reason') == before.get('last_failure_reason')
+    assert sp.summary(stopping.store, stopping.policy)['recorded_usd'] == pytest.approx(outcome.usage['known_cost_usd'], abs=1e-5)
+
 
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
     """Once anything has been paid for, a count that stops being available ends the attempt as failed, not
