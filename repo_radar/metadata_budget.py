@@ -262,29 +262,37 @@ class Budget:
         return [Reservation(key, upper, price, send) for key, upper, send in zip(keys, uppers, sends)]
 
     def settle(self, reservation, usage, reported_cost):
-        """Record a reply and return its cost, or None when it is unknown.
+        """Record a reply and return its known cost, or None when it is unknown.
 
-        Only reliable usage (positive input and output counts) can release a reservation: with it, a
-        finite positive reported cost wins, else the cost is priced from the usage. Anything else (no
-        usage, zero-filled or partial usage, a missing or invalid cost with no price) keeps the whole
-        reservation counted as spent.
+        A finite positive reported cost is a known charge whatever the usage says: zero-filled or absent counts
+        don't make it free. Without one, only reliable usage (positive input and output counts) prices a
+        charge; anything else keeps the whole reservation counted as spent. A known charge is recorded in full,
+        even above its reservation, and then no further request fits. When the usage can't confirm a reported
+        cost (litellm computes it from the same counts, so partial counts give a partial cost), the reply also
+        keeps its reservation as uncertain: it commits the larger of the two, never their sum, and counts as a
+        call of unknown cost. Under an announced price rise with reliable usage, the higher priced amount is the
+        charge, since the reported cost may use the old table.
         """
         upper = self._open.pop(reservation.key, 0.0)
         self.calls += 1
-        cost = None
+        cost, keep = None, 0.0
         price = reservation.price or self.price
-        if reliable_usage(usage):
+        usable = reliable_usage(usage)
+        priced = None
+        if usable:
             self.input_tokens += usage.input_tokens
             self.output_tokens += usage.output_tokens
-            priced = (usage.input_tokens * price[0] + usage.output_tokens * price[1]
-                      if price is not None else None)
-            if reliable_cost(reported_cost):
-                cost = float(reported_cost)
-                announced = reservation.price[2] if reservation.price else bool(self.rates and self.rates.announced)
-                if announced:   # the reported cost uses the old table
-                    cost = max(cost, priced)
-            else:
-                cost = priced
+            if price is not None:
+                priced = usage.input_tokens * price[0] + usage.output_tokens * price[1]
+        announced = reservation.price[2] if reservation.price else bool(self.rates and self.rates.announced)
+        if reliable_cost(reported_cost):
+            cost = float(reported_cost)
+            if not usable:
+                keep = upper   # counts can't confirm it: the true charge may be higher, up to the reservation
+            elif announced and priced is not None:
+                cost = max(cost, priced)
+        else:
+            cost = priced
         if cost is None:
             self.unknown_calls += 1
             self.retained += upper
@@ -292,8 +300,13 @@ class Budget:
                           lambda: self.hold.unknown(reservation.send))
         else:
             self.cost += cost   # in full, even above its bound: the bill is never clipped to fit the cap
-            self._persist(cost, lambda: self.ledger.settle(reservation.key, cost),
-                          lambda: self.hold.settle(reservation.send, cost))
+            if keep > cost:
+                self.unknown_calls += 1
+                self.retained += keep - cost
+            # The pilot ledger has no partly-known state: such a reply stays unknown there, to be reconciled.
+            self._persist(cost, (lambda: self.ledger.mark_unknown(reservation.key)) if keep > cost
+                          else (lambda: self.ledger.settle(reservation.key, cost)),
+                          lambda: self.hold.settle(reservation.send, cost, keep))
         return cost
 
     def _persist(self, cost, write, record=None):

@@ -245,7 +245,8 @@ class Executor:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(self.width, 1)) as pool:
             futures = [pool.submit(send, item) for item in items]
             concurrent.futures.wait(futures)
-        turns, send_error, storage_error, unknown = [], None, None, False
+        turns, send_error, storage_error = [], None, None
+        unknown_before = self.budget.unknown_calls
         for item, reservation, future in zip(items, reservations, futures):
             error = future.exception()
             record = {'stage': item.stage, 'id': item.id, 'counted_tokens': item.tokens, 'max_output': item.output}
@@ -266,13 +267,12 @@ class Executor:
             except LedgerWriteError as e:
                 storage_error = storage_error or e
                 cost = e.cost
-            unknown = unknown or cost is None
             self.calls.append({**record, 'status': turn.status, 'seconds': round(seconds, 3), 'cost_usd': cost,
                                'input_tokens': turn.usage.input_tokens if turn.usage else None,
                                'output_tokens': turn.usage.output_tokens if turn.usage else None})
             turns.append(turn)
         failure = send_error or storage_error
-        if failure is None and unknown:
+        if failure is None and self.budget.unknown_calls > unknown_before:   # unknown, or not fully known
             failure = im.StaleUpdate("a reply's cost is unknown, so its full reservation stays counted; stopping before "
                                      "any further paid request")
         return turns, failure

@@ -109,7 +109,10 @@ def _known(attempt):
 
 
 def _uncertain(attempt):
-    return sum(s['bound'] for s in attempt['sends'].values() if s['status'] in ('reserved', 'unknown'))
+    """Unresolved bounds, plus whatever a settled send must still keep above its known charge (`keep`: a
+    known reported cost whose price couldn't be checked against its usage keeps at least its bound)."""
+    return sum(s['bound'] if s['status'] in ('reserved', 'unknown') else max(0, s.get('keep', 0) - s['cost'])
+               for s in attempt['sends'].values() if s['status'] != 'released')
 
 
 def committed(attempt):
@@ -134,6 +137,8 @@ def _valid(data):
                     or not isinstance(send.get('bound'), int):
                 return False
             if send['status'] == 'settled' and not isinstance(send.get('cost'), int):
+                return False
+            if not isinstance(send.get('keep', 0), int):
                 return False
     return True
 

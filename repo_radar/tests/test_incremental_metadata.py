@@ -2324,7 +2324,7 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
         usage = budget.summary()
         assert usage['cost_usd'] is None and usage['unknown_cost_calls'] == 1 and usage['retained_reservation_usd'] > 0
         reopened = Ledger(ledger_path, 40.0, allowances)
-        assert reopened.spent() == pytest.approx(usage['retained_reservation_usd'])
+        assert reopened.spent() == pytest.approx(usage['known_cost_usd'] + usage['retained_reservation_usd'])
         with pytest.raises(BudgetExceeded, match='reconcile'):
             Budget(MODEL, ledger=reopened, label='full').reserve({'other': 1}, 1, 1)
 

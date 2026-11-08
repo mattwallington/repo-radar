@@ -516,12 +516,12 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
         assert sum(ro == 16384 and "A0" in p for _, p, ro in completed) == 1
 
 
-def _reply(text, cost, finish="stop", prompt_tokens=100, completion_tokens=200):
+def _reply(text, cost, finish="stop", prompt_tokens=100, completion_tokens=200, usage=True):
     """A litellm completion as the real transport returns it: text, finish reason, usage and its cost."""
     choice = types.SimpleNamespace(message=types.SimpleNamespace(content=text), finish_reason=finish)
     return types.SimpleNamespace(choices=[choice], _hidden_params={"response_cost": cost},
                                  usage=types.SimpleNamespace(prompt_tokens=prompt_tokens,
-                                                             completion_tokens=completion_tokens))
+                                                             completion_tokens=completion_tokens) if usage else None)
 
 
 @pytest.mark.parametrize("stage", ["chunk", "synthesis", "single"])
@@ -663,25 +663,63 @@ def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path)
     assert [s["status"] for s in attempt["sends"].values()] == ["released", "settled"]
     assert sp.summary(args._spending.store, args._spending.policy)["recorded_usd"] == pytest.approx(budget.cost, abs=1e-6)
 
-    # A reply that costs more than the whole estimate is recorded in full, and the next chunk can't be sent:
-    # no top-up is bought and the attempt fails with the previous summary kept.
-    (tmp_path / "repo.md").write_text(previous)
+    # A reported $50 charge under the $40 allowance is a known charge however incomplete its usage: call_llm
+    # returns it, the attempt, the sync's cost and the reopened weekly record keep it once, and the next chunk
+    # isn't sent. No top-up is bought and the attempt fails with the previous summary kept.
     monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "chunk")
-    budgets.clear(), sends.clear()
     events = []
 
     class _Logger:
         def event(self, name, **kw): events.append((name, kw))
         def error(self, name, **kw): events.append((name, kw))
 
-    monkeypatch.setattr(litellm, "completion", lambda model, messages, max_tokens, **kw:
-                        sends.append(model) or _reply("A", 100.0))
-    ctx = _fake_ctx()._replace(sync_logger=_Logger())
-    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, _fake_args(), ctx)
-    assert len(sends) == 1 and budgets[0].cost == 100.0 and ctx.stats["api_cost"] == 100.0
-    assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
-    assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")]
-    assert (tmp_path / "repo.md").read_text() == previous
+    returned = []
+    real_call = sync.call_llm
+    monkeypatch.setattr(sync, "call_llm", lambda *a, **kw: returned.append(real_call(*a, **kw)[1]) or
+                        ("A", returned[-1], None))
+    for n, usage in enumerate([{"prompt_tokens": 100, "completion_tokens": 0}, {"usage": False},
+                               {"prompt_tokens": 0, "completion_tokens": 0}]):
+        (tmp_path / "repo.md").write_text(previous)
+        budgets.clear(), sends.clear(), events.clear(), returned.clear()
+        monkeypatch.setattr(litellm, "completion", lambda model, messages, max_tokens, usage=usage, **kw:
+                            sends.append(model) or _reply("A", 50.0, **usage))
+        args = _fake_args()
+        args._spending = sp.Spending("stable", store=sp.Store(tmp_path / f"over{n}"), policy=lambda: (True, 75.0))
+        ctx = _fake_ctx()._replace(sync_logger=_Logger())
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+        assert budgets[0].cap == 40 and len(sends) == 1, usage
+        assert returned == [50.0] and budgets[0].cost == 50.0 and ctx.stats["api_cost"] == 50.0, usage
+        assert sp.summary(sp.Store(tmp_path / f"over{n}"), lambda: (True, 75.0))["recorded_usd"] == 50, usage
+        assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
+        assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")]
+        assert (tmp_path / "repo.md").read_text() == previous
+    monkeypatch.setattr(sync, "call_llm", real_call)
+
+    # A gateway error (504, 502 or 500) may come after the model ran, so it keeps its whole share, unlike the
+    # 429 above. The legacy retry it triggers no longer fits the single-call estimate and isn't sent.
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single")
+    for status in (504, 502, 500):
+        class GatewayError(Exception):
+            status_code = status
+
+        def gateway(model, messages, max_tokens, **kw):
+            sends.append(model)
+            raise GatewayError("upstream request failed")
+
+        (tmp_path / "repo.md").write_text(previous)
+        budgets.clear(), sends.clear(), events.clear()
+        monkeypatch.setattr(litellm, "completion", gateway)
+        args = _fake_args()
+        args._spending = sp.Spending("stable", store=sp.Store(tmp_path / f"gw{status}"), policy=lambda: (True, 75.0))
+        ctx = _fake_ctx()._replace(sync_logger=_Logger())
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+        assert len(sends) == 1 and budgets[0].unknown_calls == 1 and budgets[0].refused_calls == 0, status
+        assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")], status
+        [attempt] = json.loads((tmp_path / f"gw{status}" / sp.LEDGER_NAME).read_text())["attempts"].values()
+        assert attempt["status"] == "closed" and [x["status"] for x in attempt["sends"].values()] == ["unknown"]
+        assert sp.summary(sp.Store(tmp_path / f"gw{status}"), lambda: (True, 75.0))["reserved_usd"] == pytest.approx(
+            budgets[0].retained, abs=1e-5)
+        assert (tmp_path / "repo.md").read_text() == previous
 
     # In a normal sync the estimate is admitted against the weekly cap first; with too little left this week
     # the repository is skipped before any send, with nothing written and no error.
