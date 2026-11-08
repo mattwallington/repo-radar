@@ -663,6 +663,29 @@ def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path)
     assert [s["status"] for s in attempt["sends"].values()] == ["released", "settled"]
     assert sp.summary(args._spending.store, args._spending.policy)["recorded_usd"] == pytest.approx(budget.cost, abs=1e-6)
 
+    # A 429 that carries charge evidence is no refund: the charge is recorded and the send keeps its bound, so
+    # the single-call retry no longer fits and isn't sent.
+    charged = litellm.RateLimitError(message="rate limited", llm_provider="gemini", model=argon)
+    charged._hidden_params = {"response_cost": 0.0001}
+
+    def limited_with_charge(model, messages, max_tokens, **kw):
+        sends.append(model)
+        raise charged
+
+    (tmp_path / "repo.md").write_text(previous)
+    budgets.clear(), sends.clear()
+    monkeypatch.setattr(litellm, "completion", limited_with_charge)
+    args = _fake_args()
+    args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "charged"), policy=lambda: (True, 75.0))
+    ctx = _fake_ctx()
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+    budget = budgets[0]
+    assert sends == [argon] and budget.refused_calls == 0 and budget.cost == pytest.approx(0.0001)
+    assert ctx.stats["errors"] == 1 and (tmp_path / "repo.md").read_text() == previous
+    week = sp.summary(args._spending.store, args._spending.policy)
+    assert week["recorded_usd"] == pytest.approx(0.0001) and week["reserved_usd"] == pytest.approx(budget.retained, abs=1e-5)
+    assert budget.retained > 0
+
     # A reported $50 charge under the $40 allowance is a known charge however incomplete its usage: call_llm
     # returns it, the attempt, the sync's cost and the reopened weekly record keep it once, and the next chunk
     # isn't sent. No top-up is bought and the attempt fails with the previous summary kept.

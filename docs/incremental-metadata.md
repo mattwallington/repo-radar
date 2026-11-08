@@ -171,7 +171,8 @@ cost is recorded as soon as the reply arrives (an incomplete reply included), an
 off. A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back, so the generator's usual retry or fallback still fits.
 Any other send whose cost is unknown keeps its whole reservation: a timeout, a dropped connection, or a 500,
-502 or 504, since a gateway can fail after the model ran. Protected builds use the same rule, though they
+502 or 504, since a gateway can fail after the model ran. A refusal that carries a charge is no refund: the
+charge is recorded and the request keeps at least its reservation. Protected builds use the same rule, though they
 never retry. A send the allowance can't cover isn't made
 and the attempt fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
 

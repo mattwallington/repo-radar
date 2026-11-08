@@ -284,6 +284,35 @@ _MAYBE_PROCESSED_TYPES = frozenset({'Timeout', 'TimeoutError', 'APITimeoutError'
                                     'ConnectionError', 'RemoteProtocolError'})
 
 
+def error_charge(error):
+    """A trustworthy positive charge carried by a failed send's error, or None: a structured response_cost on
+    the exception, its body or error detail, or its (or its response's) _hidden_params. The largest is kept."""
+    from repo_radar.metadata_budget import reliable_cost
+    response = getattr(error, 'response', None)
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else None
+    places = [error, body, detail, getattr(error, '_hidden_params', None), getattr(response, '_hidden_params', None)]
+    found = []
+    for place in places:
+        value = place.get('response_cost') if isinstance(place, dict) else getattr(place, 'response_cost', None)
+        if place is not None and reliable_cost(value):
+            found.append(float(value))
+    return max(found) if found else None
+
+
+def account_failed_send(budget, reservation, error):
+    """The money for a send that raised, the same way for both senders: a charge it carries is recorded in
+    full and keeps at least its bound; a positively unpaid refusal gives its bound back; anything else keeps
+    the whole bound as unknown. Never a retry decision."""
+    charge = error_charge(error) if isinstance(error, Exception) else None
+    if charge is not None:
+        budget.settle(reservation, None, charge)
+    elif isinstance(error, Exception) and refused_without_charge(error):
+        budget.refuse(reservation)
+    else:
+        budget.fail(reservation)
+
+
 def refused_without_charge(error):
     """True only on positive evidence that the provider refused a send without charging for it, so its
     reservation can go back to the attempt: a typed or structured 429, a 503 or 529, or Gemini's structured
@@ -291,6 +320,11 @@ def refused_without_charge(error):
     class name: any other status (500, 502 and 504 included), a timeout or dropped connection, or reported
     usage or cost. Digits in the message never count. Whether to retry is a separate question
     (is_transient_server_error); this only decides money, for both senders."""
+    from repo_radar.spending import SpendingStopped
+    if isinstance(error, SpendingStopped):
+        return True   # stopped before it went out: nothing was sent
+    if error_charge(error) is not None:
+        return False   # charge evidence vetoes a refund
     names = {cls.__name__ for cls in type(error).__mro__}
     if names & _MAYBE_PROCESSED_TYPES:
         return False
@@ -371,10 +405,7 @@ def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
         if reservation is not None:
             from repo_radar.metadata_budget import LedgerWriteError
             try:
-                if isinstance(error, Exception) and refused_without_charge(error):
-                    budget.refuse(reservation)   # not billed: the bound goes back, so a retry still fits
-                else:
-                    budget.fail(reservation)     # may have been billed: its whole bound stays
+                account_failed_send(budget, reservation, error)
             except LedgerWriteError:
                 pass                             # the hold is now broken and refuses any further send
         raise
