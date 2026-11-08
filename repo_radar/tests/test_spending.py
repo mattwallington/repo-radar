@@ -237,3 +237,57 @@ def test_stop_closes_this_process_holds_and_exits_without_waiting_for_the_provid
     with pytest.raises(sp.SpendingStopped):
         record.admit('o/t', 'm', 'full', 1)
     assert sp.summary(sp.Store(root), lambda: (True, 75.0))['available_usd'] == 74
+
+
+def test_stop_records_a_finished_protected_reply_whose_sibling_is_still_waiting(tmp_path):
+    """A real two-request protected wave inside the production worker arrangement: one reply has come back
+    with a $50 charge, the other provider never answers. On SIGTERM the $50 is recorded (it was handed to the
+    weekly record on arrival, not when the wave finished), the waiting request keeps its $1 bound, and the
+    next $40 attempt isn't admitted."""
+    import signal
+    root = tmp_path / 'spending'
+    script = textwrap.dedent('''
+        import sys, threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from repo_radar import llm, spending as sp, summary_pipeline as mr
+        from repo_radar.metadata_budget import Budget
+        record = sp.Spending('stable', store=sp.Store(sys.argv[1]), policy=lambda: (True, 75.0))
+        provider = threading.Event()   # never set: request b stays in flight
+
+        def call_model_turn(request, timeout):
+            if request['id'] == 'b':
+                provider.wait()
+            return llm.TurnResult('complete', 'A', [], llm.TurnUsage(100, 200), 50.0, [])
+        llm.call_model_turn = call_model_turn
+        real_note = Budget.note_reply
+
+        def note_reply(self, *args):
+            real_note(self, *args)
+            print('reply a handed over', flush=True)
+        Budget.note_reply = note_reply
+
+        def generate():
+            budget = Budget('claude-sonnet-5', label='full', spending=record, owner='o/r')
+            budget.acquire(40)
+            executor = mr.Executor('claude-sonnet-5', None, budget, lambda item: item.request, width=2)
+            items = [mr.Prepared('map', i, {'id': i}, 10, 1000, 0, 60, 500_000) for i in ('a', 'b')]
+            executor.wave(items)
+
+        with sp.stop_on_sigterm(record):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                for future in as_completed([pool.submit(generate)]):
+                    future.result()
+    ''')
+    proc = subprocess.Popen([sys.executable, '-c', script, str(root)], cwd=tmp_path, stdout=subprocess.PIPE,
+                            text=True, env={**os.environ, 'PYTHONPATH': str(ROOT)})
+    assert proc.stdout.readline().strip() == 'reply a handed over'
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=10) == 143
+    [attempt] = json.loads((root / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert attempt['status'] == 'closed'
+    assert sorted(s['status'] for s in attempt['sends'].values()) == ['settled', 'unknown']
+    week = sp.summary(sp.Store(root), lambda: (True, 75.0))
+    assert (week['recorded_usd'], week['reserved_usd'], week['available_usd']) == (50, 1, 24)
+    with pytest.raises(sp.WeeklyCapRefused):
+        context(root).admit('o/s', 'm', 'full', 40)
+

@@ -418,6 +418,19 @@ class Hold:
         if self.stopping:
             raise SpendingStopped("the sync is stopping; no further request is sent")
 
+    @staticmethod
+    def settled_receipt(cost_usd, keep_usd=0.0):
+        return ('settled', to_micro(cost_usd), to_micro(keep_usd) if keep_usd else 0)
+
+    def note(self, number, receipt):
+        """Hand over a reply's receipt the moment it arrives, from the thread that received it, without writing
+        it: the coordinator's settle writes it later, and a Stop's close applies it if that comes first. Ordered
+        with close by the same lock; a known charge already noted is never replaced."""
+        with self.lock:
+            current = self.pending.get(str(number))
+            if current is None or current[0] != 'settled':
+                self.pending[str(number)] = receipt
+
     def _receipt(self, number, receipt):
         with self.lock:
             self.pending[str(number)] = receipt
@@ -426,7 +439,7 @@ class Hold:
     def settle(self, number, cost_usd, keep_usd=0.0):
         """A reply's known cost, recorded in full even above its bound; `keep_usd` is what it must still hold
         at least, when its price couldn't be checked. Settling twice changes nothing."""
-        self._receipt(number, ('settled', to_micro(cost_usd), to_micro(keep_usd) if keep_usd else 0))
+        self._receipt(number, self.settled_receipt(cost_usd, keep_usd))
 
     def release(self, number):
         """A send the provider refused without charging: its bound goes back to the allowance."""

@@ -275,24 +275,10 @@ class Budget:
         """
         upper = self._open.pop(reservation.key, 0.0)
         self.calls += 1
-        cost, keep = None, 0.0
-        price = reservation.price or self.price
-        usable = reliable_usage(usage)
-        priced = None
-        if usable:
+        if reliable_usage(usage):
             self.input_tokens += usage.input_tokens
             self.output_tokens += usage.output_tokens
-            if price is not None:
-                priced = usage.input_tokens * price[0] + usage.output_tokens * price[1]
-        announced = reservation.price[2] if reservation.price else bool(self.rates and self.rates.announced)
-        if reliable_cost(reported_cost):
-            cost = float(reported_cost)
-            if not usable:
-                keep = upper   # counts can't confirm it: the true charge may be higher, up to the reservation
-            elif announced and priced is not None:
-                cost = max(cost, priced)
-        else:
-            cost = priced
+        cost, keep = self.charge(reservation, usage, reported_cost)
         if cost is None:
             self.unknown_calls += 1
             self.retained += upper
@@ -308,6 +294,32 @@ class Budget:
                           else (lambda: self.ledger.settle(reservation.key, cost)),
                           lambda: self.hold.settle(reservation.send, cost, keep))
         return cost
+
+    def charge(self, reservation, usage, reported_cost):
+        """(known cost or None, amount it must still keep): settle's pricing, with no state changed, so the
+        receipt a worker hands over on arrival (note_reply) is exactly the one settle records."""
+        upper = reservation.upper or 0.0
+        price = reservation.price or self.price
+        usable = reliable_usage(usage)
+        priced = (usage.input_tokens * price[0] + usage.output_tokens * price[1]
+                  if usable and price is not None else None)
+        announced = reservation.price[2] if reservation.price else bool(self.rates and self.rates.announced)
+        if reliable_cost(reported_cost):
+            cost = float(reported_cost)
+            if not usable:
+                return cost, upper   # counts can't confirm it: the true charge may be higher, up to the reservation
+            return (max(cost, priced) if announced and priced is not None else cost), 0.0
+        return priced, 0.0
+
+    def note_reply(self, reservation, usage, reported_cost):
+        """Hand a reply's known charge to the weekly record the moment it arrives, from the worker that
+        received it, so a Stop before the coordinator settles still records it. Writes nothing and changes no
+        accounting here; settle remains the one settlement. Safe from worker threads."""
+        if self.hold is None or reservation.send is None:
+            return
+        cost, keep = self.charge(reservation, usage, reported_cost)
+        if cost is not None:
+            self.hold.note(reservation.send, self.hold.settled_receipt(cost, keep))
 
     def _persist(self, cost, write, record=None):
         """The result is already accounted for in memory, so a failed write must not be accounted for again."""

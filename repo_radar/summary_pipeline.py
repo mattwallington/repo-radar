@@ -236,14 +236,24 @@ class Executor:
         except BudgetError as e:
             return refused, im.StaleUpdate(str(e), warning=self.unpaid())
 
-        def send(item):
+        def send(item, reservation):
             self.budget.check_dispatch()   # a Stop since the wave was reserved: this send doesn't start
             started = time.monotonic()
             timeout = item.seconds if left is None else min(item.seconds, left)
-            return llm.call_model_turn(item.request, timeout), time.monotonic() - started
+            try:
+                turn = llm.call_model_turn(item.request, timeout)
+            except Exception as error:
+                charge = llm.error_charge(error)
+                if charge is not None:
+                    self.budget.note_reply(reservation, None, charge)
+                raise
+            # Its charge reaches the weekly record now, not when the slowest sibling returns: a Stop meanwhile
+            # still records it. The settlement below stays the only one.
+            self.budget.note_reply(reservation, turn.usage, turn.cost)
+            return turn, time.monotonic() - started
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(self.width, 1)) as pool:
-            futures = [pool.submit(send, item) for item in items]
+            futures = [pool.submit(send, item, reservation) for item, reservation in zip(items, reservations)]
             concurrent.futures.wait(futures)
         turns, send_error, storage_error = [], None, None
         unknown_before = self.budget.unknown_calls
