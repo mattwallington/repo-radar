@@ -134,9 +134,11 @@ def write_rejected(pilot, mode, candidate):
 
 
 def write_result(pilot, mode, record):
-    path = pilot / f"results-{mode}.json"
-    path.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
-    print(json.dumps(record, indent=2, sort_keys=True))
+    """The full record goes to an owner-only file (its usage can hold a refused reply's text); the terminal
+    gets the short summary run_case prints."""
+    write_owner_only(pilot / f"results-{mode}.json", json.dumps(record, indent=2, sort_keys=True) + '\n')
+    print(json.dumps({k: record.get(k) for k in ('mode', 'status', 'reason', 'cost', 'elapsed_seconds', 'ledger_spent_usd')},
+                     sort_keys=True))
 
 
 def cost_text(usage):

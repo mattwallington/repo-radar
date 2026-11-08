@@ -1203,6 +1203,60 @@ def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkey
     assert 'm0 now records a change' in new.text and mr.SECTION_WARNING in new.info['coverage_note']
 
 
+def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monkeypatch, tmp_path):
+    """Pilot run 3: a paid update stopped on 'the answer is not a JSON object'. One object in a fence, or
+    among a few words, is the answer; with none (or two) the reply is refused after the spend, and the start
+    of it is kept, redacted, in the attempt's record. A final turn with no tools also asks Gemini for JSON,
+    and the request counted is the one sent."""
+    def attempt(where, answer, crowd):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+        old = im.load_document(pristine, 'app-abc1234')
+        components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+        patch = {'base_document_sha256': old.sha256,
+                 'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                               'content': '## Key Components\n- m0 now records a change\n'}]}
+
+        def reply(stage, text):
+            if stage == 'map':
+                return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                        'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            return answer(patch)
+        fake = GeminiFake(monkeypatch, reply)
+        counted, real_count = [], PreflightSession.count_request
+
+        def count(self, request, timeout=None):   # one note that leaves no room for tools, when crowded
+            result = real_count(self, request, timeout=timeout)
+            counted.append(request)
+            return result._replace(tokens=60_000) if crowd and 'covers_pages' in json.dumps(request) else result
+        monkeypatch.setattr(PreflightSession, 'count_request', count)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        return outcome, fake, counted, pristine, old
+
+    fenced = lambda patch: f"Here are the edits:\n```JSON\n{json.dumps(patch, indent=2)}\n```\nThat's all."
+    outcome, fake, counted, pristine, _old = attempt(tmp_path / 'fenced', fenced, crowd=True)
+    assert outcome.status == 'published', outcome
+    assert 'm0 now records a change' in im.load_document(pristine, 'app-abc1234').text
+    (_text, body), = fake.stage('edit')
+    assert 'tools' not in body and body['generationConfig']['response_mime_type'] == 'application/json'
+    assert counted[-1]['response_format'] == {'type': 'json_object'} and 'tools' not in counted[-1]
+
+    prose = lambda patch: "I reviewed every note and the summary needs no edits. (key test-not-a-key, AIza" + 'x' * 30 + ")"
+    outcome, fake, _counted, pristine, old = attempt(tmp_path / 'prose', prose, crowd=False)
+    assert outcome.status == 'failed' and 'not a JSON object' in outcome.reason and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    saved = state['usage']['rejected_reply']
+    assert state['consecutive_failures'] == 1 and saved['call'] == 'edit t1'
+    assert saved['text'].startswith('I reviewed every note') and 'test-not-a-key' not in saved['text'] and 'AIzax' not in saved['text']
+
+    two = json.dumps({'a': 1}) + ' or ' + json.dumps({'b': 2})
+    with pytest.raises(im.PatchError, match='2 JSON objects'):
+        im.parse_answer(two)
+
+
 def test_a_resource_limit_after_paid_map_calls_is_a_failure(monkeypatch, tmp_path):
     """A spool read that fails mid-run, after map waves were bought, fails the update and moves the streak;
     the same limit before anything is sent is still a skip."""

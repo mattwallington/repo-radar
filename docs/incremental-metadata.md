@@ -99,7 +99,12 @@ omissions. There are no shell, network, host-filesystem or write tools.
    its results would still fit, and the delivered-results budget has room left, and never on the last turn. A result is cut to the room left in the counted request, with a notice saying so. Its
    answer is a set of section edits: replace, delete or insert, each naming the section's id and hash.
    Edits that don't match are rejected, untouched sections keep their exact bytes, and the app writes the
-   commit IDs, timestamps and provenance itself.
+   commit IDs, timestamps and provenance itself. A reply that isn't JSON as a whole may still hold exactly
+   one complete JSON object, in a code fence or among a few words, and that object is the answer, checked as usual;
+   with none or several, the reply is refused. A final request with no tools defined (the one-note case)
+   also asks Gemini for a JSON reply; a later final turn keeps the tool definitions its history needs and
+   doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, and the first
+   4 KiB of its text after redaction.
 
 On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
 usual options and output floors, which are priced in. A whole update has one 20-minute allowance, from
