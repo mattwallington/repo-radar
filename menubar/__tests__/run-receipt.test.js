@@ -9,6 +9,7 @@ const path = require('path');
 const { planReconcile, validateReceipt, qualifiesForSchedule, completionQualifies,
         needsCatchUp, SCHEMA, EXIT_SKIPPED_NO_WORK } = require('../run-receipt');
 const MAIN = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+const SUMMARY = fs.readFileSync(path.join(__dirname, '..', 'spending-summary.js'), 'utf8');
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
 const receipt = (over = {}) => ({
@@ -198,8 +199,11 @@ assert.ok(/shellEnv\.REPO_RADAR_TRIGGER =/.test(MAIN),
   'the in-app path must DECLARE its trigger, not rely on the variable being absent');
 assert.ok(/addEnvVar\('REPO_RADAR_TRIGGER', 'scheduled'\)/.test(MAIN),
   'the LaunchAgent must declare scheduled');
-assert.ok(/writeFileSync\(configFile,[\s\S]*?\{ mode: 0o600 \}\)/.test(MAIN)
-  && /chmodSync\(configFile, 0o600\)/.test(MAIN), 'config must be created AND chmod-ed 0600');
+// The Settings save goes through the owner-only atomic writer, which creates its temp file 0600 and
+// chmods the result (spending-settings.test.js checks a 0644 config comes out 0600).
+assert.ok(/writePrivateFileAtomic\(configFile, /.test(MAIN)
+  && /openSync\(tmp, 'wx', 0o600\)/.test(SUMMARY) && /chmodSync\(file, 0o600\)/.test(SUMMARY),
+  'config must be created AND chmod-ed 0600');
 {
   const fn = MAIN.slice(MAIN.indexOf('function checkMissedSync()'));
   const body = fn.slice(0, fn.indexOf('\n}'));
