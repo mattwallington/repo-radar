@@ -89,6 +89,18 @@ test('Save writes nothing for an invalid value and a dev save reports truthfully
   assert.deepStrictEqual([refused.ok, refused.field, calls.length], [false, STOP, 0]);
   const overCap = saveSettings({ [LIMIT]: 12, [STOP]: 2, [ON]: true, [CAP]: 1000.5 }, hooks('stable'));
   assert.deepStrictEqual([overCap.ok, overCap.field, calls.length], [false, CAP, 0]);
+  // With the limit off the amount stays editable and is still checked and kept: an invalid amount saves
+  // nothing, the corrected one saves with the limit still off.
+  assert.ok(!/weekly-cap[^\n]*\.disabled|\.disabled\s*=\s*!document\.getElementById\(SPENDING_INPUTS\[spending\.WEEKLY/.test(
+    fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.js'), 'utf8')), 'the weekly amount is never disabled');
+  const offInvalid = saveSettings({ [LIMIT]: 12, [STOP]: 2, [ON]: false, [CAP]: spending.parseLimitInput('60.555') },
+    hooks('stable'));
+  assert.deepStrictEqual([offInvalid.ok, offInvalid.field, calls.length], [false, CAP, 0]);
+  const offFixed = saveSettings({ [LIMIT]: 12, [STOP]: 2, [ON]: false, [CAP]: spending.parseLimitInput('60.55') },
+    hooks('stable'));
+  assert.ok(offFixed.ok);
+  assert.deepStrictEqual([calls[0][1][ON], calls[0][1][CAP]], [false, 60.55]);
+  calls.length = 0;
 
   const dev = saveSettings({ ...WEEKLY, [LIMIT]: 5.25, [STOP]: 3, schedule: { enabled: true } }, hooks('dev'));
   assert.strictEqual(dev.ok, true);

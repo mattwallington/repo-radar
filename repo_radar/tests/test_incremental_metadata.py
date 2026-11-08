@@ -988,8 +988,11 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
         real_init(self, *args, **kwargs)
         self.evidence_dir = evidence
     monkeypatch.setattr(mr.Pipeline, '__init__', keeping_evidence)
+    from repo_radar import spending as sp
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     with PreflightSession() as session:
-        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                       spending=record)
     assert outcome.status == 'published', outcome
 
     # Every page was mapped exactly once, at most four at a time, and each request stayed bounded.
@@ -1009,6 +1012,12 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
     assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0
     assert usage['rate_input_per_mtok'] == 0.75
+    # In a normal sync the update held exactly its quote, not the $12 limit, and closed at its known cost.
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert abs(attempt['allowance'] - sp.to_micro(usage['estimated_total_usd'])) <= 1
+    assert attempt['allowance'] < 12_000_000 and attempt['status'] == 'closed'
+    week = sp.summary(record.store, record.policy)
+    assert week['recorded_usd'] == pytest.approx(usage['known_cost_usd'], abs=1e-4) and week['reserved_usd'] == 0
 
     # Every merge and editor request names each cited file's real status and paths.
     changes = snap.changes_between(repo.path, base, target)

@@ -157,7 +157,7 @@ class Store:
     def _check_owner_only(self, path, kind):
         info = os.lstat(path)
         mode_ok = stat.S_ISDIR(info.st_mode) if kind == 'dir' else stat.S_ISREG(info.st_mode)
-        loose = info.st_mode & (0o022 if kind == 'dir' else 0o077)
+        loose = info.st_mode & 0o077
         if not mode_ok or info.st_uid != os.getuid() or loose:
             raise SpendingUnavailable(f"the spending record's {kind} isn't private to this user")
 

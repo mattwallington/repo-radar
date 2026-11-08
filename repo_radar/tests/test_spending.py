@@ -123,6 +123,12 @@ def test_holds_survive_reopening_belong_to_their_period_and_damage_is_unavailabl
     os.chmod(ledger, 0o644)
     assert sp.summary(sp.Store(root), lambda: (True, 75.0))['status'] == 'unavailable'
     os.chmod(ledger, 0o600)
+    os.chmod(root, 0o755)   # a readable directory is unsafe too, and is reported, never quietly tightened
+    assert sp.summary(sp.Store(root), lambda: (True, 75.0))['status'] == 'unavailable'
+    with pytest.raises(sp.SpendingUnavailable, match='private'):
+        context(root).admit('o/r', 'm', 'full', 1)
+    assert root.stat().st_mode & 0o777 == 0o755
+    os.chmod(root, 0o700)
     ledger.unlink()
     with pytest.raises(sp.SpendingUnavailable, match='missing'):
         context(root).initialize()

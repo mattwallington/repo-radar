@@ -4,7 +4,7 @@ Each document records the commit it was built from. A later sync updates it from
 model summarizes each page of the diff, the notes are merged, and a final editor returns section edits
 that the app validates and applies. A full rebuild still happens weekly, when the model or policy
 changes, or when the baseline cannot be used; it reads the pinned source in chunks of at most 128,000
-input tokens and is capped at $25 per attempt. Both run on the shared summary_pipeline. Every other
+input tokens and is capped at $40 per attempt. Both run on the shared summary_pipeline. Every other
 repository keeps the existing full-generation path unchanged.
 
 A failure never replaces a good document: it stays as it was, and INDEX marks it stale.

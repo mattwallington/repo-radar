@@ -138,7 +138,6 @@ function renderSpendingSettings() {
     document.getElementById(SPENDING_INPUTS[spending.STOP_FIELD]).value = String(effective.failureStop);
     document.getElementById(SPENDING_INPUTS[spending.WEEKLY_ENABLED_FIELD]).checked = effective.weeklyEnabled;
     document.getElementById(SPENDING_INPUTS[spending.WEEKLY_CAP_FIELD]).value = spending.formatLimit(effective.weeklyCapUsd);
-    syncWeeklyCapInput();
     const rebuild = spending.rebuildIntervalText(configData);
     document.getElementById('rebuild-interval-text').textContent = rebuild ? ` ${rebuild}` : '';
     clearFieldErrors();
@@ -166,13 +165,6 @@ function clearFieldErrors() {
 for (const id of Object.values(SPENDING_INPUTS)) {
     document.getElementById(id).addEventListener('input', clearFieldErrors);
 }
-
-// The amount only applies while the limit is on; it keeps its value either way.
-function syncWeeklyCapInput() {
-    document.getElementById(SPENDING_INPUTS[spending.WEEKLY_CAP_FIELD]).disabled =
-        !document.getElementById(SPENDING_INPUTS[spending.WEEKLY_ENABLED_FIELD]).checked;
-}
-document.getElementById(SPENDING_INPUTS[spending.WEEKLY_ENABLED_FIELD]).addEventListener('change', syncWeeklyCapInput);
 
 function renderScheduleSettings() {
     const schedule = configData.schedule || {
