@@ -87,9 +87,11 @@ omissions. There are no shell, network, host-filesystem or write tools.
    else about a note stays strict: its shape, its section ids and its size, before and after the repair.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
    the status and paths of the file ids they cite, and what wasn't analyzed: at most 4 turns, 6 `read_file`
-   or `search` calls, 64 KiB of delivered tool results, 65,536 input tokens per request and 16,384 output
-   tokens. Tools are offered only while a tool-calling reply and its results would still fit, and never on
-   the last turn. A result is cut to the room left in the counted request, with a notice saying so. Its
+   or `search` calls, 64 KiB of delivered tool results and 16,384 output tokens. Its first request is
+   prepared to fit 65,536 tokens with room for a tool-calling reply; every editor request, including the
+   later ones that replay earlier replies with their provider fields, may use up to 128,000 input tokens,
+   or the model's input budget if that is smaller. Tools are offered only while a tool-calling reply and
+   its results would still fit, and the delivered-results budget has room left, and never on the last turn. A result is cut to the room left in the counted request, with a notice saying so. Its
    answer is a set of section edits: replace, delete or insert, each naming the section's id and hash.
    Edits that don't match are rejected, untouched sections keep their exact bytes, and the app writes the
    commit IDs, timestamps and provenance itself.
@@ -124,8 +126,9 @@ project's configured tier.
 
 The quote is only a check. Every request is still counted in full before it's sent: instructions, tool
 definitions and tool results. For Claude the count comes from Anthropic's Count Tokens API, from the
-same request shape that is sent. If that count isn't available, the update is skipped rather than
-sent on a local estimate.
+same request shape that is sent. If that count isn't available, nothing is sent on a local estimate:
+before any request has gone out the update is skipped, and after a paid call it fails, so the failure
+streak and its hold still apply.
 
 The requests of a wave are reserved together at their input plus maximum output, so they can't each
 pass against the same remaining budget. A reply settles its reservation with its reported or computed
