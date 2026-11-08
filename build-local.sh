@@ -163,7 +163,7 @@ node menubar/scripts/pydeps.js --assert-matrix || {
 }
 success "Release gates passed"
 
-# Build identity, as release.sh sets it for each channel.
+# Build identity for each channel.
 CHANNEL="stable"
 APP_ID="com.mattwallington.repo-radar"
 PRODUCT_NAME="Repo Radar"

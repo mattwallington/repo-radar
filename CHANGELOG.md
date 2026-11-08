@@ -7,23 +7,44 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **Opted-in full rebuilds send smaller requests and are capped at $25.** Every full-rebuild request, whether the whole repository, a chunk or the final reduction, now fits 128,000 input tokens. A file too large for one chunk is split into ordered parts rather than cut short, and if a rebuild can't fit or can't finish its reduction, it stops and keeps the old summary instead of summarizing excerpts. Each rebuild attempt stops before a request that could take its spending past $25. On Gemini, whose token counts are local estimates, each request is priced as if it used the model's whole input limit. The cap doesn't apply to repositories that aren't opted in to incremental summaries, and it limits one attempt rather than promising a rebuild finishes within it.
+- **Chunk analyses cover all eight summary subjects.** Each chunk is now asked about architecture, database schema and configuration as well as the overview, technology stack, components, interfaces and dependencies, and to say "not present here" when its files don't cover a subject.
+- **Incremental updates keep 1.0.38's editor fix on the shared pipeline.** The editor's first request is still prepared to fit 65,536 tokens and later requests may use up to 128,000, the quote covers that, and a request refused after anything was paid for counts as a failure.
+
+### Removed
+- **The unused manual installer (`setup.sh`) is gone** from the app bundle and the setup guide. The app provisions its own Python runtime, as before.
+- **`release.sh` no longer carries its old publishing steps.** Releases publish from GitHub Actions; the script still runs its gates, and its `--dry-run` works as before.
+
+### Fixed
+- **Download links point to `ReperioHealth/repo-radar-releases`,** where releases are published.
+- **One malformed note no longer fails a whole summary update.** A page's note that named summary sections it wasn't given used to stop the update after its pages had been paid for. Those references are now dropped, along with any change left with no section; the rest of the note is used, the drops are counted in the attempt's usage, and the coverage note says so. A resource limit hit after paid calls, such as an unreadable page spool, now counts as a failed update rather than a skip.
+
+## [1.0.38] - 2026-11-08
+
+### Added
+- **Settings has a Spending section.** It sets the incremental update limit (default $12; $1 to $100, in dollars and cents) and how many failures in a row pause automatic metadata for a repository (default 2; 1 to 10). The next sync uses the new values, with no restart. Changing the failure number doesn't clear a repository's count: raising it can release a hold and lowering it can hold sooner. A value Settings can't accept saves nothing and points at the field. A missing or invalid value in the config file is treated as the default, never as no limit.
+
+### Changed
+- **A missing API key no longer counts toward the failure pause.** The update is still reported as failed, but setting the key isn't followed by a hold that only Sync Now can lift.
+- **Saving Settings in the dev build reports success when it succeeded.** It used to say the save failed because the dev build can't install a schedule, even though everything else had been saved. The dev build still leaves the stored schedule as it is, and says so when the window asked for a different one.
+- **The command-line `configure` wizard keeps your other settings.** It used to rewrite the config with only the token and repositories, dropping API keys, the model, the schedule and the spending limits.
+
+### Fixed
+- **A long summary update no longer fails on the editor's second turn.** The editor's first reply can carry hidden data from the model that has to be sent back with the next request, so that request could be much larger than the reply looked, and updates stopped at the 65,536-token limit after paying for every page. The first editor request is still prepared to fit 65,536 tokens, but later requests may now use up to 128,000, and the update's quote before any model call covers that. The $12 limit is unchanged. A request still too large stops before it is sent, keeps the old summary and counts as a failure.
+
+## [1.0.37] - 2026-11-07
+
+### Changed
 - **Incremental summaries now scale to any diff.** The model used to read a whole diff within 16 turns, which made long diffs fail expensively. Now each page of the diff gets one short model call, the notes are merged when there are too many to hand over, and one short conversation edits the summary. A large change is no longer a reason for a full rebuild: the 20%, eight-page and 16 MiB rules are gone. Lockfiles, generated files and diffs over 2 MiB are listed as not analyzed rather than summarized. Any failure keeps the previous summary, with no retries and no automatic full rebuild. A note that cites a file by its path, or cites one it wasn't shown, no longer stops the update: the path becomes the file's id, anything else is dropped, and the summary says when file attribution is incomplete. A full rebuild left unfinished only because of a removed rule is no longer owed.
 - **Repeated failures stop spending until a person retries.** After 2 failed updates in a row, incremental or full, scheduled and other automatic syncs make no model call for that repository, even when a weekly rebuild is due, so a failing full rebuild can't repeat about $20 a day. The update is reported as skipped, and the old summary stays marked stale in `INDEX.md`. The menu's Sync Now or `--regenerate-metadata` tries once more, and a publication clears the hold. Skipped updates don't count.
 - **Opted-in full rebuilds on Gemini ask for low thinking, and a failure says where it stopped.** Thinking shares the output limit, and a rebuild had been rejected for an incomplete reply without saying which call. Chunk, synthesis and single-pass calls now request low thinking, with their limits unchanged at 8,192 and 16,384 tokens. That makes truncation less likely but doesn't rule it out: a truncated reply is still rejected with no retry. The failure reason and attempt usage now name the stage, call and chunk, the output limit, the finish reason and the output token counts.
 - **The incremental spending limit is now $12 per update, up from $8,** and the whole update is quoted against it before the first model call. A quote over the limit stops the update with nothing sent. Gemini is now priced at its Standard tier, which is what these requests get, and at Google's announced January 2027 price for Gemini 3.8 Flash and the flash-latest alias. Other providers keep their higher tiers in the bound.
-- **A missing API key no longer counts toward the failure pause.** The update is still reported as failed, but setting the key isn't followed by a hold that only Sync Now can lift.
-- **Saving Settings in the dev build reports success when it succeeded.** It used to say the save failed because the dev build can't install a schedule, even though everything else had been saved. The dev build still leaves the stored schedule as it is, and says so when the window asked for a different one.
-- **The command-line `configure` wizard keeps your other settings.** It used to rewrite the config with only the token and repositories, dropping API keys, the model, the schedule and the spending limits.
 - **Credentials moved within very large changes stay withheld.** Git's rename detection stopped looking once a change had too many files, so an edited credential moved within a huge restructure could reach a model. An edited copy of a credential that itself didn't change wasn't detected either. Both are detected now, as is anything else Git sees as a rename or copy of a protected file. This is detection by similarity, not a scan for secret content. That search can be long, so it now stops at the update's 20-minute limit, and the document is kept rather than building protection from a partial list.
 
 ### Added
-- **Settings has a Spending section.** It sets the incremental update limit (default $12; $1 to $100, in dollars and cents) and how many failures in a row pause automatic metadata for a repository (default 2; 1 to 10). The next sync uses the new values, with no restart. Changing the failure number doesn't clear a repository's count: raising it can release a hold and lowering it can hold sooner. A value Settings can't accept saves nothing and points at the field. A missing or invalid value in the config file is treated as the default, never as no limit.
 - **`incremental_full_rebuild_days` sets how often an opted-in repository gets a full rebuild.** The default is still 7, and 0 turns the age trigger off. A malformed value stops a metadata sync before any work.
 - **The progress view shows how far a long summary update has got.**
 - **The telehealth pilot can replay historical changes from a manifest,** with a free `plan` mode that reports each case's pages and quote.
-
-### Fixed
-- **A long summary update no longer fails on the editor's second turn.** The editor's first reply can carry hidden data from the model that has to be sent back with the next request, so that request could be much larger than the reply looked, and updates stopped at the 65,536-token limit after paying for every page. The first editor request is still prepared to fit 65,536 tokens, but later requests may now use up to 128,000, and the update's quote before any model call covers that. The $12 limit is unchanged. A request still too large stops before it is sent, keeps the old summary and counts as a failure.
 
 ## [1.0.36] - 2026-11-04
 

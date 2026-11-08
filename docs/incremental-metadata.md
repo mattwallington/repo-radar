@@ -83,8 +83,13 @@ omissions. There are no shell, network, host-filesystem or write tools.
    that. A note or merged note may cite only the files its request listed. An exact path of one of those
    files becomes its id; any other citation is dropped and the change kept, possibly with no file. Each
    call's record and the attempt's usage count those repaired and dropped citations, and when one was
-   dropped the editor and the published coverage note say file attribution is incomplete. Everything
-   else about a note stays strict: its shape, its section ids and its size, before and after the repair.
+   dropped the editor and the published coverage note say file attribution is incomplete. Section ids
+   are repaired the same way: a single id becomes a list, an id the request wasn't given (or a blank or
+   non-string) is dropped, and a change whose sections were all dropped is dropped with them, so one
+   malformed change doesn't fail the update. Those repairs are counted too (`normalized_sections`,
+   `dropped_sections`, `dropped_changes`), and the editor and the coverage note say when any were dropped.
+   Everything else about a note stays strict: its shape and its size, before and after the repairs, and a
+   note left with nothing is refused.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
    the status and paths of the file ids they cite, and what wasn't analyzed: at most 4 turns, 6 `read_file`
    or `search` calls, 64 KiB of delivered tool results and 16,384 output tokens. Its first request is
@@ -136,8 +141,21 @@ pass against the same remaining budget. A reply settles its reservation with its
 cost. If the cost isn't known, the whole reservation stays counted and no further request goes out. An
 update uses one set of prices throughout, including Google's announced January 2027 price for Gemini
 3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
-automatic retries, including after a 429 or 503, and no model fallbacks. Full rebuilds follow the
-existing full-generation cost policy: they aren't under the incremental update limit.
+automatic retries, including after a 429 or 503, and no model fallbacks.
+
+An opted-in full rebuild runs on the same request executor. Every request, whether the whole repository,
+a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
+lower). The whole repository goes as one request only when it fits; otherwise the source is split into
+chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
+until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
+something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
+document stays, rather than send excerpts. A full rebuild is capped at **$25** per attempt
+(`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
+when its count is only a local estimate, as on Gemini, that worst case is the model's whole input limit.
+A request that could pass the cap stops the rebuild; once anything has been spent, that counts as a failed
+update. The cap bounds what
+one attempt can spend; it doesn't promise a repository can be rebuilt for that much. Repositories that
+aren't opted in keep the legacy full generator, which isn't capped.
 
 On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
@@ -155,7 +173,8 @@ the document it started from is unchanged, and the repository is still at the sa
 `INDEX.md` marks such a document stale and names the analyzed revision, the attempted revision and
 the reason. An opted-in repository that has never had a document is listed as having metadata
 unavailable. The sync's progress view and Activity report the update as failed (an error) or skipped
-(a warning, for example an unavailable token count or price, a spending limit, or the spool limit).
+(a warning, for example an unavailable token count or price, a spending limit, or the spool limit). Such a
+stop is a skip only while nothing has been paid for; once any call has been sent, it is a failure.
 When any call fails, nothing further is started, the calls already launched finish and are accounted
 for, and no partial set of notes is used. A failed incremental update is not followed by an automatic
 full rebuild; the next ordinary sync tries again from the start, spending again, up to the hold below.

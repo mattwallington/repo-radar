@@ -10,8 +10,6 @@ from repo_radar.constants import YELLOW, RED, RESET, CYAN, GREEN
 from repo_radar import model_catalog
 from repo_radar.model_catalog import acceptance_budget, get_caps, is_known_model
 
-# TODO: refactor sync_mode to use analyze_repo_chunk and combine_chunk_analyses
-
 DEFAULT_MODEL = 'claude-sonnet-5-5'
 
 # Maximum input context window for each supported model.
@@ -662,23 +660,29 @@ def _frame_file(file_info):
 
 
 def _build_analysis_prompt(full_name, chunk, chunk_num, total_chunks):
-    """The assembled chunk-analysis prompt. Shared by the chunker (to budget the finished prompt)
-    and analyze_repo_chunk (to send it), so the budgeted text and the sent text can never drift."""
+    """The assembled chunk-analysis prompt. Shared by the chunkers (to count the finished prompt)
+    and the senders, so the counted text and the sent text can never drift. It asks about the same
+    eight subjects the final document covers."""
     combined_content = "\n".join(_frame_file(f) for f in chunk)
     chunk_info = f" (chunk {chunk_num}/{total_chunks})" if total_chunks > 1 else ""
     return f"""Analyze this portion of the repository and provide analysis.
 
 Repository: {full_name}{chunk_info}
 
-Analyze these files and provide:
+Report what these files show about each of these subjects:
 
 1. **Overview**: What functionality is covered in these files?
 2. **Technology Stack**: Languages, frameworks, and libraries used.
-3. **Key Components**: Important files and what they do.
-4. **API Endpoints/Interfaces**: Any APIs, exported functions, or public interfaces.
-5. **Dependencies**: External services, databases, or systems referenced (list specific service names).
+3. **Architecture**: Structure, layers and patterns visible in these files.
+4. **Key Components**: Important files and what they do.
+5. **API Endpoints/Interfaces**: Any APIs, exported functions, or public interfaces.
+6. **Dependencies**: External services, databases, or systems referenced (list specific service names).
+7. **Database Schema**: Tables, models, migrations or queries that show how data is stored.
+8. **Configuration**: Environment variables, configuration files and settings.
 
-Be specific and technical. Focus on what's present in these files.
+These files are only part of the repository, so they may say nothing about some subjects. Report only
+facts these files support, and write "not present here" for a subject they don't cover. Be specific
+and technical.
 
 Repository files:
 
@@ -896,57 +900,6 @@ def chunk_repo_files(files, model, max_tokens=None, full_name=""):
     return _repack_to_fit(packed, content_budget, model, full_name)
 
 
-def analyze_repo_chunk(full_name, chunk, chunk_num, total_chunks):
-    """Analyze a chunk of repository files."""
-    prompt = _build_analysis_prompt(full_name, chunk, chunk_num, total_chunks)
-
-    # Retry logic
-    max_retries = 3
-    base_wait = 2
-
-    for retry in range(max_retries):
-        try:
-            analysis, api_cost, _ = call_llm(get_ai_model(), prompt, max_tokens=8192)
-            return analysis, api_cost
-
-        except IncompleteResponseError:
-            raise  # a rejected reply, not a rate limit: no retry
-        except Exception as e:
-            error_str = str(e)
-
-            transient = is_transient_server_error(e)
-            if transient and retry == max_retries - 1:
-                raise
-
-            # Keep the existing rate-limit policy and delay handling.
-            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                if retry < max_retries - 1:
-                    import time
-                    import random
-
-                    wait_time = base_wait ** (retry + 1) + random.uniform(0, 1)
-
-                    # Try to parse suggested delay
-                    if 'retry in' in error_str.lower():
-                        try:
-                            import re
-                            match = re.search(r'retry in (\d+(?:\.\d+)?)', error_str.lower())
-                            if match:
-                                suggested_wait = float(match.group(1))
-                                wait_time = max(wait_time, suggested_wait)
-                        except:
-                            pass
-
-                    reason = "Server unavailable" if transient else "Rate limit"
-                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise Exception(f"Rate limit exceeded after {max_retries} retries")
-            else:
-                raise
-
-
 # Guards for hierarchical synthesis. Coverage is the priority — every chunk reaches the final
 # report — so these bound the work rather than dropping input; hitting them degrades to an
 # explicit, warned truncation instead of silently analysing part of the repository.
@@ -1111,18 +1064,6 @@ def _compact_every_part(full_name, analyses, budget, model):
     return []
 
 
-def _local_degraded_analysis(full_name, part_count):
-    """A synthesis-failed placeholder produced WITHOUT an LLM call.
-
-    Used only when the budget cannot accommodate even a single framed part. Sending the
-    request anyway would guarantee a context-window rejection; returning this keeps the sync
-    alive and leaves a record the metadata parser will flag as degraded.
-    """
-    return (f"Synthesis for {full_name} could not be completed: {part_count} analysis parts "
-            f"could not be reduced to fit the model's context window. Re-run with a "
-            f"larger-context model, or narrow the repository's file selection.")
-
-
 def _fallback_chain(model, limit=6):
     """The model plus every model a rate limit could fall back to, in order."""
     chain, seen, current = [model], {model}, model
@@ -1163,61 +1104,43 @@ def _synthesis_budget(full_name, model):
     return max(budget, overhead + 1000)
 
 
-def combine_chunk_analyses(full_name, analyses, model=None,
-                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS,
-                           synthesize=None, session=None):
-    """Combine chunk analyses into one cohesive report, bounded by the model's context.
+def combine_chunk_analyses(full_name, analyses, *, model, synthesize, session,
+                           max_depth=SYNTHESIS_MAX_DEPTH, max_calls=SYNTHESIS_MAX_CALLS):
+    """Combine chunk analyses into one cohesive report, bounded by the model's context. The legacy
+    full generator's synthesis (modes/sync.py); protected full builds use summary_pipeline instead.
 
-    Previously every chunk analysis was concatenated into a single prompt with no bound, so a
-    large repository produced a request larger than the context window and the whole metadata
-    step failed (observed: 1,189,532 tokens against a 1,000,000 limit). Chunking bounded the
-    INPUT files but nothing bounded their combination.
+    Analyses are grouped into ordered batches that each fit the budget, every batch is synthesised,
+    and the results are combined again until a single bounded synthesis remains, so every chunk
+    reaches the final report. The depth and call guards end in a terminal, coverage-losing pass.
 
-    This performs a hierarchical map-reduce instead: analyses are grouped into ordered batches
-    that each fit the budget, every batch is synthesised, and the results are combined again
-    until a single bounded synthesis remains. Every chunk therefore reaches the final report.
+    synthesize: callable(prompt, model) -> (text, cost, model_used), the caller's own sender with its
+    retry, model-fallback and rate-limit accounting; this function keeps ownership of bounding.
+    model_used is fed back into the budget, because a fallback model may have a smaller window than
+    the one the budget was computed from.
 
-    synthesize: optional callable(prompt, model) -> (text, cost, model_used), letting a caller
-    supply its own retry, model-fallback and rate-limit accounting while this function keeps
-    ownership of bounding. model_used is fed back into the budget, because a fallback model may
-    have a smaller window than the one the budget was computed from — budgeting one model while
-    calling another is how a "bounded" prompt can still overflow.
+    session: the PreflightSession (or a test stub) exposing count(model, prompt, requested_output).
+    Each round's batch plan starts from the local-estimate partition and is tightened, split-only,
+    with authoritative counts where the provider gives them; every send is counted through run().
 
-    session: optional PreflightSession (or test stub) exposing count(model, prompt, requested_output).
-    When supplied, the AUTHORITATIVE synthesis path activates: the per-round batch plan is computed
-    from authoritative provider counts (coverage-preserving, split-only), the send loop iterates that
-    plan, and every send is preflighted through run(). With session is None the behaviour is Branch 1,
-    unchanged.
-
-    Returns (final_analysis, total_api_cost) — cost is aggregated across every round. On the
-    authoritative path a synthesis that cannot be reduced to fit degrades to
-    (DegradedSynthesis(reason), cost_so_far): the sentinel occupies the result slot while the cost
-    already incurred at earlier levels is still returned. The caller checks
-    isinstance(result, DegradedSynthesis).
+    Returns (final_analysis, total_api_cost), with cost aggregated across every round. A synthesis
+    that cannot be reduced to fit degrades to (DegradedSynthesis(reason), cost_so_far); the caller
+    checks isinstance(result, DegradedSynthesis).
     """
     analyses = [a for a in (analyses or []) if a and str(a).strip()]
     if not analyses:
         return "", 0.0
-    if model is None:
-        model = get_ai_model()
 
     def run(batch, terminal=False):
         """One synthesis call. Returns (text, cost) and re-budgets if the model changed.
 
-        With a preflight `session`, the EXACT prompt about to be sent is authoritatively counted
-        first — so every send is counted — and, if it authoritatively overflows the acceptance
-        budget, the batch is truncated to fit before sending. That truncation is legitimate ONLY for
-        a singleton batch or a terminal batch; an ordinary multi-item overflow is prevented upstream
-        by the coverage-preserving split plan and is never truncated here.
+        The EXACT prompt about to be sent is counted first, so every send is counted, and if it
+        authoritatively overflows the acceptance budget the batch is truncated to fit before sending.
+        That truncation is legitimate ONLY for a singleton batch or a terminal batch; an ordinary
+        multi-item overflow is prevented upstream by the coverage-preserving split plan.
         """
         nonlocal model, budget
-        if session is not None:
-            batch = _preflight_synthesis_batch(session, full_name, batch, model, terminal)
-        prompt = _build_synthesis_prompt(full_name, batch)
-        if synthesize is None:
-            text, cost, used = _synthesize_once(full_name, batch, model)
-        else:
-            text, cost, used = synthesize(prompt, model)
+        batch = _preflight_synthesis_batch(session, full_name, batch, model, terminal)
+        text, cost, used = synthesize(_build_synthesis_prompt(full_name, batch), model)
         if used and used != model:
             # Re-derive the budget from whichever model actually served the request, keeping
             # the smaller of the two so a fallback can only tighten, never loosen.
@@ -1248,150 +1171,65 @@ def combine_chunk_analyses(full_name, analyses, model=None,
         text, cost = run(trimmed, terminal=True)
         return text, total_cost + cost
 
-    if session is not None:
-        # AUTHORITATIVE synthesis (Phase C). The per-round batch plan comes from authoritative
-        # provider counts (coverage-preserving, split-only); the send loop ITERATES that plan
-        # rather than re-batching by local estimate, and never truncates an ordinary multi-item
-        # batch (that would silently drop repository coverage). Every send is preflighted through
-        # run(). Branch 1 (session is None) is left byte-for-byte unchanged below.
-        while True:
-            plan = authoritative_synthesis_level(session, full_name, level, model)
-            if isinstance(plan, DegradedSynthesis):
-                # Degradation preserves the cost already incurred at earlier levels.
-                return plan, total_cost
-            if len(plan) == 1:
-                text, cost = run(plan[0])
-                return text, total_cost + cost
-
-            # Guards charge the AUTHORITATIVE post-split batch count. The +1 reserves the final
-            # reduction, so max_calls is a true ceiling rather than a ceiling on the map rounds.
-            remaining_depth = max_depth - depth
-            if remaining_depth <= 0 or calls + len(plan) + 1 > max_calls:
-                reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
-                print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
-                      f"truncating to a single final pass{RESET}")
-                return run_terminal(level)
-
-            print(f"    {CYAN}Synthesising {len(level)} parts in {len(plan)} batches "
-                  f"(round {depth + 1}){RESET}")
-
-            before = _total_tokens(level, model)
-            combined = []
-            idx = 0
-            while idx < len(plan):
-                # Enforce the ceiling per CALL: a mid-round model change can grow the replan.
-                if calls + 1 >= max_calls:
-                    print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
-                          f"remaining parts to finish{RESET}")
-                    remainder = combined + [a for b in plan[idx:] for a in b]
-                    return run_terminal(remainder)
-
-                prev_model = model
-                text, cost = run(plan[idx])
-                combined.append(text)
-                total_cost += cost
-                calls += 1
-                idx += 1
-
-                if model != prev_model:
-                    # The serving model changed (a smaller-window fallback): REPLAN only the unsent
-                    # remainder with the new model before the next send, so each prompt fits the
-                    # CURRENT model's authoritative budget. Coverage is preserved — nothing dropped.
-                    remainder = [a for b in plan[idx:] for a in b]
-                    if remainder:
-                        replanned = authoritative_synthesis_level(
-                            session, full_name, remainder, model)
-                        if isinstance(replanned, DegradedSynthesis):
-                            return replanned, total_cost
-                        plan, idx = replanned, 0
-
-            # No-progress guard: a whole round that failed to shrink would loop at the same size.
-            if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
-                print(f"    {YELLOW}Synthesis: a round made no progress; "
-                      f"truncating to finish{RESET}")
-                return run_terminal(combined)
-
-            level = combined
-            depth += 1
-
+    # The per-round batch plan comes from authoritative provider counts where available
+    # (coverage-preserving, split-only); the send loop ITERATES that plan rather than re-batching,
+    # and never truncates an ordinary multi-item batch (that would silently drop coverage).
     while True:
-        # A single analysis larger than one whole request cannot be reduced by regrouping —
-        # nothing to combine it with. Truncation is the only remaining move, and it is loud.
-        if len(level) == 1 and _budget_tokens(
-                _build_synthesis_prompt(full_name, level), model) > budget:
-            print(f"    {YELLOW}Synthesis: one analysis alone exceeds the context budget; "
-                  f"truncating it to fit (some detail from this section is lost){RESET}")
-            level = _truncate_all_to_fit(full_name, level, budget, model)
-            if not level:
-                print(f"    {YELLOW}Synthesis: budget cannot fit even one part; "
-                      f"reporting locally without a request{RESET}")
-                return _local_degraded_analysis(full_name, 1), total_cost
-
-        batches = _batch_by_budget(full_name, level, budget, model)
-
-        if len(batches) == 1:
-            text, cost = run(batches[0])
+        plan = authoritative_synthesis_level(session, full_name, level, model)
+        if isinstance(plan, DegradedSynthesis):
+            # Degradation preserves the cost already incurred at earlier levels.
+            return plan, total_cost
+        if len(plan) == 1:
+            text, cost = run(plan[0])
             return text, total_cost + cost
 
-        # Guards: stop expanding work, but never by dropping input. The +1 reserves the final
+        # Guards charge the AUTHORITATIVE post-split batch count. The +1 reserves the final
         # reduction, so max_calls is a true ceiling rather than a ceiling on the map rounds.
         remaining_depth = max_depth - depth
-        if remaining_depth <= 0 or calls + len(batches) + 1 > max_calls:
+        if remaining_depth <= 0 or calls + len(plan) + 1 > max_calls:
             reason = ('maximum depth' if remaining_depth <= 0 else 'maximum call budget')
             print(f"    {YELLOW}Synthesis: {reason} reached with {len(level)} parts; "
-                  f"truncating each to fit a single final pass{RESET}")
-            trimmed = _truncate_all_to_fit(full_name, level, budget, model)
-            if not trimmed:
-                print(f"    {YELLOW}Synthesis: {len(level)} parts cannot be reduced to fit; "
-                      f"reporting locally without a request{RESET}")
-                return _local_degraded_analysis(full_name, len(level)), total_cost
-            text, cost = run(trimmed)
-            return text, total_cost + cost
+                  f"truncating to a single final pass{RESET}")
+            return run_terminal(level)
 
-        print(f"    {CYAN}Synthesising {len(level)} parts in {len(batches)} batches "
+        print(f"    {CYAN}Synthesising {len(level)} parts in {len(plan)} batches "
               f"(round {depth + 1}){RESET}")
 
         before = _total_tokens(level, model)
         combined = []
-        pending = list(level)
-        while pending:
-            # Enforce the ceiling per CALL, not per round: re-batching can yield more calls
-            # than the round's estimate (a shrunk budget makes smaller batches), so a
-            # once-per-round check can be overrun mid-round.
+        idx = 0
+        while idx < len(plan):
+            # Enforce the ceiling per CALL: a mid-round model change can grow the replan.
             if calls + 1 >= max_calls:
                 print(f"    {YELLOW}Synthesis: call budget reached mid-round; truncating the "
-                      f"remaining {len(combined) + len(pending)} parts to finish{RESET}")
-                remainder = combined + pending
-                trimmed = _truncate_all_to_fit(full_name, remainder, budget, model)
-                if not trimmed:
-                    print(f"    {YELLOW}Synthesis: {len(remainder)} parts cannot be reduced "
-                          f"to fit; reporting locally without a request{RESET}")
-                    return _local_degraded_analysis(full_name, len(remainder)), total_cost
-                text, cost = run(trimmed)
-                return text, total_cost + cost
+                      f"remaining parts to finish{RESET}")
+                remainder = combined + [a for b in plan[idx:] for a in b]
+                return run_terminal(remainder)
 
-            # Re-batch before every call rather than once per round: a mid-round fallback to a
-            # smaller-window model shrinks the budget, and batches sized for the previous model
-            # would overflow it. Re-deriving keeps each prompt within the CURRENT budget.
-            batch = _batch_by_budget(full_name, pending, budget, model)[0]
-            text, cost = run(batch)
+            prev_model = model
+            text, cost = run(plan[idx])
             combined.append(text)
             total_cost += cost
             calls += 1
-            pending = pending[len(batch):]
+            idx += 1
 
-        # No-progress detection: if a whole round failed to shrink the material, recursing
-        # again would loop at the same size and burn the call budget for nothing.
+            if model != prev_model:
+                # The serving model changed (a smaller-window fallback): REPLAN only the unsent
+                # remainder with the new model before the next send, so each prompt fits the
+                # CURRENT model's authoritative budget. Coverage is preserved — nothing dropped.
+                remainder = [a for b in plan[idx:] for a in b]
+                if remainder:
+                    replanned = authoritative_synthesis_level(
+                        session, full_name, remainder, model)
+                    if isinstance(replanned, DegradedSynthesis):
+                        return replanned, total_cost
+                    plan, idx = replanned, 0
+
+        # No-progress guard: a whole round that failed to shrink would loop at the same size.
         if len(combined) >= len(level) and _total_tokens(combined, model) >= before:
-            print(f"    {YELLOW}Synthesis: a round made no progress ({before:,} tokens in, "
-                  f"{_total_tokens(combined, model):,} out); truncating to finish{RESET}")
-            trimmed = _truncate_all_to_fit(full_name, combined, budget, model)
-            if not trimmed:
-                print(f"    {YELLOW}Synthesis: {len(combined)} parts cannot be reduced to "
-                      f"fit; reporting locally without a request{RESET}")
-                return _local_degraded_analysis(full_name, len(combined)), total_cost
-            text, cost = run(trimmed)
-            return text, total_cost + cost
+            print(f"    {YELLOW}Synthesis: a round made no progress; "
+                  f"truncating to finish{RESET}")
+            return run_terminal(combined)
 
         level = combined
         depth += 1
@@ -1445,64 +1283,6 @@ Here are the analyses to combine:
         combined_prompt += f"\n--- Analysis Part {i} ---\n{analysis}\n"
 
     return combined_prompt
-
-
-def _synthesize_once(full_name, analyses, model=None):
-    """Run ONE synthesis call over the given analyses. Returns (text, api_cost, model_used).
-
-    The caller is responsible for ensuring the batch fits the model's budget; this function
-    does not bound its input. `model` is threaded in explicitly — resolving it independently
-    via get_ai_model() would let the caller budget one model and this call use another.
-    """
-    if model is None:
-        model = get_ai_model()
-    combined_prompt = _build_synthesis_prompt(full_name, analyses)
-
-    # Use retry logic
-    max_retries = 3
-    base_wait = 2
-
-    for retry in range(max_retries):
-        try:
-            final_analysis, api_cost, _ = call_llm(
-                model, combined_prompt, max_tokens=SYNTHESIS_OUTPUT_TOKENS
-            )
-            return final_analysis, api_cost, model
-
-        except IncompleteResponseError:
-            raise  # a rejected reply, not a rate limit: no retry
-        except Exception as e:
-            error_str = str(e)
-
-            transient = is_transient_server_error(e)
-            if transient and retry == max_retries - 1:
-                raise
-
-            if transient or 'RateLimitError' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
-                if retry < max_retries - 1:
-                    import time
-                    import random
-
-                    wait_time = base_wait ** (retry + 1) + random.uniform(0, 1)
-
-                    if 'retry in' in error_str.lower():
-                        try:
-                            import re
-                            match = re.search(r'retry in (\d+(?:\.\d+)?)', error_str.lower())
-                            if match:
-                                suggested_wait = float(match.group(1))
-                                wait_time = max(wait_time, suggested_wait)
-                        except:
-                            pass
-
-                    reason = "Server unavailable" if transient else "Rate limit"
-                    print(f"    {YELLOW}{reason}, retrying in {wait_time:.1f}s{RESET}")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise Exception(f"Rate limit exceeded after {max_retries} retries")
-            else:
-                raise
 
 
 # The single-vs-chunk decision is MONOTONIC: Branch 1's local-estimate chunk decision
@@ -1728,9 +1508,8 @@ def authoritative_chunks(session, full_name, files, model):
 #
 # The analysis analogue of authoritative_chunks, one level up: instead of
 # splitting FILES into chunks it splits ANALYSES into synthesis batches, driven
-# by authoritative provider counts of the exact synthesis prompt. Active ONLY
-# when combine_chunk_analyses is passed a PreflightSession; with session is None
-# the hierarchical synthesis above is Branch 1, byte-for-byte unchanged.
+# by authoritative provider counts of the exact synthesis prompt, where the
+# provider gives them, and by the Branch 1 partition where it doesn't.
 # ---------------------------------------------------------------------------
 
 # Sentinel returned by the authoritative synthesis path when the analyses cannot be reduced to fit

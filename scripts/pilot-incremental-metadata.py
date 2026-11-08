@@ -48,7 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from repo_radar import incremental_map_reduce as mr  # noqa: E402
+from repo_radar import summary_pipeline as mr  # noqa: E402
 from repo_radar import incremental_metadata as im  # noqa: E402
 from repo_radar import metadata_snapshot as snap  # noqa: E402
 from repo_radar.metadata import UnsafeHeader, render_metadata_document  # noqa: E402

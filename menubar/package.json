@@ -84,10 +84,6 @@
     ],
     "extraResources": [
       {
-        "from": "resources/setup.sh",
-        "to": "resources/setup.sh"
-      },
-      {
         "from": "../repo-radar",
         "to": "resources/repo-radar"
       },

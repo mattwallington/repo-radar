@@ -1,7 +1,7 @@
 #!/bin/bash
-# release.sh - Full release workflow for Repo Radar
+# release.sh - Release gates for Repo Radar. It no longer publishes: releases publish from GitHub
+# Actions (see DEVELOPMENT.md, "Releasing").
 # Usage: ./release.sh [--minor|--major|--dry-run|--help]
-# Default: patch bump (1.0.4 -> 1.0.5)
 set -euo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -39,8 +39,8 @@ for arg in "$@"; do
       echo ""
       echo -e "${BOLD}Usage:${NC} ./release.sh [options]"
       echo ""
-      echo "  With no arguments, bumps the patch version and releases (paused, see below)."
-      echo "  e.g. 1.0.4 -> 1.0.5"
+      echo "  Runs the release gates and works out the next version (a patch bump by default,"
+      echo "  e.g. 1.0.4 -> 1.0.5). It changes nothing and publishes nothing."
       echo ""
       echo -e "${BOLD}Options:${NC}"
       echo "  --minor     Bump minor version (1.0.4 -> 1.1.0)"
@@ -48,18 +48,11 @@ for arg in "$@"; do
       echo "  --dry-run   Run every gate and show the next version without changing anything"
       echo "  --help, -h  Show this help message"
       echo ""
-      echo -e "${BOLD}Publishing is paused:${NC}"
-      echo "  Builds are now Reperio-signed, but this script still publishes to the old"
-      echo "  mattwallington/repo-radar feed. Until the feed moves to ReperioHealth/repo-radar-releases,"
-      echo "  a run without --dry-run stops after the gates and changes nothing. Use ./build-local.sh"
-      echo "  to build and verify a signed app without publishing."
-      echo ""
-      echo -e "${BOLD}What it will do once publishing resumes:${NC}"
-      echo "  1. Bumps the version (VERSION + package.json)"
-      echo "  2. Commits the version bump and creates a git tag"
-      echo "  3. Builds the Electron app (arm64 + x64)"
-      echo "  4. Pushes to GitHub"
-      echo "  5. Creates a GitHub Release with artifacts"
+      echo -e "${BOLD}Publishing:${NC}"
+      echo "  Releases publish from GitHub Actions to ReperioHealth/repo-radar-releases when main or"
+      echo "  dev changes (see DEVELOPMENT.md, \"Releasing\"). This script no longer publishes: a run"
+      echo "  without --dry-run runs the same gates, then refuses. Use ./build-local.sh to build and"
+      echo "  verify a signed app without publishing."
       echo ""
       echo -e "${BOLD}Branches:${NC}"
       echo "  main   Production release (Repo Radar)"
@@ -113,9 +106,9 @@ CURRENT_BRANCH=$(git branch --show-current)
 IS_DEV=false
 if [[ "$CURRENT_BRANCH" == "dev" ]]; then
   IS_DEV=true
-  info "Dev branch — will build Repo Radar Dev and create pre-release"
+  info "Dev branch — the Repo Radar Dev channel"
 elif [[ "$CURRENT_BRANCH" == "main" ]]; then
-  info "Main branch — production release"
+  info "Main branch — the production channel"
 else
   error "Must be on main or dev branch (currently on: $CURRENT_BRANCH)"
 fi
@@ -203,187 +196,15 @@ success "New version:     ${BOLD}$NEW_VERSION${NC} ($BUMP_TYPE$DEV_LABEL)"
 if $DRY_RUN; then
   step "Dry run summary"
   dry "All gates passed for v$NEW_VERSION"
-  dry "Publishing is paused: a run without --dry-run stops here and changes nothing"
+  dry "This script no longer publishes: a run without --dry-run stops here and changes nothing"
   echo ""
   info "No changes were made. To build a signed app without publishing, use ./build-local.sh."
   exit 0
 fi
 
-# ── Paused until the feed moves ──────────────────────────────────────────────
+# ── No local publishing ──────────────────────────────────────────────────────
 
-# Builds are now Reperio-signed, but this script still publishes to mattwallington/repo-radar,
-# the feed that personal-team installs update from, and they can't accept a Reperio-signed update.
-# The org-move work replaces this script; until then build with build-local.sh.
-echo -e "${RED}[error]${NC} release.sh publishing is paused: it would publish a Reperio-signed build to the old mattwallington/repo-radar feed." >&2
+# Releases publish from GitHub Actions; this script only runs the gates.
+echo -e "${RED}[error]${NC} release.sh no longer publishes: releases publish from GitHub Actions to ReperioHealth/repo-radar-releases." >&2
 echo "  Use ./build-local.sh to build and verify a signed app without publishing (see README, \"Building a signed app locally\")." >&2
-echo "  Releases resume once the update feed moves to ReperioHealth/repo-radar-releases." >&2
 exit 1
-
-# ── Update version files ─────────────────────────────────────────────────────
-
-step "Updating version files"
-
-echo "$NEW_VERSION" > "$VERSION_FILE"
-success "Updated VERSION -> $NEW_VERSION"
-
-# Update version in package.json (but NOT appId/productName — those are build-time only)
-node -e "
-  const fs = require('fs');
-  const pkg = JSON.parse(fs.readFileSync('menubar/package.json', 'utf8'));
-  pkg.version = '$NEW_VERSION';
-  fs.writeFileSync('menubar/package.json', JSON.stringify(pkg, null, 2) + '\n');
-"
-success "Updated menubar/package.json -> $NEW_VERSION"
-
-# Sync package-lock.json version
-cd "$SCRIPT_DIR/menubar" && npm install --package-lock-only --silent
-cd "$SCRIPT_DIR"
-success "Updated menubar/package-lock.json -> $NEW_VERSION"
-
-# ── Git commit and tag ────────────────────────────────────────────────────────
-
-step "Creating git commit and tag"
-
-git add VERSION menubar/package.json menubar/package-lock.json
-git commit -m "release: v$NEW_VERSION"
-success "Committed: release: v$NEW_VERSION"
-
-git tag "v$NEW_VERSION"
-success "Tagged: v$NEW_VERSION"
-
-# ── Build ─────────────────────────────────────────────────────────────────────
-
-step "Building Electron app"
-
-# Write build-info.json with channel (consumed by the app at runtime)
-CHANNEL="stable"
-if $IS_DEV; then CHANNEL="dev"; fi
-node -e "
-  const fs = require('fs');
-  fs.writeFileSync('menubar/build-info.json', JSON.stringify({
-    version: '$NEW_VERSION',
-    channel: '$CHANNEL',
-    buildDate: new Date().toISOString(),
-    buildTimestamp: Date.now()
-  }, null, 2));
-"
-
-# For dev builds, temporarily swap appId and productName for the build
-if $IS_DEV; then
-  node -e "
-    const fs = require('fs');
-    const pkg = JSON.parse(fs.readFileSync('menubar/package.json', 'utf8'));
-    pkg.build.appId = 'com.mattwallington.repo-radar-dev';
-    pkg.build.productName = 'Repo Radar Dev';
-    pkg.build.mac.icon = 'assets/icon-dev.icns';
-    fs.writeFileSync('menubar/package.json', JSON.stringify(pkg, null, 2) + '\n');
-  "
-  success "Temporarily set appId/productName/icon for dev build"
-fi
-
-info "Installing dependencies..."
-cd "$SCRIPT_DIR/menubar"
-npm install
-
-info "Building for macOS (arm64 + x64)..."
-npx electron-builder --mac --arm64 --x64
-
-cd "$SCRIPT_DIR"
-success "Build complete"
-
-# Revert temporary dev changes to package.json
-if $IS_DEV; then
-  git checkout menubar/package.json
-  success "Reverted package.json to committed state"
-fi
-
-# ── Create installer zips ─────────────────────────────────────────────────────
-
-step "Creating distribution packages"
-
-node menubar/scripts/create-installer.js
-success "Distribution packages created"
-
-# ── Find zip files ────────────────────────────────────────────────────────────
-
-step "Locating release artifacts"
-
-DIST_DIR="$SCRIPT_DIR/menubar/dist"
-
-ASSETS=()
-
-# Artifact prefix is always "repo-radar" (the npm package name, used by ${name} in artifactName)
-ART_PREFIX="repo-radar"
-
-# Zips (for auto-updater and manual download)
-for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.zip" \
-         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-x64-mac.zip"; do
-  if [[ -f "$f" ]]; then
-    success "Found: $(basename "$f")"
-    ASSETS+=("$f")
-  else
-    warn "Missing: $(basename "$f")"
-  fi
-done
-
-# DMGs (for manual download)
-for f in "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-arm64-mac.dmg" \
-         "$DIST_DIR/$ART_PREFIX-$NEW_VERSION-x64-mac.dmg"; do
-  if [[ -f "$f" ]]; then
-    success "Found: $(basename "$f")"
-    ASSETS+=("$f")
-  fi
-done
-
-# Update manifest (required for electron-updater)
-LATEST_YML="$DIST_DIR/latest-mac.yml"
-if [[ -f "$LATEST_YML" ]]; then
-  success "Found: latest-mac.yml"
-  ASSETS+=("$LATEST_YML")
-else
-  warn "Missing latest-mac.yml (auto-updater won't work)"
-fi
-
-if [[ ${#ASSETS[@]} -eq 0 ]]; then
-  error "No release artifacts found in $DIST_DIR - build may have failed"
-fi
-
-# ── Push ──────────────────────────────────────────────────────────────────────
-
-step "Pushing to remote"
-
-git push origin "$CURRENT_BRANCH"
-git push origin "v$NEW_VERSION"
-success "Pushed commit and tag to origin"
-
-# ── Create GitHub release ─────────────────────────────────────────────────────
-
-step "Creating GitHub release"
-
-RELEASE_ARGS=(
-  "v$NEW_VERSION"
-  --title "Repo Radar v$NEW_VERSION"
-  --generate-notes
-)
-
-if $IS_DEV; then
-  RELEASE_ARGS+=(--prerelease)
-fi
-
-gh release create "${RELEASE_ARGS[@]}" "${ASSETS[@]}"
-
-if $IS_DEV; then
-  success "GitHub pre-release created: Repo Radar Dev v$NEW_VERSION"
-else
-  success "GitHub release created: Repo Radar v$NEW_VERSION"
-fi
-
-# ── Done ──────────────────────────────────────────────────────────────────────
-
-step "Release complete!"
-
-echo ""
-echo -e "  ${GREEN}${BOLD}Repo Radar v$NEW_VERSION has been released!${NC}"
-echo ""
-echo -e "  GitHub: $(gh browse --no-browser 2>/dev/null || echo 'https://github.com/mattwallington/repo-radar')/releases/tag/v$NEW_VERSION"
-echo ""
