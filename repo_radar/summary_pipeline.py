@@ -801,7 +801,9 @@ class Pipeline:
             if tokens - empty <= room:
                 return item[key]
             data = body.encode('utf-8')
-            keep = int(len(data) * max(room, 0) / max(tokens - empty, 1) * 0.9)
+            # The notice's bytes come out of the result's own allotment, so it never passes `left`.
+            keep = min(int(len(data) * max(room, 0) / max(tokens - empty, 1) * 0.9),
+                       left - len(TOOL_TRUNCATED_NOTICE.encode('utf-8')))
             if keep < 256:
                 break
             body = data[:keep].decode('utf-8', 'ignore') + TOOL_TRUNCATED_NOTICE
