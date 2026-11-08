@@ -204,8 +204,9 @@ class Budget:
         self.cap = allowance_usd if self.cap is None else min(self.cap, allowance_usd)
 
     def close_spending(self):
-        """Close the admitted allowance, keeping known charges and unresolved bounds. Returns why it couldn't
-        be recorded, or None; the durable hold then stays as it was, which only ever overcounts."""
+        """Close the admitted allowance, applying any receipt a failed write left pending, keeping known charges
+        and unresolved bounds. Returns why it couldn't be recorded, or None; the open durable hold then stays as
+        it was and the receipts stay pending for another close."""
         if self.hold is None:
             return None
         try:
@@ -213,6 +214,11 @@ class Budget:
         except Exception as e:
             return f"the spending record couldn't be closed ({type(e).__name__})"
         return None
+
+    def check_dispatch(self):
+        """Raise spending.SpendingStopped if the sync is stopping, so a reserved send doesn't start."""
+        if self.hold is not None:
+            self.hold.check_dispatch()
 
     def reserve(self, request, input_tokens, max_output):
         """Reserve the worst-case cost of `request` before it is sent, or raise BudgetError."""

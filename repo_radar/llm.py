@@ -330,6 +330,8 @@ def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
         reservation = budget.reserve_send(model, {'model': model, 'prompt': prompt, 'max_tokens': max_tokens},
                                           tokens, max_tokens, margin=1.0 if exact else LEGACY_MARGIN)
     try:
+        if budget is not None:
+            budget.check_dispatch()   # a Stop since the reservation: don't start this send
         if responses_api:
             response = litellm.responses(model=model, input=prompt, max_output_tokens=max_tokens,
                                          custom_llm_provider=provider, max_retries=0)

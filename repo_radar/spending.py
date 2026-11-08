@@ -6,8 +6,13 @@ the period's committed money (closed attempts' known charges and retained unknow
 attempt's whole allowance) and the new allowance must fit the weekly cap when the cap is on. Each send is
 then recorded inside that allowance before it goes out, its known cost is recorded as soon as the reply
 arrives, and closing the attempt keeps its known charges and unresolved bounds and releases the rest. A
-send whose cost is unknown keeps its whole bound, and one the provider refused without charging (a rate
-limit, or a server error with no usage) gives it back; nothing ever expires by elapsed time.
+send whose cost is unknown keeps its whole bound, and one the provider positively refused without charging
+(llm.refused_without_charge) gives it back; nothing ever expires by elapsed time.
+
+A receipt (a known cost, an unknown one, a refusal) is kept in memory until it is durably written, so a
+failed write never loses a known charge: the next write, or the close, applies it. A Stop (SIGTERM) during
+generation stops new admissions and sends, closes this process's open attempts and exits; requests already
+in flight keep their bounds, since the provider may still charge for them (stop_on_sigterm).
 
 Periods: the first runs from activation (the first normal sync using this ledger) to the next Monday
 00:00 UTC, later ones Monday to Monday UTC. Every charge belongs to the period its attempt was admitted in.
@@ -273,12 +278,21 @@ def read_weekly_policy():
 
 # ---- admission and one attempt's allowance ------------------------------------------------------
 
+class SpendingStopped(SpendingError):
+    """The sync is stopping: no new admission, reservation or send starts."""
+
+
 class Spending:
-    """The production spending context a normal sync hands its workers."""
+    """The production spending context a normal sync hands its workers. It knows this process's open
+    attempts, so a Stop can close them; one lock orders admission, every receipt, close and the stop."""
 
     def __init__(self, channel, store=None, policy=read_weekly_policy, clock=None):
+        import threading
         self.channel, self.store, self.policy = channel, store or Store(), policy
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.lock = threading.Lock()
+        self.stopping = False
+        self.holds = set()
 
     def initialize(self):
         """Start the first period now unless this storage already holds a ledger."""
@@ -286,51 +300,89 @@ class Spending:
             self.store.ready(self.clock())
 
     def admit(self, repo, model, kind, amount_usd):
-        """Admit one attempt's whole allowance before its first send, or raise WeeklyCapRefused."""
+        """Admit one attempt's whole allowance before its first send, or raise WeeklyCapRefused. Admission and
+        registration happen together, so a Stop either closes the new hold or refuses it before any send."""
         amount = to_micro(amount_usd)
-        with self.store.transaction():
-            now = self.clock()
-            data = self.store.ready(now)
-            enabled, cap_usd = self.policy()
-            start, end = period_of(_utc(data['activated_at']), now)
-            used = sum(committed(a) for a in data['attempts'].values() if _utc(a['period_start']) == start)
-            if enabled and used + amount > to_micro(cap_usd):
-                raise WeeklyCapRefused(to_usd(amount), to_usd(max(0, to_micro(cap_usd) - used)), end)
-            attempt_id = uuid.uuid4().hex
-            data['attempts'][attempt_id] = {
-                'channel': self.channel, 'repo': repo, 'model': model, 'kind': kind,
-                'period_start': start.isoformat(), 'admitted_at': now.isoformat(), 'allowance': amount,
-                'status': 'open', 'sends': {}, 'next_send': 1}
-            self.store.save(data)
-        return Hold(self.store, attempt_id, amount, self.clock)
+        with self.lock:
+            if self.stopping:
+                raise SpendingStopped("the sync is stopping")
+            with self.store.transaction():
+                now = self.clock()
+                data = self.store.ready(now)
+                enabled, cap_usd = self.policy()
+                start, end = period_of(_utc(data['activated_at']), now)
+                used = sum(committed(a) for a in data['attempts'].values() if _utc(a['period_start']) == start)
+                if enabled and used + amount > to_micro(cap_usd):
+                    raise WeeklyCapRefused(to_usd(amount), to_usd(max(0, to_micro(cap_usd) - used)), end)
+                attempt_id = uuid.uuid4().hex
+                data['attempts'][attempt_id] = {
+                    'channel': self.channel, 'repo': repo, 'model': model, 'kind': kind,
+                    'period_start': start.isoformat(), 'admitted_at': now.isoformat(), 'allowance': amount,
+                    'status': 'open', 'sends': {}, 'next_send': 1}
+                self.store.save(data)
+            hold = Hold(self.store, attempt_id, amount, self.clock, self)
+            self.holds.add(hold)
+        return hold
+
+    def stop(self):
+        """Stop first, then close every hold this process owns with the ordinary close. Returns the problems,
+        if any; a hold that couldn't be closed keeps its whole durable allowance."""
+        with self.lock:
+            self.stopping = True
+            problems = []
+            for hold in list(self.holds):
+                try:
+                    hold._close_locked()
+                except Exception as e:
+                    problems.append(f"{type(e).__name__}: {e}")
+            return problems
 
 
 class Hold:
     """One admitted attempt's allowance: each send is recorded inside it before transport and settled once.
-    After any failed write the hold is broken and refuses further sends; the durable record keeps the
-    previous, larger hold."""
 
-    def __init__(self, store, attempt_id, allowance, clock):
+    Receipts are kept in memory (`pending`, by send number) until a durable write applies them, so a failed
+    write never loses a known charge; the next receipt or the close applies every pending one, idempotently.
+    After a failed write the hold is broken and refuses new reservations for good, even once its record
+    recovers."""
+
+    def __init__(self, store, attempt_id, allowance, clock, context=None):
+        import threading
         self.store, self.attempt_id, self.allowance, self.clock = store, attempt_id, allowance, clock
+        self.context = context
+        self.lock = context.lock if context is not None else threading.Lock()
         self.allowance_usd = to_usd(allowance)
+        self.pending = {}      # send number -> ('settled', cost, keep) | ('unknown',) | ('released',)
         self.broken = False
         self.closed = False
 
-    def _change(self, change):
-        if self.broken:
-            raise SpendingError("an earlier spending record write failed; no further request is sent")
+    @property
+    def stopping(self):
+        return bool(self.context and self.context.stopping)
+
+    def _write(self, change=None, close=False):
+        """One transaction: every pending receipt, then `change`, then the close if asked. On failure nothing
+        pending is forgotten and the previous durable record stands."""
         try:
             with self.store.transaction():
                 data = self.store.load()
                 attempt = (data or {}).get('attempts', {}).get(self.attempt_id)
                 if attempt is None:
                     raise SpendingUnavailable("this attempt is missing from the spending record")
-                result = change(attempt)
+                for number, receipt in self.pending.items():
+                    _apply_receipt(attempt['sends'][number], receipt)
+                result = change(attempt) if change else None
+                if close and attempt['status'] == 'open':
+                    for send in attempt['sends'].values():
+                        if send['status'] == 'reserved':
+                            send['status'] = 'unknown'   # unresolved: the provider may still charge for it
+                    attempt.update(status='closed', closed_at=self.clock().isoformat())
                 self.store.save(data)
-                return result
         except SpendingError:
             self.broken = True
             raise
+        self.pending.clear()
+        return result
 
     def reserve(self, bounds_usd):
         """Record a wave of sends before any of it goes out; their send numbers, in order."""
@@ -349,47 +401,98 @@ class Hold:
                 attempt['sends'][str(number)] = {'bound': bound, 'status': 'reserved', 'cost': None}
                 numbers.append(number)
             return numbers
-        return self._change(change)
+        with self.lock:
+            if self.stopping:
+                raise SpendingStopped("the sync is stopping; no further request is sent")
+            if self.broken:
+                raise SpendingError("an earlier spending record write failed; no further request is sent")
+            return self._write(change)
 
-    def settle(self, number, cost_usd):
-        """A reply's known cost, recorded in full even above its bound. Settling twice changes nothing."""
-        def change(attempt):
-            send = attempt['sends'][str(number)]
-            if send['status'] == 'reserved':
-                send.update(status='settled', cost=to_micro(cost_usd))
-        self._change(change)
+    def check_dispatch(self):
+        """Raise if a send reserved here must not start after all, because the sync is stopping."""
+        if self.stopping:
+            raise SpendingStopped("the sync is stopping; no further request is sent")
+
+    def _receipt(self, number, receipt):
+        with self.lock:
+            self.pending[str(number)] = receipt
+            self._write()
+
+    def settle(self, number, cost_usd, keep_usd=0.0):
+        """A reply's known cost, recorded in full even above its bound; `keep_usd` is what it must still hold
+        at least, when its price couldn't be checked. Settling twice changes nothing."""
+        self._receipt(number, ('settled', to_micro(cost_usd), to_micro(keep_usd) if keep_usd else 0))
 
     def release(self, number):
         """A send the provider refused without charging: its bound goes back to the allowance."""
-        def change(attempt):
-            send = attempt['sends'][str(number)]
-            if send['status'] == 'reserved':
-                send['status'] = 'released'
-        self._change(change)
+        self._receipt(number, ('released',))
 
     def unknown(self, number):
         """A send whose cost is unknown: its whole bound stays committed."""
-        def change(attempt):
-            send = attempt['sends'][str(number)]
-            if send['status'] == 'reserved':
-                send['status'] = 'unknown'
-        self._change(change)
+        self._receipt(number, ('unknown',))
 
     def close(self):
-        """End the attempt: known charges and unresolved bounds stay, the unused allowance is released.
-        A send still reserved here is unresolved and keeps its bound. Closing twice changes nothing."""
+        """End the attempt: every pending receipt is applied, known charges and unresolved bounds stay, and only
+        the unused allowance is released. If the record can't be written the open hold stays as it was, the
+        receipts stay pending for another close, and the error is raised. Closing twice changes nothing."""
+        with self.lock:
+            self._close_locked()
+
+    def _close_locked(self):
         if self.closed:
             return
-
-        def change(attempt):
-            if attempt['status'] == 'open':
-                for send in attempt['sends'].values():
-                    if send['status'] == 'reserved':
-                        send['status'] = 'unknown'
-                attempt.update(status='closed', closed_at=self.clock().isoformat())
-        self.broken = False   # closing only ever keeps or lowers what was already counted
-        self._change(change)
+        self._write(close=True)
         self.closed = True
+        if self.context is not None:
+            self.context.holds.discard(self)
+
+
+def _apply_receipt(send, receipt):
+    """Idempotent: a known charge is applied once and never downgraded; a late known charge replaces an
+    unknown one; unknown and released only resolve a send still reserved."""
+    kind = receipt[0]
+    if kind == 'settled':
+        if send['status'] != 'settled':
+            send.update(status='settled', cost=receipt[1])
+            if receipt[2]:
+                send['keep'] = receipt[2]
+    elif send['status'] == 'reserved':
+        send['status'] = kind
+
+
+def stop_on_sigterm(spending, wait_seconds=0.7, exit=None):
+    """For the generation phase: on SIGTERM (the app's Stop), stop `spending` and close this process's open
+    attempts on a short cleanup thread, then exit 143 at once, without waiting for provider requests or the
+    worker pool. The app sends SIGKILL a second after Stop, so cleanup that can't finish in `wait_seconds`
+    leaves the durable holds as they were. A context manager; the previous handler comes back on exit. Only
+    the main thread can install it; elsewhere it does nothing."""
+    import signal
+    import threading
+    exit = exit or os._exit
+
+    @contextlib.contextmanager
+    def installed():
+        if spending is None or threading.current_thread() is not threading.main_thread():
+            yield
+            return
+
+        def cleanup():
+            for problem in spending.stop():
+                print(f"Spending record: an attempt couldn't be closed on Stop ({problem}); its hold stays",
+                      file=sys.stderr, flush=True)
+
+        def handle(signum, _frame):
+            worker = threading.Thread(target=cleanup, name='spending-stop', daemon=True)
+            worker.start()
+            worker.join(wait_seconds)
+            exit(128 + signum)
+
+        previous = signal.signal(signal.SIGTERM, handle)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+    return installed()
 
 
 # ---- the read-only summary ------------------------------------------------------------------------

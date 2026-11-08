@@ -237,6 +237,7 @@ class Executor:
             return refused, im.StaleUpdate(str(e), warning=self.unpaid())
 
         def send(item):
+            self.budget.check_dispatch()   # a Stop since the wave was reserved: this send doesn't start
             started = time.monotonic()
             timeout = item.seconds if left is None else min(item.seconds, left)
             return llm.call_model_turn(item.request, timeout), time.monotonic() - started

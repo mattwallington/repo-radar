@@ -36,7 +36,7 @@ from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking
 from repo_radar.preflight import PreflightSession
 from repo_radar.metadata_budget import (Budget, BudgetError, LedgerWriteError, LEGACY_MARGIN, FULL_CAP_USD,
                                         legacy_allowance)
-from repo_radar.spending import Spending, SpendingError, WeeklyCapRefused, policy_from_config
+from repo_radar.spending import Spending, SpendingError, WeeklyCapRefused, policy_from_config, stop_on_sigterm
 from repo_radar.model_catalog import is_known_model
 from repo_radar.metadata import (
     DEGRADED_DIR_NAME,
@@ -499,6 +499,7 @@ def generate_repo_metadata(task_data, session, args, ctx):
 
     # One accounting total for the whole attempt: every send's recorded cost, including incomplete replies.
     budget = None
+    counted_error = False
 
     def spent():
         return budget.cost if budget is not None else 0.0
@@ -1287,6 +1288,7 @@ Stack Trace:
         # Count as error
         with ctx.stats_lock:
             ctx.stats['errors'] += 1
+        counted_error = True
 
         if ctx.sync_logger:
             ctx.sync_logger.error(
@@ -1304,8 +1306,17 @@ Stack Trace:
             ctx.stats['api_cost'] += spent()
             if budget is not None and budget.unknown_calls:
                 ctx.stats['unknown_cost_calls'] = ctx.stats.get('unknown_cost_calls', 0) + budget.unknown_calls
-        if budget is not None:
-            budget.close_spending()   # known charges stay; the rest of its allowance is released
+        # Known charges stay (including any a failed write left pending); the rest of its allowance is released.
+        closing = budget.close_spending() if budget is not None else None
+        if closing:
+            # An accounting problem: reported like any other repository error, but counted once.
+            ctx.console.print(f"[red]{full_name}: {closing}; its spending hold stays as it was[/red]")
+            with ctx.stats_lock:
+                if not counted_error:
+                    ctx.stats['errors'] += 1
+            if ctx.sync_logger:
+                ctx.sync_logger.error("spending_record_failed", repo=full_name, error_type="SpendingError",
+                                      detail=closing)
 
 
 def sync_mode(args):
@@ -2095,7 +2106,9 @@ Stack Trace:
         # Run metadata generation with live progress. ONE PreflightSession is shared across every
         # repo in this phase, so its authoritative-count memo and per-model breaker are process-wide
         # (intended: identical prompts are counted once; a model that degrades stays degraded).
-        with PreflightSession() as session:
+        # Stop (SIGTERM) in this phase closes this process's open spending holds and exits 143 at once; the
+        # network wait's own handler has already been restored by now.
+        with PreflightSession() as session, stop_on_sigterm(getattr(args, '_spending', None)):
             ctx = SyncContext(meta_progress, meta_tasks, stats, stats_lock, sync_logger, console)
             with Live(meta_progress, console=console, refresh_per_second=10):
                 with ThreadPoolExecutor(max_workers=max_metadata_workers) as executor:
