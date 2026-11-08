@@ -2,9 +2,7 @@
 
 import os
 import sys
-import json
 import time
-import random
 import signal
 import uuid
 import traceback
@@ -26,29 +24,12 @@ from repo_radar.receipts import (EXIT_SKIPPED_NO_WORK, parse_instant, qualifies_
                                  run_mode, write_receipt)
 from repo_radar.constants import GREEN, BLUE, CYAN, YELLOW, RED, BOLD, RESET, REPO_COLORS, PROGRESS_COLORS
 from repo_radar.git import run_git_command, determine_preferred_branch, get_repo_status
-from repo_radar.files import collect_repo_files, should_include_file
-from repo_radar.llm import (get_ai_model, get_model_context_window, get_chunking_threshold,
-    count_tokens_accurate, chunk_repo_files, repo_needs_chunking, get_fallback_model,
-    rate_limit_tracker, RateLimitTracker, call_llm, provider_for_model, combine_chunk_analyses,
-    _build_analysis_prompt, _build_full_repo_prompt,
-    authoritative_partition, authoritative_chunks, DegradedSynthesis, PartitionResult,
-    InputBudgetUnavailable, IncompleteResponseError, is_transient_server_error)
+from repo_radar.files import should_include_file
+from repo_radar.llm import get_ai_model, provider_for_model
 from repo_radar.preflight import PreflightSession
-from repo_radar.metadata_budget import (Budget, BudgetError, LedgerWriteError, LEGACY_MARGIN, FULL_CAP_USD,
-                                        legacy_allowance)
-from repo_radar.spending import (Spending, SpendingError, SpendingStopped, WeeklyCapRefused, policy_from_config,
-                                 stop_on_sigterm)
+from repo_radar.spending import Spending, SpendingError, policy_from_config, stop_on_sigterm
 from repo_radar.model_catalog import is_known_model
-from repo_radar.metadata import (
-    DEGRADED_DIR_NAME,
-    PARSE_STATUS_DEGRADED,
-    PARSE_STATUS_OK,
-    degradation_reasons,
-    parse_llm_response,
-    read_attempt_state,
-    regenerate_index,
-    save_degraded_response,
-)
+from repo_radar.metadata import read_attempt_state, regenerate_index
 from repo_radar.ui import get_short_id, format_id, send_status_update, set_status_attempt
 # Imported by name so callers and tests keep using sync.wait_for_network.
 from repo_radar.network import NetworkWaitCancelled, wait_for_network
@@ -297,8 +278,8 @@ def _incremental_status(args, full_name, short_id, status, percent, color):
 
 
 def _dry_run_decision(repo_path, cache_name, full_name, args):
-    """What an opted-in repository's metadata would get, from its current checkout: read-only Git,
-    no token counts, model calls or state writes."""
+    """What a repository's metadata would get, from its current checkout: read-only Git, no token counts,
+    model calls or state writes. A repository not opted in to incremental updates is full-only."""
     try:
         target = incremental_metadata.snap.resolve_commit(repo_path, 'HEAD')
         if target is None:
@@ -308,7 +289,8 @@ def _dry_run_decision(repo_path, cache_name, full_name, args):
         force = bool(getattr(args, 'regenerate_metadata', False))
         decision = incremental_metadata.decide(
             repo_path, full_name, doc, state, get_ai_model(), target, datetime.now(), force=force,
-            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS))
+            full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
+            allow_incremental=full_name in getattr(args, '_incremental_repos', ()))
         held = incremental_metadata.held_reason(state, doc, force, resolve_trigger(default='cli'),
                                                 _incremental_policy(args)[1])
         if held and decision.strategy != 'none':
@@ -325,11 +307,12 @@ def _incremental_policy(args):
     return policy if isinstance(policy, tuple) and len(policy) == 2 else incremental_spending_policy(None)[:2]
 
 
-def _generate_incremental(task_data, session, args, ctx):
-    """Metadata for a repository opted in to incremental updates (config incremental_metadata_repos).
+def generate_repo_metadata(task_data, session, args, ctx):
+    """Metadata for one repository, through the one shared worker (incremental_metadata.update_repository).
 
-    The incremental module decides between nothing, an update from the document's analyzed commit and
-    a full rebuild, and never replaces a good document with a failed attempt. This reports the outcome
+    The worker decides between nothing, a full rebuild and, only for a repository opted in to incremental
+    updates (config incremental_metadata_repos), an update from the document's analyzed commit; any other
+    repository is full-only. It never replaces a good document with a failed attempt. This reports the outcome
     truthfully: an update that failed or was skipped is never shown as success.
     """
     repo_config, cache_name, _commit_hash, short_id, color, _ = task_data
@@ -354,7 +337,8 @@ def _generate_incremental(task_data, session, args, ctx):
             full_rebuild_days=getattr(args, '_incremental_full_rebuild_days', DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS),
             trigger=resolve_trigger(default='cli'),
             update_limit_usd=_incremental_policy(args)[0], failure_stop=_incremental_policy(args)[1],
-            spending=getattr(args, '_spending', None))
+            spending=getattr(args, '_spending', None),
+            allow_incremental=full_name in getattr(args, '_incremental_repos', ()))
     except Exception as e:
         outcome = _escaped_incremental_outcome(cache_name, full_name, e)
     return _report_incremental(task_data, outcome, model, args, ctx)
@@ -367,7 +351,8 @@ def _escaped_incremental_outcome(cache_name, full_name, error):
 
 
 def _report_incremental(task_data, outcome, model, args, ctx):
-    """Progress, Activity and stats for one opted-in repository's outcome, at most once per run."""
+    """Progress, Activity and stats for one repository's metadata outcome and its known spend, at most once
+    per run. The Activity event keeps its metadata_incremental name; its strategy says full or incremental."""
     repo_config, _cache_name, _commit_hash, short_id, color, _ = task_data
     full_name = repo_config['full_name']
     reported = getattr(args, '_incremental_reported', None)
@@ -435,10 +420,9 @@ def _report_incremental(task_data, outcome, model, args, ctx):
 
 
 def _record_incremental_git_failure(args, full_name, cache_name, step, sync_logger):
-    """An opted-in repository's Git step failed before metadata: record the attempt so INDEX shows its
-    metadata stale or unavailable. Errors were already counted by the Git step."""
-    if (full_name not in getattr(args, '_incremental_repos', ()) or args.dry_run or args.skip_metadata
-            or getattr(args, 'repos_only', False)):
+    """A repository's Git step failed before metadata: record the attempt so INDEX shows its metadata stale
+    or unavailable. Errors were already counted by the Git step, so nothing here counts them again."""
+    if args.dry_run or args.skip_metadata or getattr(args, 'repos_only', False):
         return
     state_error = incremental_metadata.record_failure(
         PRISTINE_DIR, cache_name, full_name, f"{step} failed, so metadata was not updated", phase='git')
@@ -446,880 +430,6 @@ def _record_incremental_git_failure(args, full_name, cache_name, step, sync_logg
     if state_error and sync_logger:
         sync_logger.event("metadata_incremental", level='error', repo=full_name, status='failed',
                           reason=f"{step} failed", state_error=state_error)
-
-
-def _admit_legacy_attempt(session, full_name, model, args, prompts, chunked):
-    """The legacy attempt's Budget, admitted against the weekly cap before its first send.
-
-    Its allowance is one estimate (metadata_budget.legacy_allowance): every prepared prompt's input plus its
-    maximum output and, when chunked, every synthesis call the bounded synthesis may make at its complete
-    input and output ceilings, with a 25% margin and at most $40. That allowance is the attempt's hard limit
-    for every send, retry and fallback; nothing is topped up once sending starts. Raises WeeklyCapRefused."""
-    from repo_radar.llm import (output_budget, legacy_request_tokens, _synthesis_budget, SYNTHESIS_MAX_CALLS,
-                                SYNTHESIS_OUTPUT_TOKENS)
-    try:
-        requests = []
-        for prompt, requested in prompts:
-            output = output_budget(model, requested)
-            requests.append((legacy_request_tokens(session, model, prompt, output)[0], output))
-        synthesis = ((SYNTHESIS_MAX_CALLS, _synthesis_budget(full_name, model),
-                      output_budget(model, SYNTHESIS_OUTPUT_TOKENS)) if chunked else None)
-        allowance = legacy_allowance(model, requests, synthesis)
-    except (InputBudgetUnavailable, ValueError, TypeError):
-        allowance = FULL_CAP_USD   # an estimate that can't be computed; never permission to send unpriced
-    budget = Budget(model, label='legacy', spending=getattr(args, '_spending', None), owner=full_name)
-    budget.acquire(allowance)
-    return budget
-
-
-def generate_repo_metadata(task_data, session, args, ctx):
-    """Generate metadata for a single repo with progress updates."""
-    repo_config, cache_name, commit_hash, short_id, color, _ = task_data
-    full_name = repo_config['full_name']
-    if full_name in getattr(args, '_incremental_repos', ()):
-        return _generate_incremental(task_data, session, args, ctx)
-    repo_path = PRISTINE_DIR / cache_name
-
-    task_id, task_color = ctx.meta_tasks[full_name]
-
-    # Longer random delay to stagger requests and avoid rate limits
-    import random
-    # Increased delay range: 3-7 seconds between repos
-    time.sleep(random.uniform(3.0, 7.0))
-
-    ctx.meta_progress.update(task_id, completed=5, status=f"[{task_color}]collecting files...[/{task_color}]")
-
-    # Send status update to UI
-    if hasattr(args, 'status_server') and args.status_server:
-        send_status_update('progress', {
-            'repo': full_name, 'short_name': short_id,
-            'status': '📝 generating metadata...',
-            'percent': 5,
-            'color': color
-        }, args.status_server)
-
-    # One accounting total for the whole attempt: every send's recorded cost, including incomplete replies.
-    budget = None
-    counted_error = False
-
-    def spent():
-        return budget.cost if budget is not None else 0.0
-
-    try:
-        # Custom metadata generation with progress updates
-        if args.dry_run:
-            ctx.meta_progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would analyze[/dim]")
-            time.sleep(0.1)
-            ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ analyzed (dry run)[/{task_color}]")
-            return 0.0
-
-        # Check for appropriate API key based on model
-        model = get_ai_model()
-        api_key_missing = False
-
-        provider = provider_for_model(model)
-        if provider == 'gemini':
-            api_key_missing = not os.getenv('GEMINI_API_KEY')
-        elif provider == 'anthropic':
-            api_key_missing = not os.getenv('ANTHROPIC_API_KEY')
-        elif provider == 'openai':
-            api_key_missing = not os.getenv('OPENAI_API_KEY')
-
-        if api_key_missing:
-            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no API key[/yellow]")
-
-            # Send status update to UI
-            if hasattr(args, 'status_server') and args.status_server:
-                send_status_update('progress', {
-                    'repo': full_name, 'short_name': short_id,
-                    'status': '⊘ skipped - no API key',
-                    'percent': 100,
-                    'color': 'yellow'
-                }, args.status_server)
-
-            # Note: Not counting as error since this is expected when user hasn't configured keys yet
-            # But it will be reported in the final stats
-            return 0.0
-
-        ctx.meta_progress.update(task_id, completed=10, status=f"[{task_color}]analyzing...[/{task_color}]")
-
-        # Send status update
-        if hasattr(args, 'status_server') and args.status_server:
-            send_status_update('progress', {
-                'repo': full_name, 'short_name': short_id,
-                'status': '🤖 analyzing with AI...',
-                'percent': 10,
-                'color': color
-            }, args.status_server)
-
-        # Collect files
-        files = collect_repo_files(repo_path)
-        if not files:
-            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]⊘ no files found[/yellow]")
-            return 0.0
-
-        # Get model and calculate accurate token count
-        model = get_ai_model()
-        total_tokens = sum(count_tokens_accurate(f['content'], model) for f in files)
-        threshold = get_chunking_threshold(model)
-        context_window = get_model_context_window(model)
-
-        # ONE authoritative decision helper, so production decides on the same finished
-        # prompt the tests exercise (it used to reimplement the decision inline). Returns
-        # whether to chunk, the value it decided on, and whether that value is the exact
-        # finished-prompt count or a lower bound.
-        needs_chunk, decision_value, decision_exact = repo_needs_chunking(
-            full_name, files, model, threshold)
-        # Seam (a): the authoritative preflight makes the final single-vs-chunk decision,
-        # monotonically tightening Branch 1's local estimate (which still feeds the display
-        # below). In production the session memoizes this exact count, so it adds no paid
-        # call the partition would not already make; in tests it is a stub.
-        needs_chunk = authoritative_partition(session, full_name, files, model) == "chunk"
-
-        budget_label = "prompt-budget" if decision_exact else "content lower bound"
-        budget_note = f" / {decision_value:,} {budget_label}" if decision_value != total_tokens else ""
-        ctx.meta_progress.update(task_id, completed=20, status=f"[{task_color}]{total_tokens:,} tokens{budget_note} ({context_window//1000}K context, {threshold//1000}K usable)[/{task_color}]")
-
-        def _finish_degraded(reason):
-            """Persist ONE degraded metadata record and stop. Recording the CURRENT commit
-            stops the repo being retried forever; parse_status=degraded keeps it visible in
-            INDEX. Any cost already spent (chunk-analysis sends + combine) stays in
-            the attempt's budget and is still accounted below."""
-            degraded_content = f"""---
-repo_name: {full_name.split('/')[-1]}
-full_name: {full_name}
-cache_dir: {cache_name}
-clone_url: {repo_config['clone_url']}
-last_commit: {commit_hash}
-last_updated: {datetime.now().isoformat()}
-brief: Repository analysis
-type: Unknown
-language: Unknown
-framework: None
-database: None
-apis: None
-port: N/A
-related_repos: []
-parse_status: {PARSE_STATUS_DEGRADED}
-degraded_reason: {reason}
----
-
-# Repository: {full_name}
-
-_Metadata generation degraded before completion: {reason}_
-"""
-            metadata_file = PRISTINE_DIR / f"{cache_name}.md"
-            with open(metadata_file, 'w') as f:
-                f.write(degraded_content)
-            ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]\u26a0 degraded[/yellow]")
-            if hasattr(args, 'status_server') and args.status_server:
-                send_status_update('progress', {
-                    'repo': full_name, 'short_name': short_id,
-                    'status': '\u26a0 degraded metadata',
-                    'percent': 100,
-                    'color': 'yellow'
-                }, args.status_server)
-            with ctx.stats_lock:
-                ctx.stats['metadata_generated'] += 1
-                ctx.stats['degraded'] = ctx.stats.get('degraded', 0) + 1
-            if ctx.sync_logger:
-                ctx.sync_logger.event("metadata_degraded",
-                                      level=_activity_level("metadata_degraded", is_degraded=True),
-                                      repo=full_name, reason=reason)
-
-        if needs_chunk:
-            # Seam (b)+(d1): authoritative partition into sendable chunks. Every returned
-            # chunk's real analysis prompt has been authoritatively counted to fit; a truthy
-            # degraded_reason means the repo overflowed even at the template floor BEFORE any
-            # send, so persist ONE degraded record and make zero call_llm.
-            _partition = authoritative_chunks(session, full_name, files, model)
-            if _partition.degraded_reason:
-                _finish_degraded(_partition.degraded_reason)
-                return
-            chunks = _partition.chunks
-            budget = _admit_legacy_attempt(
-                session, full_name, model, args,
-                [(_build_analysis_prompt(full_name, chunk, i, len(chunks)), 8192) for i, chunk in enumerate(chunks, 1)],
-                chunked=True)
-            expected_chunks = len(chunks)
-            ctx.meta_progress.update(task_id, completed=25, status=f"[{task_color}]{len(chunks)} chunks (expected ~{expected_chunks})[/{task_color}]")
-
-            # Send status update
-            if hasattr(args, 'status_server') and args.status_server:
-                send_status_update('progress', {
-                    'repo': full_name, 'short_name': short_id,
-                    'status': f'🤖 processing {len(chunks)} chunks...',
-                    'percent': 25,
-                    'color': color
-                }, args.status_server)
-
-            chunk_analyses = []
-            for i, chunk in enumerate(chunks, 1):
-                # Calculate and log chunk size for debugging
-                chunk_tokens = sum(count_tokens_accurate(f['content'], model) for f in chunk)
-                ctx.console.print(f"[cyan]Chunk {i}/{len(chunks)}: {chunk_tokens:,} content tokens ({len(chunk)} files)[/cyan]")
-
-                # Add delay BEFORE processing each chunk (including first to give breathing room)
-                if i == 1:
-                    # Initial delay before first chunk
-                    ctx.meta_progress.update(task_id, status=f"[dim]waiting 3s before starting chunks...[/dim]")
-                    time.sleep(3)
-                else:
-                    # Longer delay between subsequent chunks
-                    ctx.meta_progress.update(task_id, status=f"[dim]waiting 6s before next chunk...[/dim]")
-                    time.sleep(6)
-
-                chunk_progress = 25 + (50 * i / len(chunks))
-                ctx.meta_progress.update(task_id, completed=chunk_progress, status=f"[{task_color}]chunk {i}/{len(chunks)} ({chunk_tokens:,} tokens)...[/{task_color}]")
-
-                # Send periodic status updates to UI
-                if hasattr(args, 'status_server') and args.status_server and i % 2 == 0:  # Every 2 chunks
-                    send_status_update('progress', {
-                        'repo': full_name, 'short_name': short_id,
-                        'status': f'🤖 chunk {i}/{len(chunks)}...',
-                        'percent': int(chunk_progress),
-                        'color': color
-                    }, args.status_server)
-
-                # Retry logic with model fallback for rate limits
-                max_retries = 5
-                base_wait = 3
-                chunk_result = None
-                current_model = get_ai_model()
-
-                for retry in range(max_retries):
-                    try:
-                        import litellm
-                        # Route through the shared builder the chunker budgets, so the
-                        # prompt sent is exactly the one measured to fit.
-                        prompt = _build_analysis_prompt(full_name, chunk, i, len(chunks))
-
-                        analysis, api_cost, response = call_llm(
-                            current_model, prompt, max_tokens=8192, budget=budget, session=session
-                        )
-
-                        # Update rate limit tracker
-                        rate_limit_tracker.update_from_response(response)
-
-                        # Log rate limit status after each chunk
-                        rate_status = rate_limit_tracker.get_status_string()
-                        if rate_status != "Rate limits: Unknown":
-                            ctx.console.print(f"    [dim]{rate_status}[/dim]")
-
-                        chunk_analyses.append(analysis)
-
-                        # Success! Break out of retry loop
-                        break
-
-                    except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
-                        raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
-                    except Exception as e:
-                        import traceback
-                        error_str = str(e)
-                        error_type = type(e).__name__
-
-                        # Log VERY detailed error for debugging
-                        ctx.console.print(f"\n[bold red]╔══ ERROR ON CHUNK {i}/{len(chunks)} (Retry {retry+1}/{max_retries}) ══╗[/bold red]")
-                        ctx.console.print(f"[red]Repository: {full_name}[/red]")
-                        ctx.console.print(f"[red]Model: {current_model}[/red]")
-                        ctx.console.print(f"[red]Error Type: {error_type}[/red]")
-                        ctx.console.print(f"[red]Error Module: {type(e).__module__}[/red]")
-                        ctx.console.print(f"[red]Error: {error_str[:300]}[/red]")
-                        ctx.console.print(f"[bold red]╚══════════════════════════════════════╝[/bold red]\n")
-
-                        if is_transient_server_error(e):
-                            if retry == max_retries - 1:
-                                raise
-                            wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                            ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
-                            time.sleep(wait_time)
-                            continue
-
-                        # Check if it's a rate limit error
-                        is_rate_limit = (
-                            error_type == 'RateLimitError' or
-                            '429' in error_str or
-                            'RESOURCE_EXHAUSTED' in error_str or
-                            'rate_limit' in error_str.lower()
-                        )
-
-                        if is_rate_limit:
-                            # Try fallback model if available
-                            fallback_model = get_fallback_model(current_model)
-
-                            if fallback_model and retry < max_retries - 1:
-                                ctx.console.print(f"[bold yellow]🔄 Rate limited on {current_model}[/bold yellow]")
-                                ctx.console.print(f"[bold yellow]   Falling back to {fallback_model} (separate quota)[/bold yellow]")
-                                current_model = fallback_model
-                                ctx.meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-
-                                # Short delay before trying fallback
-                                time.sleep(2)
-                                continue
-                            elif retry < max_retries - 1:
-                                # No fallback available, wait and retry same model
-                                wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                                ctx.console.print(f"[yellow]No fallback available. Waiting {int(wait_time)}s...[/yellow]")
-                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-
-                                # Send status update to UI
-                                if hasattr(args, 'status_server') and args.status_server:
-                                    send_status_update('progress', {
-                                        'repo': full_name, 'short_name': short_id,
-                                        'status': f'⏳ rate limited, waiting {int(wait_time)}s...',
-                                        'percent': int(chunk_progress),
-                                        'color': 'yellow'
-                                    }, args.status_server)
-
-                                time.sleep(wait_time)
-                                continue
-                            else:
-                                # Max retries exceeded
-                                raise Exception(f"Rate limit exceeded after {max_retries} retries")
-                        else:
-                            # Non-rate-limit error, raise immediately
-                            raise
-
-                # Note: Delay before next chunk is now at the start of the loop
-
-            # Set by whichever path produces `analysis`; used to name the model in a
-            # degraded-parse warning, since a rate-limit fallback means it is not
-            # necessarily the configured one.
-            analysis_model = None
-
-            if chunk_analyses:
-                ctx.meta_progress.update(task_id, completed=80, status=f"[{task_color}]combining analyses...[/{task_color}]")
-
-                # Retry logic for combine step with model fallback
-                current_model_combine = current_model  # Use whatever model succeeded for chunks
-
-                def _synthesize_bounded(prompt, synth_model):
-                    """One bounded synthesis call, with this loop's retry/fallback.
-
-                    combine_chunk_analyses owns *bounding* (how the analyses are
-                    batched so no prompt exceeds the window); this closure keeps the
-                    existing retry, model fallback and rate-limit accounting. It
-                    returns the model actually used so the caller can re-budget when a
-                    fallback has a smaller context window.
-                    """
-                    nonlocal current_model_combine
-                    for attempt in range(max_retries):
-                        try:
-                            text, cost, resp = call_llm(
-                                current_model_combine, prompt, max_tokens=16384, budget=budget, session=session
-                            )
-                            rate_limit_tracker.update_from_response(resp)
-                            return text, cost, current_model_combine
-                        except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
-                            raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
-                        except Exception as exc:
-                            if is_transient_server_error(exc):
-                                if attempt == max_retries - 1:
-                                    raise
-                                wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
-                                ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
-                                time.sleep(wait_time)
-                                continue
-                            err = str(exc)
-                            is_rl = (type(exc).__name__ == 'RateLimitError'
-                                     or '429' in err or 'RESOURCE_EXHAUSTED' in err)
-                            if not is_rl:
-                                raise
-                            fb = get_fallback_model(current_model_combine)
-                            if fb and attempt < max_retries - 1:
-                                ctx.console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fb}[/bold yellow]")
-                                current_model_combine = fb
-                                ctx.meta_progress.update(task_id, status=f"[yellow]combine fallback to {fb.split('/')[-1]}...[/yellow]")
-                                time.sleep(2)
-                            elif attempt < max_retries - 1:
-                                wait_time = (base_wait ** (attempt + 1)) + random.uniform(0, 3)
-                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-                                time.sleep(wait_time)
-                            else:
-                                raise Exception(
-                                    f"Rate limit exceeded on combine after {max_retries} retries")
-                    raise Exception(f"Combine failed after {max_retries} retries")
-
-                for retry in range(max_retries):
-                    try:
-                        # Bounded hierarchical synthesis. The previous inline version
-                        # concatenated every chunk analysis into ONE prompt with no
-                        # bound, which is what produced
-                        #   prompt is too long: 1189532 tokens > 1000000 maximum
-                        # on large repositories. Batching happens inside; this call
-                        # may perform several LLM requests and returns their total cost.
-                        analysis, _ = combine_chunk_analyses(
-                            full_name, chunk_analyses,
-                            model=current_model_combine,
-                            synthesize=_synthesize_bounded,
-                            session=session,
-                        )
-
-                        # Success! Break out of retry loop
-                        break
-
-                    except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
-                        raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
-                    except Exception as e:
-                        error_str = str(e)
-                        error_type = type(e).__name__
-
-                        if is_transient_server_error(e):
-                            raise  # the request-level budget is exhausted; do not replay batches
-
-                        is_rate_limit = (
-                            error_type == 'RateLimitError' or
-                            '429' in error_str or
-                            'RESOURCE_EXHAUSTED' in error_str
-                        )
-
-                        if is_rate_limit:
-                            # Try fallback model
-                            fallback_model = get_fallback_model(current_model_combine)
-
-                            if fallback_model and retry < max_retries - 1:
-                                ctx.console.print(f"[bold yellow]🔄 Combine step rate limited, falling back to {fallback_model}[/bold yellow]")
-                                current_model_combine = fallback_model
-                                ctx.meta_progress.update(task_id, status=f"[yellow]combine fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-                                time.sleep(2)
-                                continue
-                            elif retry < max_retries - 1:
-                                # No fallback, wait
-                                wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                                ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-                                time.sleep(wait_time)
-                                continue
-                            else:
-                                raise Exception(f"Rate limit exceeded on combine after {max_retries} retries")
-                        else:
-                            raise
-                # The combine step may have fallen back to a different model than the
-                # one chunking used; this is the model that actually produced `analysis`.
-                analysis_model = current_model_combine
-                if isinstance(analysis, DegradedSynthesis):
-                    # Seam (d2): the per-chunk analysis sends already happened and their cost
-                    # is already in the attempt's budget, including completed synthesis calls; it could not be
-                    # reduced to fit, so make NO final synthesis send and persist a degraded
-                    # record at the current commit.
-                    _finish_degraded(analysis.reason)
-                    return
-        else:
-            # Repo fits in context - single analysis
-            ctx.meta_progress.update(task_id, completed=40, status=f"[{task_color}]fits in context, analyzing...[/{task_color}]")
-
-            # Retry logic with model fallback for rate limits
-            max_retries = 5
-            base_wait = 3
-            analysis = None
-            current_model = get_ai_model()
-            budget = _admit_legacy_attempt(session, full_name, model, args,
-                                           [(_build_full_repo_prompt(full_name, files), 16384)], chunked=False)
-
-            for retry in range(max_retries):
-                try:
-                    import litellm
-                    # Route through the shared builder the decision measured, so the
-                    # prompt sent is exactly the one checked to fit.
-                    prompt = _build_full_repo_prompt(full_name, files)
-
-                    ctx.meta_progress.update(task_id, completed=60, status=f"[{task_color}]waiting for LLM...[/{task_color}]")
-
-                    # call_llm counts the exact payload with the session before sending it (memoized in
-                    # production, since authoritative_partition already counted this same prompt) and
-                    # reserves it inside the attempt's allowance, so every send was counted.
-                    analysis, single_cost, response = call_llm(
-                        current_model, prompt, max_tokens=16384, budget=budget, session=session
-                    )
-                    analysis_model = current_model  # may be a fallback after a retry
-
-                    # Update rate limit tracker
-                    rate_limit_tracker.update_from_response(response)
-
-                    # Log rate limit status
-                    rate_status = rate_limit_tracker.get_status_string()
-                    if rate_status != "Rate limits: Unknown":
-                        ctx.console.print(f"    [dim]{rate_status}[/dim]")
-
-                    # Send rate limit info to UI (only if we have data)
-                    if hasattr(args, 'status_server') and args.status_server and rate_status != "Rate limits: Unknown":
-                        send_status_update('rate-limit', {
-                            'status': rate_status,
-                            'remaining_requests': rate_limit_tracker.remaining.get('requests'),
-                            'limit_requests': rate_limit_tracker.limits.get('requests'),
-                            'remaining_tokens': rate_limit_tracker.remaining.get('tokens'),
-                            'limit_tokens': rate_limit_tracker.limits.get('tokens')
-                        }, args.status_server)
-
-                    # Success! Break out of retry loop
-                    break
-
-                except (IncompleteResponseError, BudgetError, LedgerWriteError, SpendingError):
-                    raise  # a rejected reply or a spending stop, not a rate limit: no retry or fallback
-                except Exception as e:
-                    error_str = str(e)
-                    error_type = type(e).__name__
-
-                    # Log detailed error for debugging
-                    ctx.console.print(f"\n[red]Error analyzing repo:[/red]")
-                    ctx.console.print(f"[red]Repo: {full_name}[/red]")
-                    ctx.console.print(f"[red]Model: {current_model}[/red]")
-                    ctx.console.print(f"[red]Type: {error_type}[/red]")
-                    ctx.console.print(f"[red]Message: {error_str[:300]}[/red]")
-
-                    if is_transient_server_error(e):
-                        if retry == max_retries - 1:
-                            raise
-                        wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                        ctx.meta_progress.update(task_id, status=f"[yellow]server unavailable, waiting {int(wait_time)}s...[/yellow]")
-                        time.sleep(wait_time)
-                        continue
-
-                    is_rate_limit = (
-                        error_type == 'RateLimitError' or
-                        '429' in error_str or
-                        'RESOURCE_EXHAUSTED' in error_str or
-                        'rate_limit' in error_str.lower()
-                    )
-
-                    if is_rate_limit:
-                        # Try fallback model if available
-                        fallback_model = get_fallback_model(current_model)
-
-                        if fallback_model and retry < max_retries - 1:
-                            ctx.console.print(f"[bold yellow]🔄 Falling back to {fallback_model}[/bold yellow]")
-                            current_model = fallback_model
-                            ctx.meta_progress.update(task_id, status=f"[yellow]fallback to {fallback_model.split('/')[-1]}...[/yellow]")
-                            time.sleep(2)
-                            continue
-                        elif retry < max_retries - 1:
-                            # No fallback, wait
-                            wait_time = (base_wait ** (retry + 1)) + random.uniform(0, 3)
-                            ctx.console.print(f"[yellow]Retry {retry+1}/{max_retries}: Waiting {int(wait_time)}s...[/yellow]")
-                            ctx.meta_progress.update(task_id, status=f"[yellow]waiting {int(wait_time)}s...[/yellow]")
-
-                            # Send status update to UI
-                            if hasattr(args, 'status_server') and args.status_server:
-                                send_status_update('progress', {
-                                    'repo': full_name, 'short_name': short_id,
-                                    'status': f'⏳ rate limited (attempt {retry+1}/{max_retries}), waiting {int(wait_time)}s...',
-                                    'percent': 60,
-                                    'color': 'yellow'
-                                }, args.status_server)
-
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            # Max retries exceeded
-                            raise Exception(f"Rate limit exceeded after {max_retries} retries")
-                    else:
-                        # Non-rate-limit error, raise immediately
-                        raise
-
-        ctx.meta_progress.update(task_id, completed=90, status=f"[{task_color}]saving metadata...[/{task_color}]")
-
-        # Parse and save (simplified - use existing parse logic)
-        parsed = parse_llm_response(analysis)
-
-        # A failed parse used to be written to disk and indexed as if it were fine, so
-        # `type: Unknown` looked like a model that didn't know rather than a parser that
-        # gave up. Say so out loud, record it in the frontmatter, and keep the raw
-        # response — without it, diagnosing a bad parse after the fact is guesswork.
-        parse_problems = degradation_reasons(parsed)
-        parse_status = PARSE_STATUS_DEGRADED if parse_problems else PARSE_STATUS_OK
-        if parse_problems:
-            # Name the model that actually produced this response — including a
-            # rate-limit fallback — since which model degrades is the whole diagnostic.
-            print(f"  {YELLOW}Degraded metadata parse for {full_name}"
-                  f" (model: {analysis_model or get_ai_model()}){RESET}")
-            for problem in parse_problems:
-                print(f"    {YELLOW}- {problem}{RESET}")
-            try:
-                saved_to = save_degraded_response(PRISTINE_DIR, cache_name, analysis)
-                print(f"    {YELLOW}raw response saved (redacted, owner-only) to"
-                      f" {DEGRADED_DIR_NAME}/{saved_to.name}{RESET}")
-            except Exception as exc:
-                print(f"    {YELLOW}could not save raw response: {exc}{RESET}")
-
-        # Build metadata file
-        quick_ref = parsed['quick_ref']
-        brief = parsed['brief']
-        related_repos = parsed['related_repos']
-        main_analysis = parsed['analysis']
-
-        # Build Quick Reference table
-        quick_ref_table = "## Quick Reference\n\n| Property | Value |\n|----------|-------|\n"
-        if 'type' in quick_ref:
-            quick_ref_table += f"| **Type** | {quick_ref['type']} |\n"
-        if 'language' in quick_ref:
-            quick_ref_table += f"| **Language** | {quick_ref['language']} |\n"
-        if 'framework' in quick_ref and quick_ref['framework'].lower() != 'none':
-            quick_ref_table += f"| **Framework** | {quick_ref['framework']} |\n"
-        if 'database' in quick_ref and quick_ref['database'].lower() != 'none':
-            quick_ref_table += f"| **Database** | {quick_ref['database']} |\n"
-        if 'apis' in quick_ref and quick_ref['apis'].lower() != 'none':
-            quick_ref_table += f"| **APIs Exposed** | {quick_ref['apis']} |\n"
-        if 'port' in quick_ref and quick_ref['port'].lower() != 'n/a':
-            quick_ref_table += f"| **Port** | {quick_ref['port']} |\n"
-        if 'dependencies' in quick_ref:
-            quick_ref_table += f"| **Key Dependencies** | {quick_ref['dependencies']} |\n"
-        quick_ref_table += "\n---\n\n"
-
-        metadata_content = f"""---
-repo_name: {full_name.split('/')[-1]}
-full_name: {full_name}
-cache_dir: {cache_name}
-clone_url: {repo_config['clone_url']}
-last_commit: {commit_hash}
-last_updated: {datetime.now().isoformat()}
-brief: {brief}
-type: {quick_ref.get('type', 'Unknown')}
-language: {quick_ref.get('language', 'Unknown')}
-framework: {quick_ref.get('framework', 'None')}
-database: {quick_ref.get('database', 'None')}
-apis: {quick_ref.get('apis', 'None')}
-port: {quick_ref.get('port', 'N/A')}
-related_repos: {json.dumps(related_repos)}
-parse_status: {parse_status}
----
-
-# Repository: {full_name}
-
-{quick_ref_table}{main_analysis}
-"""
-
-        metadata_file = PRISTINE_DIR / f"{cache_name}.md"
-        with open(metadata_file, 'w') as f:
-            f.write(metadata_content)
-
-        # Create symlink
-        repo_name = full_name.split('/')[-1]
-        metadata_symlink = PRISTINE_DIR / f"{repo_name}.md"
-        if metadata_symlink.exists() or metadata_symlink.is_symlink():
-            try:
-                metadata_symlink.unlink()
-            except:
-                pass
-        try:
-            metadata_symlink.symlink_to(f"{cache_name}.md")
-        except Exception:
-            pass
-
-        ctx.meta_progress.update(task_id, completed=100, status=f"[{task_color}]✓ generated (${spent():.4f})[/{task_color}]")
-
-        # Send status update to UI
-        if hasattr(args, 'status_server') and args.status_server:
-            send_status_update('progress', {
-                'repo': full_name, 'short_name': short_id,
-                'status': f'✓ metadata complete (${spent():.4f})',
-                'percent': 100,
-                'color': color
-            }, args.status_server)
-
-        with ctx.stats_lock:
-            ctx.stats['metadata_generated'] += 1
-
-        if ctx.sync_logger:
-            ctx.sync_logger.event(
-                "metadata_generated",
-                repo=full_name,
-                cost=f"${spent():.4f}",
-            )
-
-        return spent()
-
-    except (WeeklyCapRefused, SpendingStopped) as e:
-        # Only admission refuses, before any send, and a Stop between sends is an interruption: nothing is
-        # written, so the previous metadata and its commit stay and a later sync tries again. Not an error, a
-        # retry, a fallback or a degraded record.
-        why = 'sync stopped' if isinstance(e, SpendingStopped) else 'weekly spending limit'
-        ctx.meta_progress.update(task_id, completed=100, status=f"[yellow]\u26a0 skipped: {why}[/yellow]")
-        if hasattr(args, 'status_server') and args.status_server:
-            send_status_update('progress', {
-                'repo': full_name, 'short_name': short_id,
-                'status': f'\u26a0 metadata skipped: {why}',
-                'percent': 100,
-                'color': 'yellow'
-            }, args.status_server)
-        with ctx.stats_lock:
-            ctx.stats['skipped'] = ctx.stats.get('skipped', 0) + 1
-        if ctx.sync_logger:
-            ctx.sync_logger.event("metadata_skipped",
-                                  level=_activity_level("metadata_skipped", is_degraded=True),
-                                  repo=full_name, reason=str(e), cost=f"${spent():.4f}")
-        return spent()
-
-    except InputBudgetUnavailable as e:
-        # Claude's token count was unavailable, so the prompt's size is unverified. Skip rather than
-        # risk an oversized send. Nothing is written: the previous metadata and its commit stay, so
-        # the next sync retries this repo. Not _finish_degraded, which would stamp this commit.
-        ctx.meta_progress.update(task_id, completed=100, status="[yellow]\u26a0 skipped: token count unavailable[/yellow]")
-        if hasattr(args, 'status_server') and args.status_server:
-            send_status_update('progress', {
-                'repo': full_name, 'short_name': short_id,
-                'status': '\u26a0 metadata skipped: token count unavailable',
-                'percent': 100,
-                'color': 'yellow'
-            }, args.status_server)
-        with ctx.stats_lock:
-            ctx.stats['skipped'] = ctx.stats.get('skipped', 0) + 1
-        if ctx.sync_logger:
-            ctx.sync_logger.event("metadata_skipped",
-                                  level=_activity_level("metadata_skipped", is_degraded=True),
-                                  repo=full_name, reason=str(e), cost=f"${spent():.4f}")
-        return spent()
-
-    except Exception as e:
-        import traceback
-
-        full_error = str(e)
-        error_type = type(e).__name__
-        stack_trace = traceback.format_exc()
-
-        # Show more descriptive error for common issues. The type comes first: a rejected reply's
-        # message can contain "429" (its character count) without being a rate limit, and so can a
-        # spending message's dollar amounts.
-        if isinstance(e, (BudgetError, LedgerWriteError, SpendingError)):
-            short_msg = ("Spending limit reached" if isinstance(e, BudgetError) else "Spending record error")
-            detailed_msg = f"""ERROR: {short_msg}
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-The previous metadata was kept. Requests already sent stay counted at their recorded or
-reserved cost; no further request was sent for this repository."""
-        elif isinstance(e, IncompleteResponseError):
-            short_msg = "Incomplete response from model"
-            detailed_msg = f"""ERROR: Incomplete Response
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- The model's reply was empty or cut off, so it wasn't used
-- The previous metadata was kept; the next sync tries this repository again
-
-Stack Trace:
-{stack_trace}"""
-        elif 'NotFoundError' in full_error:
-            short_msg = f"Model not found: {get_ai_model()}"
-            detailed_msg = f"""ERROR: Model Not Found
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- The model name is incorrect or not supported by litellm
-- The model requires a specific API endpoint configuration
-- Check the model name in Settings → AI Model
-
-Stack Trace:
-{stack_trace}"""
-        elif 'AuthenticationError' in full_error or 'API key' in full_error:
-            short_msg = "Invalid API key"
-            detailed_msg = f"""ERROR: Authentication Failed
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- Your API key is invalid or expired
-- The API key doesn't have access to this model
-- Check your API key in Settings → API Configuration
-
-Stack Trace:
-{stack_trace}"""
-        elif 'RateLimitError' in full_error or '429' in full_error:
-            short_msg = "Rate limit exceeded"
-            detailed_msg = f"""ERROR: Rate Limit Exceeded
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Details:
-{full_error}
-
-This usually means:
-- Too many requests to the API
-- Exceeded quota for your API key
-- Try again in a few minutes
-
-Stack Trace:
-{stack_trace}"""
-        else:
-            short_msg = full_error[:50]
-            detailed_msg = f"""ERROR: Metadata Generation Failed
-Repository: {full_name}
-Model: {get_ai_model()}
-Error Type: {error_type}
-
-Full Error:
-{full_error}
-
-Stack Trace:
-{stack_trace}"""
-
-        ctx.meta_progress.update(task_id, completed=100, status=f"[red]✗ {short_msg}[/red]")
-
-        # Send detailed error to status server
-        if hasattr(args, 'status_server') and args.status_server:
-            send_status_update('progress', {
-                'repo': full_name, 'short_name': short_id,
-                'status': f'✗ metadata failed: {short_msg}',
-                'percent': 100,
-                'color': 'red'
-            }, args.status_server)
-
-            # Send detailed error info
-            send_status_update('error', {
-                'repo': full_name,
-                'message': short_msg,
-                'fullError': detailed_msg
-            }, args.status_server)
-
-        # Count as error
-        with ctx.stats_lock:
-            ctx.stats['errors'] += 1
-        counted_error = True
-
-        if ctx.sync_logger:
-            ctx.sync_logger.error(
-                "metadata_failed",
-                repo=full_name,
-                error_type=error_type,
-                detail=full_error,
-                cost=f"${spent():.4f}",
-            )
-
-        return spent()
-    finally:
-        # Completed calls count even when later requests or local processing fail, once each.
-        with ctx.stats_lock:
-            ctx.stats['api_cost'] += spent()
-            if budget is not None and budget.unknown_calls:
-                ctx.stats['unknown_cost_calls'] = ctx.stats.get('unknown_cost_calls', 0) + budget.unknown_calls
-        # Known charges stay (including any a failed write left pending); the rest of its allowance is released.
-        closing = budget.close_spending() if budget is not None else None
-        if closing:
-            # An accounting problem: reported like any other repository error, but counted once.
-            ctx.console.print(f"[red]{full_name}: {closing}; its spending hold stays as it was[/red]")
-            with ctx.stats_lock:
-                if not counted_error:
-                    ctx.stats['errors'] += 1
-            if ctx.sync_logger:
-                ctx.sync_logger.error("spending_record_failed", repo=full_name, error_type="SpendingError",
-                                      detail=closing)
 
 
 def sync_mode(args):
@@ -1549,9 +659,9 @@ def sync_mode(args):
         _terminal('blocked', reason='no_configuration')
         return 1
 
-    # Opt-in to incremental metadata. Read on every run, because an opted-in repository must keep off
-    # the full generator even under --repos-only. A malformed list is a configuration error whenever
-    # metadata is enabled; with metadata off nothing uses it.
+    # Opt-in to incremental metadata: which repositories may update from a diff. Every other repository
+    # is full-only on the same worker. A malformed list is a configuration error whenever metadata is
+    # enabled; with metadata off nothing uses it.
     try:
         args._incremental_repos = incremental_metadata_repos(config)
         args._incremental_full_rebuild_days = incremental_full_rebuild_days(config)
@@ -1583,7 +693,6 @@ def sync_mode(args):
             args._spending.initialize()   # the first normal sync starts the first period
         except SpendingError as e:
             console.print(f"[yellow]Warning: spending record unavailable ({e}); metadata updates won't be sent[/yellow]")
-    incremental_repos = args._incremental_repos
     args._incremental_reported = set()
     args._incremental_index_due = False
 
@@ -1713,7 +822,7 @@ def sync_mode(args):
                     progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would clone[/dim]")
                     time.sleep(0.1)  # Simulate work
                     note = ''
-                    if full_name in incremental_repos and not args.skip_metadata and not getattr(args, 'repos_only', False):
+                    if not args.skip_metadata and not getattr(args, 'repos_only', False):
                         note = '; metadata: full rebuild (new repository)'
                     progress.update(task_id, completed=100, status=f"[{color}]✓ cloned (dry run){note}[/{color}]")
                     return (True, 'cloned', cache_name, None, False, short_id, color)
@@ -1768,9 +877,7 @@ def sync_mode(args):
                 result = run_git_command(['git', 'rev-parse', 'HEAD'], cwd=repo_path, check=False)
                 commit_hash = result.stdout.strip() if result.returncode == 0 else None
 
-                needs_metadata = commit_hash and not args.skip_metadata
-                if full_name in incremental_repos and getattr(args, 'repos_only', False):
-                    needs_metadata = False
+                needs_metadata = bool(commit_hash) and not args.skip_metadata and not getattr(args, 'repos_only', False)
 
                 # If metadata is needed, show as 90% with waiting status
                 if needs_metadata:
@@ -1824,7 +931,7 @@ def sync_mode(args):
                     progress.update(task_id, completed=50, status=f"[dim][DRY RUN] would update[/dim]")
                     time.sleep(0.1)  # Simulate work
                     note = ''
-                    if full_name in incremental_repos and not args.skip_metadata and not getattr(args, 'repos_only', False):
+                    if not args.skip_metadata and not getattr(args, 'repos_only', False):
                         note = f"; metadata: {_dry_run_decision(repo_path, cache_name, full_name, args)}"
                     progress.update(task_id, completed=100, status=f"[{color}]✓ updated (dry run){note}[/{color}]")
                     return (True, 'updated', cache_name, None, False, short_id, color)
@@ -1923,38 +1030,9 @@ def sync_mode(args):
                 result = run_git_command(['git', 'rev-parse', 'HEAD'], cwd=repo_path, check=False)
                 new_commit = result.stdout.strip() if result.returncode == 0 else None
 
-                # Check if metadata needs regeneration
-                needs_metadata = False
-                if full_name in incremental_repos:
-                    # Due work (a weekly rebuild, an unfinished attempt) can exist on an unchanged HEAD,
-                    # so opted-in repositories are always evaluated; the decision may be "nothing".
-                    needs_metadata = bool(new_commit) and not args.skip_metadata and not getattr(args, 'repos_only', False)
-                elif new_commit and not args.skip_metadata:
-                    metadata_file = PRISTINE_DIR / f"{cache_name}.md"
-
-                    # Force regeneration if requested
-                    if args.regenerate_metadata:
-                        needs_metadata = True
-                    # Check if metadata file doesn't exist
-                    elif not metadata_file.exists():
-                        needs_metadata = True
-                    # Check if metadata exists but commit changed
-                    elif metadata_file.exists():
-                        try:
-                            with open(metadata_file, 'r') as f:
-                                content = f.read()
-                                if content.startswith('---'):
-                                    parts = content.split('---', 2)
-                                    if len(parts) >= 3:
-                                        frontmatter = parts[1]
-                                        for line in frontmatter.split('\n'):
-                                            if line.startswith('last_commit:'):
-                                                old_commit_meta = line.split(':', 1)[1].strip()
-                                                if old_commit_meta != new_commit:
-                                                    needs_metadata = True
-                                                break
-                        except Exception:
-                            needs_metadata = True
+                # Due work (an unfinished rebuild owed, a changed tree, a missing document) can exist on an
+                # unchanged HEAD too, so every repository is evaluated; the decision may be "nothing".
+                needs_metadata = bool(new_commit) and not args.skip_metadata and not getattr(args, 'repos_only', False)
 
                 if old_commit and new_commit and old_commit != new_commit:
                     status_msg = f"[{color}]✓ updated ({old_commit[:7]} → {new_commit[:7]})[/{color}]"
@@ -2124,10 +1202,9 @@ Stack Trace:
                         except Exception as e:
                             task_data = futures[future]
                             full_name = task_data[0]['full_name']
-                            if full_name in incremental_repos:
-                                # Same reporting as any other opted-in failure, counted once.
-                                _report_incremental(task_data, _escaped_incremental_outcome(task_data[1], full_name, e),
-                                                    get_ai_model(), args, ctx)
+                            # Same reporting as any other failure, counted once.
+                            _report_incremental(task_data, _escaped_incremental_outcome(task_data[1], full_name, e),
+                                                get_ai_model(), args, ctx)
 
         console.print()
 
@@ -2137,7 +1214,7 @@ Stack Trace:
             regenerate_index(args)
             console.print(f"[green]✓ INDEX.md updated[/green]")
     elif args._incremental_index_due and not args.dry_run:
-        # An opted-in repository failed before its metadata phase: INDEX must say so.
+        # A repository failed before its metadata phase: INDEX must say so.
         regenerate_index(args)
 
     # Summary

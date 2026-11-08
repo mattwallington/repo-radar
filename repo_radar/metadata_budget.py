@@ -8,9 +8,9 @@ provider positively refused without charging (llm.refused_without_charge) gives 
 
 An ordinary incremental attempt has one cap (INCREMENTAL_CAP_USD), and a protected full build another
 (FULL_CAP_USD). The full cap is per attempt: it stops a build before a request that could pass it, and is
-no promise that a repository can be fully built for that much. A legacy full attempt (repositories not
-opted in to incremental metadata) is capped by its own estimate (legacy_allowance). The telehealth pilot
-shares one durable Ledger across runs.
+no promise that a repository can be fully built for that much. A full-only attempt (a repository not opted
+in to incremental metadata) is capped by its own estimate (full_allowance), never more than the full cap.
+The telehealth pilot shares one durable Ledger across runs.
 
 In a normal sync a Budget also carries the production spending context (repo_radar.spending): acquire()
 admits the attempt's whole allowance against the weekly cap before its first send, every reservation is
@@ -34,7 +34,7 @@ from pathlib import Path
 
 INCREMENTAL_CAP_USD = 12.0
 FULL_CAP_USD = 40.0
-LEGACY_MARGIN = 1.25          # a legacy attempt's estimate and local-count requests, on top of list rates
+ESTIMATE_MARGIN = 1.25        # a full-only attempt's estimate, on top of list rates
 
 # Vendor-announced list price rises the pricing table doesn't know yet: model -> (first day of the new
 # price, input, output per token). Google lists Gemini 3.8 Flash at $0.75/$3.75 per million through
@@ -127,23 +127,30 @@ def reliable_cost(cost):
     return isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost > 0
 
 
-def legacy_allowance(model, requests, synthesis=None, now=None):
-    """The whole allowance a legacy full attempt is admitted for, before its first send.
+def full_allowance(rates, requests, synthesis=None):
+    """The whole allowance a full-only attempt is admitted for, before its first send, at the attempt's
+    `rates` (its Budget's rate snapshot).
 
-    `requests` are the prepared sends as (input_tokens, max_output): the one full prompt, or every chunk.
-    `synthesis` is (calls, input_tokens, max_output) for the reduction a chunked build may still need, priced
-    at the bounded synthesis's call ceiling and its complete input and output ceilings, since how much of it
-    runs isn't known yet. Uncached list rates times LEGACY_MARGIN, rounded up to a microdollar, at most
-    FULL_CAP_USD; an estimate that can't be computed is FULL_CAP_USD. An app-side estimate, not a bill bound."""
-    import math
-    rates = rate_snapshot(model, now)
-    if rates is None or not requests or any(tokens is None for tokens, _output in requests):
+    `requests` are the prepared sends as (counted input tokens, max output, reserved input tokens): the one
+    whole-repository request, or every chunk. `synthesis` is (calls, input ceiling, max output, reserved input
+    tokens) for the reduction a chunked build may still need, priced at its call bound and complete input and
+    output ceilings, since how much of it runs isn't known yet. The estimate is ESTIMATE_MARGIN times that
+    total, floored at the largest single reservation any of those sends makes (a local count reserves the
+    model's whole input limit, which can be far more than a small repository's estimate), rounded up to a
+    microdollar and at most FULL_CAP_USD: min(40, max(1.25 * estimate, largest send)). Without rates or counts
+    it is FULL_CAP_USD, which never authorizes an unpriced send. An app-side estimate, not a bill bound."""
+    if rates is None or not requests or any(tokens is None for tokens, _output, _reserve in requests):
         return FULL_CAP_USD
-    total = sum(tokens * rates.input + output * rates.output for tokens, output in requests)
+
+    def cost(tokens, output):
+        return tokens * rates.input + output * rates.output
+    total = sum(cost(tokens, output) for tokens, output, _reserve in requests)
+    largest = max(cost(reserve, output) for _tokens, output, reserve in requests)
     if synthesis:
-        calls, tokens, output = synthesis
-        total += calls * (tokens * rates.input + output * rates.output)
-    return min(FULL_CAP_USD, math.ceil(round(total * LEGACY_MARGIN * 1e6, 3)) / 1e6)
+        calls, tokens, output, reserve = synthesis
+        total += calls * cost(tokens, output)
+        largest = max(largest, cost(reserve, output))
+    return min(FULL_CAP_USD, math.ceil(round(max(total * ESTIMATE_MARGIN, largest) * 1e6, 3)) / 1e6)
 
 
 def request_key(label, request):
