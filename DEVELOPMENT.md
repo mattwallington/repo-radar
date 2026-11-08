@@ -32,7 +32,7 @@ repo-radar/
 │   ├── config.py              # Paths, load/save config
 │   ├── git.py                 # Git operations
 │   ├── files.py               # File collection and filtering
-│   ├── llm.py                 # Model config, chunking, rate limiting
+│   ├── llm.py                 # Model config, prompts, token counting, the one sender
 │   ├── metadata.py            # Response parsing, index generation
 │   ├── ui.py                  # Help text, formatting, status updates
 │   ├── modes/                 # CLI modes (configure, sync, analyze, clean)
