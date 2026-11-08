@@ -1,7 +1,4 @@
-"""File collection and filtering for repository analysis."""
-
-import os
-from repo_radar.git import run_git_command
+"""File filtering for repository analysis."""
 
 
 # Folder names a real source module can have too (an insurance `coverage` module, say): build output only at a
@@ -71,40 +68,3 @@ def should_include_file(file_path, roots=frozenset({''})):
             return True
 
     return False
-
-
-def collect_repo_files(repo_path):
-    """Collect relevant files from a repository for metadata generation."""
-    result = run_git_command(['git', 'ls-files'], cwd=repo_path, check=False)
-    if result.returncode != 0:
-        return []
-
-    files = []
-    max_file_size = 100 * 1024  # 100KB
-
-    for file_path in result.stdout.strip().split('\n'):
-        if not file_path or not should_include_file(file_path):
-            continue
-
-        full_path = repo_path / file_path
-
-        # Check file size
-        try:
-            if full_path.stat().st_size > max_file_size:
-                continue
-        except:
-            continue
-
-        # Read file content
-        try:
-            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                files.append({
-                    'path': file_path,
-                    'size': len(content),
-                    'content': content
-                })
-        except:
-            continue
-
-    return files
