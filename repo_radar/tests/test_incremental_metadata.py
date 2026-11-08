@@ -1743,6 +1743,7 @@ def test_full_only_rebuilds_admit_their_estimate_and_hold_after_failures(monkeyp
     tight = sp.Spending('stable', store=record.store, policy=lambda: (True, week['recorded_usd'] + 0.01))
     refused = attempt(FileCounts(10), trigger='manual', spending=tight)
     assert refused.status == 'skipped' and refused.reason.startswith('Weekly spending limit') and not fake.sends
+    assert 'admitted_usd' not in refused.usage   # nothing was admitted
     assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 2
 
 

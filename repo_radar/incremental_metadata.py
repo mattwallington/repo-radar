@@ -626,8 +626,8 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     build = summary_pipeline.FullBuild(full_name, files, model, session, budget)
     plan = build.prepare()
     allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
-    budget.extra['admitted_usd'] = allowance
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
+    budget.extra['admitted_usd'] = allowance   # only once it was admitted
     text = build.run(plan)
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
