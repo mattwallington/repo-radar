@@ -174,9 +174,8 @@ async def _anthropic_count(model, prompt):
 async def _count_once(model, prompt, timeout_s):
     """One bounded attempt at an authoritative token count via Anthropic's Count Tokens API.
 
-    Uses _completion_messages so the counted message structure is EXACTLY what call_llm will
-    send on the completion path — counting a different shape than what's sent would make the
-    count meaningless. Timeouts, network errors, 408, 429 and 5xx are transient: they return
+    Uses _completion_messages, the single-prompt completion shape, so what is counted is the shape a
+    single-prompt request sends; counting a different shape would make the count meaningless. Timeouts, network errors, 408, 429 and 5xx are transient: they return
     PreflightResult(None, False, reason) with a safe reason naming the failure. A 4xx the provider
     won't change its mind about raises TokenCountRejected (see _anthropic_count). Only
     KeyboardInterrupt/SystemExit are enveloped rather than swallowed, so an operator-initiated
@@ -227,7 +226,7 @@ class PreflightSession:
       * Per-model circuit breaker — the first non-authoritative answer for a model opens the breaker,
         so the rest of the sync skips the (already-known-unavailable) provider call for that model and
         logs it exactly once. With no authoritative count, that model's metadata is skipped for the
-        rest of the sync (llm.InputBudgetUnavailable), not sent on the local estimate. Later calls get
+        rest of the sync (the attempt stops before sending), not sent on the local estimate. Later calls get
         the same result, so its reason survives. Other models are unaffected. A rejected count
         (TokenCountRejected) is an error, not unavailability: it propagates and opens no breaker.
       * Memo — an authoritative count is cached under (model, sha256(canonical_request)) so an

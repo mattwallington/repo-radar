@@ -19,7 +19,7 @@ import threading
 import time
 from collections import namedtuple
 
-from repo_radar.files import should_include_file
+from repo_radar.files import should_include_file, under_build_output
 
 COLLECTOR_MAX_BYTES = 100 * 1024     # files.collect_repo_files skips files larger than this
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
@@ -335,11 +335,11 @@ class GitSnapshot:
         return run_git(self.repo, ['cat-file', 'blob', entry.oid], limit)
 
 
-def collector_eligible(entry):
-    """Whether today's full-generation collector would include this file (path rules and its
+def collector_eligible(entry, roots=frozenset({''})):
+    """Whether the full collector includes this file (path rules, with `roots` the build roots, and its
     100 KiB ceiling). Only regular files count: the pinned reader never follows symlinks."""
     return (entry is not None and entry.mode in REGULAR_MODES
-            and should_include_file(entry.path) and entry.size <= COLLECTOR_MAX_BYTES)
+            and should_include_file(entry.path, roots) and entry.size <= COLLECTOR_MAX_BYTES)
 
 
 def changes_between(repo, base, target, deadline=None):
@@ -379,11 +379,13 @@ def change_fraction(base_manifest, target_manifest, changes):
     a modified file counts once. A change counts both paths of a rename. Returns None when no file is
     eligible at either commit (nothing to analyze incrementally).
     """
-    def eligible_size(entry):
-        return entry.size if collector_eligible(entry) else None
+    roots = build_roots(base_manifest, target_manifest)
 
-    union = {p for p, e in base_manifest.items() if collector_eligible(e)}
-    union |= {p for p, e in target_manifest.items() if collector_eligible(e)}
+    def eligible_size(entry):
+        return entry.size if collector_eligible(entry, roots) else None
+
+    union = {p for p, e in base_manifest.items() if collector_eligible(e, roots)}
+    union |= {p for p, e in target_manifest.items() if collector_eligible(e, roots)}
     if not union:
         return None
 
@@ -435,8 +437,11 @@ LOCKFILE_NAMES = frozenset({
     'composer.lock', 'gemfile.lock', 'cargo.lock', 'poetry.lock', 'pipfile.lock', 'uv.lock', 'pdm.lock', 'go.sum',
     'mix.lock', 'pubspec.lock', 'podfile.lock', 'flake.lock', 'packages.lock.json', 'gradle.lockfile',
 })
-GENERATED_DIRS = frozenset({'node_modules', 'vendor', 'dist', '.next', '.nuxt', '__pycache__', 'pods', '.gradle',
-                            '.terraform', 'coverage'})
+GENERATED_DIRS = frozenset({'node_modules', '.next', '.nuxt', '__pycache__', 'pods', '.gradle', '.terraform'})
+# `vendor`, `dist` and `coverage` are generated only at a build root (files.under_build_output), which is
+# the repository root or a folder holding one of BUILD_MANIFESTS.
+BUILD_MANIFESTS = frozenset({'package.json', 'go.mod', 'composer.json', 'gemfile', 'pyproject.toml', 'setup.py',
+                             'cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'mix.exs', 'pubspec.yaml'})
 GENERATED_SUFFIXES = ('.min.js', '.min.css', '.js.map', '.css.map', '.pb.go', '_pb2.py')
 OVERSIZED_DIFF = 'diff larger than 2 MiB'
 
@@ -445,12 +450,25 @@ Omission = namedtuple('Omission', 'file_id status path reason')
 Page = namedtuple('Page', 'id kind file_ids path size')   # kind: 'diff', or 'omissions' (no model call)
 
 
-def generated_reason(path):
-    """Why a changed path's body isn't worth a model's attention, or None for ordinary files."""
+def build_roots(*manifests):
+    """The lowercased folders that hold a build manifest in any of `manifests`, plus the repository root ('')."""
+    roots = {''}
+    for manifest in manifests:
+        for path in manifest or ():
+            folder, _, name = path.lower().rpartition('/')
+            if name in BUILD_MANIFESTS:
+                roots.add(folder)
+    return roots
+
+
+def generated_reason(path, roots=frozenset({''})):
+    """Why a changed path's body isn't worth a model's attention, or None for ordinary files. `roots` are the
+    build roots (build_roots) where a `vendor`, `dist` or `coverage` folder counts as generated."""
     parts = path.lower().split('/')
     if parts[-1] in LOCKFILE_NAMES:
         return 'lockfile'
-    if any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES):
+    if (any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES)
+            or under_build_output(path, roots)):
         return 'generated or vendored'
     return None
 
@@ -626,6 +644,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
     """
     writer = _PageWriter(spool_dir, base, target, page_bytes, spool_bytes)
     files, omissions = {}, []
+    roots = build_roots(base_manifest, target_manifest)
     for number, c in enumerate(changes, 1):
         if deadline is not None and deadline.left() <= 0:
             raise ResourceLimit('preparing the diff ran out of time')
@@ -635,7 +654,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
         entries = [e for e in (base_manifest.get(c.old_path) if c.old_path else None,
                                target_manifest.get(c.new_path) if c.new_path else None) if e]
         reasons = {omission_reason(e, exclusions) for e in entries} - {None}
-        reason = sorted(reasons)[0] if reasons else generated_reason(label)
+        reason = sorted(reasons)[0] if reasons else generated_reason(label, roots)
         text = None
         if reason is None:
             # A copy's source has its own record if it changed, so its diff isn't repeated here.

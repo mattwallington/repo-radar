@@ -71,10 +71,9 @@ DEFAULT_INCREMENTAL_FAILURE_STOP = 2
 INCREMENTAL_FAILURE_STOP_RANGE = (1, 10)         # whole numbers; 0 is invalid, not "off"
 
 
-def valid_incremental_update_limit(value):
-    """True for a finite JSON number of dollars within range and exactly in whole cents. Bounds come first,
-    so an integer too large for a float is simply out of range."""
-    low, high = INCREMENTAL_UPDATE_LIMIT_RANGE
+def _whole_cents_within(value, low, high):
+    """True for a finite JSON number of dollars within [low, high] and exactly in whole cents. Bounds come
+    first, so an integer too large for a float is simply out of range."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     if isinstance(value, float) and not math.isfinite(value):
@@ -84,6 +83,10 @@ def valid_incremental_update_limit(value):
     # Whole cents: 99.99 and 1.01 round to themselves, 12.000000001 doesn't. menubar/spending-settings.js
     # uses the same test (Number(value.toFixed(2)) === value).
     return isinstance(value, int) or round(value, 2) == value
+
+
+def valid_incremental_update_limit(value):
+    return _whole_cents_within(value, *INCREMENTAL_UPDATE_LIMIT_RANGE)
 
 
 def valid_incremental_failure_stop(value):
@@ -118,6 +121,38 @@ def incremental_spending_policy(config):
         else:
             invalid.append(INCREMENTAL_FAILURE_STOP_FIELD)
     return limit, stop, tuple(invalid)
+
+
+WEEKLY_CAP_ENABLED_FIELD = 'weekly_spend_cap_enabled'
+WEEKLY_CAP_FIELD = 'weekly_spend_cap_usd'
+DEFAULT_WEEKLY_CAP_USD = 75
+WEEKLY_CAP_RANGE = (1, 1000)                     # US dollars, at most two decimal places
+
+
+def valid_weekly_cap(value):
+    return _whole_cents_within(value, *WEEKLY_CAP_RANGE)
+
+
+def weekly_spending_policy(config):
+    """(cap enabled, weekly cap in USD, fields that were invalid). Absent values mean on at $75. Only a
+    literal false turns the cap off; any other enabled value keeps it on and is named as invalid, as is an
+    invalid amount, which falls back to $75."""
+    config = config if isinstance(config, dict) else {}
+    invalid = []
+    enabled, cap = True, float(DEFAULT_WEEKLY_CAP_USD)
+    if WEEKLY_CAP_ENABLED_FIELD in config:
+        value = config[WEEKLY_CAP_ENABLED_FIELD]
+        if isinstance(value, bool):
+            enabled = value
+        else:
+            invalid.append(WEEKLY_CAP_ENABLED_FIELD)
+    if WEEKLY_CAP_FIELD in config:
+        value = config[WEEKLY_CAP_FIELD]
+        if valid_weekly_cap(value):
+            cap = float(value)
+        else:
+            invalid.append(WEEKLY_CAP_FIELD)
+    return enabled, cap, tuple(invalid)
 
 
 def incremental_metadata_repos(config):

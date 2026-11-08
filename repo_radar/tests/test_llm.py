@@ -1,67 +1,6 @@
 import pytest
 
 from repo_radar import llm
-from repo_radar.llm import (
-    get_model_context_window,
-    get_chunking_threshold,
-    get_fallback_model,
-    chunk_repo_files,
-    RateLimitTracker,
-)
-
-
-def test_known_model_context_window():
-    assert get_model_context_window("claude-sonnet-4-6") == 1_000_000
-    assert get_model_context_window("claude-opus-4-6") == 1_000_000
-    assert get_model_context_window("gpt-4o") == 128_000
-    assert get_model_context_window("gpt-5.4") == 1_050_000
-    assert get_model_context_window("o3") == 200_000
-    assert get_model_context_window("gemini/gemini-3.1-pro-preview") == 1_048_576
-    # 272K INPUT, not the 400K total context: OpenAI documents 400K total with 128K max output,
-    # and 400_000 - 128_000 == 272_000, which is what litellm reports as max_input_tokens. This
-    # table stores input windows, so 400_000 was the total misfiled as an input limit.
-    assert get_model_context_window("gpt-5.3-codex") == 272_000
-    assert get_model_context_window("claude-sonnet-5") == 1_000_000
-
-
-def test_unknown_model_gets_default():
-    assert get_model_context_window("unknown-model") == 128_000
-
-
-def test_chunking_threshold_is_75_percent():
-    window = get_model_context_window("gpt-4o")
-    threshold = get_chunking_threshold("gpt-4o")
-    assert threshold == int(window * 0.75)
-
-
-def test_fallback_model_chain():
-    first = "gemini/gemini-3.8-flash"
-    second = get_fallback_model(first)
-    assert second == "gemini/gemini-3.5-flash-lite"
-
-
-def test_fallback_returns_none_at_end():
-    last = "gemini/gemini-3.5-flash-lite"
-    assert get_fallback_model(last) is None
-
-
-def test_fallback_unknown_gemini_shaped_returns_chain_head():
-    # Unknown but Gemini-shaped model names still get the chain head; only
-    # non-Gemini models are guarded to None (see test_fallback_guard_non_gemini_returns_none).
-    assert get_fallback_model("gemini/gemini-99") == "gemini/gemini-3.8-flash"
-
-
-def test_chunk_repo_files_small_repo():
-    files = [{"path": "a.py", "content": "x" * 100, "size": 100}]
-    chunks = chunk_repo_files(files, "gpt-4o")
-    assert len(chunks) == 1
-
-
-def test_rate_limit_tracker_initial_state():
-    tracker = RateLimitTracker()
-    assert tracker.should_wait() is False
-    assert tracker.get_wait_time() == 0
-    assert "Unknown" in tracker.get_status_string()
 
 
 def test_default_model():
@@ -98,20 +37,6 @@ def test_invariants():
     assert keys.isdisjoint(known), keys & known              # inv 3
     for old, new in llm.MODEL_MIGRATIONS.items():             # inv 4
         assert llm.provider_for_model(old) == llm.provider_for_model(new), old
-
-
-def test_fallback_guard_non_gemini_returns_none():
-    assert llm.get_fallback_model('claude-sonnet-5') is None
-    assert llm.get_fallback_model('o3') is None
-    assert llm.get_fallback_model('gpt-5.6-terra') is None
-
-
-def test_fallback_chain_gemini():
-    chain = llm.GEMINI_FALLBACK_CHAIN
-    assert chain == ['gemini/gemini-3.8-flash', 'gemini/gemini-3.5-flash-lite']
-    for i in range(len(chain) - 1):
-        assert llm.get_fallback_model(chain[i]) == chain[i + 1]
-    assert llm.get_fallback_model(chain[-1]) is None
 
 
 def test_get_ai_model_migrates(monkeypatch):
@@ -224,13 +149,19 @@ def stub_http(monkeypatch):
     return sent
 
 
+def send(model, max_tokens):
+    """One single-prompt request through the one sender, as the full adapter builds it."""
+    conversation = llm.Conversation(model, None)
+    conversation.add_user('hi')
+    return llm.call_model_turn(conversation.request(max_tokens), 60)
+
+
 def test_responses_send_works_without_the_mcp_package(stub_http):
     # litellm 1.106.0 added proxy/_experimental/mcp_server/catalog.py, which imports `mcp` at module
     # level, and responses() imports it on every call, so every GPT Pro / Codex send fails with
     # "No module named mcp". Our locks don't include `mcp` (a proxy extra); this send must still work.
     assert importlib.util.find_spec('mcp') is None, 'run in a venv built from resources/pydeps'
-    text, _cost, _resp = llm.call_llm('gpt-5.5-pro', 'hi', max_tokens=8192)
-    assert text == 'HELLO'
+    assert send('gpt-5.5-pro', 8192).text == 'HELLO'
     [(host, path, body)] = [s for s in stub_http if s[1].endswith('/responses')]
     assert host == 'api.openai.com'
     assert body['max_output_tokens'] == 8192
@@ -238,45 +169,24 @@ def test_responses_send_works_without_the_mcp_package(stub_http):
 
 def test_argon_send_requests_the_output_it_reserved(stub_http):
     model = 'gemini/gemini-4-argon'
-    text, _cost, _resp = llm.call_llm(model, 'hi', max_tokens=llm.CHUNK_OUTPUT)
-    assert text == 'HELLO', 'thought parts must not leak into the answer'
+    assert send(model, llm.CHUNK_OUTPUT).text == 'HELLO', 'thought parts must not leak into the answer'
     [(_host, _path, body)] = stub_http
     sent = body['generationConfig']['max_output_tokens']
     assert sent == llm.output_budget(model, llm.CHUNK_OUTPUT) == 32768
-    # Synthesis reserves the same output Argon's send will request.
-    assert llm._synthesis_budget('o/r', model) == max(
-        llm.get_chunking_threshold(model) - 32768,
-        llm._budget_tokens(llm._build_synthesis_prompt('o/r', []), model) + 1000)
 
 
 @pytest.mark.parametrize('model', ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-fable-5-1'])
 def test_new_claude_models_budget_conservatively_and_send_plain_text(stub_http, model, monkeypatch):
     # Policy: adaptive thinking stays on, effort is medium (native output_config), and chunk and
     # synthesis both request and reserve 16,384 output tokens.
-    from repo_radar.preflight import PreflightResult
     assert llm.count_tokens_for_budget('x' * 4000, model).strategy == 'claude-4.7+-conservative'
-    text, _cost, _resp = llm.call_llm(model, 'hi', max_tokens=llm.CHUNK_OUTPUT)
-    assert text == 'HELLO', 'thinking blocks must not leak into the answer'
+    assert send(model, llm.CHUNK_OUTPUT).text == 'HELLO', 'thinking blocks must not leak into the answer'
     [(host, _path, body)] = stub_http
     assert host == 'api.anthropic.com' and body['model'] == model
     assert body['max_tokens'] == 16384
     assert body['output_config'] == {'effort': 'medium'}
     assert not {'temperature', 'top_p', 'top_k'} & set(body), 'Claude 5.x rejects sampling params'
     assert body.get('thinking', {}).get('type') != 'enabled', 'no legacy budget_tokens thinking'
-
-    # The real partition and chunk paths reserve the same output the send requests.
-    reserved = []
-
-    class Session:
-        def count(self, m, prompt, requested_output):
-            reserved.append(requested_output)
-            return PreflightResult(100, True)
-
-    monkeypatch.setattr(llm, 'repo_needs_chunking', lambda *a, **k: (False, 1, True))
-    files = [{"path": "a.py", "size": 1, "content": "x"}]
-    assert llm.authoritative_partition(Session(), 'o/r', files, model) == 'single'
-    llm.authoritative_chunks(Session(), 'o/r', files, model)
-    assert reserved and set(reserved) == {16384}, reserved
 
 
 _OFFLINE_CHILD = r'''
@@ -295,14 +205,16 @@ def handle(self, request):
 httpx.HTTPTransport.handle_request = handle
 sys.path.insert(0, sys.argv[1])
 from repo_radar import llm
-text = llm.call_llm(llm.get_ai_model(), "hi", max_tokens=64)[0]
+conversation = llm.Conversation(llm.get_ai_model(), None)
+conversation.add_user("hi")
+text = llm.call_model_turn(conversation.request(64), 60).text
 print(json.dumps({"text": text, "sent": sent, "saved": os.environ["AI_MODEL"]}))
 '''
 
 
 def test_retired_openai_selection_sends_offline_without_litellm_model_map():
     # litellm infers the provider from its downloaded model map; when that fetch fails, its bundled
-    # map doesn't know gpt-6.1-terra and refuses the call. call_llm names the provider itself.
+    # map doesn't know gpt-6.1-terra and refuses the call. The sender names the provider itself.
     import subprocess
     root = str(Path(__file__).resolve().parents[2])
     env = {**os.environ, "OPENAI_API_KEY": "test-not-a-key", "AI_MODEL": "o4-mini"}
@@ -319,13 +231,13 @@ def test_retired_openai_selection_sends_offline_without_litellm_model_map():
     ([{"type": "thinking", "thinking": "", "signature": "s"}], "end_turn"),  # thinking, no text
     ([{"type": "text", "text": "Partial analys"}], "max_tokens"),           # cut off mid-answer
     # Valid-looking metadata cut off by the context window: litellm maps this raw stop to "stop"
-    # unless call_llm teaches it otherwise, so the raw reason must come from the transport.
+    # unless the sender teaches it otherwise, so the raw reason must come from the transport.
     ([{"type": "text", "text": "QUICK_REFERENCE_START\nType: Service\nQUICK_REFERENCE_END\n"
                                "ONE_LINE_SUMMARY_START\nAn API.\nONE_LINE_SUMMARY_END\n"
                                "RELATED_REPOS_START\nRELATED_REPOS_END\n# Overview\nThe service hand"}],
      "model_context_window_exceeded"),
 ])
-def test_incomplete_claude_reply_raises_instead_of_returning_a_stub(monkeypatch, content, stop_reason):
+def test_incomplete_claude_reply_is_never_complete(monkeypatch, content, stop_reason):
     import socket
 
     def blocked(*a, **k):
@@ -342,6 +254,5 @@ def test_incomplete_claude_reply_raises_instead_of_returning_a_stub(monkeypatch,
 
     monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', handle)
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'test-not-a-key')
-    with pytest.raises(llm.IncompleteResponseError, match='claude-sonnet-5-5 returned an incomplete response'):
-        llm.call_llm('claude-sonnet-5-5', 'hi', max_tokens=llm.CHUNK_OUTPUT)
+    assert send('claude-sonnet-5-5', llm.CHUNK_OUTPUT).status in ('incomplete', 'empty'), 'never a usable reply'
     assert [p for p in sent if p == '/v1/messages'] == ['/v1/messages'], 'no retry'

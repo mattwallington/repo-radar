@@ -11,7 +11,21 @@ const spending = require('../spending-settings');
 const SPENDING_INPUTS = {
     [spending.LIMIT_FIELD]: 'incremental-update-limit',
     [spending.STOP_FIELD]: 'incremental-failure-stop',
+    [spending.WEEKLY_ENABLED_FIELD]: 'weekly-cap-enabled',
+    [spending.WEEKLY_CAP_FIELD]: 'weekly-cap',
 };
+
+// "Spend this week": read on open and focus, after a successful Save and when a sync finishes. Never
+// polled; any failure reads as unavailable, never as $0.
+function refreshWeeklySpend() {
+    const line = document.getElementById('weekly-spend');
+    ipcRenderer.invoke('spending-summary:get')
+        .then((summary) => { line.textContent = spending.spendLine(summary); })
+        .catch(() => { line.textContent = spending.spendLine(null); });
+}
+
+ipcRenderer.on('spending-changed', refreshWeeklySpend);
+window.addEventListener('focus', refreshWeeklySpend);
 
 // Handle config loaded
 ipcRenderer.on('config-loaded', (event, config) => {
@@ -43,6 +57,8 @@ window.addEventListener('DOMContentLoaded', () => {
     
     // Request version info
     ipcRenderer.send('get-version');
+
+    refreshWeeklySpend();
 });
 
 // Handle save result
@@ -52,6 +68,7 @@ ipcRenderer.on('config-saved', (event, success, error, field, notice) => {
         return;
     }
     if (success) {
+        refreshWeeklySpend();
         showNotification(notice || 'Settings saved successfully!', 'success');
         // Close window after a short delay, a little longer when there is a notice to read
         setTimeout(() => {
@@ -119,6 +136,8 @@ function renderSpendingSettings() {
     const effective = spending.effectiveSpending(configData);
     document.getElementById(SPENDING_INPUTS[spending.LIMIT_FIELD]).value = spending.formatLimit(effective.limitUsd);
     document.getElementById(SPENDING_INPUTS[spending.STOP_FIELD]).value = String(effective.failureStop);
+    document.getElementById(SPENDING_INPUTS[spending.WEEKLY_ENABLED_FIELD]).checked = effective.weeklyEnabled;
+    document.getElementById(SPENDING_INPUTS[spending.WEEKLY_CAP_FIELD]).value = spending.formatLimit(effective.weeklyCapUsd);
     const rebuild = spending.rebuildIntervalText(configData);
     document.getElementById('rebuild-interval-text').textContent = rebuild ? ` ${rebuild}` : '';
     clearFieldErrors();
@@ -485,6 +504,8 @@ document.getElementById('save-btn').addEventListener('click', () => {
     const spendingValues = {
         [spending.LIMIT_FIELD]: spending.parseLimitInput(document.getElementById(SPENDING_INPUTS[spending.LIMIT_FIELD]).value),
         [spending.STOP_FIELD]: spending.parseStopInput(document.getElementById(SPENDING_INPUTS[spending.STOP_FIELD]).value),
+        [spending.WEEKLY_ENABLED_FIELD]: document.getElementById(SPENDING_INPUTS[spending.WEEKLY_ENABLED_FIELD]).checked,
+        [spending.WEEKLY_CAP_FIELD]: spending.parseLimitInput(document.getElementById(SPENDING_INPUTS[spending.WEEKLY_CAP_FIELD]).value),
     };
     const invalid = spending.validateSpending(spendingValues);
     if (invalid) {

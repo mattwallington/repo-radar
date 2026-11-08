@@ -95,7 +95,7 @@
                         <option value="gpt-5.3-codex">GPT-5.3 Codex (retires Apr 1, 2027)</option>
                     </optgroup>
                 </select>
-                <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Opted-in repositories send every full-rebuild request at up to 128K tokens (less if the model's limit is lower); other repositories' full builds still chunk at about 75% of the model's context. OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
+                <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Every full-rebuild request is sent at up to 128K tokens (less if the model's limit is lower), for every repository. OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
             </div>
         </div>
 
@@ -112,6 +112,24 @@
                 <input type="text" inputmode="numeric" id="incremental-failure-stop" class="form-control spending-input" placeholder="2">
                 <small class="form-help">Scheduled syncs stop buying summary updates for a repository that keeps failing; Git fetching carries on. Sync Now can still retry; an incremental retry stays within the limit above. A whole number from 1 to 10.</small>
                 <small class="form-help form-error" id="incremental-failure-stop-error" hidden></small>
+            </div>
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="weekly-cap-enabled">
+                    Limit weekly spending
+                </label>
+                <small class="form-help form-error" id="weekly-cap-enabled-error" hidden></small>
+            </div>
+            <div class="form-group">
+                <label for="weekly-cap">Weekly spending limit (USD)</label>
+                <input type="text" inputmode="decimal" id="weekly-cap" class="form-control spending-input" placeholder="75">
+                <small class="form-help">The most summary updates and rebuilds may commit in one week, for stable and dev builds together. An update whose whole allowance doesn't fit what is left is skipped before any model call and the current summary is kept. $1 to $1,000. When the limit is off, spending is still recorded and each update keeps its own limit.</small>
+                <small class="form-help form-error" id="weekly-cap-error" hidden></small>
+            </div>
+            <div class="form-group">
+                <label id="weekly-spend-label">Spend this week</label>
+                <div class="form-help" id="weekly-spend" aria-labelledby="weekly-spend-label" aria-live="polite">Reading…</div>
+                <small class="form-help">Recorded charges, plus amounts held for updates that are running or whose cost is unknown. Each update counts toward the week it started in, even if it finishes after Monday 00:00 UTC. Stopping a sync releases what its updates didn't use, except for requests already sent, which stay held because they may still be charged. These are the app's estimates from list prices, not your provider's bill.</small>
             </div>
         </div>
 

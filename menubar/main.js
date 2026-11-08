@@ -18,6 +18,7 @@ const { planReconcile, needsCatchUp, completionQualifies, SCHEDULING_CHANNEL,
         EXIT_SKIPPED_NO_WORK } = require('./run-receipt');
 const { createModelNoticeController } = require('./model-notice-controller');
 const { parseModelLabels, persistConfig, saveSettings, sameSchedule } = require('./model-notice');
+const { readSpendingSummary, summaryRunner, writePrivateFileAtomic, UNAVAILABLE: SPEND_UNAVAILABLE } = require('./spending-summary');
 // Activity History (Task 2.3): Electron-free trigger-glue wired into triggerSync()/stop-sync
 // below, plus the quota module (for the one-time startup reconcile-all delegation to Python).
 const activityGlue = require('./activity/trigger-glue');
@@ -1789,6 +1790,8 @@ function triggerSync({ showWindow = true, trigger = null, notBefore = null } = {
           currentSyncProcess = null;
           syncCancelledByUser = false;
           stopIconAnimation();
+          // An open Settings window re-reads the week's spend now that this sync's attempts are closed.
+          if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.webContents.send('spending-changed');
           // Activity History (Task 5.2 / Ruling P5-4): retention runs FIRST, before the refresh +
           // rebuild below. `_spawnPythonRetain` is `spawnSync` -- retention has already finished
           // deleting by the time it returns -- so refreshing first would let the cache name an
@@ -2357,9 +2360,9 @@ function saveConfigToFile(config) {
     // the umask and land 0644; and because overwriting preserves the existing mode, a file
     // already created 0644 by an older build would stay world-readable forever. Hence both:
     // the mode for creation, and an explicit chmod that also tightens pre-existing files.
-    // (Same belt-and-braces treatment as the LaunchAgent writer below.)
-    fs.writeFileSync(configFile, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
-    fs.chmodSync(configFile, 0o600);
+    // (Same belt-and-braces treatment as the LaunchAgent writer below.) The write is atomic too: a sync
+    // reads the weekly spending settings from this file at each admission and must never see half of it.
+    writePrivateFileAtomic(configFile, JSON.stringify(toWrite, null, 2));
     return { success: true, scheduleKept };
   } catch (e) {
     console.error('Error saving config:', e);
@@ -2614,6 +2617,13 @@ ipcMain.on('save-config', (event, config) => {
       updateTrayMenu();
     }, 500);
   }
+});
+
+// The weekly spend readout for Settings: Python's own aggregate, read with this channel's verified runtime
+// and nothing else (no sync runner, provisioning or credentials). Unavailable whenever that can't run.
+ipcMain.handle('spending-summary:get', () => {
+  if (!runtimeChannel || runtimeDisabled) return SPEND_UNAVAILABLE;
+  return readSpendingSummary(summaryRunner(layout(os.homedir(), runtimeChannel).current, os.homedir(), runtimeChannel));
 });
 
 // Get version info handler

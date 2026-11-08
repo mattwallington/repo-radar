@@ -1,11 +1,13 @@
-"""Incremental metadata for opted-in repositories (config `incremental_metadata_repos`).
+"""Metadata for every repository: one decision, one worker, one publication path.
 
-Each document records the commit it was built from. A later sync updates it from that commit: the
-model summarizes each page of the diff, the notes are merged, and a final editor returns section edits
-that the app validates and applies. A full rebuild still happens weekly, when the model or policy
-changes, or when the baseline cannot be used; it reads the pinned source in chunks of at most 128,000
-input tokens and is capped at $25 per attempt. Both run on the shared summary_pipeline. Every other
-repository keeps the existing full-generation path unchanged.
+Each document records the commit it was built from. For a repository opted in to incremental updates
+(config `incremental_metadata_repos`), a later sync updates it from that commit: the model summarizes
+each page of the diff, the notes are merged, and a final editor returns section edits that the app
+validates and applies. A full rebuild happens weekly, when the model or policy changes, or when the
+baseline cannot be used. Every other repository is full-only: rebuilt in full when its tracked tree
+changes, with no weekly rebuild. A full rebuild reads the pinned source in requests of at most 128,000
+input tokens and is capped at $40 per attempt (a full-only one at its own estimate). Both run on the
+shared summary_pipeline.
 
 A failure never replaces a good document: it stays as it was, and INDEX marks it stale.
 """
@@ -244,8 +246,8 @@ def prepare_diff(repo_path, doc, base, target, spool_dir, deadline=None):
 
 
 def decide(repo_path, full_name, doc, state, model, target, now, force=False,
-           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, deadline=None):
-    """Choose 'full', 'incremental' or 'none' for an opted-in repository at commit `target`.
+           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, deadline=None, allow_incremental=True):
+    """Choose 'full', 'incremental' or 'none' for a repository at commit `target`.
 
     Pure apart from read-only Git: no model calls, token counts or state writes, so dry runs can
     report it. Rules, in order: a forced or unusable baseline, a changed model or policy, an
@@ -254,8 +256,13 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     anything else is incremental. How much changed picks the amount of work, never a full rebuild;
     the fraction changed is only a diagnostic. Listing the changes shares `deadline` with the rest of the
     attempt; running out raises snap.ResourceLimit rather than selecting anything.
+
+    Without `allow_incremental` (a repository not opted in to incremental updates) the same baseline checks
+    apply, there is no age-triggered rebuild, and a changed tree means full, with no diff listed.
     """
     deadline = deadline or snap.Deadline(ATTEMPT_SECONDS)
+    if not allow_incremental:
+        full_rebuild_days = 0
 
     def full(reason, change=None, built=None, adopt=None):
         return Decision('full', reason, None, target, built, None, change, adopt)
@@ -286,6 +293,8 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     if base_snap.tree_id() == target_snap.tree_id():
         return Decision('none', 'no tracked change since the analyzed commit', base, target, built,
                         full_model, None, adopt)
+    if not allow_incremental:
+        return full('the tracked tree changed', built=built, adopt=adopt)
     changes = snap.changes_between(repo_path, base, target, deadline)
     change = snap.change_fraction(base_snap.manifest(), target_snap.manifest(), changes)
     reason = f"{change.fraction:.1%} of the source changed" if change else 'the tracked tree changed'
@@ -566,8 +575,10 @@ def pinned_files(snapshot, exclusions):
     outside_selection counts tracked files the collector's extension and size rules leave out.
     """
     files, omitted, outside = [], [], 0
-    for path, entry in sorted(snapshot.manifest().items()):
-        if not snap.collector_eligible(entry):
+    manifest = snapshot.manifest()
+    roots = snap.build_roots(manifest)
+    for path, entry in sorted(manifest.items()):
+        if not snap.collector_eligible(entry, roots):
             outside += 1
             continue
         reason = snap.omission_reason(entry, exclusions)
@@ -583,7 +594,8 @@ def pinned_files(snapshot, exclusions):
     return files, omitted, outside
 
 
-def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited):
+def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited,
+             estimate_allowance=False):
     """A complete document built from the pinned commit by the shared summary pipeline's full adapter
     (summary_pipeline.FullBuild), with the existing full-generation prompts and output format. Never written
     directly: the caller publishes it. `inherited` is the previous document's credential exclusions
@@ -593,7 +605,12 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     On Gemini, thinking and the visible answer share the output limit, so every call asks for low thinking
     in the counted request, leaving more room to answer; that makes truncation less likely, not impossible.
     A truncated reply is still rejected, with nothing retried. budget.extra['full_stage'] says which call was
-    last attempted and how it ended: set before each send, finished after its settlement."""
+    last attempted and how it ended: set before each send, finished after its settlement.
+
+    The build's first stage is prepared (counted and fitted, nothing sent) before the attempt is admitted
+    against the weekly cap, and that same plan is what's sent. An opted-in repository's rebuild is admitted for
+    the whole full cap; with `estimate_allowance` (a full-only repository) it is admitted for the plan's own
+    estimate (FullBuild.allowance), which is also its hard limit."""
     from repo_radar import summary_pipeline
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
@@ -607,7 +624,13 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     if not files:
         raise StaleUpdate("no analyzable source")
     budget.extra['pipeline_version'] = PIPELINE_VERSION
-    text = summary_pipeline.FullBuild(full_name, files, model, session, budget).run()
+    from repo_radar.metadata_budget import FULL_CAP_USD
+    build = summary_pipeline.FullBuild(full_name, files, model, session, budget)
+    plan = build.prepare()
+    allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
+    budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
+    budget.extra['admitted_usd'] = allowance   # only once it was admitted
+    text = build.run(plan)
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
     if problems or not parsed['analysis'].strip():
@@ -726,22 +749,29 @@ def _cleared_setup_failure(state, now):
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
                       missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None,
-                      trigger='manual', update_limit_usd=None, failure_stop=None):
-    """Decide and, when needed, update one opted-in repository's metadata. Never raises an Exception:
+                      trigger='manual', update_limit_usd=None, failure_stop=None, spending=None,
+                      allow_incremental=True):
+    """Decide and, when needed, update one repository's metadata. Never raises an Exception:
     every failure, from reading the baseline to the last state write, keeps the previous document,
     is recorded when storage allows, and comes back as a failed or skipped Outcome. Outcome.state_error
     says when the attempt record couldn't be saved. `missing_credential` names the provider key
     variable when it isn't set; that fails a due update before any count or send. `trigger` is who started
     this sync, which decides whether a repository held after repeated failures may try again (held_reason).
     `update_limit_usd` caps one incremental update and `failure_stop` is the hold threshold, both from Settings;
-    a missing or invalid value means the default ($12 and 2), never no limit."""
+    a missing or invalid value means the default ($12 and 2), never no limit. `spending` is a normal sync's
+    production spending context (repo_radar.spending.Spending): the attempt's whole allowance is admitted
+    against the weekly cap before its first send and closed when it ends. Without it, nothing is recorded.
+
+    `allow_incremental` is whether the repository is opted in to incremental updates. Without it the update is
+    full-only: no weekly rebuild, a changed tree is rebuilt in full, and the rebuild is admitted for its own
+    estimate (FullBuild.allowance) rather than the whole full cap."""
     import time
     import uuid
     from repo_radar.metadata import write_text_atomic, render_metadata_document
     from repo_radar.config import valid_incremental_failure_stop, valid_incremental_update_limit
     from repo_radar.metadata_budget import Budget, FULL_CAP_USD, INCREMENTAL_CAP_USD
-    from repo_radar.llm import InputBudgetUnavailable, IncompleteResponseError
     from repo_radar.preflight import TokenCountRejected
+    from repo_radar.spending import SpendingError, SpendingStopped, WeeklyCapRefused
 
     started = time.monotonic()
     deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)   # selection, preparation and sends share it
@@ -751,12 +781,15 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
     committed = False
     update_limit = float(update_limit_usd) if valid_incremental_update_limit(update_limit_usd) else INCREMENTAL_CAP_USD
     failure_stop = int(failure_stop) if valid_incremental_failure_stop(failure_stop) else HOLD_AFTER_FAILURES
+    if not allow_incremental:
+        full_rebuild_days = 0   # an implementation move gives these repositories no new rebuild schedule
 
     def finish(status, reason, counts=True):
         """`counts=False` is for a known setup failure before anything is sent: it is reported as failed, but
         the streak keeps its count, its last counted failure and any full-rebuild debt."""
         reason = safe_reason(reason)
         after = None
+        closing = budget.close_spending() if budget else None   # known charges stay; the unused rest is released
         if committed and status != 'published':
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
@@ -777,6 +810,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             state_error = _try_write_state(pristine_dir, cache_name, attempt)
         if after:
             state_error = safe_reason(f"after publishing: {after}" + (f"; {state_error}" if state_error else ''))
+        if closing:
+            state_error = safe_reason(closing + (f"; {state_error}" if state_error else ''))
         return Outcome(status, decision.strategy if decision else None, reason, decision.base if decision else None,
                        target, usage, time.monotonic() - started, state_error)
 
@@ -788,7 +823,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         if target is None:
             return finish('failed', 'the repository has no commit')
         decision = decide(repo_path, full_name, doc, state, model, target, now, force=force,
-                          full_rebuild_days=full_rebuild_days, deadline=deadline)
+                          full_rebuild_days=full_rebuild_days, deadline=deadline, allow_incremental=allow_incremental)
         if decision.adopt:
             state = {**state, 'adoption': decision.adopt}
         if decision.strategy == 'none':
@@ -830,7 +865,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         log(f"{decision.strategy}: {decision.reason}")
 
         cap = update_limit if decision.strategy == 'incremental' else FULL_CAP_USD
-        budget = Budget(model, cap=cap, label=decision.strategy)
+        budget = Budget(model, cap=cap, label=decision.strategy, spending=spending, owner=full_name)
         if missing_credential:   # setup, not a bought failure: it doesn't move the streak toward a hold
             return finish('failed', f"no API key: {missing_credential} is not set", counts=False)
 
@@ -839,7 +874,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                                                                 budget, log=log, deadline=deadline)
         else:
             candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
-                                                  baseline=document_commit(repo_path, doc), inherited=inherited)
+                                                  baseline=document_commit(repo_path, doc), inherited=inherited,
+                                                  estimate_allowance=not allow_incremental)
         # Publish only what was built from exactly this document and this commit.
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:
@@ -872,15 +908,23 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('published', None)
     except StaleUpdate as e:
         return finish('skipped' if e.warning else 'failed', e.reason)
+    except SpendingStopped:
+        # Stop arrived between sends: an interruption like any other Stop, not a failure that moves the streak.
+        return finish('skipped', 'the sync was stopped')
+    except WeeklyCapRefused as e:
+        # Only admission refuses, before any send: the previous document, failure count, last counted failure
+        # and any full-rebuild obligation all stay. No retry, fallback or other strategy follows.
+        return finish('skipped', str(e))
+    except SpendingError as e:   # an accounting problem, never a refusal; before any send it isn't a bought failure
+        return finish('failed', f"spending record: {e}", counts=bool(budget and budget.calls))
     except snap.ResourceLimit as e:   # from selection or a full build's discovery: no fallback, no partial list
         return finish('skipped', str(e))
-    except InputBudgetUnavailable as e:
-        return finish('skipped', f"token count unavailable: {e}")
     except TokenCountRejected as e:
-        return finish('failed', str(e))
-    except IncompleteResponseError as e:
         return finish('failed', str(e))
     except snap.GitError as e:
         return finish('failed', f"git: {e}")
     except Exception as e:  # a provider, transport or storage error; its type and a bounded message
         return finish('failed', f"{type(e).__name__}: {e}")
+    finally:   # an interrupt that skipped finish still closes the allowance (closing twice changes nothing)
+        if budget is not None:
+            budget.close_spending()

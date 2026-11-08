@@ -16,7 +16,7 @@ Repo Radar clones your configured repos into `~/repos-pristine/` (configurable),
 - **Auto-updates** — the app checks for new versions and offers one-click updates
 - **Copy LLM Config** — one-click copy of the config snippet for CLAUDE.md / AGENTS.md
 - **Smart chunking** for large repos with model-aware context window management
-- **Rate limit handling** with automatic fallback and UI display
+- **Spending limits** per update and per week, with each request's worst case reserved before it is sent
 - **Clean uninstall** — tray menu option to remove all config, logs, and scheduled tasks
 
 ## Install

@@ -260,21 +260,41 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
     ctx, _events = _ctx()
     task = (REPO_CONFIG, 'app-abc1234', base, 'app', 'cyan', 1)
-    monkeypatch.setattr(S.time, 'sleep', lambda s: None)
-    legacy_calls = []
-    monkeypatch.setattr(S, 'collect_repo_files', lambda path: legacy_calls.append(path) or [])
-    incremental_calls = []
+    calls = []
     real_update = im.update_repository
-    monkeypatch.setattr(im, 'update_repository', lambda *a, **k: incremental_calls.append(a) or
+    monkeypatch.setattr(im, 'update_repository', lambda *a, **k: calls.append(k['allow_incremental']) or
                         im.Outcome('none', 'none', 'unchanged', base, base, {}, 0.0))
 
-    # A repository that isn't opted in still takes the full generator; an opted-in one never does.
+    # Every repository takes the one shared worker; only an opted-in one may update from a diff.
     S.generate_repo_metadata(task, None, _sync_args(), ctx)
-    assert legacy_calls and not incremental_calls
-    legacy_calls.clear()
     S.generate_repo_metadata(task, None, _sync_args(_incremental_repos=frozenset({FULL})), ctx)
-    assert incremental_calls and not legacy_calls
+    assert calls == [False, True]
     monkeypatch.setattr(im, 'update_repository', real_update)
+
+    # Full-only: a healthy legacy document at the same tree is adopted with nothing bought, even when it is
+    # old enough for a weekly rebuild; a changed tree is rebuilt in full, without listing a diff.
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'full-only', updated=NOW - timedelta(days=30))
+    with monkeypatch.context() as m:
+        m.setattr(snap, 'changes_between', lambda *a, **k: pytest.fail('a full-only decision listed a diff'))
+        d = decide(repo, pristine, allow_incremental=False)
+        assert (d.strategy, d.adopt['configured_model']) == ('none', MODEL)
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+        d = decide(repo, pristine, allow_incremental=False)
+        assert (d.strategy, d.reason) == ('full', 'the tracked tree changed')
+
+    # Its rebuild publishes through the common path, which keeps the <repo>.md alias.
+    seen = {}
+
+    def built(*a, estimate_allowance, **k):
+        seen['estimate'] = estimate_allowance
+        doc = im.load_document(pristine, 'app-abc1234')
+        return im.Candidate('## Overview\nRebuilt.\n', im.current_fields(doc), None, [], 0, snap.NO_EXCLUSIONS)
+    with PreflightSession() as session:
+        rebuilt = update(pristine, repo, session, allow_incremental=False, run_full_fn=built)
+    assert (rebuilt.status, rebuilt.strategy, seen['estimate']) == ('published', 'full', True), rebuilt
+    alias = pristine / 'app.md'
+    assert alias.is_symlink() and os.readlink(alias) == 'app-abc1234.md' and 'Rebuilt.' in alias.read_text()
     repo, base, pristine = setup_pristine(monkeypatch, tmp_path / 'b')
 
     # The legacy document is adopted (no paid bootstrap); an unchanged tree needs nothing.
@@ -988,8 +1008,11 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
         real_init(self, *args, **kwargs)
         self.evidence_dir = evidence
     monkeypatch.setattr(mr.Pipeline, '__init__', keeping_evidence)
+    from repo_radar import spending as sp
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     with PreflightSession() as session:
-        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                       spending=record)
     assert outcome.status == 'published', outcome
 
     # Every page was mapped exactly once, at most four at a time, and each request stayed bounded.
@@ -1009,6 +1032,12 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     assert sum(int(n) for n in re.findall(r'"covers_pages":(\d+)', edits[0][0])) == len(maps)
     assert usage['estimated_total_usd'] > usage['known_cost_usd'] > 0
     assert usage['rate_input_per_mtok'] == 0.75
+    # In a normal sync the update held exactly its quote, not the $12 limit, and closed at its known cost.
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert abs(attempt['allowance'] - sp.to_micro(usage['estimated_total_usd'])) <= 1
+    assert attempt['allowance'] < 12_000_000 and attempt['status'] == 'closed'
+    week = sp.summary(record.store, record.policy)
+    assert week['recorded_usd'] == pytest.approx(usage['known_cost_usd'], abs=1e-4) and week['reserved_usd'] == 0
 
     # Every merge and editor request names each cited file's real status and paths.
     changes = snap.changes_between(repo.path, base, target)
@@ -1072,9 +1101,9 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     for key, total in (('normalized_file_citations', 2), ('dropped_file_citations', 6)):
         assert usage[key] == sum(c.get(key, 0) for c in saved['calls']) == total
 
-    # Notes stay strict about their shape, sections and size: a wrong or missing field, an empty string, an
-    # unknown section, or a note over its limit as written, even one that dropping citations would shrink.
-    # An unknown file is dropped rather than refused.
+    # Notes stay strict about their shape and size: a wrong or missing field, an empty string, or a note over
+    # its limit as written, even one that dropping citations or sections would shrink. An unknown file or
+    # section is dropped rather than refused.
     long_path = 'src/' + 'p' * 400 + '.py'
     paths = {long_path: 'f1'}
     for bad in ({'changes': [], 'questions': 'x', 'no_summary_change_reason': 'r'},
@@ -1082,13 +1111,18 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
                 {'changes': [{'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
                 {'changes': [{'files': 'f1', 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
                 {'changes': [{'files': [''], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
-                {'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}], 'no_summary_change_reason': None},
+                {'changes': [{'files': ['f1'], 'what': 'w' * 3000, 'sections': ['s9']},
+                             {'files': ['f1'], 'what': 'w', 'sections': ['s1']}], 'no_summary_change_reason': None},
                 {'changes': [{'files': [long_path], 'what': 'w' * 2800, 'sections': []}], 'no_summary_change_reason': None}):
         with pytest.raises(mr.NoteError):
             mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
     note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
                                             ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
     assert note['changes'][0]['files'] == [] and repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_file_citations': 1}
+    note, _text, repairs = mr.validate_note({'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}]},
+                                            ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
+    assert note['changes'] == [{'files': ['f1'], 'what': 'w', 'sections': []}]
+    assert repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_sections': 1}
 
 
 def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatch, tmp_path):
@@ -1172,9 +1206,10 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
 
 
-def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkeypatch, tmp_path):
+def test_a_change_naming_unknown_sections_is_repaired_not_the_whole_update(monkeypatch, tmp_path):
     """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
-    whole update failed. Now that change is dropped and counted; the note's other change still lands."""
+    whole update failed. Now those ids are dropped and counted, and the change reaches the editor without a
+    section, next to the note's other change."""
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     repo.write('src/m0.py', 'changed = True\n')
     repo.commit('one change')
@@ -1196,9 +1231,9 @@ def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkey
         outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
     assert outcome.status == 'published', outcome
     editor = fake.stage('edit')[0][0]
-    assert 'm0 records a change' in editor and 'UNPLACED' not in editor and mr.SECTION_WARNING in editor
+    assert 'm0 records a change' in editor and 'UNPLACED change' in editor and mr.SECTION_WARNING in editor
     usage = outcome.usage
-    assert (usage['normalized_sections'], usage['dropped_sections'], usage['dropped_changes']) == (1, 2, 1)
+    assert (usage['normalized_sections'], usage['dropped_sections']) == (1, 2) and 'dropped_changes' not in usage
     new = im.load_document(pristine, 'app-abc1234')
     assert 'm0 now records a change' in new.text and mr.SECTION_WARNING in new.info['coverage_note']
 
@@ -1295,7 +1330,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     def reply(stage, text):
         assert stage == 'map'
         if '[page p2 ' in text:
-            return httpx.Response(503, json={"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+            return httpx.Response(500, json={"error": {"message": "internal", "status": "INTERNAL"}})
         return {'changes': [], 'no_summary_change_reason': 'routine'}
     fake = GeminiFake(monkeypatch, reply)
     with PreflightSession() as session:
@@ -1316,7 +1351,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     fake.sends.clear()
     decision = decide(repo, pristine, model=GEMINI)
     evidence = tmp_path / 'evidence'
-    with PreflightSession() as session, pytest.raises(Exception, match='overloaded|UNAVAILABLE|503'):
+    with PreflightSession() as session, pytest.raises(Exception, match='internal|INTERNAL|500'):
         im.run_incremental(repo.path, FULL, old, decision, GEMINI, session, budget, case='c1', evidence_dir=evidence)
     assert len(fake.sends) == 4
     reopened = Ledger(path, 40.0, allowances)
@@ -1333,7 +1368,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     def mostly_fine(stage, text):
         assert stage == 'map'
         if '[page p3 ' in text:
-            return {'changes': [{'files': [], 'what': 'a section it was never given', 'sections': ['s999']}]}
+            return {'changes': [{'files': [], 'what': 'a change with no sections key'}]}   # malformed: refused
         return {'changes': [], 'no_summary_change_reason': 'routine'}
     fake = GeminiFake(monkeypatch, mostly_fine)
     real_settle, failures = Ledger.settle, []
@@ -1420,8 +1455,9 @@ def gemini_text(text, prompt_tokens=100, finish='STOP'):
                           "totalTokenCount": prompt_tokens + 20}})
 
 
-def full_build(pristine, repo, session, model=GEMINI):
-    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW)
+def full_build(pristine, repo, session, model=GEMINI, **kw):
+    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, model, session, force=True, now=NOW,
+                                **kw)
 
 
 def test_a_truncated_full_synthesis_is_rejected_with_low_thinking_and_says_where(monkeypatch, tmp_path):
@@ -1462,7 +1498,7 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     old = im.load_document(pristine, 'app-abc1234')
     counts = FileCounts(50_000)   # two files to a chunk: five chunks, each counted far below the catalog bound
     rate_in, rate_out = Budget(GEMINI).price   # the prices this attempt uses, whatever the date
-    expensive = round((8.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $24.60
+    expensive = round((13.2 - 20 * rate_out) / rate_in)   # reported prompt tokens: three chunks settle at about $39.60
 
     fake = GeminiFake(monkeypatch, lambda stage, text: gemini_text('## Analysis\nTwo files.\n', expensive))
     outcome = full_build(pristine, repo, counts)
@@ -1473,19 +1509,265 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     # Three chunks were sent and settled once each; the fourth was refused before sending, and says why.
     assert len(fake.sends) == 3 and {s for s, _t, _b in fake.sends} == {'full'}
     assert outcome.status == 'failed' and outcome.reason.startswith('full chunk 4/5 (call 4): ')
-    assert '$25.00 limit' in outcome.reason
+    assert '$40.00 limit' in outcome.reason
     usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
     assert (usage['calls'], usage['unknown_cost_calls'], usage['retained_reservation_usd'], usage['open_reservation_usd']) == (3, 0, 0, 0)
     assert usage['known_cost_usd'] == usage['cost_usd'] == pytest.approx(3 * per_chunk, rel=1e-6)
+    assert usage['known_cost_usd'] > 25   # past the old $25 cap: the second and third chunks are now bought
     assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
     assert im.load_document(pristine, 'app-abc1234').text == old.text
 
-    # Cheap replies: the same build finishes under the cap, with every chunk and one reduction.
+    # Cheap replies, in a normal sync's weekly record: the same build finishes under the cap, with every chunk
+    # and one reduction. It was admitted for the whole $40, recorded each reply once inside that hold, and
+    # closing released the rest.
+    from repo_radar import spending as sp
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
-    outcome = full_build(pristine, repo, counts)
+    outcome = full_build(pristine, repo, counts, spending=record)
     assert outcome.status == 'published', outcome
     assert len(fake.sends) == 6 and outcome.usage['calls'] == 6 and outcome.usage['cost_usd'] < 1
     assert im.load_document(pristine, 'app-abc1234').info['pipeline_version'] == im.PIPELINE_VERSION
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert (attempt['allowance'], attempt['status'], len(attempt['sends'])) == (40_000_000, 'closed', 6)
+    week = sp.summary(record.store, record.policy)
+    assert week['recorded_usd'] == pytest.approx(outcome.usage['cost_usd'], abs=1e-5) and week['reserved_usd'] == 0
+
+    # With less than $40 left this week the next full build isn't admitted: nothing is sent, the document,
+    # its failure count and last counted failure stay, and it says what it needed and what remains.
+    published = im.load_document(pristine, 'app-abc1234').text
+    before = metadata.read_attempt_state(pristine, 'app-abc1234')
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY)
+    tight = sp.Spending('dev', store=record.store, policy=lambda: (True, 39.99 + week['recorded_usd']))
+    outcome = full_build(pristine, repo, counts, spending=tight)
+    assert outcome.status == 'skipped' and fake.sends == [] and outcome.usage['calls'] == 0
+    assert outcome.reason.startswith('Weekly spending limit: this update needs up to $40.00; $39.99 remains until ')
+    after = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert after['consecutive_failures'] == before['consecutive_failures']
+    assert after.get('last_failure_reason') == before.get('last_failure_reason')
+    assert im.load_document(pristine, 'app-abc1234').text == published
+
+
+def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch, tmp_path):
+    """The protected executor uses the same money rule as legacy sends: a typed 429 was refused without
+    charge, so its reservation goes back and closing releases the whole $40. The attempt still fails, with
+    the one transport call and no retry, fallback or weekly-cap skip."""
+    from repo_radar import spending as sp
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    old = im.load_document(pristine, 'app-abc1234')
+    limited = httpx.Response(429, json={'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED', 'message': 'quota'}},
+                             request=httpx.Request('POST', 'https://x'))
+    fake = GeminiFake(monkeypatch, lambda stage, text: limited)
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+    outcome = full_build(pristine, repo, FileCounts(10), spending=record)
+    assert outcome.status == 'failed' and len(fake.sends) == 1, outcome
+    assert (outcome.usage['calls'], outcome.usage['refused_calls'], outcome.usage['unknown_cost_calls']) == (1, 1, 0)
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert attempt['status'] == 'closed' and [s['status'] for s in attempt['sends'].values()] == ['released']
+    week = sp.summary(record.store, record.policy)
+    assert (week['recorded_usd'], week['reserved_usd'], week['available_usd']) == (0, 0, 75)
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+
+    # A 429 that carries charge evidence is no refund (moved here from the retired full generator's test): the
+    # charge is recorded once and the send keeps its bound.
+    import litellm
+    from repo_radar import llm
+    charged = litellm.RateLimitError(message='rate limited', llm_provider='gemini', model=GEMINI)
+    charged._hidden_params = {'response_cost': 0.0001}
+    billed = sp.Spending('stable', store=sp.Store(tmp_path / 'charged'), policy=lambda: (True, 75.0))
+    with monkeypatch.context() as m:
+        m.setattr(llm, 'call_model_turn', lambda request, timeout: (_ for _ in ()).throw(charged))
+        outcome = full_build(pristine, repo, FileCounts(10), spending=billed)
+    assert outcome.status == 'failed' and outcome.usage['refused_calls'] == 0, outcome
+    assert outcome.usage['known_cost_usd'] == pytest.approx(0.0001) and outcome.usage['retained_reservation_usd'] > 0
+    week = sp.summary(billed.store, billed.policy)
+    assert week['recorded_usd'] == pytest.approx(0.0001) and week['reserved_usd'] > 0
+
+    # A Stop landing between two sends is an interruption, not a failure: the update ends skipped, the failure
+    # count doesn't move, and the reply that did come back is recorded.
+    before = metadata.read_attempt_state(pristine, 'app-abc1234')
+    stopping = sp.Spending('stable', store=sp.Store(tmp_path / 'stopped'), policy=lambda: (True, 75.0))
+
+    def first_then_stop(stage, text):
+        stopping.request_stop()   # what the Stop handler does first
+        return '## Analysis\nTwo files.\n'
+    fake = GeminiFake(monkeypatch, first_then_stop)
+    outcome = full_build(pristine, repo, FileCounts(50_000), spending=stopping)
+    assert outcome.status == 'skipped' and outcome.reason == 'the sync was stopped' and len(fake.sends) == 1, outcome
+    after = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert after['consecutive_failures'] == before['consecutive_failures']
+    assert after.get('last_failure_reason') == before.get('last_failure_reason')
+    assert sp.summary(stopping.store, stopping.policy)['recorded_usd'] == pytest.approx(outcome.usage['known_cost_usd'], abs=1e-5)
+
+
+def test_vendor_dist_and_coverage_are_generated_only_at_a_build_root():
+    """A source folder named like a build output (an insurance `coverage` module) is analyzed, by incremental
+    updates and full builds alike; the same name at the repository root or beside a build manifest is still
+    treated as generated."""
+    roots = snap.build_roots({'web-app/package.json': None, 'mobile-api/go.mod': None}, {'README.md': None})
+    generated = ['coverage/lcov.info', 'dist/app.js', 'web-app/dist/main.js', 'mobile-api/vendor/x/y.go',
+                 'src/node_modules/a.js', 'Web-App/Coverage/index.html']
+    analyzed = ['mobile-api/internal/coverage/plan.go', 'web-app/src/coverage/rules.ts', 'docs/dist/notes.md']
+    assert all(snap.generated_reason(p, roots) == 'generated or vendored' for p in generated)
+    assert all(snap.generated_reason(p, roots) is None for p in analyzed)
+    assert snap.generated_reason('yarn.lock', roots) == 'lockfile'
+    # Full builds' collector uses the same rule: the coverage module is summarized, build output isn't.
+    from repo_radar.files import should_include_file
+    assert ([should_include_file(p, roots) for p in ('mobile-api/internal/coverage/plan.go', 'web-app/dist/main.js')]
+            == [True, False])
+
+
+def test_full_only_pinned_plan(monkeypatch, tmp_path):
+    """The free plan check for full-only repositories: the real decision, pinned collection, FullBuild.prepare
+    and allowance, with a deterministic local count and no transport. Selection is full and lists no diff; only
+    the pinned commit's bytes are selected, without the credential or the inherited exclusion; the prepared
+    request fits; the allowance is the conservative floor; and nothing is sent or admitted while preparing."""
+    from repo_radar import llm
+    from repo_radar.metadata_budget import FULL_CAP_USD, ESTIMATE_MARGIN
+    from repo_radar.model_catalog import get_caps
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=30))
+    repo.write('.env', 'API_TOKEN=SENTINEL-CREDENTIAL\n')
+    repo.write('src/m0.py', 'pinned = True\n')
+    target = repo.commit('second commit')
+    repo.write('src/m1.py', 'DIRTY = "SENTINEL-DIRTY"\n')              # an uncommitted edit
+    repo.write('src/untracked.py', 'UNTRACKED = "SENTINEL-UNTRACKED"\n')
+
+    def no_send(*a, **k):
+        pytest.fail('preparation sent a request')
+    monkeypatch.setattr(httpx.HTTPTransport, 'handle_request', no_send)
+    monkeypatch.setattr(llm, 'call_model_turn', no_send)
+    doc = im.load_document(pristine, 'app-abc1234')
+    with monkeypatch.context() as m:
+        m.setattr(snap, 'changes_between', lambda *a, **k: pytest.fail('a full-only decision listed a diff'))
+        decision = im.decide(repo.path, FULL, doc, None, GEMINI, target, NOW, allow_incremental=False)
+    assert (decision.strategy, decision.reason) == ('full', 'the tracked tree changed')
+
+    events = []
+
+    class Record:   # the weekly record: admission is the event to watch
+        def admit(self, owner, model, label, amount):
+            events.append(('admit', amount))
+            return types.SimpleNamespace(close=lambda: None, check_dispatch=lambda: None, reserve=lambda u: [None] * len(u))
+
+    class Stop(Exception):
+        pass
+    real_prepare = mr.FullBuild.prepare
+
+    def prepare(self):
+        plan = real_prepare(self)
+        events.append(('prepared', plan, self.budget.hold))
+        return plan
+
+    def run(self, plan=None):
+        events.append(('run', plan))
+        raise Stop
+    monkeypatch.setattr(mr.FullBuild, 'prepare', prepare)
+    monkeypatch.setattr(mr.FullBuild, 'run', run)
+    budget = Budget(GEMINI, cap=FULL_CAP_USD, label='full', spending=Record(), owner=FULL)
+    inherited = snap.Exclusions(frozenset({'src/m2.py'}), frozenset())
+    with pytest.raises(Stop):
+        im.run_full(repo.path, FULL, target, GEMINI, FileCounts(40), budget, baseline=base, inherited=inherited,
+                    estimate_allowance=True)
+
+    (kind, plan, hold), (admitted, amount), (ran, sent) = events
+    assert (kind, hold, admitted, ran) == ('prepared', None, 'admit', 'run') and sent is plan
+    single = plan.single
+    assert plan.chunks is None and single.tokens <= single.limit
+    request = json.dumps(single.request)
+    assert 'pinned = True' in request and 'SENTINEL' not in request and '.env' not in request
+    assert 'module 2' not in request and 'module 3' in request   # the inherited exclusion still applies
+    floor = Budget(GEMINI).upper_bound(get_caps(GEMINI).max_input, single.output)
+    estimate = Budget(GEMINI).upper_bound(single.tokens, single.output)
+    assert single.reserve_tokens == get_caps(GEMINI).max_input and ESTIMATE_MARGIN * estimate < floor
+    assert amount == budget.extra['admitted_usd'] == pytest.approx(floor, abs=2e-6) and amount < FULL_CAP_USD
+
+
+def test_full_only_rebuilds_admit_their_estimate_and_hold_after_failures(monkeypatch, tmp_path):
+    """A full-only repository through the shared worker: a small local-count plan is admitted for its
+    conservative floor and sends; a failure after paid chunks keeps the old document and reports the chunks'
+    spend once; two automatic failures hold before any count or send; a manual retry passes the hold but not
+    the weekly limit, which skips without moving the streak."""
+    from repo_radar import spending as sp
+    monkeypatch.setenv('AI_MODEL', GEMINI)
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+
+    def change(n):
+        repo.write('src/m0.py', f'changed = {n}\n')
+        repo.commit(f'change {n}')
+
+    class Counting(FileCounts):
+        def count_request(self, request, timeout=None):
+            counted.append(request)
+            return super().count_request(request, timeout)
+    counted = []
+
+    def attempt(session, trigger='schedule', spending=record):
+        return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                    allow_incremental=False, spending=spending, trigger=trigger)
+
+    change(1)
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY)
+    outcome = attempt(FileCounts(10))
+    assert outcome.status == 'published' and len(fake.sends) == 1, outcome
+    [entry] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert entry['allowance'] == round(outcome.usage['admitted_usd'] * 1e6) and outcome.usage['admitted_usd'] < 2
+
+    # Five chunks are paid for, then the reduction comes back cut off: the old document stays, and the five
+    # chunks' spend (and the reduction's) is reported once, in the sync's stats and in the weekly record.
+    change(2)
+    old = (pristine / 'app-abc1234.md').read_text()
+    cut_off = gemini_text('## Overview\nCut o', finish='MAX_TOKENS')
+    fake = GeminiFake(monkeypatch, lambda stage, text: cut_off if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
+    ctx, events = _ctx()
+    args = _sync_args(_spending=record, _incremental_repos=frozenset())
+    task = (REPO_CONFIG, 'app-abc1234', None, 'app', 'cyan', 1)
+    monkeypatch.setenv('REPO_RADAR_TRIGGER', 'schedule')
+    S.generate_repo_metadata(task, FileCounts(50_000), args, ctx)
+    reported = [f for name, f in events if name == 'metadata_incremental']
+    assert len(fake.sends) == 6 and len(reported) == 1 and reported[0]['status'] == 'failed', reported
+    assert reported[0]['strategy'] == 'full' and (pristine / 'app-abc1234.md').read_text() == old
+    usage = metadata.read_attempt_state(pristine, 'app-abc1234')['usage']
+    assert usage['calls'] == 6 and usage['known_cost_usd'] > 0 and ctx.stats['api_cost'] == pytest.approx(usage['known_cost_usd'])
+    assert S.generate_repo_metadata(task, FileCounts(50_000), args, ctx) is not None   # a second failure
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 2
+
+    # Held: nothing is counted, admitted or sent.
+    week = sp.summary(record.store, record.policy)
+    fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY)
+    held = attempt(Counting(10))
+    assert held.status == 'skipped' and 'held after 2' in held.reason and not counted and not fake.sends, held
+    assert sp.summary(record.store, record.policy)['recorded_usd'] == week['recorded_usd']
+
+    # A manual retry passes the hold, never the money: with too little left this week it isn't admitted.
+    tight = sp.Spending('stable', store=record.store, policy=lambda: (True, week['recorded_usd'] + 0.01))
+    refused = attempt(FileCounts(10), trigger='manual', spending=tight)
+    assert refused.status == 'skipped' and refused.reason.startswith('Weekly spending limit') and not fake.sends
+    assert 'admitted_usd' not in refused.usage   # nothing was admitted
+    assert metadata.read_attempt_state(pristine, 'app-abc1234')['consecutive_failures'] == 2
+
+
+@pytest.mark.parametrize('per_file,output_tokens,chunks', [(15_000, 3_000, 2), (26_000, 8_192, 3)])
+def test_a_chunked_full_only_plan_fits_its_whole_send_sequence(monkeypatch, tmp_path, per_file, output_tokens, chunks):
+    """On a local-count model every chunk and the synthesis reserve the model's whole input limit, and each
+    reservation sits on top of what earlier sends cost. The allowance covers that sequence, so a small chunked
+    plan with realistic replies publishes instead of paying for its chunks and failing (review round 1)."""
+    from repo_radar import spending as sp
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n' + 'x = 1\n' * 100)
+    repo.commit('one change')
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+
+    def reply(stage, text):   # each reply reports 120,000 prompt tokens and `output_tokens` out
+        data = gemini_text(FULL_REPLY if 'Please synthesize' in text else '## Analysis\nSome files.\n', 120_000).json()
+        data['usageMetadata'].update(candidatesTokenCount=output_tokens, totalTokenCount=120_000 + output_tokens)
+        return httpx.Response(200, json=data)
+    fake = GeminiFake(monkeypatch, reply)
+    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(per_file),
+                                   now=NOW, allow_incremental=False, spending=record, trigger='schedule')
+    assert outcome.status == 'published', outcome
+    assert len(fake.sends) == chunks + 1 and outcome.usage['calls'] == chunks + 1
+    assert outcome.usage['known_cost_usd'] < outcome.usage['admitted_usd'] < 40
 
 
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
@@ -1570,7 +1852,8 @@ def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_p
     # The same repository counted above the target, though far inside the old 75%-of-window rule, is chunked.
     single = 21 * len(json.dumps([{'role': 'user', 'content': llm._build_full_repo_prompt(FULL, [
         {'path': p, 'size': len(c), 'content': c} for p, c in expected])}]))
-    assert 128_000 < single < llm.get_chunking_threshold(MODEL)
+    from repo_radar.model_catalog import get_caps
+    assert 128_000 < single < 0.75 * get_caps(MODEL).max_input   # the retired path's window would have taken it whole
     outcome, sends, sizes = run(21)
     assert outcome.status == 'published', outcome
     counted = [c['messages'] for c in provider.counts]
@@ -1615,6 +1898,12 @@ def test_full_requests_fit_the_128k_target_whole_and_in_order(monkeypatch, tmp_p
     assert outcome.status == 'failed' and "still don't fit one request after 1 levels" in outcome.reason
     assert all(size <= 128_000 for size in sizes) and not any('truncated' in text_of(b) for b in sends)
     assert im.load_document(pristine, 'app-abc1234').text == current.text != old.text
+    # The call guard stops it the same way (kept from the retired generator's synthesis tests).
+    monkeypatch.setattr(llm, 'SYNTHESIS_MAX_DEPTH', 4)
+    monkeypatch.setattr(llm, 'SYNTHESIS_MAX_CALLS', 1)
+    outcome, sends, _sizes = run(21, per_analysis=30_000)
+    assert outcome.status == 'failed' and 'would need more than 1 synthesis calls' in outcome.reason, outcome
+    assert im.load_document(pristine, 'app-abc1234').text == current.text
 
 
 def test_full_chunk_requests_ask_for_all_eight_subjects(monkeypatch, tmp_path):
@@ -2181,7 +2470,7 @@ def test_every_opted_in_failure_is_reported_and_keeps_the_document(monkeypatch, 
     elif failure == 'state_write':
         monkeypatch.setattr(im, 'write_state', lambda *a: (_ for _ in ()).throw(OSError(28, 'No space left on device')))
     elif failure == 'worker_exception':
-        monkeypatch.setattr(S, '_generate_incremental', lambda *a: (_ for _ in ()).throw(RuntimeError('worker broke')))
+        monkeypatch.setattr(S, 'generate_repo_metadata', lambda *a: (_ for _ in ()).throw(RuntimeError('worker broke')))
     else:
         shutil.rmtree(origin)
 
@@ -2273,7 +2562,7 @@ def test_pilot_cap_survives_failure_and_restart(monkeypatch, tmp_path, capsys):
         usage = budget.summary()
         assert usage['cost_usd'] is None and usage['unknown_cost_calls'] == 1 and usage['retained_reservation_usd'] > 0
         reopened = Ledger(ledger_path, 40.0, allowances)
-        assert reopened.spent() == pytest.approx(usage['retained_reservation_usd'])
+        assert reopened.spent() == pytest.approx(usage['known_cost_usd'] + usage['retained_reservation_usd'])
         with pytest.raises(BudgetExceeded, match='reconcile'):
             Budget(MODEL, ledger=reopened, label='full').reserve({'other': 1}, 1, 1)
 
