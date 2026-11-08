@@ -57,6 +57,8 @@ TOOL_ROOM_NOTICE = "[unavailable: the request has no room left for this result; 
 TOOL_TRUNCATED_NOTICE = "\n[truncated: no room for the rest of this result]\n"
 TOOL_MINIMUM_NOTICE = "[unavailable]"   # what every result in a batch can always be, so none is ever blank
 FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply now with only the JSON answer."
+REJECTED_REPLY_BYTES = 4 * 1024     # how much of a refused reply the attempt's record keeps, after redaction
+KEY_VARIABLES = ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN')
 ATTRIBUTION_WARNING = ("File attribution is incomplete: some notes cite no file for a change, though every diff page "
                        "was processed.")
 SECTION_WARNING = ("Some notes named summary sections they weren't given; those references were dropped, along with "
@@ -146,6 +148,15 @@ def unpaid(budget):
     """The one rule for refusals: a stop is only a skip while nothing has been sent; after any paid call it
     is a failure, so the failure streak and its hold still apply."""
     return budget.calls == 0
+
+
+def rejected_reply(call, text):
+    """What the attempt's record keeps of a refused reply, so the next failure can be diagnosed: which call,
+    and the start of its text, redacted (configured keys and known secret shapes) before it is cut."""
+    from repo_radar.activity.redact import Redactor
+    from repo_radar.metadata import redact_secrets
+    scrubbed = Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(redact_secrets(text or ''))
+    return {'call': call, 'text': scrubbed.encode('utf-8')[:REJECTED_REPLY_BYTES].decode('utf-8', 'ignore')}
 
 
 class Executor:
@@ -686,6 +697,7 @@ class Pipeline:
             note, text, repairs = validate_note(im.parse_answer(turn.text), files, self.section_ids, limit, merged,
                                                 self._paths(files))
         except (im.PatchError, NoteError) as e:
+            self.budget.extra['rejected_reply'] = rejected_reply(f"{item.stage} {item.id}", turn.text)
             raise im.StaleUpdate(f"{item.stage} {item.id}: the note was rejected: {e}") from None
         record = next(c for c in reversed(self.calls) if (c['stage'], c['id']) == (item.stage, item.id))
         record.update(repairs)
@@ -831,10 +843,13 @@ class Pipeline:
         if number < EDIT_TURNS and results_room and tokens + out + CONTINUATION_TOKENS <= room:
             return request, tokens, out, limit, True
         conversation.add_user(FINAL_TURN_MESSAGE)
-        request = conversation.request(EDIT_OUTPUT)
         if number > 1:
+            request = conversation.request(EDIT_OUTPUT)
             request['tool_choice'] = 'none'
         else:
+            # No tool is defined, so the provider can also be asked for JSON alone (Gemini). With tool
+            # definitions kept for the history, that combination isn't relied on.
+            request = conversation.request(EDIT_OUTPUT, json_reply=True)
             request.pop('tools', None)
         tokens, out, limit = self._edit_output_and_limit(request)
         return request, tokens, out, limit, False
@@ -861,6 +876,7 @@ class Pipeline:
             try:
                 analysis, fields, note = im.apply_patch(self.sections, self.fields, im.parse_answer(turn.text), self.doc.sha256)
             except im.PatchError as e:
+                self.budget.extra['rejected_reply'] = rejected_reply(f"edit t{number}", turn.text)
                 raise im.StaleUpdate(f"the model's edits were rejected: {e}") from None
             warnings = self._app_warnings(nodes)
             if warnings:   # the app's own warnings, whatever the editor said

@@ -472,13 +472,28 @@ def apply_patch(sections, fields, patch, base_sha):
 
 
 def parse_answer(text):
-    """The JSON object in a final reply, allowing a fenced block around it."""
-    stripped = text.strip()
-    fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', stripped, re.S)
+    """The JSON value in a final reply. A reply that isn't JSON as a whole may still hold exactly one
+    top-level JSON object, in a code fence or among a few words of prose; that object is the answer. None,
+    or two or more, and the reply is refused. What comes back is validated exactly as before."""
+    stripped = (text or '').strip()
     try:
-        return json.loads(fenced.group(1) if fenced else stripped)
+        return json.loads(stripped)
     except ValueError:
-        raise PatchError("the answer is not a JSON object") from None
+        pass
+    decoder, found, index = json.JSONDecoder(), [], stripped.find('{')
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(stripped, index)
+        except ValueError:
+            index = stripped.find('{', index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        index = stripped.find('{', end)
+    if len(found) != 1:
+        raise PatchError("the answer is not a JSON object" if not found else
+                         f"the answer holds {len(found)} JSON objects, not one")
+    return found[0]
 
 
 # ---- talking to the model ----------------------------------------------------------------------------

@@ -18,6 +18,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 - **Download links point to `ReperioHealth/repo-radar-releases`,** where releases are published.
 - **One malformed note no longer fails a whole summary update.** A page's note that named summary sections it wasn't given used to stop the update after its pages had been paid for. Those references are now dropped, along with any change left with no section; the rest of the note is used, the drops are counted in the attempt's usage, and the coverage note says so. A resource limit hit after paid calls, such as an unreadable page spool, now counts as a failed update rather than a skip.
+- **The editor's answer is no longer refused for how it's wrapped.** A paid update could stop with "the answer is not a JSON object" when the model put its edits in a code fence or added a few words around them. One JSON object in the reply is now taken as the answer and checked as before; a reply with none, or with several, is still refused. A one-note update's tool-free request also asks Gemini for JSON. When an answer is refused, the start of the reply, with secrets redacted, is kept in the attempt's record so the failure can be diagnosed.
 
 ## [1.0.38] - 2026-11-08
 
