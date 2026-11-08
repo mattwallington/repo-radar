@@ -168,6 +168,7 @@ class Budget:
         self.cost = 0.0            # settled, known
         self.retained = 0.0        # reservations kept because the cost is unknown
         self.unknown_calls = 0
+        self.refused_calls = 0     # sends the provider refused without charging; their bounds were released
         self.ledger_write_failures = 0
         self._open = {}            # key -> upper
         self.extra = {}            # attempt facts for the record: changed and read bytes
@@ -298,6 +299,20 @@ class Budget:
                 self.ledger_write_failures += 1
                 raise LedgerWriteError(e, cost) from None
 
+    def refuse(self, reservation):
+        """The provider refused the send without charging for it (a rate limit, or a server error that reported
+        no usage): its reservation goes back to the attempt, so an authorized retry or fallback still fits. A
+        durable pilot ledger, which has no such state, keeps it as unknown."""
+        upper = self._open.pop(reservation.key, 0.0)
+        self.calls += 1
+        if self.ledger is not None:
+            self.unknown_calls += 1
+            self.retained += upper
+        else:
+            self.refused_calls += 1
+        self._persist(None, lambda: self.ledger.mark_unknown(reservation.key),
+                      lambda: self.hold.release(reservation.send))
+
     def fail(self, reservation):
         """The send raised after the reservation: whether it was billed is unknown, so keep it."""
         upper = self._open.pop(reservation.key, 0.0)
@@ -317,6 +332,7 @@ class Budget:
                 'known_cost_usd': known, 'unknown_cost_calls': self.unknown_calls,
                 'retained_reservation_usd': round(self.retained, 6),
                 'open_reservation_usd': round(sum(self._open.values()), 6),
+                'refused_calls': self.refused_calls,
                 'ledger_write_failures': self.ledger_write_failures, **self.extra}
 
 

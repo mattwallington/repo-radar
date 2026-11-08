@@ -168,9 +168,10 @@ synthesis may still make (its 32-call ceiling at its complete input and output c
 prices with a 25% margin, and at most $40 (`$40` too when the estimate can't be computed). Every send,
 retry and fallback is counted and reserved inside that allowance at the serving model's own prices, its
 cost is recorded as soon as the reply arrives (an incomplete reply included), and the SDK's own retries are
-off. A send whose cost is unknown, a rate-limited one included, keeps its whole reservation, so a single-call
-repository usually has no room left for a retry; a send the allowance can't cover isn't made and the attempt
-fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
+off. A send the provider refused without charging, a rate limit (429) or a server error (5xx) that reported no
+usage, gives its reservation back, so the generator's usual retry or fallback still fits. Any other send whose
+cost is unknown, such as a timeout, keeps its whole reservation. A send the allowance can't cover isn't made
+and the attempt fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
 
 ### The weekly spending limit
 

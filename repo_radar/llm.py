@@ -275,6 +275,19 @@ def _map_context_window_stop_as_truncation():
     _FINISH_REASON_MAP.setdefault("model_context_window_exceeded", "length")
 
 
+def refused_without_charge(error):
+    """True for a provider refusal that bills nothing: a rate limit (429) or a transient server error (5xx),
+    raised with no usage. A timeout, a dropped connection or anything else may have been processed, so it
+    isn't one. Decided from the error's type and status, never from digits in its message."""
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if 'RateLimitError' in names:
+        return True
+    response = getattr(error, 'response', None)
+    if 429 in (getattr(error, 'status_code', None), getattr(response, 'status_code', None)):
+        return True
+    return is_transient_server_error(error)
+
+
 def legacy_request_tokens(session, model, prompt, max_output):
     """(input tokens, exact) for one legacy prompt: the provider's authoritative count when the session has
     one (memoized, so counting again costs nothing), else the local count, which callers price with a margin."""
@@ -299,8 +312,9 @@ def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
     With `budget` (the legacy attempt's metadata_budget.Budget), the send is counted with `session` and
     reserved inside the attempt's allowance at this model's own rates before it goes out, and its cost is
     recorded straight after transport, before any text is read or an incomplete reply rejected; api_cost is
-    then that recorded cost (0.0 when unknown, which keeps its whole reservation). SDK retries are off: every
-    retry or fallback is the caller's, and reserved again.
+    then that recorded cost (0.0 when unknown, which keeps its whole reservation). A send the provider refused
+    without charging (refused_without_charge) gives its reservation back. SDK retries are off: every retry or
+    fallback is the caller's, and reserved again.
     """
     import litellm
 
@@ -325,13 +339,16 @@ def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
                 _map_context_window_stop_as_truncation()
             response = litellm.completion(model=model, messages=_completion_messages(prompt), max_tokens=max_tokens,
                                           custom_llm_provider=provider, num_retries=0, max_retries=0, **extra)
-    except BaseException:
+    except BaseException as error:
         if reservation is not None:
             from repo_radar.metadata_budget import LedgerWriteError
             try:
-                budget.fail(reservation)   # sent, so it may have been billed: its whole bound stays
+                if isinstance(error, Exception) and refused_without_charge(error):
+                    budget.refuse(reservation)   # not billed: the bound goes back, so a retry still fits
+                else:
+                    budget.fail(reservation)     # may have been billed: its whole bound stays
             except LedgerWriteError:
-                pass                       # the hold is now broken and refuses any further send
+                pass                             # the hold is now broken and refuses any further send
         raise
 
     hidden = getattr(response, '_hidden_params', None)

@@ -6,7 +6,8 @@ the period's committed money (closed attempts' known charges and retained unknow
 attempt's whole allowance) and the new allowance must fit the weekly cap when the cap is on. Each send is
 then recorded inside that allowance before it goes out, its known cost is recorded as soon as the reply
 arrives, and closing the attempt keeps its known charges and unresolved bounds and releases the rest. A
-send whose cost is unknown keeps its whole bound; nothing ever expires by elapsed time.
+send whose cost is unknown keeps its whole bound, and one the provider refused without charging (a rate
+limit, or a server error with no usage) gives it back; nothing ever expires by elapsed time.
 
 Periods: the first runs from activation (the first normal sync using this ledger) to the next Monday
 00:00 UTC, later ones Monday to Monday UTC. Every charge belongs to the period its attempt was admitted in.
@@ -124,7 +125,8 @@ def _valid(data):
         if not all(isinstance(attempt[k], int) and attempt[k] >= 0 for k in ('allowance',)):
             return False
         for send in attempt['sends'].values():
-            if send.get('status') not in ('reserved', 'settled', 'unknown') or not isinstance(send.get('bound'), int):
+            if send.get('status') not in ('reserved', 'settled', 'unknown', 'released') \
+                    or not isinstance(send.get('bound'), int):
                 return False
             if send['status'] == 'settled' and not isinstance(send.get('cost'), int):
                 return False
@@ -355,6 +357,14 @@ class Hold:
             send = attempt['sends'][str(number)]
             if send['status'] == 'reserved':
                 send.update(status='settled', cost=to_micro(cost_usd))
+        self._change(change)
+
+    def release(self, number):
+        """A send the provider refused without charging: its bound goes back to the allowance."""
+        def change(attempt):
+            send = attempt['sends'][str(number)]
+            if send['status'] == 'reserved':
+                send['status'] = 'released'
         self._change(change)
 
     def unknown(self, number):

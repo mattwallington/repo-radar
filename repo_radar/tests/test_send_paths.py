@@ -1,3 +1,4 @@
+import json
 import threading
 import types
 from pathlib import Path
@@ -584,7 +585,8 @@ def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stag
 
 def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path):
     """A legacy attempt is admitted for one estimate and every send, retry and fallback reserves inside it at
-    the model that actually serves it. When what's left can't cover the next send, the attempt fails without
+    the model that actually serves it. A send the provider refused without charging (a 429) gives its share
+    back, so the retry still fits. When what's left can't cover the next send, the attempt fails without
     sending it or buying more, and a dollar amount in that message never reads as a 429."""
     import litellm
     import repo_radar.modes.sync as sync, repo_radar.llm as llm
@@ -623,20 +625,48 @@ def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path)
     ctx = _fake_ctx()
     sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, _fake_args(), ctx)
     budget = budgets[0]
-    # Each chunk starts from the configured model. The rate-limited sends keep their whole bounds (unknown
-    # cost); the fallback's two chunks and synthesis reserved and were priced at its own, cheaper rates.
+    # Each chunk starts from the configured model. The rate-limited sends were refused without charge and
+    # gave their shares back; the fallback's two chunks and synthesis reserved and were priced at its own,
+    # cheaper rates.
     argon = "gemini/gemini-4-argon"
     assert sends == [argon, fallback, argon, fallback, fallback]
     rate_in, rate_out = price_per_token(fallback)
     assert budget.cost == pytest.approx(3 * (100 * rate_in + 200 * rate_out))
-    assert budget.unknown_calls == 2 and budget.retained > 0 and budget.cap <= 40
-    assert ctx.stats["metadata_generated"] == 1 and ctx.stats["unknown_cost_calls"] == 2
+    assert (budget.refused_calls, budget.unknown_calls, budget.retained) == (2, 0, 0) and budget.cap <= 40
+    assert ctx.stats["metadata_generated"] == 1 and not ctx.stats.get("unknown_cost_calls")
 
-    # The same repository whose only model keeps rate limiting: the first send's bound stays retained, so
-    # the 1.25x estimate has no room for a second whole send. No retry is bought; the attempt fails.
+    # A single-call repository: a 429, then the retry on the same model succeeds within the one estimate,
+    # and the weekly record shows the refused send released and the reply's cost recorded once.
+    from repo_radar import spending as sp
     (tmp_path / "repo.md").write_text(previous)
     monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single")
     monkeypatch.setattr(sync, "get_fallback_model", lambda m: None)
+    budgets.clear(), sends.clear()
+
+    def limited_once(model, messages, max_tokens, **kw):
+        sends.append(model)
+        if len(sends) == 1:
+            raise RateLimitError("429 RESOURCE_EXHAUSTED")
+        return _reply("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", None)
+
+    monkeypatch.setattr(litellm, "completion", limited_once)
+    args = _fake_args()
+    args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "week"), policy=lambda: (True, 75.0))
+    ctx = _fake_ctx()
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+    budget = budgets[0]
+    assert sends == [argon, argon] and ctx.stats["metadata_generated"] == 1 and ctx.stats["errors"] == 0
+    rate_in, rate_out = price_per_token(argon)
+    assert budget.cost == pytest.approx(100 * rate_in + 200 * rate_out) and budget.cost < budget.cap
+    assert (budget.refused_calls, budget.unknown_calls, budget.retained) == (1, 0, 0)
+    [attempt] = json.loads((tmp_path / "week" / sp.LEDGER_NAME).read_text())["attempts"].values()
+    assert [s["status"] for s in attempt["sends"].values()] == ["released", "settled"]
+    assert sp.summary(args._spending.store, args._spending.policy)["recorded_usd"] == pytest.approx(budget.cost, abs=1e-6)
+
+    # A reply that costs more than the whole estimate is recorded in full, and the next chunk can't be sent:
+    # no top-up is bought and the attempt fails with the previous summary kept.
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "chunk")
     budgets.clear(), sends.clear()
     events = []
 
@@ -644,15 +674,17 @@ def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path)
         def event(self, name, **kw): events.append((name, kw))
         def error(self, name, **kw): events.append((name, kw))
 
+    monkeypatch.setattr(litellm, "completion", lambda model, messages, max_tokens, **kw:
+                        sends.append(model) or _reply("A", 100.0))
     ctx = _fake_ctx()._replace(sync_logger=_Logger())
     sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, _fake_args(), ctx)
-    assert len(sends) == 1 and ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
+    assert len(sends) == 1 and budgets[0].cost == 100.0 and ctx.stats["api_cost"] == 100.0
+    assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
     assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")]
     assert (tmp_path / "repo.md").read_text() == previous
 
     # In a normal sync the estimate is admitted against the weekly cap first; with too little left this week
     # the repository is skipped before any send, with nothing written and no error.
-    from repo_radar import spending as sp
     args = _fake_args()
     args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "spending"), policy=lambda: (True, 1.0))
     held = sp.Spending("dev", store=args._spending.store, policy=lambda: (True, 1.0)).admit("o/other", "m", "full", 1)
