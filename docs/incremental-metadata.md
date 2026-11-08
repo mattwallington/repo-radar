@@ -7,8 +7,9 @@ its own, merges those notes when there are too many to hand over together, and t
 conversation edits only the sections the change affects. Diff size selects the amount of work, not a
 different strategy. A full rebuild still happens weekly, or when the model or policy changes.
 
-It is off for every repository unless you list it. Repositories that aren't listed keep today's
-full-generation path unchanged.
+It is off for every repository unless you list it. Every repository, listed or not, goes through the
+same worker and the same full-build adapter: one that isn't listed is full-only, rebuilt in full when
+its tracked source changes and never updated from a diff (see "Repositories that aren't opted in").
 
 ## Turning it on and off
 
@@ -22,19 +23,19 @@ The names must match the `full_name` of a configured repository. There are no wi
 keeps the field when it saves the config. A malformed list stops a metadata-enabled sync with an
 error before any work.
 
-To turn it off, remove the name, or the whole field, and the repository goes back to the
-full-generation path on its next metadata-enabled sync. The extra frontmatter fields that
-incremental documents carry are ignored by everything else. To force a full rebuild of an opted-in
-repository, run `repo-radar sync --regenerate-metadata`.
+To turn it off, remove the name, or the whole field, and the repository is full-only from its next
+metadata-enabled sync. To force a full rebuild of any repository, run
+`repo-radar sync --regenerate-metadata`.
 
 `"incremental_full_rebuild_days"` sets how old a full build can get before the next one: a whole
 number of days, 7 by default, with 0 turning the age trigger off. There's no Settings control for it.
 
 ## What happens on each sync
 
-Every metadata-enabled sync evaluates each opted-in repository, even when its HEAD didn't move,
-because a weekly rebuild can be due. `--skip-metadata` and `--repos-only` do nothing for opted-in
-repositories. `--dry-run` reports the decision without any token counts, model calls or file writes.
+Every metadata-enabled sync evaluates each repository, even when its HEAD didn't move, because a
+weekly rebuild or an unfinished rebuild can be due. `--skip-metadata` and `--repos-only` skip metadata
+for every repository. `--dry-run` reports the decision without any token counts, model calls or file
+writes.
 
 The decision, in order:
 
@@ -51,7 +52,18 @@ How much of the source changed is recorded as a diagnostic only. A full rebuild 
 chose because a change was large, and that never finished, isn't owed any more: its failure stays on
 record and the update takes the incremental path. A requested rebuild that didn't finish is still due.
 
-An existing document written by the full generator is adopted once without a paid rebuild. Its
+### Repositories that aren't opted in
+
+A repository that isn't in `incremental_metadata_repos` uses the same decision with two differences: there
+is no age-triggered rebuild (it gains no weekly schedule), and a changed tracked tree means a full rebuild,
+with no diff listed. An unchanged tree does nothing, even when only the commit moved, and a healthy document
+from the retired generator is adopted at the same tree without a rebuild. It gets the same failure hold,
+reporting, `INDEX.md` staleness and `<repo>.md` alias as an opted-in repository. Its rebuild analyzes the
+pinned commit, so uncommitted or untracked files never reach a document labelled with that commit, and it
+uses the shared collector, credential exclusions and full adapter below. It is admitted for its own
+estimate rather than the whole $40 (see the full rebuild below).
+
+An existing document written by the retired full generator is adopted once without a paid rebuild. Its
 `last_updated` becomes its full-build time, and its model is recorded as unknown. A document also
 records its `pipeline_version`; a new version doesn't force a rebuild.
 
@@ -68,10 +80,11 @@ omissions. There are no shell, network, host-filesystem or write tools.
    or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
    files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
    which need no model call. They're listed as not analyzed, never described as analyzed source.
-   Generated or vendored means an explicit list: a directory named `node_modules`, `vendor`, `dist`,
-   `.next`, `.nuxt`, `__pycache__`, `Pods`, `.gradle`, `.terraform` or `coverage` at any depth, or a name
-   ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go` or `_pb2.py`. A real source directory
-   with one of those names is listed as not analyzed too.
+   Generated or vendored means an explicit list: a directory named `node_modules`, `.next`, `.nuxt`,
+   `__pycache__`, `Pods`, `.gradle` or `.terraform` at any depth; a `vendor`, `dist` or `coverage` directory
+   at a build root (the repository root, or a folder holding a build manifest such as `package.json`,
+   `go.mod` or `pyproject.toml`); or a name ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go`
+   or `_pb2.py`. A source folder named `coverage` deeper in the tree, such as `src/coverage/`, is analyzed.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
@@ -148,7 +161,7 @@ update uses one set of prices throughout, including Google's announced January 2
 3.8 Flash. Attempt usage records the quote, the prices, the pages and the calls per stage. There are no
 automatic retries, including after a 429 or 503, and no model fallbacks.
 
-An opted-in full rebuild runs on the same request executor. Every request, whether the whole repository,
+A full rebuild runs on the same request executor. Every request, whether the whole repository,
 a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
 lower). The whole repository goes as one request only when it fits; otherwise the source is split into
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
@@ -158,34 +171,38 @@ document stays, rather than send excerpts. A full rebuild is capped at **$40** p
 (`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
 when its count is only a local estimate, as on Gemini, that worst case is the model's whole input limit.
 A request that could pass the cap stops the rebuild; once anything has been spent, that counts as a failed
-update. The cap bounds what
-one attempt can spend; it doesn't promise a repository can be rebuilt for that much.
+update. The cap bounds what one attempt can spend; it doesn't promise a repository can be rebuilt for that much.
 
-Repositories that aren't opted in keep the legacy full generator, with its collection, prompts, chunking,
-retries and model fallbacks, but each attempt now has one allowance, estimated before its first send: every
-prepared prompt's input plus its maximum output and, for a chunked build, every synthesis call the bounded
-synthesis may still make (its 32-call ceiling at its complete input and output ceilings), at uncached list
-prices with a 25% margin, and at most $40 (`$40` too when the estimate can't be computed). Every send,
-retry and fallback is counted and reserved inside that allowance at the serving model's own prices, its
-cost is recorded as soon as the reply arrives (an incomplete reply included), and the SDK's own retries are
-off. A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
-overloaded reply (503, 529), gives its reservation back, so the generator's usual retry or fallback still fits.
-Any other send whose cost is unknown keeps its whole reservation: a timeout, a dropped connection, or a 500,
-502 or 504, since a gateway can fail after the model ran. A refusal that carries a charge is no refund: the
-charge is recorded and the request keeps at least its reservation. Protected builds use the same rule, though they
-never retry. A send the allowance can't cover isn't made
-and the attempt fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
+Before anything is sent, the rebuild's first stage is prepared: the whole-repository request or every
+chunk, counted and fitted. That costs nothing but counting, comes before the weekly admission, and is
+exactly what's then sent. An opted-in repository's rebuild is admitted for $40. A full-only rebuild is
+admitted for its own estimate: the prepared requests' counted input and maximum output and, for chunks, a
+reduction at the adapter's input ceiling and output limit for at most one call fewer than the chunks (and
+no more than 32), at uncached list prices with a 25% margin. The requests go one at a time, each
+reservation on top of what the earlier ones cost, so that is floored at the whole sequence's worst case:
+every request's estimate except the largest-reserving one's, with the same margin, plus that request's
+whole reservation. A local count reserves the model's whole input limit, and a small repository's estimate
+can be cents. The allowance is at most $40 (also $40 when the estimate can't be computed, which
+never authorizes a send without a price). The admitted amount is the attempt's hard limit and is recorded
+in attempt usage as `admitted_usd`; a later request that can't fit stops the attempt, with no top-up,
+retry or switch to a diff.
+
+A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
+overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
+whole reservation: a timeout, a dropped connection, or a 500, 502 or 504, since a gateway can fail after the
+model ran. A refusal that carries a charge is no refund: the charge is recorded and the request keeps at
+least its reservation. Nothing is retried, and the SDK's own retries are off.
 
 ### The weekly spending limit
 
-Every generation attempt in a normal sync, incremental, protected full or legacy, is admitted against a
+Every generation attempt in a normal sync, incremental or full, is admitted against a
 weekly limit before its first send: **$75** by default, on unless Settings turns it off (`weekly_spend_cap_enabled`,
 `weekly_spend_cap_usd`, $1 to $1,000). The record lives in `~/.config/repo-radar/spending/`, owner-only, and
 is shared by stable and dev builds and every repository root. It holds attempt and send identifiers, the
 channel, repository, model, times and amounts, never prompts, replies, credentials or settings.
 
-- **What an attempt holds.** A diff update holds its whole quote, a protected full rebuild $40, and a legacy
-  attempt its estimate. That hold is also the attempt's hard limit: nothing is topped up once sending starts.
+- **What an attempt holds.** A diff update holds its whole quote, an opted-in full rebuild $40, and a
+  full-only rebuild its estimate. That hold is also the attempt's hard limit: nothing is topped up once sending starts.
   An attempt is admitted only if the week's committed money (recorded charges, unknown-cost reservations and
   every running attempt's whole hold) plus its own hold fits the limit.
 - **A refusal** is a skip before any send: the previous summary, the failure count, the last failure and any
@@ -220,7 +237,7 @@ can't be read it says the spend is unavailable, never $0.
 Combined enforcement needs both the stable and the dev app on a build that uses this record: an older build
 neither checks nor records spending. The record doesn't estimate what older builds spent.
 
-On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
+On Gemini, a full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
 for synthesis or a single pass. Low thinking makes truncation less likely but doesn't rule it out: a truncated
 reply is still rejected, nothing is retried, and the document stays. Attempt usage's `full_stage` records the
@@ -234,7 +251,7 @@ model work, and the new document replaces the old one atomically only after the 
 the document it started from is unchanged, and the repository is still at the same commit.
 
 `INDEX.md` marks such a document stale and names the analyzed revision, the attempted revision and
-the reason. An opted-in repository that has never had a document is listed as having metadata
+the reason. A repository that has never had a document is listed as having metadata
 unavailable. The sync's progress view and Activity report the update as failed (an error) or skipped
 (a warning, for example an unavailable token count or price, a spending limit, or the spool limit). Such a
 stop is a skip only while nothing has been paid for; once any call has been sent, it is a failure.

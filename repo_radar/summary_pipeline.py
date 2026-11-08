@@ -263,7 +263,7 @@ class Executor:
             if item.reserve_tokens != item.tokens:
                 record['reserved_input_tokens'] = item.reserve_tokens
             if error is not None:
-                try:   # the same money rule as legacy sends; it never makes this a retry or a skip
+                try:   # the one money rule for a failed send; it never makes this a retry or a skip
                     llm.account_failed_send(self.budget, reservation, error)
                 except LedgerWriteError as e:
                     storage_error = storage_error or e
@@ -952,6 +952,9 @@ SINGLE_SKIP_BYTES_PER_TOKEN = 8
 
 # One chunk request: its 1-based index, the total, its files (or ordered parts of one) and the request.
 Chunk = namedtuple('Chunk', 'index total files item')
+# A full build's prepared first stage, counted and fitted but not sent: the one whole-repository request, or
+# the ordered chunks (exactly one of the two).
+FullPlan = namedtuple('FullPlan', 'single chunks')
 
 
 class FullBuild:
@@ -1207,17 +1210,48 @@ class FullBuild:
 
     # ---- the whole build -------------------------------------------------------------------------
 
-    def run(self):
-        """The full document's text, in the existing full format."""
+    def prepare(self):
+        """The build's first stage, counted and fitted, with nothing sent: the whole repository as one request
+        when it fits, otherwise the ordered chunks. Counting is all it spends, so it comes before admission;
+        run() then sends exactly this plan. Synthesis requests depend on chunk replies and are prepared as
+        they become known."""
         from repo_radar import llm
         prompt = llm._build_full_repo_prompt(self.full_name, self.files)
         if len(prompt.encode('utf-8')) <= SINGLE_SKIP_BYTES_PER_TOKEN * FULL_INPUT_TARGET:
             item = self._prepare('single', 'single', prompt, llm.FULL_REPO_OUTPUT)
             if item.tokens <= item.limit:
-                [node] = _settle_wave(self, [self._start(item)],
-                                      lambda _i, _item, turn: Node('single', frozenset(), frozenset(), None, self._text(turn)))
-                return node.text
-        chunks = self.chunks()
+                return FullPlan(item, None)
+        return FullPlan(None, self.chunks())
+
+    def allowance(self, plan):
+        """What a full-only attempt is admitted for (metadata_budget.full_allowance): the plan's counted
+        requests and, for chunks, the bounded synthesis at this adapter's input ceiling and output limit, with
+        at most one reduction fewer than the chunks (and no more than the synthesis call guard). Floored at the
+        send sequence's worst case, so the largest reservation still fits on top of every other send's cost;
+        when counts are local estimates, each reservation is the model's whole input limit."""
+        from repo_radar import llm
+        from repo_radar.metadata_budget import full_allowance
+        from repo_radar.model_catalog import acceptance_budget, get_caps
+        items = [plan.single] if plan.single else [chunk.item for chunk in plan.chunks]
+        synthesis = None
+        if plan.chunks:
+            output = llm.output_budget(self.model, llm.SYNTHESIS_OUTPUT_TOKENS)
+            ceiling = min(FULL_INPUT_TARGET, acceptance_budget(self.model, output))
+            estimated = any(item.reserve_tokens != item.tokens for item in items)
+            caps = get_caps(self.model)
+            reserve = caps.max_input if estimated and caps is not None else ceiling
+            calls = min(llm.SYNTHESIS_MAX_CALLS, max(1, len(plan.chunks) - 1))
+            synthesis = (calls, ceiling, output, reserve)
+        return full_allowance(self.budget.rates, [(i.tokens, i.output, i.reserve_tokens) for i in items], synthesis)
+
+    def run(self, plan=None):
+        """The full document's text, in the existing full format, from `plan` (prepare()'s, by default)."""
+        plan = plan or self.prepare()
+        if plan.single is not None:
+            [node] = _settle_wave(self, [self._start(plan.single)],
+                                  lambda _i, _item, turn: Node('single', frozenset(), frozenset(), None, self._text(turn)))
+            return node.text
+        chunks = plan.chunks
         self.log(f"{len(chunks)} chunks")
         nodes = map_reduce(self, chunks)
         if len(nodes) != 1 or nodes[0].pages != frozenset(range(1, len(chunks) + 1)):
