@@ -95,7 +95,7 @@
                         <option value="gpt-5.3-codex">GPT-5.3 Codex (retires Apr 1, 2027)</option>
                     </optgroup>
                 </select>
-                <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Chunk size is ~75% of context (1M → ~785K, 200K → ~150K). OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
+                <small class="form-help">Choose the AI model for metadata generation. The top group holds the current recommended picks; the rest are still usable but older. Opted-in repositories send every full-rebuild request at up to 128K tokens (less if the model's limit is lower); other repositories' full builds still chunk at about 75% of the model's context. OpenAI <code>codex</code> and <code>-pro</code> variants are routed through the Responses API automatically.</small>
             </div>
         </div>
 
