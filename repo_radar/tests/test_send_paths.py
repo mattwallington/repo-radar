@@ -1,3 +1,4 @@
+import json
 import threading
 import types
 from pathlib import Path
@@ -283,7 +284,7 @@ def test_exact_payload_counted_before_send_all_three_shapes(monkeypatch, tmp_pat
         monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: _files(2))
         # Record what call_llm really requests: it applies output_budget to every send.
         monkeypatch.setattr(sync, "call_llm",
-            lambda model, prompt, max_tokens=8192: ev.append(("send", llm.output_budget(model, max_tokens), dig(prompt))) or
+            lambda model, prompt, max_tokens=8192, **_kw: ev.append(("send", llm.output_budget(model, max_tokens), dig(prompt))) or
             ("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", 0.0, None))
         return ev, _LogSession()
     def assert_counted_before_send(ev):
@@ -305,7 +306,7 @@ def test_exact_payload_counted_before_send_all_three_shapes(monkeypatch, tmp_pat
 def _run_repo(monkeypatch, tmp_path, files, chunks_result, synth_level, records):
     import repo_radar.modes.sync as sync, repo_radar.llm as llm
     monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **k: files)
-    monkeypatch.setattr(sync, "call_llm", lambda model, prompt, max_tokens=8192: records.append(max_tokens) or ("A", 0.0, None))
+    monkeypatch.setattr(sync, "call_llm", lambda model, prompt, max_tokens=8192, **_kw: records.append(max_tokens) or ("A", 0.0, None))
     monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "chunk")
     monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **k: chunks_result)
     monkeypatch.setattr(llm, "authoritative_synthesis_level", synth_level)   # combine_chunk_analyses resolves it in llm
@@ -390,7 +391,7 @@ def test_rejected_reply_is_not_retried_as_a_rate_limit(monkeypatch, tmp_path, st
     monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **k: "single" if stage == "single" else "chunk")
     ev = []
 
-    def send(model, prompt, max_tokens=8192):
+    def send(model, prompt, max_tokens=8192, **_kw):
         failing = stage != "synthesis" or max_tokens == 16384
         ev.append(("send", "fail" if failing else "ok"))
         if failing:
@@ -468,7 +469,7 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
                     llm.IncompleteResponseError("HTTP 503")):
             assert not llm.is_transient_server_error(err)
 
-    def send(m, prompt, max_tokens=8192):
+    def send(m, prompt, max_tokens=8192, **_kw):
         failing = stage != "synthesis" or (max_tokens == 16384 and "A1" in prompt)
         if stage == "chunk":
             failing = max_tokens == 8192 and "(chunk 1/2)" in prompt
@@ -515,11 +516,21 @@ def test_transient_server_failure_retries_only_the_failed_request(monkeypatch, t
         assert sum(ro == 16384 and "A0" in p for _, p, ro in completed) == 1
 
 
+def _reply(text, cost, finish="stop", prompt_tokens=100, completion_tokens=200, usage=True):
+    """A litellm completion as the real transport returns it: text, finish reason, usage and its cost."""
+    choice = types.SimpleNamespace(message=types.SimpleNamespace(content=text), finish_reason=finish)
+    return types.SimpleNamespace(choices=[choice], _hidden_params={"response_cost": cost},
+                                 usage=types.SimpleNamespace(prompt_tokens=prompt_tokens,
+                                                             completion_tokens=completion_tokens) if usage else None)
+
+
 @pytest.mark.parametrize("stage", ["chunk", "synthesis", "single"])
-@pytest.mark.parametrize("fail_late", [True, False])
+@pytest.mark.parametrize("fail_late", [True, False, "incomplete"])
 def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stage, fail_late):
-    """Keep partial chunk/synthesis spend and a response's spend before local processing.
-    Successful controls use the same path and catch duplicate credits."""
+    """Keep partial chunk/synthesis spend, a response's spend before local processing, and an incomplete
+    reply's spend. Only the transport is faked: call_llm records each cost once, in the attempt's budget,
+    before the text is read or rejected. Successful controls use the same path and catch duplicate credits."""
+    import litellm
     import repo_radar.modes.sync as sync, repo_radar.llm as llm
     monkeypatch.setenv("AI_MODEL", "claude-sonnet-5")
     previous = "---\nlast_commit: oldcommit\n---\n\n# previous metadata\n"
@@ -533,18 +544,20 @@ def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stag
     completed, events = [], []
     calls = 0
 
-    def send(model, prompt, max_tokens=8192):
+    def completion(model, messages, max_tokens, **kw):
         nonlocal calls
+        assert kw["num_retries"] == 0 and kw["max_retries"] == 0   # every retry is the caller's, reserved again
         calls += 1
         fail_at = 2 if stage == "chunk" else 4  # second chunk or second synthesis batch
-        if fail_late and stage != "single" and calls == fail_at:
+        if fail_late is True and stage != "single" and calls == fail_at:
             raise RuntimeError("later request failed")
         cost = calls / 8  # exact binary fractions, with a nonzero subtotal before failure
         completed.append(cost)
-        return f"A{calls - 1}" if max_tokens == 8192 else "SUMMARY", cost, None
+        incomplete = fail_late == "incomplete" and (stage == "single" or calls == fail_at)
+        return _reply(f"A{calls - 1}" if max_tokens == 8192 else "SUMMARY", cost, "length" if incomplete else "stop")
 
-    monkeypatch.setattr(sync, "call_llm", send)
-    if stage == "single" and fail_late:
+    monkeypatch.setattr(litellm, "completion", completion)
+    if stage == "single" and fail_late is True:
         def local_failure(response):
             raise ValueError("local rate tracker failed after the completed response")
         monkeypatch.setattr(sync.rate_limit_tracker, "update_from_response", local_failure)
@@ -558,15 +571,191 @@ def test_completed_call_spend_survives_later_failure(monkeypatch, tmp_path, stag
     result = sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"),
                                         _StubSession(lambda p: PreflightResult(1, True)), _fake_args(), ctx)
     subtotal = sum(completed)
+    failed = bool(fail_late)
     assert subtotal > 0 and result == subtotal and ctx.stats["api_cost"] == 1.0 + subtotal
-    assert ctx.stats["errors"] == int(fail_late)
-    assert ctx.stats["metadata_generated"] == int(not fail_late)
-    if fail_late:
+    assert ctx.stats["errors"] == int(failed)
+    assert ctx.stats["metadata_generated"] == int(not failed)
+    if failed:
         assert (tmp_path / "repo.md").read_text() == previous
         assert [(n, f["cost"]) for n, f in events] == [("metadata_failed", f"${subtotal:.4f}")]
     else:
         assert _read_frontmatter(tmp_path)["last_commit"] == "newcommit"
         assert [(n, f["cost"]) for n, f in events] == [("metadata_generated", f"${subtotal:.4f}")]
+
+
+def test_legacy_sends_stay_inside_their_admitted_estimate(monkeypatch, tmp_path):
+    """A legacy attempt is admitted for one estimate and every send, retry and fallback reserves inside it at
+    the model that actually serves it. A send the provider refused without charging (a 429) gives its share
+    back, so the retry still fits. When what's left can't cover the next send, the attempt fails without
+    sending it or buying more, and a dollar amount in that message never reads as a 429."""
+    import litellm
+    import repo_radar.modes.sync as sync, repo_radar.llm as llm
+    from repo_radar.metadata_budget import Budget, price_per_token
+    monkeypatch.setenv("AI_MODEL", "gemini/gemini-4-argon")
+    monkeypatch.setenv("GEMINI_API_KEY", "synthetic-test-key")
+    previous = "---\nlast_commit: oldcommit\n---\n\n# previous metadata\n"
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "collect_repo_files", lambda *a, **kw: _files(2))
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "chunk")
+    monkeypatch.setattr(sync, "authoritative_chunks", lambda *a, **kw: llm.PartitionResult([_files(1), _files(1)], None))
+    monkeypatch.setattr(llm, "authoritative_synthesis_level", lambda s, n, analyses, m: [analyses])
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    fallback = "gemini/gemini-3.8-flash"
+    monkeypatch.setattr(sync, "get_fallback_model", lambda m: fallback if m != fallback else None)
+    budgets, sends = [], []
+    real_reserve = Budget.reserve_send
+
+    def reserve_send(self, model, request, tokens, output, margin=1.0):
+        budgets.append(self)
+        return real_reserve(self, model, request, tokens, output, margin)
+    monkeypatch.setattr(Budget, "reserve_send", reserve_send)
+
+    class RateLimitError(Exception):
+        pass
+
+    def completion(model, messages, max_tokens, **kw):
+        sends.append(model)
+        if model != fallback:
+            raise RateLimitError("429 RESOURCE_EXHAUSTED")
+        text = "QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n" if max_tokens == 16384 else "A"
+        return _reply(text, None)   # no reported cost: priced from usage at the serving model's rates
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    local = _StubSession(lambda p: PreflightResult(None, False))   # Gemini has no authoritative count
+    ctx = _fake_ctx()
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, _fake_args(), ctx)
+    budget = budgets[0]
+    # Each chunk starts from the configured model. The rate-limited sends were refused without charge and
+    # gave their shares back; the fallback's two chunks and synthesis reserved and were priced at its own,
+    # cheaper rates.
+    argon = "gemini/gemini-4-argon"
+    assert sends == [argon, fallback, argon, fallback, fallback]
+    rate_in, rate_out = price_per_token(fallback)
+    assert budget.cost == pytest.approx(3 * (100 * rate_in + 200 * rate_out))
+    assert (budget.refused_calls, budget.unknown_calls, budget.retained) == (2, 0, 0) and budget.cap <= 40
+    assert ctx.stats["metadata_generated"] == 1 and not ctx.stats.get("unknown_cost_calls")
+
+    # A single-call repository: a 429, then the retry on the same model succeeds within the one estimate,
+    # and the weekly record shows the refused send released and the reply's cost recorded once.
+    from repo_radar import spending as sp
+    (tmp_path / "repo.md").write_text(previous)
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single")
+    monkeypatch.setattr(sync, "get_fallback_model", lambda m: None)
+    budgets.clear(), sends.clear()
+
+    def limited_once(model, messages, max_tokens, **kw):
+        sends.append(model)
+        if len(sends) == 1:
+            raise RateLimitError("429 RESOURCE_EXHAUSTED")
+        return _reply("QUICK_REFERENCE_START\nType: Library\nQUICK_REFERENCE_END\n", None)
+
+    monkeypatch.setattr(litellm, "completion", limited_once)
+    args = _fake_args()
+    args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "week"), policy=lambda: (True, 75.0))
+    ctx = _fake_ctx()
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+    budget = budgets[0]
+    assert sends == [argon, argon] and ctx.stats["metadata_generated"] == 1 and ctx.stats["errors"] == 0
+    rate_in, rate_out = price_per_token(argon)
+    assert budget.cost == pytest.approx(100 * rate_in + 200 * rate_out) and budget.cost < budget.cap
+    assert (budget.refused_calls, budget.unknown_calls, budget.retained) == (1, 0, 0)
+    [attempt] = json.loads((tmp_path / "week" / sp.LEDGER_NAME).read_text())["attempts"].values()
+    assert [s["status"] for s in attempt["sends"].values()] == ["released", "settled"]
+    assert sp.summary(args._spending.store, args._spending.policy)["recorded_usd"] == pytest.approx(budget.cost, abs=1e-6)
+
+    # A 429 that carries charge evidence is no refund: the charge is recorded and the send keeps its bound, so
+    # the single-call retry no longer fits and isn't sent.
+    charged = litellm.RateLimitError(message="rate limited", llm_provider="gemini", model=argon)
+    charged._hidden_params = {"response_cost": 0.0001}
+
+    def limited_with_charge(model, messages, max_tokens, **kw):
+        sends.append(model)
+        raise charged
+
+    (tmp_path / "repo.md").write_text(previous)
+    budgets.clear(), sends.clear()
+    monkeypatch.setattr(litellm, "completion", limited_with_charge)
+    args = _fake_args()
+    args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "charged"), policy=lambda: (True, 75.0))
+    ctx = _fake_ctx()
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+    budget = budgets[0]
+    assert sends == [argon] and budget.refused_calls == 0 and budget.cost == pytest.approx(0.0001)
+    assert ctx.stats["errors"] == 1 and (tmp_path / "repo.md").read_text() == previous
+    week = sp.summary(args._spending.store, args._spending.policy)
+    assert week["recorded_usd"] == pytest.approx(0.0001) and week["reserved_usd"] == pytest.approx(budget.retained, abs=1e-5)
+    assert budget.retained > 0
+
+    # A reported $50 charge under the $40 allowance is a known charge however incomplete its usage: call_llm
+    # returns it, the attempt, the sync's cost and the reopened weekly record keep it once, and the next chunk
+    # isn't sent. No top-up is bought and the attempt fails with the previous summary kept.
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "chunk")
+    events = []
+
+    class _Logger:
+        def event(self, name, **kw): events.append((name, kw))
+        def error(self, name, **kw): events.append((name, kw))
+
+    returned = []
+    real_call = sync.call_llm
+    monkeypatch.setattr(sync, "call_llm", lambda *a, **kw: returned.append(real_call(*a, **kw)[1]) or
+                        ("A", returned[-1], None))
+    for n, usage in enumerate([{"prompt_tokens": 100, "completion_tokens": 0}, {"usage": False},
+                               {"prompt_tokens": 0, "completion_tokens": 0}]):
+        (tmp_path / "repo.md").write_text(previous)
+        budgets.clear(), sends.clear(), events.clear(), returned.clear()
+        monkeypatch.setattr(litellm, "completion", lambda model, messages, max_tokens, usage=usage, **kw:
+                            sends.append(model) or _reply("A", 50.0, **usage))
+        args = _fake_args()
+        args._spending = sp.Spending("stable", store=sp.Store(tmp_path / f"over{n}"), policy=lambda: (True, 75.0))
+        ctx = _fake_ctx()._replace(sync_logger=_Logger())
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+        assert budgets[0].cap == 40 and len(sends) == 1, usage
+        assert returned == [50.0] and budgets[0].cost == 50.0 and ctx.stats["api_cost"] == 50.0, usage
+        assert sp.summary(sp.Store(tmp_path / f"over{n}"), lambda: (True, 75.0))["recorded_usd"] == 50, usage
+        assert ctx.stats["errors"] == 1 and ctx.stats["metadata_generated"] == 0
+        assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")]
+        assert (tmp_path / "repo.md").read_text() == previous
+    monkeypatch.setattr(sync, "call_llm", real_call)
+
+    # A gateway error (504, 502 or 500) may come after the model ran, so it keeps its whole share, unlike the
+    # 429 above. The legacy retry it triggers no longer fits the single-call estimate and isn't sent.
+    monkeypatch.setattr(sync, "authoritative_partition", lambda *a, **kw: "single")
+    for status in (504, 502, 500):
+        class GatewayError(Exception):
+            status_code = status
+
+        def gateway(model, messages, max_tokens, **kw):
+            sends.append(model)
+            raise GatewayError("upstream request failed")
+
+        (tmp_path / "repo.md").write_text(previous)
+        budgets.clear(), sends.clear(), events.clear()
+        monkeypatch.setattr(litellm, "completion", gateway)
+        args = _fake_args()
+        args._spending = sp.Spending("stable", store=sp.Store(tmp_path / f"gw{status}"), policy=lambda: (True, 75.0))
+        ctx = _fake_ctx()._replace(sync_logger=_Logger())
+        sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+        assert len(sends) == 1 and budgets[0].unknown_calls == 1 and budgets[0].refused_calls == 0, status
+        assert [(n, f["error_type"]) for n, f in events] == [("metadata_failed", "BudgetExceeded")], status
+        [attempt] = json.loads((tmp_path / f"gw{status}" / sp.LEDGER_NAME).read_text())["attempts"].values()
+        assert attempt["status"] == "closed" and [x["status"] for x in attempt["sends"].values()] == ["unknown"]
+        assert sp.summary(sp.Store(tmp_path / f"gw{status}"), lambda: (True, 75.0))["reserved_usd"] == pytest.approx(
+            budgets[0].retained, abs=1e-5)
+        assert (tmp_path / "repo.md").read_text() == previous
+
+    # In a normal sync the estimate is admitted against the weekly cap first; with too little left this week
+    # the repository is skipped before any send, with nothing written and no error.
+    args = _fake_args()
+    args._spending = sp.Spending("stable", store=sp.Store(tmp_path / "spending"), policy=lambda: (True, 1.0))
+    held = sp.Spending("dev", store=args._spending.store, policy=lambda: (True, 1.0)).admit("o/other", "m", "full", 1)
+    sends.clear(), events.clear()
+    ctx = _fake_ctx()._replace(sync_logger=_Logger())
+    sync.generate_repo_metadata(_fake_task_data(tmp_path, "newcommit"), local, args, ctx)
+    assert sends == [] and ctx.stats["errors"] == 0 and ctx.stats["skipped"] == 1
+    assert [n for n, _f in events] == ["metadata_skipped"] and events[0][1]["reason"].startswith("Weekly spending limit")
+    assert (tmp_path / "repo.md").read_text() == previous
+    held.close()
 
 
 @pytest.mark.parametrize("case", ["401", "400-credit", "503", "timeout"])

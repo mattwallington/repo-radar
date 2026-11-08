@@ -85,9 +85,9 @@ omissions. There are no shell, network, host-filesystem or write tools.
    call's record and the attempt's usage count those repaired and dropped citations, and when one was
    dropped the editor and the published coverage note say file attribution is incomplete. Section ids
    are repaired the same way: a single id becomes a list, an id the request wasn't given (or a blank or
-   non-string) is dropped, and a change whose sections were all dropped is dropped with them, so one
-   malformed change doesn't fail the update. Those repairs are counted too (`normalized_sections`,
-   `dropped_sections`, `dropped_changes`), and the editor and the coverage note say when any were dropped.
+   non-string) is dropped, and a change whose sections were all dropped is kept with none, so one
+   malformed change doesn't fail the update or lose what it says. Those repairs are counted too
+   (`normalized_sections`, `dropped_sections`), and the editor and the coverage note say when any were dropped.
    Everything else about a note stays strict: its shape and its size, before and after the repairs, and a
    note left with nothing is refused.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
@@ -154,13 +154,71 @@ lower). The whole repository goes as one request only when it fits; otherwise th
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
 until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
 something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
-document stays, rather than send excerpts. A full rebuild is capped at **$25** per attempt
+document stays, rather than send excerpts. A full rebuild is capped at **$40** per attempt
 (`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
 when its count is only a local estimate, as on Gemini, that worst case is the model's whole input limit.
 A request that could pass the cap stops the rebuild; once anything has been spent, that counts as a failed
 update. The cap bounds what
-one attempt can spend; it doesn't promise a repository can be rebuilt for that much. Repositories that
-aren't opted in keep the legacy full generator, which isn't capped.
+one attempt can spend; it doesn't promise a repository can be rebuilt for that much.
+
+Repositories that aren't opted in keep the legacy full generator, with its collection, prompts, chunking,
+retries and model fallbacks, but each attempt now has one allowance, estimated before its first send: every
+prepared prompt's input plus its maximum output and, for a chunked build, every synthesis call the bounded
+synthesis may still make (its 32-call ceiling at its complete input and output ceilings), at uncached list
+prices with a 25% margin, and at most $40 (`$40` too when the estimate can't be computed). Every send,
+retry and fallback is counted and reserved inside that allowance at the serving model's own prices, its
+cost is recorded as soon as the reply arrives (an incomplete reply included), and the SDK's own retries are
+off. A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
+overloaded reply (503, 529), gives its reservation back, so the generator's usual retry or fallback still fits.
+Any other send whose cost is unknown keeps its whole reservation: a timeout, a dropped connection, or a 500,
+502 or 504, since a gateway can fail after the model ran. A refusal that carries a charge is no refund: the
+charge is recorded and the request keeps at least its reservation. Protected builds use the same rule, though they
+never retry. A send the allowance can't cover isn't made
+and the attempt fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
+
+### The weekly spending limit
+
+Every generation attempt in a normal sync, incremental, protected full or legacy, is admitted against a
+weekly limit before its first send: **$75** by default, on unless Settings turns it off (`weekly_spend_cap_enabled`,
+`weekly_spend_cap_usd`, $1 to $1,000). The record lives in `~/.config/repo-radar/spending/`, owner-only, and
+is shared by stable and dev builds and every repository root. It holds attempt and send identifiers, the
+channel, repository, model, times and amounts, never prompts, replies, credentials or settings.
+
+- **What an attempt holds.** A diff update holds its whole quote, a protected full rebuild $40, and a legacy
+  attempt its estimate. That hold is also the attempt's hard limit: nothing is topped up once sending starts.
+  An attempt is admitted only if the week's committed money (recorded charges, unknown-cost reservations and
+  every running attempt's whole hold) plus its own hold fits the limit.
+- **A refusal** is a skip before any send: the previous summary, the failure count, the last failure and any
+  owed full rebuild stay, with no retry, fallback or other strategy. The reason says what the update needed
+  and what remains until the week resets.
+- **During and after an attempt.** Each send is recorded inside the hold before it goes out and its cost as
+  soon as the reply arrives. When the attempt ends, however it ends, its known charges and unresolved
+  reservations stay and the rest of its hold is released. A cost above its reservation is recorded in full
+  and stops further sends. A reported cost is a known charge even when the reply's token counts are missing.
+  If a cost can't be written at once it is kept and written by the next update to the record or the close, and
+  that attempt sends nothing more.
+- **Stop.** The Stop button during summary generation stops new updates and sends, closes this sync's open
+  holds and ends the sync at once: the unused part of each hold is released, a reply that has already come
+  back is recorded at its charge, and a request still in flight keeps its whole reservation, because the
+  provider may still charge for it. An update stopped between two requests is skipped, not counted as a
+  failure. A sync killed outright, a power
+  loss or a record that can't be written leaves the whole hold counted. Nothing expires with time, and there
+  is no reset button.
+- **Weeks.** The first period runs from the first sync that uses the record to the next Monday 00:00 UTC, with
+  nothing estimated for earlier spending; later ones run Monday to Monday UTC. A charge belongs to the week
+  its attempt was admitted in, even if it finishes after Monday. Settings are read again at each admission, so
+  lowering the limit affects new attempts only.
+- **Turned off,** nothing is refused for the week, but every charge is still recorded and each attempt keeps
+  its own limit.
+- **A record that can't be trusted** (it existed and is now missing, damaged or not owner-only) is
+  unavailable: nothing is admitted until it is fixed, and it is never recreated at $0.
+
+Settings shows the week's recorded spend, what is reserved or uncertain and what is available, from the same
+aggregation admission uses. Before the first sync it says tracking starts with the next sync; when the record
+can't be read it says the spend is unavailable, never $0.
+
+Combined enforcement needs both the stable and the dev app on a build that uses this record: an older build
+neither checks nor records spending. The record doesn't estimate what older builds spent.
 
 On Gemini, an opted-in full rebuild's chunk, synthesis and single-pass calls ask for low thinking, because
 thinking and the visible answer share the output limit. Their limits stay 8,192 tokens for a chunk and 16,384
@@ -196,7 +254,7 @@ Any update that ends failed, incremental or full, adds one to `consecutive_failu
 except a failure because the provider's API key isn't set: that is reported as failed but leaves the count
 as it was.
 A skipped update doesn't count, including one superseded by newer work or stopped by a resource or spending
-limit, and a publication resets the count to 0. A document replaced some other way starts again from none.
+limit before anything was paid for, and a publication resets the count to 0. A document replaced some other way starts again from none.
 
 At 2 failures in a row by default (Settings can choose 1 to 10, `incremental_failure_stop`; a missing or
 invalid value means 2), a sync started by anything but a person makes no model call for that repository, even

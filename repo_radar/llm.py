@@ -275,7 +275,90 @@ def _map_context_window_stop_as_truncation():
     _FINISH_REASON_MAP.setdefault("model_context_window_exceeded", "length")
 
 
-def call_llm(model, prompt, max_tokens=8192):
+# Statuses that mean the provider turned the request away before doing billable work: a rate limit, and
+# service unavailable or overloaded. 500, 502 and 504 aren't among them: a gateway can fail after the model ran.
+_UNPAID_STATUSES = frozenset({429, 503, 529})
+_UNPAID_PROVIDER_STATUSES = frozenset({'RESOURCE_EXHAUSTED', 'UNAVAILABLE', 'OVERLOADED'})
+_UNPAID_TYPES = frozenset({'RateLimitError', 'ServiceUnavailableError'})
+_MAYBE_PROCESSED_TYPES = frozenset({'Timeout', 'TimeoutError', 'APITimeoutError', 'ReadTimeout', 'APIConnectionError',
+                                    'ConnectionError', 'RemoteProtocolError'})
+
+
+def error_charge(error):
+    """A trustworthy positive charge carried by a failed send's error, or None: a structured response_cost on
+    the exception, its body or error detail, or its (or its response's) _hidden_params. The largest is kept."""
+    from repo_radar.metadata_budget import reliable_cost
+    response = getattr(error, 'response', None)
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else None
+    places = [error, body, detail, getattr(error, '_hidden_params', None), getattr(response, '_hidden_params', None)]
+    found = []
+    for place in places:
+        value = place.get('response_cost') if isinstance(place, dict) else getattr(place, 'response_cost', None)
+        if place is not None and reliable_cost(value):
+            found.append(float(value))
+    return max(found) if found else None
+
+
+def account_failed_send(budget, reservation, error):
+    """The money for a send that raised, the same way for both senders: a charge it carries is recorded in
+    full and keeps at least its bound; a positively unpaid refusal gives its bound back; anything else keeps
+    the whole bound as unknown. Never a retry decision."""
+    charge = error_charge(error) if isinstance(error, Exception) else None
+    if charge is not None:
+        budget.settle(reservation, None, charge)
+    elif isinstance(error, Exception) and refused_without_charge(error):
+        budget.refuse(reservation)
+    else:
+        budget.fail(reservation)
+
+
+def refused_without_charge(error):
+    """True only on positive evidence that the provider refused a send without charging for it, so its
+    reservation can go back to the attempt: a typed or structured 429, a 503 or 529, or Gemini's structured
+    RESOURCE_EXHAUSTED, UNAVAILABLE or OVERLOADED. Structured evidence the other way wins over a permissive
+    class name: any other status (500, 502 and 504 included), a timeout or dropped connection, or reported
+    usage or cost. Digits in the message never count. Whether to retry is a separate question
+    (is_transient_server_error); this only decides money, for both senders."""
+    from repo_radar.spending import SpendingStopped
+    if isinstance(error, SpendingStopped):
+        return True   # stopped before it went out: nothing was sent
+    if error_charge(error) is not None:
+        return False   # charge evidence vetoes a refund
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & _MAYBE_PROCESSED_TYPES:
+        return False
+    response = getattr(error, 'response', None)
+    if getattr(error, 'usage', None) is not None or getattr(response, 'usage', None) is not None:
+        return False
+    body = getattr(error, 'body', None)
+    detail = body.get('error', body) if isinstance(body, dict) else {}
+    detail = detail if isinstance(detail, dict) else {}
+    if detail.get('usage') is not None or (isinstance(body, dict) and body.get('usage') is not None):
+        return False
+    signals = [getattr(error, 'status_code', None), getattr(response, 'status_code', None),
+               getattr(error, 'status', None), getattr(error, 'code', None), detail.get('code'), detail.get('status')]
+    numbers = {int(s) for s in signals if isinstance(s, (int, str)) and not isinstance(s, bool)
+               and str(s).isdigit() and 100 <= int(s) <= 599}
+    named = {s for s in signals if isinstance(s, str) and not s.isdigit()}
+    if numbers:
+        return numbers <= _UNPAID_STATUSES and not (named - _UNPAID_PROVIDER_STATUSES)
+    if named:
+        return named <= _UNPAID_PROVIDER_STATUSES
+    return bool(names & _UNPAID_TYPES)
+
+
+def legacy_request_tokens(session, model, prompt, max_output):
+    """(input tokens, exact) for one legacy prompt: the provider's authoritative count when the session has
+    one (memoized, so counting again costs nothing), else the local count, which callers price with a margin."""
+    if session is not None:
+        counted = session.count(model, prompt, max_output)
+        if counted.authoritative and isinstance(counted.tokens, int) and counted.tokens > 0:
+            return counted.tokens, True
+    return count_tokens_accurate(prompt, model), False
+
+
+def call_llm(model, prompt, max_tokens=8192, *, budget=None, session=None):
     """Call an LLM and return (text, api_cost, raw_response).
 
     Transparently routes between ``litellm.completion`` (Chat Completions,
@@ -285,6 +368,13 @@ def call_llm(model, prompt, max_tokens=8192):
     Callers get back a single string of generated text, the dollar cost if
     litellm reports it, and the raw response object so they can still feed
     it to ``rate_limit_tracker.update_from_response``.
+
+    With `budget` (the legacy attempt's metadata_budget.Budget), the send is counted with `session` and
+    reserved inside the attempt's allowance at this model's own rates before it goes out, and its cost is
+    recorded straight after transport, before any text is read or an incomplete reply rejected; api_cost is
+    then that recorded cost (0.0 when unknown, which keeps its whole reservation). A send the provider refused
+    without charging (refused_without_charge) gives its reservation back. SDK retries are off: every retry or
+    fallback is the caller's, and reserved again.
     """
     import litellm
 
@@ -292,13 +382,45 @@ def call_llm(model, prompt, max_tokens=8192):
     # Name the provider explicitly: litellm otherwise infers it from its downloaded model map, and
     # when that fetch fails its bundled map doesn't know newer ids such as gpt-6.1-terra.
     provider = provider_for_model(model)
-    if _needs_responses_api(model):
-        response = litellm.responses(
-            model=model,
-            input=prompt,
-            max_output_tokens=max_tokens,
-            custom_llm_provider=provider,
-        )
+    responses_api = _needs_responses_api(model)
+    reservation = None
+    if budget is not None:
+        from repo_radar.metadata_budget import LEGACY_MARGIN
+        tokens, exact = legacy_request_tokens(session, model, prompt, max_tokens)
+        reservation = budget.reserve_send(model, {'model': model, 'prompt': prompt, 'max_tokens': max_tokens},
+                                          tokens, max_tokens, margin=1.0 if exact else LEGACY_MARGIN)
+    try:
+        if budget is not None:
+            budget.check_dispatch()   # a Stop since the reservation: don't start this send
+        if responses_api:
+            response = litellm.responses(model=model, input=prompt, max_output_tokens=max_tokens,
+                                         custom_llm_provider=provider, max_retries=0)
+        else:
+            extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
+            if provider == 'anthropic':
+                _map_context_window_stop_as_truncation()
+            response = litellm.completion(model=model, messages=_completion_messages(prompt), max_tokens=max_tokens,
+                                          custom_llm_provider=provider, num_retries=0, max_retries=0, **extra)
+    except BaseException as error:
+        if reservation is not None:
+            from repo_radar.metadata_budget import LedgerWriteError
+            try:
+                account_failed_send(budget, reservation, error)
+            except LedgerWriteError:
+                pass                             # the hold is now broken and refuses any further send
+        raise
+
+    hidden = getattr(response, '_hidden_params', None)
+    reported = hidden.get('response_cost') if isinstance(hidden, dict) else None
+    api_cost = reported or 0.0
+    if reservation is not None:
+        raw = getattr(response, 'usage', None)
+        usage = (TurnUsage(getattr(raw, 'input_tokens', None), getattr(raw, 'output_tokens', None)) if responses_api
+                 else TurnUsage(getattr(raw, 'prompt_tokens', None), getattr(raw, 'completion_tokens', None))
+                 ) if raw is not None else None
+        api_cost = budget.settle(reservation, usage, reported) or 0.0
+
+    if responses_api:
         # Prefer the convenience attribute; fall back to manual extraction.
         text = getattr(response, 'output_text', None)
         if not text:
@@ -307,16 +429,6 @@ def call_llm(model, prompt, max_tokens=8192):
             except (AttributeError, IndexError, TypeError):
                 text = ''
     else:
-        extra = {"output_config": {"effort": "medium"}} if model in CLAUDE_MEDIUM_EFFORT_MODELS else {}
-        if provider == 'anthropic':
-            _map_context_window_stop_as_truncation()
-        response = litellm.completion(
-            model=model,
-            messages=_completion_messages(prompt),
-            max_tokens=max_tokens,
-            custom_llm_provider=provider,
-            **extra,
-        )
         try:
             text = response.choices[0].message.content or ''
         except (AttributeError, IndexError):
@@ -329,11 +441,6 @@ def call_llm(model, prompt, max_tokens=8192):
                 raise IncompleteResponseError(
                     f"{model} returned an incomplete response (finish_reason={finish!r}, "
                     f"{len(text)} characters of text); not using it")
-
-    api_cost = 0.0
-    hidden = getattr(response, '_hidden_params', None)
-    if isinstance(hidden, dict):
-        api_cost = hidden.get('response_cost') or 0.0
 
     return text, api_cost, response
 
