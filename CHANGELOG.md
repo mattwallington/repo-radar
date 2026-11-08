@@ -4,6 +4,19 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.38] - 2026-11-08
+
+### Added
+- **Settings has a Spending section.** It sets the incremental update limit (default $12; $1 to $100, in dollars and cents) and how many failures in a row pause automatic metadata for a repository (default 2; 1 to 10). The next sync uses the new values, with no restart. Changing the failure number doesn't clear a repository's count: raising it can release a hold and lowering it can hold sooner. A value Settings can't accept saves nothing and points at the field. A missing or invalid value in the config file is treated as the default, never as no limit.
+
+### Changed
+- **A missing API key no longer counts toward the failure pause.** The update is still reported as failed, but setting the key isn't followed by a hold that only Sync Now can lift.
+- **Saving Settings in the dev build reports success when it succeeded.** It used to say the save failed because the dev build can't install a schedule, even though everything else had been saved. The dev build still leaves the stored schedule as it is, and says so when the window asked for a different one.
+- **The command-line `configure` wizard keeps your other settings.** It used to rewrite the config with only the token and repositories, dropping API keys, the model, the schedule and the spending limits.
+
+### Fixed
+- **A long summary update no longer fails on the editor's second turn.** The editor's first reply can carry hidden data from the model that has to be sent back with the next request, so that request could be much larger than the reply looked, and updates stopped at the 65,536-token limit after paying for every page. The first editor request is still prepared to fit 65,536 tokens, but later requests may now use up to 128,000, and the update's quote before any model call covers that. The $12 limit is unchanged. A request still too large stops before it is sent, keeps the old summary and counts as a failure.
+
 ## [1.0.37] - 2026-11-07
 
 ### Changed

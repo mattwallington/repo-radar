@@ -5,10 +5,16 @@ let configData = null;
 
 const { ipcRenderer } = require('electron');
 const { providerForModel, migrateModel, DEFAULT_MODEL, KNOWN_MODEL_IDS } = require('../model-policy');
+const spending = require('../spending-settings');
+
+// Settings input id for each spending config field.
+const SPENDING_INPUTS = {
+    [spending.LIMIT_FIELD]: 'incremental-update-limit',
+    [spending.STOP_FIELD]: 'incremental-failure-stop',
+};
 
 // Handle config loaded
 ipcRenderer.on('config-loaded', (event, config) => {
-    console.log('Config loaded:', config);
     configData = config || {
         github_token: '',
         gemini_api_key: '',
@@ -40,22 +46,23 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 // Handle save result
-ipcRenderer.on('config-saved', (event, success, error) => {
+ipcRenderer.on('config-saved', (event, success, error, field, notice) => {
+    if (!success && SPENDING_INPUTS[field]) {   // main refused a spending value; nothing was written
+        showFieldError(field, error);
+        return;
+    }
     if (success) {
-        showNotification('Settings saved successfully!', 'success');
-        // Close window after a short delay
+        showNotification(notice || 'Settings saved successfully!', 'success');
+        // Close window after a short delay, a little longer when there is a notice to read
         setTimeout(() => {
             window.close();
-        }, 1000);
+        }, notice ? 2500 : 1000);
     } else {
         showNotification(`Error saving settings: ${error}`, 'error');
     }
 });
 
 function renderForm() {
-    console.log('Rendering form with config:', configData);
-    console.log('Number of repositories:', configData?.repositories?.length || 0);
-    
     // Render GitHub token
     const tokenInput = document.getElementById('github-token');
     if (tokenInput) {
@@ -97,11 +104,47 @@ function renderForm() {
         highlightRequiredApiKey(aiModelSelect.value);
     }
     
+    renderSpendingSettings();
+
     // Render schedule settings
     renderScheduleSettings();
     
     // Render repositories
     renderRepositories();
+}
+
+// The values the next sync will use: stored valid ones, otherwise the defaults. An invalid stored value
+// shows as its default and the field must be valid to save, so it is never quietly persisted.
+function renderSpendingSettings() {
+    const effective = spending.effectiveSpending(configData);
+    document.getElementById(SPENDING_INPUTS[spending.LIMIT_FIELD]).value = spending.formatLimit(effective.limitUsd);
+    document.getElementById(SPENDING_INPUTS[spending.STOP_FIELD]).value = String(effective.failureStop);
+    const rebuild = spending.rebuildIntervalText(configData);
+    document.getElementById('rebuild-interval-text').textContent = rebuild ? ` ${rebuild}` : '';
+    clearFieldErrors();
+}
+
+function showFieldError(field, message) {
+    clearFieldErrors();
+    const input = document.getElementById(SPENDING_INPUTS[field]);
+    const error = document.getElementById(`${SPENDING_INPUTS[field]}-error`);
+    error.textContent = message;
+    error.hidden = false;
+    input.setAttribute('aria-invalid', 'true');
+    input.focus();
+}
+
+function clearFieldErrors() {
+    for (const id of Object.values(SPENDING_INPUTS)) {
+        const error = document.getElementById(`${id}-error`);
+        error.textContent = '';
+        error.hidden = true;
+        document.getElementById(id).removeAttribute('aria-invalid');
+    }
+}
+
+for (const id of Object.values(SPENDING_INPUTS)) {
+    document.getElementById(id).addEventListener('input', clearFieldErrors);
 }
 
 function renderScheduleSettings() {
@@ -438,6 +481,18 @@ function highlightRequiredApiKey(model) {
 
 // Save button
 document.getElementById('save-btn').addEventListener('click', () => {
+    // Spending first: a bad value keeps the window open on that field, and nothing is saved.
+    const spendingValues = {
+        [spending.LIMIT_FIELD]: spending.parseLimitInput(document.getElementById(SPENDING_INPUTS[spending.LIMIT_FIELD]).value),
+        [spending.STOP_FIELD]: spending.parseStopInput(document.getElementById(SPENDING_INPUTS[spending.STOP_FIELD]).value),
+    };
+    const invalid = spending.validateSpending(spendingValues);
+    if (invalid) {
+        showFieldError(invalid.field, invalid.message);
+        return;
+    }
+    Object.assign(configData, spendingValues);
+
     // Update API keys and model
     configData.github_token = document.getElementById('github-token').value;
     configData.gemini_api_key = document.getElementById('gemini-api-key').value;

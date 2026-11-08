@@ -1,6 +1,7 @@
 """Configuration loading/saving and path constants."""
 
 import json
+import math
 import re
 import os
 import tempfile
@@ -59,6 +60,64 @@ def incremental_full_rebuild_days(config):
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"incremental_full_rebuild_days must be a nonnegative whole number of days, not {value!r}")
     return value
+
+
+# The Settings "Spending" section. menubar/spending-settings.js holds the same bounds for the window; Python
+# enforces them on its own every sync, so a hand-edited or older config can never mean "unlimited".
+INCREMENTAL_UPDATE_LIMIT_FIELD = 'incremental_update_limit_usd'
+INCREMENTAL_UPDATE_LIMIT_RANGE = (1, 100)        # US dollars, at most two decimal places
+INCREMENTAL_FAILURE_STOP_FIELD = 'incremental_failure_stop'
+DEFAULT_INCREMENTAL_FAILURE_STOP = 2
+INCREMENTAL_FAILURE_STOP_RANGE = (1, 10)         # whole numbers; 0 is invalid, not "off"
+
+
+def valid_incremental_update_limit(value):
+    """True for a finite JSON number of dollars within range and exactly in whole cents. Bounds come first,
+    so an integer too large for a float is simply out of range."""
+    low, high = INCREMENTAL_UPDATE_LIMIT_RANGE
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    if not low <= value <= high:
+        return False
+    # Whole cents: 99.99 and 1.01 round to themselves, 12.000000001 doesn't. menubar/spending-settings.js
+    # uses the same test (Number(value.toFixed(2)) === value).
+    return isinstance(value, int) or round(value, 2) == value
+
+
+def valid_incremental_failure_stop(value):
+    """True for a whole number within range. A float like 2.0 counts, since JSON can't tell it from 2."""
+    low, high = INCREMENTAL_FAILURE_STOP_RANGE
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+        return False
+    return low <= value <= high
+
+
+def incremental_spending_policy(config):
+    """(update limit in USD, consecutive-failure stop, fields that were invalid) for this sync.
+
+    Absent values take the defaults quietly. Invalid ones take the defaults too and are named in the last
+    item so the caller can warn; their values are never echoed. Neither can become None, zero or unlimited."""
+    from repo_radar.metadata_budget import INCREMENTAL_CAP_USD
+    config = config if isinstance(config, dict) else {}
+    invalid = []
+    limit, stop = INCREMENTAL_CAP_USD, DEFAULT_INCREMENTAL_FAILURE_STOP
+    if INCREMENTAL_UPDATE_LIMIT_FIELD in config:
+        value = config[INCREMENTAL_UPDATE_LIMIT_FIELD]
+        if valid_incremental_update_limit(value):
+            limit = float(value)
+        else:
+            invalid.append(INCREMENTAL_UPDATE_LIMIT_FIELD)
+    if INCREMENTAL_FAILURE_STOP_FIELD in config:
+        value = config[INCREMENTAL_FAILURE_STOP_FIELD]
+        if valid_incremental_failure_stop(value):
+            stop = int(value)
+        else:
+            invalid.append(INCREMENTAL_FAILURE_STOP_FIELD)
+    return limit, stop, tuple(invalid)
 
 
 def incremental_metadata_repos(config):
