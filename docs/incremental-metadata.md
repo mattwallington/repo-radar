@@ -168,9 +168,11 @@ synthesis may still make (its 32-call ceiling at its complete input and output c
 prices with a 25% margin, and at most $40 (`$40` too when the estimate can't be computed). Every send,
 retry and fallback is counted and reserved inside that allowance at the serving model's own prices, its
 cost is recorded as soon as the reply arrives (an incomplete reply included), and the SDK's own retries are
-off. A send the provider refused without charging, a rate limit (429) or a server error (5xx) that reported no
-usage, gives its reservation back, so the generator's usual retry or fallback still fits. Any other send whose
-cost is unknown, such as a timeout, keeps its whole reservation. A send the allowance can't cover isn't made
+off. A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
+overloaded reply (503, 529), gives its reservation back, so the generator's usual retry or fallback still fits.
+Any other send whose cost is unknown keeps its whole reservation: a timeout, a dropped connection, or a 500,
+502 or 504, since a gateway can fail after the model ran. Protected builds use the same rule, though they
+never retry. A send the allowance can't cover isn't made
 and the attempt fails with the previous summary kept. The 25% margin is the app's estimate, not a guaranteed provider bill.
 
 ### The weekly spending limit
@@ -191,8 +193,14 @@ channel, repository, model, times and amounts, never prompts, replies, credentia
 - **During and after an attempt.** Each send is recorded inside the hold before it goes out and its cost as
   soon as the reply arrives. When the attempt ends, however it ends, its known charges and unresolved
   reservations stay and the rest of its hold is released. A cost above its reservation is recorded in full
-  and stops further sends. A crashed sync's hold stays counted; nothing expires with time, and there is no
-  reset button.
+  and stops further sends. A reported cost is a known charge even when the reply's token counts are missing.
+  If a cost can't be written at once it is kept and written by the next update to the record or the close, and
+  that attempt sends nothing more.
+- **Stop.** The Stop button during summary generation stops new updates and sends, closes this sync's open
+  holds and ends the sync at once: the unused part of each hold is released, but a request already in flight
+  keeps its whole reservation, because the provider may still charge for it. A sync killed outright, a power
+  loss or a record that can't be written leaves the whole hold counted. Nothing expires with time, and there
+  is no reset button.
 - **Weeks.** The first period runs from the first sync that uses the record to the next Monday 00:00 UTC, with
   nothing estimated for earlier spending; later ones run Monday to Monday UTC. A charge belongs to the week
   its attempt was admitted in, even if it finishes after Monday. Settings are read again at each admission, so
