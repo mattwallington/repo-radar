@@ -16,8 +16,10 @@ in flight keep their bounds, since the provider may still charge for them (stop_
 
 Periods: the first runs from activation (the first normal sync using this ledger) to the next Monday
 00:00 UTC, later ones Monday to Monday UTC. Every charge belongs to the period its attempt was admitted in.
-Only the current and previous periods are kept: each admission drops closed attempts from older periods,
-which nothing reads, so the file stays small however long the app runs.
+Only the current and previous four periods are kept: each admission drops closed attempts from older
+periods, which nothing reads, so the file stays small however long the app runs. The ledger trusts the
+system clock to say which period is current: a clock set back further than that margin finds a period
+whose closed attempts are gone and under-counts it.
 
 Amounts are integer microdollars, rounded up. The ledger stores attempt and send identifiers, the channel,
 repository name, model, times and amounts only: never prompts, replies, credentials or configuration.
@@ -125,9 +127,9 @@ def committed(attempt):
 
 
 def compact(data, period_start):
-    """Drop closed attempts admitted before the period preceding `period_start`. Open ones stay, since a
-    running process may still write to its hold."""
-    cutoff = period_start - timedelta(days=7)
+    """Drop closed attempts admitted more than four weeks before `period_start`. The extra weeks are margin
+    for a clock set back; open ones stay, since a running process may still write to its hold."""
+    cutoff = period_start - timedelta(days=28)
     data['attempts'] = {k: a for k, a in data['attempts'].items()
                         if a['status'] == 'open' or _utc(a['period_start']) >= cutoff}
 

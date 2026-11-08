@@ -135,16 +135,16 @@ def test_holds_survive_reopening_belong_to_their_period_and_damage_is_unavailabl
     assert not ledger.exists()
 
 
-def test_admission_keeps_only_the_current_and_previous_periods(tmp_path):
+def test_admission_keeps_only_the_current_and_previous_four_periods(tmp_path):
     root = tmp_path / 'spending'
     weeks = [WEDNESDAY, MONDAY + timedelta(days=1), MONDAY + timedelta(days=8)]
     for when in weeks:
         context(root, now=when).admit('o/r', 'm', 'full', 2).close()
     running = context(root, now=weeks[0]).admit('o/r', 'm', 'full', 1)   # an open hold is never dropped
-    context(root, now=MONDAY + timedelta(days=15)).admit('o/r', 'm', 'full', 3)
+    context(root, now=MONDAY + timedelta(days=36)).admit('o/r', 'm', 'full', 3)   # four weeks after Nov 16
     kept = json.loads((root / sp.LEDGER_NAME).read_text())['attempts']
     assert sorted((a['period_start'][:10], a['status']) for a in kept.values()) == [
-        ('2026-11-04', 'open'), ('2026-11-16', 'closed'), ('2026-11-23', 'open')]
+        ('2026-11-04', 'open'), ('2026-11-16', 'closed'), ('2026-12-14', 'open')]
     running.close()
 
 
