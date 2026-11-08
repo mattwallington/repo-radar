@@ -100,7 +100,7 @@ omissions. There are no shell, network, host-filesystem or write tools.
    answer is a set of section edits: replace, delete or insert, each naming the section's id and hash.
    Edits that don't match are rejected, untouched sections keep their exact bytes, and the app writes the
    commit IDs, timestamps and provenance itself. A reply that isn't JSON as a whole may still hold exactly
-   one JSON object, in a code fence or among a few words, and that object is the answer, checked as usual;
+   one complete JSON object, in a code fence or among a few words, and that object is the answer, checked as usual;
    with none or several, the reply is refused. A final request with no tools defined (the one-note case)
    also asks Gemini for a JSON reply; a later final turn keeps the tool definitions its history needs and
    doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, and the first

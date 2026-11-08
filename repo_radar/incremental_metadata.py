@@ -473,7 +473,7 @@ def apply_patch(sections, fields, patch, base_sha):
 
 def parse_answer(text):
     """The JSON value in a final reply. A reply that isn't JSON as a whole may still hold exactly one
-    top-level JSON object, in a code fence or among a few words of prose; that object is the answer. None,
+    complete JSON object, in a code fence or among a few words of prose; that object is the answer. None,
     or two or more, and the reply is refused. What comes back is validated exactly as before."""
     stripped = (text or '').strip()
     try:

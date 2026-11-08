@@ -155,7 +155,7 @@ def rejected_reply(call, text):
     and the start of its text, redacted (configured keys and known secret shapes) before it is cut."""
     from repo_radar.activity.redact import Redactor
     from repo_radar.metadata import redact_secrets
-    scrubbed = Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(redact_secrets(text or ''))
+    scrubbed = redact_secrets(Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(text or ''))
     return {'call': call, 'text': scrubbed.encode('utf-8')[:REJECTED_REPLY_BYTES].decode('utf-8', 'ignore')}
 
 
