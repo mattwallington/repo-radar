@@ -85,9 +85,9 @@ omissions. There are no shell, network, host-filesystem or write tools.
    call's record and the attempt's usage count those repaired and dropped citations, and when one was
    dropped the editor and the published coverage note say file attribution is incomplete. Section ids
    are repaired the same way: a single id becomes a list, an id the request wasn't given (or a blank or
-   non-string) is dropped, and a change whose sections were all dropped is dropped with them, so one
-   malformed change doesn't fail the update. Those repairs are counted too (`normalized_sections`,
-   `dropped_sections`, `dropped_changes`), and the editor and the coverage note say when any were dropped.
+   non-string) is dropped, and a change whose sections were all dropped is kept with none, so one
+   malformed change doesn't fail the update or lose what it says. Those repairs are counted too
+   (`normalized_sections`, `dropped_sections`), and the editor and the coverage note say when any were dropped.
    Everything else about a note stays strict: its shape and its size, before and after the repairs, and a
    note left with nothing is refused.
 4. **Editing.** One conversation gets the document's sections and hashes, its summary fields, the notes,
@@ -196,7 +196,7 @@ Any update that ends failed, incremental or full, adds one to `consecutive_failu
 except a failure because the provider's API key isn't set: that is reported as failed but leaves the count
 as it was.
 A skipped update doesn't count, including one superseded by newer work or stopped by a resource or spending
-limit, and a publication resets the count to 0. A document replaced some other way starts again from none.
+limit before anything was paid for, and a publication resets the count to 0. A document replaced some other way starts again from none.
 
 At 2 failures in a row by default (Settings can choose 1 to 10, `incremental_failure_stop`; a missing or
 invalid value means 2), a sync started by anything but a person makes no model call for that repository, even

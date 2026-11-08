@@ -1072,9 +1072,9 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     for key, total in (('normalized_file_citations', 2), ('dropped_file_citations', 6)):
         assert usage[key] == sum(c.get(key, 0) for c in saved['calls']) == total
 
-    # Notes stay strict about their shape, sections and size: a wrong or missing field, an empty string, an
-    # unknown section, or a note over its limit as written, even one that dropping citations would shrink.
-    # An unknown file is dropped rather than refused.
+    # Notes stay strict about their shape and size: a wrong or missing field, an empty string, or a note over
+    # its limit as written, even one that dropping citations or sections would shrink. An unknown file or
+    # section is dropped rather than refused.
     long_path = 'src/' + 'p' * 400 + '.py'
     paths = {long_path: 'f1'}
     for bad in ({'changes': [], 'questions': 'x', 'no_summary_change_reason': 'r'},
@@ -1082,13 +1082,18 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
                 {'changes': [{'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
                 {'changes': [{'files': 'f1', 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
                 {'changes': [{'files': [''], 'what': 'w', 'sections': []}], 'no_summary_change_reason': None},
-                {'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}], 'no_summary_change_reason': None},
+                {'changes': [{'files': ['f1'], 'what': 'w' * 3000, 'sections': ['s9']},
+                             {'files': ['f1'], 'what': 'w', 'sections': ['s1']}], 'no_summary_change_reason': None},
                 {'changes': [{'files': [long_path], 'what': 'w' * 2800, 'sections': []}], 'no_summary_change_reason': None}):
         with pytest.raises(mr.NoteError):
             mr.validate_note(bad, ['f1'], ['s1'], mr.MAX_NOTE_BYTES, paths=paths)
     note, _text, repairs = mr.validate_note({'changes': [{'files': ['f99'], 'what': 'w', 'sections': []}]},
                                             ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
     assert note['changes'][0]['files'] == [] and repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_file_citations': 1}
+    note, _text, repairs = mr.validate_note({'changes': [{'files': ['f1'], 'what': 'w', 'sections': ['s9']}]},
+                                            ['f1'], ['s1'], mr.MAX_NOTE_BYTES)
+    assert note['changes'] == [{'files': ['f1'], 'what': 'w', 'sections': []}]
+    assert repairs == {**dict.fromkeys(mr.REPAIR_COUNTS, 0), 'dropped_sections': 1}
 
 
 def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatch, tmp_path):
@@ -1172,9 +1177,10 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
 
 
-def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkeypatch, tmp_path):
+def test_a_change_naming_unknown_sections_is_repaired_not_the_whole_update(monkeypatch, tmp_path):
     """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
-    whole update failed. Now that change is dropped and counted; the note's other change still lands."""
+    whole update failed. Now those ids are dropped and counted, and the change reaches the editor without a
+    section, next to the note's other change."""
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
     repo.write('src/m0.py', 'changed = True\n')
     repo.commit('one change')
@@ -1196,9 +1202,9 @@ def test_a_change_naming_unknown_sections_is_dropped_not_the_whole_update(monkey
         outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
     assert outcome.status == 'published', outcome
     editor = fake.stage('edit')[0][0]
-    assert 'm0 records a change' in editor and 'UNPLACED' not in editor and mr.SECTION_WARNING in editor
+    assert 'm0 records a change' in editor and 'UNPLACED change' in editor and mr.SECTION_WARNING in editor
     usage = outcome.usage
-    assert (usage['normalized_sections'], usage['dropped_sections'], usage['dropped_changes']) == (1, 2, 1)
+    assert (usage['normalized_sections'], usage['dropped_sections']) == (1, 2) and 'dropped_changes' not in usage
     new = im.load_document(pristine, 'app-abc1234')
     assert 'm0 now records a change' in new.text and mr.SECTION_WARNING in new.info['coverage_note']
 
@@ -1333,7 +1339,7 @@ def test_a_failed_map_call_stops_the_update_and_settles_what_was_launched(monkey
     def mostly_fine(stage, text):
         assert stage == 'map'
         if '[page p3 ' in text:
-            return {'changes': [{'files': [], 'what': 'a section it was never given', 'sections': ['s999']}]}
+            return {'changes': [{'files': [], 'what': 'a change with no sections key'}]}   # malformed: refused
         return {'changes': [], 'no_summary_change_reason': 'routine'}
     fake = GeminiFake(monkeypatch, mostly_fine)
     real_settle, failures = Ledger.settle, []
