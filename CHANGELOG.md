@@ -4,6 +4,11 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+- **An editor edit that names a section with a list or object is refused like any other bad edit.** The update already failed and kept the current summary, but its reason was an internal type error and the refused edit's shape wasn't saved; now it says the model's edits were rejected and keeps that shape for diagnosis.
+
 ## [1.0.41] - 2026-11-09
 
 ### Fixed
