@@ -360,7 +360,45 @@ QUICK_REF_FIELDS = ('type', 'language', 'framework', 'database', 'apis', 'port',
 
 
 class PatchError(Exception):
-    """The model's edits are malformed or ambiguous; nothing is published and nothing is retried."""
+    """The model's edits are malformed or ambiguous; nothing is published and nothing is retried.
+    `operation` is the shape of the section edit at fault (see _operation_shape), when one is."""
+
+    def __init__(self, message, operation=None):
+        super().__init__(message)
+        self.operation = operation
+
+
+INSERT_LABEL_CHARS = 64   # the longest unused label an insert may carry
+
+
+def _operation_shape(index, op, by_id):
+    """A section edit's shape for diagnosis, never its prose: its position, kind, key names, its "id" and
+    "after" and whether each names a section of the base document, and its content as length and hash.
+    Unbounded and unredacted here; the attempt's record bounds and redacts it."""
+    if not isinstance(op, dict):
+        return {'index': index, 'type': type(op).__name__}
+    shape = {'index': index, 'op': op.get('op'), 'keys': sorted(op)}
+    for ref in ('id', 'after'):
+        if ref in op:
+            value = op[ref]
+            shape[ref] = value if isinstance(value, str) else f"<{type(value).__name__}>"
+            shape[f"{ref}_in_base"] = isinstance(value, str) and value in by_id
+    if 'content' in op:
+        content = op['content']
+        raw = content.encode('utf-8', 'surrogatepass') if isinstance(content, str) else None   # JSON allows "\ud800"
+        shape['content'] = ({'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()[:16]}
+                            if raw is not None else {'type': type(content).__name__})
+    return shape
+
+
+def _insert_label(label, by_id):
+    """An insert may carry an "id" only as an unused label: the app numbers sections itself, so the label
+    names nothing, and no other edit can refer to it. One that is malformed or names an existing section is
+    ambiguous, so it is refused rather than guessed at."""
+    if not isinstance(label, str) or not label.strip() or len(label) > INSERT_LABEL_CHARS:
+        raise PatchError(f"insert id must be a non-empty label of at most {INSERT_LABEL_CHARS} characters")
+    if label in by_id:
+        raise PatchError(f"insert id {label!r} names an existing section")
 
 
 def split_sections(analysis):
@@ -404,6 +442,50 @@ def _one_line(value, name, max_len):
     return value.strip()
 
 
+def _apply_op(op, by_id, replaced, deleted, targets, inserts):
+    """Check one section edit against the base document and record it. Every check raises PatchError."""
+    if not isinstance(op, dict) or op.get('op') not in ('replace', 'delete', 'insert'):
+        raise PatchError("each section edit needs op replace, delete or insert")
+    kind = op['op']
+    allowed = {'replace': {'op', 'id', 'expected_sha256', 'content'}, 'delete': {'op', 'id', 'expected_sha256'},
+               'insert': {'op', 'after', 'content'}}[kind]
+    extra = set(op) - allowed
+    if kind == 'insert' and 'id' in extra:
+        _insert_label(op['id'], by_id)   # ignored: it never becomes a section the patch can name
+        extra.discard('id')
+    if extra:
+        raise PatchError(f"{kind} has unexpected keys {sorted(extra)}")
+    if kind in ('replace', 'delete'):
+        section = by_id.get(op.get('id'))
+        if section is None:
+            raise PatchError(f"no section {op.get('id')!r}")
+        if op.get('expected_sha256') != section.sha256:
+            raise PatchError(f"{section.id}: expected_sha256 does not match the section")
+        if section.id in targets:
+            raise PatchError(f"{section.id} is edited more than once")
+        targets.add(section.id)
+        if kind == 'delete':
+            deleted.add(section.id)
+            return
+    anchor = op.get('after') if kind == 'insert' else None
+    if kind == 'insert' and anchor != 'start' and anchor not in by_id:
+        raise PatchError(f"insert after unknown section {anchor!r}")
+    content = op.get('content')
+    if not isinstance(content, str) or not content.strip():
+        raise PatchError(f"{kind} needs non-empty content")
+    if _code_lines(content.splitlines(keepends=True))[1]:
+        raise PatchError(f"{kind} content leaves a code fence open")
+    if kind == 'insert' and not _HEADING.match(content):
+        raise PatchError("inserted content must start with a Markdown heading")
+    if kind == 'replace' and _HEADING.match(by_id[op['id']].text) and not _HEADING.match(content):
+        raise PatchError(f"{op['id']}: replacement must keep a heading")
+    content = content if content.endswith('\n') else content + '\n'
+    if kind == 'replace':
+        replaced[op['id']] = content
+    else:
+        inserts.setdefault(anchor, []).append(content)
+
+
 def apply_patch(sections, fields, patch, base_sha):
     """Apply the model's section edits. Returns (analysis, fields, coverage_note).
 
@@ -424,43 +506,15 @@ def apply_patch(sections, fields, patch, base_sha):
     by_id = {s.id: s for s in sections}
     replaced, deleted, targets = {}, set(), set()
     inserts = {}
-    for op in ops:
-        if not isinstance(op, dict) or op.get('op') not in ('replace', 'delete', 'insert'):
-            raise PatchError("each section edit needs op replace, delete or insert")
-        kind = op['op']
-        allowed = {'replace': {'op', 'id', 'expected_sha256', 'content'}, 'delete': {'op', 'id', 'expected_sha256'},
-                   'insert': {'op', 'after', 'content'}}[kind]
-        if set(op) - allowed:
-            raise PatchError(f"{kind} has unexpected keys {sorted(set(op) - allowed)}")
-        if kind in ('replace', 'delete'):
-            section = by_id.get(op.get('id'))
-            if section is None:
-                raise PatchError(f"no section {op.get('id')!r}")
-            if op.get('expected_sha256') != section.sha256:
-                raise PatchError(f"{section.id}: expected_sha256 does not match the section")
-            if section.id in targets:
-                raise PatchError(f"{section.id} is edited more than once")
-            targets.add(section.id)
-            if kind == 'delete':
-                deleted.add(section.id)
-                continue
-        anchor = op.get('after') if kind == 'insert' else None
-        if kind == 'insert' and anchor != 'start' and anchor not in by_id:
-            raise PatchError(f"insert after unknown section {anchor!r}")
-        content = op.get('content')
-        if not isinstance(content, str) or not content.strip():
-            raise PatchError(f"{kind} needs non-empty content")
-        if _code_lines(content.splitlines(keepends=True))[1]:
-            raise PatchError(f"{kind} content leaves a code fence open")
-        if kind == 'insert' and not _HEADING.match(content):
-            raise PatchError("inserted content must start with a Markdown heading")
-        if kind == 'replace' and _HEADING.match(by_id[op['id']].text) and not _HEADING.match(content):
-            raise PatchError(f"{op['id']}: replacement must keep a heading")
-        content = content if content.endswith('\n') else content + '\n'
-        if kind == 'replace':
-            replaced[op['id']] = content
-        else:
-            inserts.setdefault(anchor, []).append(content)
+    for index, op in enumerate(ops):
+        try:
+            _apply_op(op, by_id, replaced, deleted, targets, inserts)
+        except PatchError as e:
+            try:   # best effort: describing the edit must never replace the refusal itself
+                e.operation = _operation_shape(index, op, by_id)
+            except Exception:
+                e.operation = {'index': index, 'unavailable': True}
+            raise
 
     # (text, written by the model). Only model-written text gets a blank line added before what follows.
     parts = [(t, True) for t in inserts.get('start', [])]

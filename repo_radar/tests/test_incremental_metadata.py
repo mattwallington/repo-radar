@@ -1404,6 +1404,80 @@ def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monk
         im.parse_answer(two)
 
 
+@pytest.mark.parametrize('case', ['unused', 'collision', 'reference', 'extra key', 'surrogate key', 'surrogate content',
+                                  'surrogate replace id', 'largest shape'])
+def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatch, tmp_path, case):
+    """Installed 1.0.40 on telehealth: editor turn 3 refused 'insert has unexpected keys ['id']', and the
+    kept 4 KiB of the reply ended before that insert. An unused label on an insert is now ignored. A label
+    that names an existing section, a later edit naming the new label, or another extra key still refuses
+    the whole patch after the spend, with no repair request, and the record keeps the edit's shape. A lone
+    surrogate, which JSON allows, never replaces that refusal or loses the kept text, and the shape stays
+    within 1 KiB as the attempt file stores it."""
+    def attempt(where, insert, later=()):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+        old = im.load_document(pristine, 'app-abc1234')
+        components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+        long = '## Key Components\n- m0 now records a change\n' + ''.join(f"- detail {i} of what m0 records\n" for i in range(200))
+        patch = {'base_document_sha256': old.sha256,
+                 'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256, 'content': long},
+                              {'op': 'insert', 'after': components.id, 'content': '## Change Records\n- m0 keeps them\n',
+                               **insert(components)}, *later]}
+        assert len(json.dumps(patch)) > mr.REJECTED_REPLY_BYTES   # the edit at fault lies past the kept text
+
+        def reply(stage, text):
+            if stage == 'map':
+                return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                        'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            return patch
+        fake = GeminiFake(monkeypatch, reply)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        return outcome, fake, pristine, old, components
+
+    if case == 'unused':
+        labelled, _fake, pristine, old, components = attempt(tmp_path / 'labelled', lambda c: {'id': 'new-change-records'})
+        plain, _fake, plain_pristine, _old, _c = attempt(tmp_path / 'plain', lambda c: {})
+        assert labelled.status == plain.status == 'published', (labelled, plain)
+        published = im._analysis_of(im.load_document(pristine, 'app-abc1234'))
+        assert published == im._analysis_of(im.load_document(plain_pristine, 'app-abc1234'))
+        assert '## Change Records' in published and 'new-change-records' not in published
+        untouched = [s.text for s in im.split_sections(im._analysis_of(old)) if s.id != components.id]
+        assert all(text.rstrip('\n') in published for text in untouched)   # the document's end is trimmed
+        return
+
+    insert, later, expected = {
+        'collision': (lambda c: {'id': c.id}, (), {'index': 1, 'id_in_base': True}),
+        'reference': (lambda c: {'id': 'new-change-records'},
+                      ({'op': 'insert', 'after': 'new-change-records', 'content': '## More\n- more\n'},),
+                      {'index': 2, 'after': 'new-change-records', 'after_in_base': False}),
+        'extra key': (lambda c: {'title': 'Change Records'}, (), {'index': 1, 'keys': ['after', 'content', 'op', 'title']}),
+        'surrogate key': (lambda c: {'\ud800': 'x'}, (), {'index': 1}),
+        'surrogate content': (lambda c: {'title': 'x', 'content': '## Change Records\n- m0 \ud800 keeps them\n'}, (),
+                              {'index': 1}),
+        'surrogate replace id': (lambda c: {}, ({'op': 'replace', 'id': 'no-such-\ud800', 'expected_sha256': 'f' * 16,
+                                                  'content': '## More\n- more\n'},), {'op': 'replace', 'index': 2, 'id_in_base': False}),
+        'largest shape': (lambda c: {'id': '\x01' * 14, **{str(i) + '\x01' * 14: 'x' for i in range(15)}}, (), {'index': 1}),
+    }[case]
+    outcome, fake, pristine, old, _components = attempt(tmp_path, insert, later)
+    assert outcome.status == 'failed' and 'edits were rejected' in outcome.reason and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert len(fake.stage('edit')) == 1, 'no repair request'
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 1 and state['usage']['known_cost_usd'] == outcome.usage['known_cost_usd']
+    saved = state['usage']['rejected_reply']
+    assert saved['text'].startswith('{') and len(saved['text'].encode('utf-8')) <= mr.REJECTED_REPLY_BYTES
+    assert '## Change Records' not in saved['text']
+    operation = saved['operation']
+    stored = im.state_path(pristine, 'app-abc1234').read_text(encoding='utf-8')
+    start = stored.index('"operation": ') + len('"operation": ')
+    assert len(stored[start:stored.index('\n      }', start) + 8].encode('utf-8')) <= mr.REJECTED_OPERATION_BYTES
+    expected = {'op': 'insert', **expected}
+    assert {k: operation.get(k) for k in expected} == expected
+    assert set(operation['content']) == {'bytes', 'sha256'} and 'keeps them' not in json.dumps(operation)
+
+
 def test_a_resource_limit_after_paid_map_calls_is_a_failure(monkeypatch, tmp_path):
     """A spool read that fails mid-run, after map waves were bought, fails the update and moves the streak;
     the same limit before anything is sent is still a skip."""
