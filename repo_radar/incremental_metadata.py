@@ -178,22 +178,36 @@ def _full_rebuild_origin(state):
     return None if origin == UNFINISHED_REASON else origin
 
 
-def full_rebuild_unfinished(state, doc, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS):
-    """True when `state` is a full rebuild started from exactly `doc` that never published and is still
-    owed. A state whose generation ID is the document's own reached its commit point and is not
-    unfinished. One chosen only by a trigger that no longer applies (a removed size rule, or the weekly
-    rule once it's turned off) isn't owed; an explicitly forced one still is, however many times it fails.
-    A record whose origin can't be recovered owes nothing: the current rules decide, and a person can
-    force a rebuild again, which is cheaper than buying one nobody asked for."""
+def _unfinished_full(state, doc):
+    """True when `state` is a full rebuild started from exactly `doc` that never published, from a trigger
+    that still exists. A state whose generation ID is the document's own reached its commit point and is not
+    unfinished. One chosen only by a removed trigger (the old size rule) isn't owed; an explicitly forced one
+    still is, however many times it fails. A record whose origin can't be recovered owes nothing: the current
+    rules decide, and a person can force a rebuild again, which is cheaper than buying one nobody asked for.
+    The schedule isn't consulted, so a failure recorded without it (record_failure) keeps the evidence."""
     st = state or {}
     if doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED:
         return False
     if st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'):
         return False
     origin = _full_rebuild_origin(st)
-    if origin is None or _REMOVED_TRIGGER.fullmatch(origin) or (origin == WEEKLY_REASON and not full_rebuild_days):
+    if origin is None or _REMOVED_TRIGGER.fullmatch(origin):
         return False
     return st.get('baseline_doc_sha256') == doc.sha256
+
+
+def full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
+    """True when an unfinished full rebuild (_unfinished_full) is still owed under the current policy: the
+    caller's interval and clock, and the document's last successful full build `built`. One owed only to the
+    weekly rule is due only while that rule is due now, so a longer interval defers it to the new date and 0
+    turns it off; with the interval on, an unknown build time keeps it owed. Any other origin, such as a forced rebuild, stays owed."""
+    if not _unfinished_full(state, doc):
+        return False
+    if _full_rebuild_origin(state) != WEEKLY_REASON:
+        return True
+    if not full_rebuild_days:
+        return False
+    return built is None or now - built >= timedelta(days=full_rebuild_days)
 
 
 def consecutive_failures(state, doc):
@@ -219,12 +233,14 @@ def held_reason(state, doc, force=False, trigger='manual', threshold=HOLD_AFTER_
     return f"held after {failures} failed updates in a row; a manual sync or a forced rebuild retries"
 
 
-def _dropped_full_attempt(state, doc, full_rebuild_days):
-    """The record of a full rebuild that didn't finish and is no longer owed, kept as evidence when a
-    new attempt replaces it. None when there isn't one."""
+def _dropped_full_attempt(state, doc, full_rebuild_days, now, built):
+    """The record of a full rebuild that didn't finish and is no longer owed under the policy decide used
+    (the same interval, clock and full-build time), kept as evidence when a new attempt replaces it. None
+    when there isn't one."""
     st = state or {}
     if (doc is None or st.get('strategy') != 'full' or st.get('status') not in UNFINISHED
-            or st.get('baseline_doc_sha256') != doc.sha256 or full_rebuild_unfinished(st, doc, full_rebuild_days)
+            or st.get('baseline_doc_sha256') != doc.sha256
+            or full_rebuild_unfinished(st, doc, full_rebuild_days, now, built)
             or (st.get('generation_id') and st.get('generation_id') == doc.info.get('generation_id'))):
         return None
     return {k: st.get(k) for k in ('status', 'reason', 'decision_reason', 'full_rebuild_origin', 'target_commit',
@@ -284,7 +300,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
         return full('configured model changed', adopt=adopt)
     if built is None:
         return full('last full build time unknown', adopt=adopt)
-    if full_rebuild_unfinished(state, doc, full_rebuild_days):
+    if full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
         return full(UNFINISHED_REASON, built=built, adopt=adopt)
     if full_rebuild_days and now - built >= timedelta(days=full_rebuild_days):
         return full(WEEKLY_REASON, built=built, adopt=adopt)
@@ -727,7 +743,7 @@ def record_failure(pristine_dir, cache_name, full_name, reason, target=None, pha
         state = read_attempt_state(pristine_dir, cache_name) or {}
     except Exception:
         state = {}
-    full_due = full_rebuild_unfinished(state, doc)
+    full_due = _unfinished_full(state, doc)
     record = {**state, 'schema': 'repo-radar-metadata-attempt/1', 'full_name': full_name,
               'attempt_id': uuid.uuid4().hex, 'status': status, 'strategy': 'full' if full_due else None,
               'phase': phase, 'base_commit': doc.info.get('last_commit') if doc else None,
@@ -850,7 +866,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                    # A missing document keeps the streak's identity as it keeps the count, so a retry while
                    # the file is away can't release the hold on it when it comes back.
                    FAILURE_STREAK_DOC: doc.sha256 if doc else state.get(FAILURE_STREAK_DOC)}
-        dropped = _dropped_full_attempt(state, doc, full_rebuild_days)
+        dropped = _dropped_full_attempt(state, doc, full_rebuild_days, now, decision.full_built_at)
         if dropped:   # its failure stays on record while the new path runs
             attempt['dropped_full_attempt'] = dropped
         attempt['pipeline_version'] = PIPELINE_VERSION
