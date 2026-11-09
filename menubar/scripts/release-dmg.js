@@ -28,8 +28,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
-  SIGNING_IDENTITY, TEAM_ID, NOTARY_PROFILE, BOOTSTRAP_BUILD, channelOf, artifactNames, fileIdentity, inspectFeed, dumpFeed,
-  checkFeedDir, inspectZips, checkPinned,
+  SIGNING_IDENTITY, TEAM_ID, NOTARY_PROFILE, channelOf, artifactNames, fileIdentity, inspectFeed, dumpFeed,
+  checkFeedDir, inspectZips,
 } = require('./release-artifacts');
 
 const BOUNDS = Object.freeze({ toolMs: 120_000, notaryMs: 1_800_000, outputBytes: 256 * 1024 });
@@ -161,7 +161,7 @@ function writeAtomically(file, text) {
 
 const identityOf = (dir, name) => { const { size, sha256 } = fileIdentity(path.join(dir, name)); return { name, size, sha256 }; };
 
-async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = process.env, run = runBounded, log = () => {} }) {
+async function finalize({ dir, version, source, env = process.env, run = runBounded, log = () => {} }) {
   const channel = channelOf(version);
   if (!channel) throw new Hold(`not a release version: ${version}`);
   if (!SHA.test(source || '')) throw new Hold(`not a source commit: ${source}`);
@@ -169,7 +169,7 @@ async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = pr
   // rewritten again, and a record that no longer verifies is kept and refused, never replaced.
   if (fs.existsSync(path.join(dir, FINALIZATION))) {
     log(`${FINALIZATION} exists: verifying it instead of finalizing again`);
-    return verifyFinalized({ dir, version, source, pins, env, run });
+    return verifyFinalized({ dir, version, source, env, run });
   }
   // The record is written only at the very end, so a failure below leaves no success marker.
   const names = artifactNames(version, channel);
@@ -186,10 +186,8 @@ async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = pr
   try { doc = inspectFeed(feedText, { version, channel, ids }); } catch (e) { throw new Hold(`before finalizing: ${e.message}`); }
   const zipBlockmaps = names.zipBlockmaps.filter((n) => fs.existsSync(path.join(dir, n)));
   const zipBlockmapIds = Object.fromEntries(zipBlockmaps.map((n) => [n, fileIdentity(path.join(dir, n)).sha256]));
-  // The apps inside the ZIPs must be this version and channel, built from `source`; a pinned build
-  // must also be its original files.
+  // The apps inside the ZIPs must be this version and channel, built from `source`.
   try {
-    if (pins && pins.version === version) checkPinned(dir, pins, source, [...names.zips, ...names.dmgs, names.feed, ...zipBlockmaps]);
     inspectZips(dir, { version, channel, source });
   } catch (e) { throw new Hold(`before finalizing: ${e.message}`); }
   const inputs = {
@@ -259,7 +257,7 @@ async function finalize({ dir, version, source, pins = BOOTSTRAP_BUILD, env = pr
 // Read-only proof that `dir` holds a finalized build of `version` from `source`: the finalizer's result
 // must describe the exact current files, and both DMGs must still pass the signature, staple and
 // Gatekeeper checks. Used before anything is uploaded.
-async function verifyFinalized({ dir, version, source, pins = BOOTSTRAP_BUILD, env = process.env, run = runBounded }) {
+async function verifyFinalized({ dir, version, source, env = process.env, run = runBounded }) {
   const channel = channelOf(version);
   const names = artifactNames(version, channel);
   const file = path.join(dir, FINALIZATION);
@@ -285,11 +283,6 @@ async function verifyFinalized({ dir, version, source, pins = BOOTSTRAP_BUILD, e
   for (const d of result.dmgs) if (!UUID.test(d.submission || '')) throw new Hold(`${d.name} has no notary submission id`);
   checkFeedDir(dir, { version, channel, finalized: true });
   try {
-    if (pins && pins.version === version) {
-      checkPinned(dir, pins, source, [...names.zips, ...present]);
-      const inputs = [...result.inputs.dmgs, result.inputs.feed];
-      if (inputs.some((i) => pins.original[i.name] !== i.sha256)) throw new Error(`the DMGs or feed finalized were not the original ${version} files`);
-    }
     inspectZips(dir, { version, channel, source });
   } catch (e) { throw new Hold(e.message); }
 

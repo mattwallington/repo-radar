@@ -6,13 +6,9 @@
 //                                              or report that it is already published
 //   release-control.js publish --dir <dist>    GitHub Actions: upload the finalized build to its draft,
 //                                              verify the uploaded bytes, then publish it
-//   release-control.js bootstrap --dir <dist> --version <x.y.z> --source <sha>
-//                                              Operator, with local gh auth: publish the preserved 1.0.34
-//                                              build from 4283e74 (pinned in release-artifacts.js), after
-//                                              release-dmg.js has finalized its DMGs
 //
 // A release is keyed by channel plus source commit and tree, recorded in its body. Stable takes the next
-// patch above every stable tag, the bootstrap floor and the checkout's VERSION; Dev takes the greater of
+// patch above every stable tag, the version floor and the checkout's VERSION; Dev takes the greater of
 // that base and the highest Dev base, with a UTC timestamp suffix above any existing one. A retry reuses
 // its reservation. Before reserving and again just before publishing, the branch must still point at the
 // source commit and no newer same-channel release may exist. An already-published source is verified and
@@ -23,13 +19,14 @@ const path = require('path');
 const crypto = require('crypto');
 const childProcess = require('child_process');
 const { releaseEnv } = require('./release-env');
-const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, BOOTSTRAP_BUILD, channelOf, fileIdentity } = require('./release-artifacts');
+const { FEED_OWNER, FEED_REPO, STABLE_VERSION, DEV_VERSION, channelOf, fileIdentity } = require('./release-artifacts');
 const { verifyFinalized } = require('./release-dmg');
 
 const SOURCE_REPO = 'ReperioHealth/repo-radar';
 const RELEASES_REPO = `${FEED_OWNER}/${FEED_REPO}`;
 const SCHEMA = 'repo-radar-release/1';
-const BOOTSTRAP_FLOOR = '1.0.34';
+// 1.0.40 was the last release built and installed by hand, so the first CI release is above it.
+const VERSION_FLOOR = '1.0.40';
 const RECEIPT = 'release-receipt.json';
 const MARKER = /<!-- repo-radar-release (\{[^\n]*\}) -->/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -66,7 +63,7 @@ const utcStamp = (now) => now.toISOString().replace(/[-:T]/g, '').slice(0, 14);
 function planVersion({ versions, channel, floor, now }) {
   const parsed = versions.map(parseVersion).filter(Boolean);
   const stableBases = parsed.filter((p) => p.dev === null).map((p) => p.base);
-  const floors = [parseVersion(BOOTSTRAP_FLOOR).base, ...(floor ? [parseVersion(floor).base] : [])];
+  const floors = [parseVersion(VERSION_FLOOR).base, ...(floor ? [parseVersion(floor).base] : [])];
   const top = maxBase([...floors, ...stableBases]);
   const nextStable = [top[0], top[1], top[2] + 1n];
   if (channel === 'stable') return baseString(nextStable);
@@ -122,12 +119,11 @@ async function assertCurrent(ctx) {
 // Notes are fixed when the draft is reserved: what changed in the source since the previous published
 // release of this channel, and the changelog as of this commit. The artifact repository's own generated
 // notes would describe only its README commit.
-function notesFor(releases, plan, version, { bootstrap = false } = {}) {
+function notesFor(releases, plan, version) {
   const repo = `https://github.com/${plan.sourceRepo}`;
   const short = (sha) => sha.slice(0, 7);
   const changelog = `[CHANGELOG.md at ${short(plan.sourceCommit)}](${repo}/blob/${plan.sourceCommit}/CHANGELOG.md)`;
   const commit = `[${short(plan.sourceCommit)}](${repo}/commit/${plan.sourceCommit})`;
-  if (bootstrap) return `First organization release, built from ${commit}. See ${changelog}.`;
   const previous = releases.filter((r) => !r.draft).map(recordOf)
     .filter((r) => r && r.channel === plan.channel && compareVersion(r.version, version) < 0)
     .sort((a, b) => compareVersion(a.version, b.version)).pop();
@@ -148,17 +144,17 @@ function releaseBody(record, notes) {
   ].join('\n');
 }
 
-async function createDraft(ctx, releases, version, extra = {}) {
+async function createDraft(ctx, releases, version) {
   const { plan, client } = ctx;
   const record = {
     schema: SCHEMA, channel: plan.channel, version, sourceRepo: plan.sourceRepo,
-    sourceCommit: plan.sourceCommit, sourceTree: plan.sourceTree, ...extra,
+    sourceCommit: plan.sourceCommit, sourceTree: plan.sourceTree,
   };
   const dev = plan.channel === 'dev';
   return client.createRelease({
     tag_name: `v${version}`,
     name: `${dev ? 'Repo Radar Dev' : 'Repo Radar'} v${version}`,
-    body: releaseBody(record, notesFor(releases, plan, version, { bootstrap: Boolean(extra.bootstrap) })),
+    body: releaseBody(record, notesFor(releases, plan, version)),
     draft: true,
     prerelease: dev,
   });
@@ -188,7 +184,7 @@ async function verifyPublished(ctx, release) {
 // The finalized build: both ZIPs, both stapled DMGs, the channel's feed and any ZIP blockmaps, exactly
 // as the DMG finalizer recorded them, with both DMGs passing the read-only Apple checks again.
 async function stage(ctx, dir, version) {
-  const finalization = await verifyFinalized({ dir, version, source: ctx.plan.sourceCommit, pins: ctx.bootstrapBuild || BOOTSTRAP_BUILD, run: ctx.appleRun });
+  const finalization = await verifyFinalized({ dir, version, source: ctx.plan.sourceCommit, run: ctx.appleRun });
   const artifacts = [...finalization.zips, ...finalization.dmgs.map(({ name, size, sha256 }) => ({ name, size, sha256 })),
     finalization.feed, ...finalization.zipBlockmaps];
   return { artifacts, finalization };
@@ -270,32 +266,6 @@ async function publish(ctx, dir) {
   });
 }
 
-async function bootstrap(ctx, dir, version) {
-  const { client, plan } = ctx;
-  const pin = ctx.bootstrapBuild || BOOTSTRAP_BUILD;
-  if (version !== pin.version || plan.sourceCommit !== pin.source) {
-    throw new Error(`bootstrap publishes only the preserved ${pin.version} build from ${pin.source}`);
-  }
-  if (!await client.onBranch(plan.sourceCommit, plan.branch)) throw new Error(`${plan.sourceCommit} is not on ${plan.branch}`);
-  const releases = await client.listReleases();
-  let own = findOwn(releases, plan);
-  if (own && !own.draft) {
-    const r = await verifyPublished(ctx, own);
-    return { published: true, version: r.version, already: true };
-  }
-  if (own && recordOf(own).version !== version) throw new Error(`this source is reserved as v${recordOf(own).version}, not v${version}`);
-  await stage(ctx, dir, version); // before any draft exists
-  if (!own) {
-    if (releases.some((r) => r.tag_name === `v${version}`)) throw new Error(`v${version} belongs to another source`);
-    own = await createDraft(ctx, releases, version, { bootstrap: true });
-  }
-  assertNotSuperseded(releases, own);
-  return publishDraft(ctx, own, dir, {
-    receiptExtra: { bootstrap: true, builtWith: 'build-local.sh' },
-    recheck: async (latest, still) => { assertNotSuperseded(latest, still); },
-  });
-}
-
 // ---- GitHub ---------------------------------------------------------------------------------------
 
 function githubClient({ sourceRepo, sourceToken, releasesToken }) {
@@ -345,8 +315,6 @@ function githubClient({ sourceRepo, sourceToken, releasesToken }) {
     },
     assetText: async (asset) => (await assetResponse(asset)).text(),
     branchSha: async (branch) => (await api(sourceRepo, `git/ref/heads/${branch}`)).object.sha,
-    commitTree: async (sha) => (await api(sourceRepo, `git/commits/${sha}`)).tree.sha,
-    onBranch: async (sha, branch) => ['ahead', 'identical'].includes((await api(sourceRepo, `compare/${sha}...${branch}`)).status),
   };
 }
 
@@ -385,13 +353,6 @@ function actionsContext() {
   return baseContext(plan, githubClient({ sourceRepo: SOURCE_REPO, sourceToken: env.SOURCE_TOKEN, releasesToken: env.RELEASES_REPO_TOKEN }));
 }
 
-// The operator's GitHub token for bootstrap: one supplied explicitly, or gh's saved login. gh runs
-// with the minimal environment; the token stays in this process and is never printed.
-function localToken(env) {
-  if (env.GH_TOKEN || env.GITHUB_TOKEN) return env.GH_TOKEN || env.GITHUB_TOKEN;
-  return childProcess.execFileSync('gh', ['auth', 'token', '--hostname', 'github.com'], { encoding: 'utf8', env: releaseEnv(env) }).trim();
-}
-
 // What built the release, for its receipt. Runs after the build, when the release venv exists.
 function toolchain(env) {
   const python = childProcess.execFileSync(env.REPO_RADAR_RELEASE_PYTHON, ['-I', '-c', 'import sys;print(sys.version.split()[0])'],
@@ -427,22 +388,7 @@ async function main(argv) {
     output({ version: r.version, published: r.published });
     return;
   }
-  if (command === 'bootstrap') {
-    const dir = opt(argv, '--dir');
-    const version = opt(argv, '--version');
-    const source = opt(argv, '--source');
-    if (!dir || !version || !SHA.test(source || '') || argv.length !== 7) {
-      throw new Error('usage: release-control.js bootstrap --dir <dist> --version <x.y.z> --source <40-character sha>');
-    }
-    if (process.env.GITHUB_ACTIONS === 'true') throw new Error('bootstrap is an operator command; CI uses reserve and publish');
-    const token = localToken(process.env);
-    const client = githubClient({ sourceRepo: SOURCE_REPO, sourceToken: token, releasesToken: token });
-    const plan = { channel: 'stable', branch: 'main', sourceRepo: SOURCE_REPO, sourceCommit: source, sourceTree: await client.commitTree(source) };
-    const r = await bootstrap(baseContext(plan, client), path.resolve(dir), version);
-    output({ version: r.version, published: r.published });
-    return;
-  }
-  throw new Error('usage: release-control.js reserve | publish --dir <dist> | bootstrap --dir <dist> --version <v> --source <sha>');
+  throw new Error('usage: release-control.js reserve | publish --dir <dist>');
 }
 
 if (require.main === module) {
@@ -453,7 +399,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  SCHEMA, RECEIPT, SOURCE_REPO, RELEASES_REPO, BOOTSTRAP_FLOOR,
-  parseVersion, compareVersion, planVersion, recordOf, notesFor, reserve, publish, bootstrap, verifyPublished,
-  actionsContext, toolchain, localToken,
+  SCHEMA, RECEIPT, SOURCE_REPO, RELEASES_REPO, VERSION_FLOOR,
+  parseVersion, compareVersion, planVersion, recordOf, notesFor, reserve, publish, verifyPublished,
+  actionsContext, toolchain,
 };
