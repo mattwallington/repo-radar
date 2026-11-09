@@ -795,14 +795,14 @@ class Pipeline:
         total = sum(len(node.text.encode('utf-8')) for node in nodes)
         if total > MAX_DIRECT_NOTES_BYTES:
             return False
-        tokens, out, limit = self._edit_output_and_limit(self._edit_conversation(nodes).request(EDIT_OUTPUT))
-        prepared = self._prepared(limit)
-        if tokens + out + CONTINUATION_TOKENS <= prepared:
+        conversation = self._edit_conversation(nodes)   # readiness's own; edit_stage builds the same afresh
+        tokens, out, limit = self._edit_output_and_limit(conversation.request(EDIT_OUTPUT))
+        if tokens + out + CONTINUATION_TOKENS <= self._prepared(limit):
             return True
         if len(nodes) < 2:
-            # A fresh conversation, so the one edit_stage sends is built from scratch the same way.
-            _request, final, _out, limit, offers_tools = self._edit_request(self._edit_conversation(nodes), 1)
-            if offers_tools or final <= self._prepared(limit):
+            # Each request is counted once: the tool request above, then the final-only one turn 1 sends.
+            _request, final, _out, limit, _tools = self._final_request(conversation, 1)
+            if final <= self._prepared(limit):
                 return True
             raise im.StaleUpdate(f"the notes and document ({final:,} tokens without tools) would not fit the "
                                  f"editor's {self._prepared(limit):,} token limit")
@@ -904,6 +904,11 @@ class Pipeline:
         results_room = EDIT_TOOL_BYTES - self.delivered_bytes >= len(TOOL_MINIMUM_NOTICE.encode('utf-8')) * EDIT_TOOL_CALLS
         if number < EDIT_TURNS and results_room and tokens + out + CONTINUATION_TOKENS <= room:
             return request, tokens, out, limit, True
+        return self._final_request(conversation, number)
+
+    def _final_request(self, conversation, number):
+        """The conversation as a final-answer-only request, counted: the final instruction, and on turn 1 no tool
+        definitions and a JSON reply."""
         conversation.add_user(FINAL_TURN_MESSAGE)
         if number > 1:
             request = conversation.request(EDIT_OUTPUT)

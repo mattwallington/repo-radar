@@ -1307,10 +1307,10 @@ def test_one_note_is_fitted_by_the_final_only_request_turn_1_sends(monkeypatch, 
     assert outcome.status == 'published', outcome
     assert im.load_document(pristine, 'app-abc1234').info['last_commit'] == target
     (text, body), = fake.stage('edit')
-    # Readiness counted the tool request twice, then the final-only one; edit_stage the same pair again.
-    assert len(counted) == 5 and ['tools' in r for r in counted] == [True, True, False, True, False]
+    # Readiness counts the tool request once, then the final-only one; edit_stage the same pair again.
+    assert len(counted) == 4 and ['tools' in r for r in counted] == [True, False, True, False]
     final = counted[-1]
-    assert counted[2] == final, "readiness counted a different final-only request from the one sent"
+    assert counted[1] == final, "readiness counted a different final-only request from the one sent"
     assert 'tools' not in body and 'tools' not in final and final['response_format'] == {'type': 'json_object'}
     assert body['generationConfig']['response_mime_type'] == 'application/json' and 'last turn' in text
     sent_user = [m['content'] for m in final['messages'] if m['role'] == 'user']
@@ -1405,7 +1405,7 @@ def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monk
 
 
 @pytest.mark.parametrize('case', ['unused', 'collision', 'reference', 'extra key', 'surrogate key', 'surrogate content',
-                                  'surrogate replace id', 'largest shape'])
+                                  'surrogate replace id', 'largest shape', 'list replace id', 'dict after'])
 def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatch, tmp_path, case):
     """Installed 1.0.40 on telehealth: editor turn 3 refused 'insert has unexpected keys ['id']', and the
     kept 4 KiB of the reply ended before that insert. An unused label on an insert is now ignored. A label
@@ -1459,6 +1459,10 @@ def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatc
         'surrogate replace id': (lambda c: {}, ({'op': 'replace', 'id': 'no-such-\ud800', 'expected_sha256': 'f' * 16,
                                                   'content': '## More\n- more\n'},), {'op': 'replace', 'index': 2, 'id_in_base': False}),
         'largest shape': (lambda c: {'id': '\x01' * 14, **{str(i) + '\x01' * 14: 'x' for i in range(15)}}, (), {'index': 1}),
+        # A JSON list or object can't name a section: a clean refusal, not an unhashable TypeError.
+        'list replace id': (lambda c: {}, ({'op': 'replace', 'id': ['s1'], 'expected_sha256': 'f' * 16,
+                                             'content': '## More\n- more\n'},), {'op': 'replace', 'index': 2, 'id': '<list>'}),
+        'dict after': (lambda c: {'after': {'id': c.id}}, (), {'index': 1, 'after': '<dict>', 'after_in_base': False}),
     }[case]
     outcome, fake, pristine, old, _components = attempt(tmp_path, insert, later)
     assert outcome.status == 'failed' and 'edits were rejected' in outcome.reason and outcome.usage['known_cost_usd'] > 0
