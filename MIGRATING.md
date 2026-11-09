@@ -37,9 +37,9 @@ rm -rf ~/bin/sync-pristine-repos-menubar
 
 ## 4. Install Repo Radar
 
-Download the latest release from [GitHub Releases](https://github.com/mattwallington/repo-radar/releases):
-- **Apple Silicon (M1-M4)**: `Repo-Radar-*-arm64-mac.zip` or `.dmg`
-- **Intel Mac**: `Repo-Radar-*-x64-mac.zip` or `.dmg`
+Download the latest release from [GitHub Releases](https://github.com/ReperioHealth/repo-radar-releases/releases):
+- **Apple Silicon (M1-M4)**: `repo-radar-*-arm64-mac.zip` or `.dmg`
+- **Intel Mac**: `repo-radar-*-x64-mac.zip` or `.dmg`
 
 Drag **Repo Radar.app** to `/Applications` and open it.
 

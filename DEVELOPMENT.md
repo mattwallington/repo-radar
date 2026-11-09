@@ -4,7 +4,7 @@
 
 ```bash
 # Clone
-git clone https://github.com/mattwallington/repo-radar.git
+git clone https://github.com/ReperioHealth/repo-radar.git
 cd repo-radar
 
 # Install Python deps
