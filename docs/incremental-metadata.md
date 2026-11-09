@@ -51,6 +51,9 @@ The decision, in order:
 How much of the source changed is recorded as a diagnostic only. A full rebuild that older versions
 chose because a change was large, and that never finished, isn't owed any more: its failure stays on
 record and the update takes the incremental path. A requested rebuild that didn't finish is still due.
+A weekly rebuild that didn't finish is owed only while the age rule is due under the current
+`incremental_full_rebuild_days`, counted from the last successful full build. After the interval is
+raised it waits for the new date, and 0 drops it. Its failure and the failure count stay on record.
 
 ### Repositories that aren't opted in
 
@@ -71,9 +74,11 @@ records its `pipeline_version`; a new version doesn't force a rebuild.
 
 All reads come from Git objects of the two pinned commits, never the working tree. Git runs without
 external diff or textconv helpers, without global or system config, and without credentials in its
-environment. Credential files (`.env`, private keys, `.netrc` and similar; `.env.example` stays
-readable), symlinks, submodules and binary files are unavailable, and the update records them as
-omissions. There are no shell, network, host-filesystem or write tools.
+environment. Credential files (`.env`, private keys, `.netrc` and similar), symlinks, submodules and binary
+files are unavailable, and the update records them as omissions. The only name exceptions are the four
+templates `.env.example`, `.env.sample`, `.env.template` and `.env.dist`, which stay readable. Other names
+stay withheld even when they look public, such as `.env.local.example` or a `.pem` certificate: a name
+can't show that a file holds no secret, and a PEM file can carry a private key. There are no shell, network, host-filesystem or write tools.
 
 1. **Pages.** The filtered diff is spooled to an owner-only directory as pages of at most 63 KiB, up to
    256 MiB in all, and removed afterwards. Each page names its commits and its files, breaks at a file
@@ -116,8 +121,8 @@ omissions. There are no shell, network, host-filesystem or write tools.
    one complete JSON object, in a code fence or among a few words, and that object is the answer, checked as usual;
    with none or several, the reply is refused. A final request with no tools defined (the one-note case)
    also asks Gemini for a JSON reply; a later final turn keeps the tool definitions its history needs and
-   doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, and the first
-   4 KiB of its text after redaction.
+   doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, the first
+   4 KiB of its text after redaction, and, for a refused section edit, its shape (at most 1 KiB, no prose).
 
 On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
 usual options and output floors, which are priced in. A whole update has one 20-minute allowance, from
@@ -281,7 +286,17 @@ skipped, a warning rather than an error: "held after 2 failed updates in a row; 
 rebuild retries". The document, the stale mark and the last failure's details all stay, and Activity and `INDEX.md`
 show the hold.
 
-The menu's Sync Now or `repo-radar sync --regenerate-metadata` tries once. If that fails too, the hold continues.
+The menu's Sync Now tries once. From a terminal, the same retry is:
+
+```sh
+REPO_RADAR_TRIGGER=manual repo-radar sync
+```
+
+It marks the sync as started by a person, so it tries once with the usual choice of an incremental update
+or a full rebuild. A bare `repo-radar sync` stays held, since unattended scripts run it too.
+`repo-radar sync --regenerate-metadata` also tries, but always buys a full rebuild, so it isn't the cheap
+retry. Every retry stays within the update or rebuild limit and the weekly spending limit. If it fails too,
+the hold continues.
 
 ## Telehealth pilot
 

@@ -4,6 +4,14 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.41] - 2026-11-09
+
+### Fixed
+- **A summary update is no longer refused because the editor labelled a new section.** The editor sometimes gave an inserted section an `id`, as edits of existing sections have, and the whole update failed after its spend. An unused label is now ignored; a label naming an existing section, or a later edit that refers to it, is still refused. The editor is also told not to add one, and a refused update's record keeps the shape of the edit at fault (never its text) so the next failure can be diagnosed.
+- **Raising the full-rebuild interval no longer keeps a failed weekly rebuild due.** A weekly rebuild that failed was retried on every sync even after the interval went from 7 to 30 days, say; only turning rebuilds off cleared it. It is now due again only when the new interval is reached, counted from the last successful full build. Until then a changed repository gets an ordinary update, an unchanged one needs nothing, and the failure stays on record. A forced rebuild that failed is still retried.
+- **The last note of a large update can go to the editor.** With one note left, the editor's fit check counted the request with its tool definitions and gave up, though that turn is sent without them. It now counts the request that is actually sent, so an update whose note fits it publishes. Merge and editor requests also list the files they cite more compactly, which leaves more room for notes.
+- **The first published release comes after 1.0.40, so installed apps update to it.** Automatic releases start at 1.0.41 (Dev at `1.0.41-dev.*`), above the last version built by hand, instead of 1.0.35. No locally built version is published by hand any more, and the remaining links to the old personal repository now point to `ReperioHealth`.
+
 ## [1.0.40] - 2026-11-08
 
 ### Added

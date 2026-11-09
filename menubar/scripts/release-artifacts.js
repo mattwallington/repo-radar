@@ -229,32 +229,6 @@ function inspectZips(dir, { version, channel, source }) {
   return names.zips.map((zip, i) => inspectZipApp(path.join(dir, zip), { version, channel, source, arch: ARCHES[i] }));
 }
 
-// ---- the one build published by hand -----------------------------------------------------------------
-// 1.0.34 was built locally before the release workflow existed. Its original artifacts are pinned here;
-// finalization may change only the DMGs (and the feed's DMG entries).
-const BOOTSTRAP_BUILD = Object.freeze({
-  version: '1.0.34',
-  source: '4283e7411263aca1fb32342bff48df1dc1c22392',
-  original: Object.freeze({
-    'repo-radar-1.0.34-arm64-mac.zip': 'f622dd42b8e7f51615f0dcd82d1f2406b95b41d9983bee8568d5ba3bdcb36266',
-    'repo-radar-1.0.34-x64-mac.zip': '5b5edbbaa3a02de585d3cc41230477adb9e9a1b4722c4c902434cad95be89a29',
-    'repo-radar-1.0.34-arm64-mac.dmg': '6161e41f314c9937453dcf21ddf6b7ba54d7468d902573763366a697543aad3a',
-    'repo-radar-1.0.34-x64-mac.dmg': '8ba1561da577db939b8cc01ba9a74f7ea25edd875047628d82022274c741f697',
-    'latest-mac.yml': '953180e64dec2d6bcbdc2244174d5e09911daa4f288fdcfe9e5158d8c5a71e6b',
-    'repo-radar-1.0.34-arm64-mac.zip.blockmap': '36f44ebdeb3998f8eb0ea4707d96b071b9cb8b21c8a257eee7bc8fdc137a6f90',
-    'repo-radar-1.0.34-x64-mac.zip.blockmap': 'ec33125eeb070ccdfc89cf005d38a09cf786392d4a905837b9dcc2492eca9621',
-  }),
-});
-
-// For a pinned build: the source must be the pinned one and each named file its original bytes.
-function checkPinned(dir, pin, source, names) {
-  if (source !== pin.source) throw new Error(`${pin.version} was built from ${pin.source}, not ${source}`);
-  for (const n of names) {
-    if (!pin.original[n]) throw new Error(`${n} is not part of the pinned ${pin.version} build`);
-    if (fileIdentity(path.join(dir, n)).sha256 !== pin.original[n]) throw new Error(`${n} is not the original ${pin.version} file`);
-  }
-}
-
 function main(argv) {
   const [command, ...rest] = argv;
   const opt = (name) => { const i = rest.indexOf(name); return i >= 0 ? rest[i + 1] : undefined; };
@@ -288,5 +262,5 @@ if (require.main === module) {
 module.exports = {
   TEAM_ID, SIGNING_IDENTITY, NOTARY_PROFILE, FEED_OWNER, FEED_REPO, ARCHES, STABLE_VERSION, DEV_VERSION, BUNDLE_IDS, PRODUCT_NAMES, APP_UPDATE,
   channelOf, feedName, artifactNames, identity, fileIdentity, inspectFeed, dumpFeed, checkFeedDir, checkAppUpdate,
-  inspectZipApp, inspectZips, checkPinned, BOOTSTRAP_BUILD,
+  inspectZipApp, inspectZips,
 };

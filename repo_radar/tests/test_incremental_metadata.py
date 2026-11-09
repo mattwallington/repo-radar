@@ -179,6 +179,51 @@ def source_repo(tmp_path, files=10, size=1000):
     return repo, repo.commit('base')
 
 
+@pytest.mark.parametrize('origin, owed', [(im.WEEKLY_REASON, False), ('regeneration requested', True)])
+def test_weekly_rebuild_debt_follows_the_current_interval(monkeypatch, tmp_path, origin, owed):
+    """A weekly rebuild that failed stays on record, but after the interval is raised from 7 to 30 days it is
+    due only when the 30-day rule is, counted from the last successful full build; a forced one stays owed."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=8))
+    doc = im.load_document(pristine, 'app-abc1234')
+    adopt = decide(repo, pristine).adopt
+    failed = {'strategy': 'full', 'status': 'failed', 'decision_reason': origin, 'full_rebuild_origin': origin,
+              'baseline_doc_sha256': doc.sha256, 'reason': 'turn limit', 'adoption': adopt,
+              'finished_at': (NOW - timedelta(hours=1)).isoformat(), 'usage': {'known_cost_usd': 1.5},
+              'consecutive_failures': 1, im.FAILURE_STREAK_DOC: doc.sha256}
+    im.write_state(pristine, 'app-abc1234', failed)
+    thirty = {'full_rebuild_days': 30}
+    expect = lambda strategy: 'full' if owed else strategy
+
+    # Unchanged source: nothing is due and nothing is bought; the failure, its usage and the streak stay.
+    assert decide(repo, pristine, **thirty).strategy == expect('none')
+    if not owed:
+        with PreflightSession() as session:
+            assert update(pristine, repo, session, full_rebuild_days=30,
+                          run_full_fn=lambda *a, **k: pytest.fail('bought a rebuild')).status == 'none'
+        assert metadata.read_attempt_state(pristine, 'app-abc1234') == failed
+
+    # Changed source: an ordinary incremental update, which keeps the old attempt as evidence and the streak.
+    repo.write('src/m0.py', 'changed = True\n')
+    repo.commit('one change')
+    assert decide(repo, pristine, **thirty).strategy == expect('incremental')
+    started = {}
+
+    def incremental(*a, **k):
+        started.update(metadata.read_attempt_state(pristine, 'app-abc1234'))
+        raise im.StaleUpdate('stopped by the test')
+    if not owed:
+        with PreflightSession() as session:
+            update(pristine, repo, session, full_rebuild_days=30, run_incremental_fn=incremental,
+                   run_full_fn=lambda *a, **k: pytest.fail('bought a rebuild'))
+        assert started['strategy'] == 'incremental' and started['consecutive_failures'] == 1
+        assert started['dropped_full_attempt']['reason'] == 'turn limit'
+        im.write_state(pristine, 'app-abc1234', failed)
+
+    # On the 30-day date, counted from the last full build, the rebuild is owed again.
+    assert decide(repo, pristine, now=NOW + timedelta(days=21, hours=23), **thirty).strategy == expect('incremental')
+    assert decide(repo, pristine, now=NOW + timedelta(days=22), **thirty).reason == im.UNFINISHED_REASON
+
+
 def setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=1), files=10):
     repo, base = source_repo(tmp_path, files)
     pristine = tmp_path / 'pristine'
@@ -346,8 +391,9 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
         im.write_state(pristine, 'app-abc1234', {**generic, **extra})
         assert decide(repo, pristine).strategy == ('full' if due else 'incremental'), extra
     im.write_state(pristine, 'app-abc1234', {**generic, 'full_rebuild_origin': im.WEEKLY_REASON})
-    assert decide(repo, pristine).reason == im.UNFINISHED_REASON
-    assert decide(repo, pristine, full_rebuild_days=0).strategy == 'incremental'
+    assert decide(repo, pristine).strategy == 'incremental'   # weekly debt waits for the weekly date
+    assert decide(repo, pristine, now=NOW + timedelta(days=6)).reason == im.UNFINISHED_REASON
+    assert decide(repo, pristine, now=NOW + timedelta(days=6), full_rebuild_days=0).strategy == 'incremental'
 
     # Consecutive real failures: the weekly origin survives a retry, and a setup failure keeps it on record.
     (pristine / '.metadata-state' / 'app-abc1234.json').unlink()
@@ -556,7 +602,7 @@ def test_opt_in_dispatch_and_rebuild_selection(monkeypatch, tmp_path):
     failed = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert failed['attempt_id'] != state['attempt_id'] and failed['baseline_doc_sha256'] == committed.sha256
     assert failed['generation_id'] is None and failed['strategy'] is None and failed['status'] == 'failed'
-    assert not im.full_rebuild_unfinished(failed, committed) and decide(repo, pristine).strategy == 'none'
+    assert not im._unfinished_full(failed, committed) and decide(repo, pristine).strategy == 'none'
     metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
     assert 'stale: analyzed' in (pristine / 'INDEX.md').read_text() and 'fetch failed' in (pristine / 'INDEX.md').read_text()
 
@@ -944,9 +990,16 @@ def dense(size):
     return ' '.join(f'{i:x}.' for i in range(size))[:size]
 
 
+def file_table(text):
+    """The file-id table's rows in a merge or editor request, as sent."""
+    rows = text.split(mr.FILE_TABLE_LABEL + '\n', 1)[1].split('\n\n', 1)[0]
+    return [] if rows == 'none' else rows.split('\n')
+
+
 def cited_identities(text):
-    """The file-id table in a merge or editor request."""
-    return json.loads(re.search(r'\(status, old_path, new_path\):\n(\{.*\})\n', text).group(1))
+    """The file-id table in a merge or editor request, by id."""
+    return {row[0]: {'status': row[1], 'old_path': row[2], 'new_path': row[3]}
+            for row in map(json.loads, file_table(text))}
 
 
 def paths_on_page(text):
@@ -959,6 +1012,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     (repo.path / 'lib').mkdir()
     repo.git('mv', 'src/m9.py', 'lib/renamed.py')
     repo.write('src/crlf.py', 'a = 1\r\nb = 2\r\n')
+    repo.write('src/say "hi".py', 'quoted = True\n')
     for i in range(9):
         repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
     target = repo.commit('rewrite everything and rename one')
@@ -1048,7 +1102,14 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     for text, _body in (*merges, edits[0]):
         table = cited_identities(text)
         assert table and all(table[file_id] == expected[file_id] for file_id in table)
-    assert renamed in cited_identities(edits[0][0])
+        assert len(file_table(text)) == len(table)   # one row per id, none merged
+    editor = cited_identities(edits[0][0])
+    assert renamed in editor and editor[renamed]['old_path'] == 'src/m9.py'
+    quoted = next(file_id for file_id, ref in expected.items() if ref['new_path'] == 'src/say "hi".py')
+    assert quoted in editor and json.dumps([quoted, 'A', None, 'src/say "hi".py'], separators=(',', ':')) in edits[0][0]
+    # Compact rows: the same mapping in fewer bytes than the old object per id.
+    old_encoding = json.dumps(editor, ensure_ascii=False, separators=(',', ':'))
+    assert len('\n'.join(file_table(edits[0][0])).encode()) < 0.8 * len(old_encoding.encode())
 
     # A large read is cut to fit the counted request, within the delivered-bytes cap, and the edit still
     # publishes; the last turn offers no tools.
@@ -1206,6 +1267,57 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
 
 
+@pytest.mark.parametrize('final_tokens, publishes', [(60_000, True), (66_000, False)])
+def test_one_note_is_fitted_by_the_final_only_request_turn_1_sends(monkeypatch, tmp_path, final_tokens, publishes):
+    """With one note left, the request with tool definitions can pass the 65,536 preparation budget while
+    the final-only request turn 1 actually sends (no tools, the last-turn instruction, JSON) fits. Readiness
+    counts that request, so the edit goes out; when even it doesn't fit, nothing is sent to the editor."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    target = repo.commit('one change')
+    old = im.load_document(pristine, 'app-abc1234')
+    components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+    patch = {'base_document_sha256': old.sha256,
+             'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                           'content': '## Key Components\n- m0 now records a change\n'}]}
+
+    def reply(stage, text):
+        if stage == 'map':
+            return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+        return patch
+    fake = GeminiFake(monkeypatch, reply)
+    counted, real_count = [], PreflightSession.count_request
+
+    def count(self, request, timeout=None):   # the tool definitions are what crowd the note out
+        result = real_count(self, request, timeout=timeout)
+        if 'covers_pages' not in json.dumps(request):
+            return result
+        counted.append(request)
+        return result._replace(tokens=70_000 if 'tools' in request else final_tokens)
+    monkeypatch.setattr(PreflightSession, 'count_request', count)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+
+    assert not fake.stage('merge') and len(fake.stage('map')) == 1
+    if not publishes:
+        assert outcome.status == 'failed' and 'without tools' in outcome.reason, outcome
+        assert not fake.stage('edit') and im.load_document(pristine, 'app-abc1234').text == old.text
+        return
+    assert outcome.status == 'published', outcome
+    assert im.load_document(pristine, 'app-abc1234').info['last_commit'] == target
+    (text, body), = fake.stage('edit')
+    # Readiness counted the tool request twice, then the final-only one; edit_stage the same pair again.
+    assert len(counted) == 5 and ['tools' in r for r in counted] == [True, True, False, True, False]
+    final = counted[-1]
+    assert counted[2] == final, "readiness counted a different final-only request from the one sent"
+    assert 'tools' not in body and 'tools' not in final and final['response_format'] == {'type': 'json_object'}
+    assert body['generationConfig']['response_mime_type'] == 'application/json' and 'last turn' in text
+    sent_user = [m['content'] for m in final['messages'] if m['role'] == 'user']
+    assert len(sent_user) == 2 and all(part in text for part in sent_user)
+    assert outcome.usage['edit_turns'] == 1
+
+
 def test_a_change_naming_unknown_sections_is_repaired_not_the_whole_update(monkeypatch, tmp_path):
     """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
     whole update failed. Now those ids are dropped and counted, and the change reaches the editor without a
@@ -1290,6 +1402,80 @@ def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monk
     two = json.dumps({'a': 1}) + ' or ' + json.dumps({'b': 2})
     with pytest.raises(im.PatchError, match='2 JSON objects'):
         im.parse_answer(two)
+
+
+@pytest.mark.parametrize('case', ['unused', 'collision', 'reference', 'extra key', 'surrogate key', 'surrogate content',
+                                  'surrogate replace id', 'largest shape'])
+def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatch, tmp_path, case):
+    """Installed 1.0.40 on telehealth: editor turn 3 refused 'insert has unexpected keys ['id']', and the
+    kept 4 KiB of the reply ended before that insert. An unused label on an insert is now ignored. A label
+    that names an existing section, a later edit naming the new label, or another extra key still refuses
+    the whole patch after the spend, with no repair request, and the record keeps the edit's shape. A lone
+    surrogate, which JSON allows, never replaces that refusal or loses the kept text, and the shape stays
+    within 1 KiB as the attempt file stores it."""
+    def attempt(where, insert, later=()):
+        repo, _base, pristine = setup_pristine(monkeypatch, where)
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+        old = im.load_document(pristine, 'app-abc1234')
+        components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+        long = '## Key Components\n- m0 now records a change\n' + ''.join(f"- detail {i} of what m0 records\n" for i in range(200))
+        patch = {'base_document_sha256': old.sha256,
+                 'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256, 'content': long},
+                              {'op': 'insert', 'after': components.id, 'content': '## Change Records\n- m0 keeps them\n',
+                               **insert(components)}, *later]}
+        assert len(json.dumps(patch)) > mr.REJECTED_REPLY_BYTES   # the edit at fault lies past the kept text
+
+        def reply(stage, text):
+            if stage == 'map':
+                return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                        'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+            return patch
+        fake = GeminiFake(monkeypatch, reply)
+        with PreflightSession() as session:
+            outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+        return outcome, fake, pristine, old, components
+
+    if case == 'unused':
+        labelled, _fake, pristine, old, components = attempt(tmp_path / 'labelled', lambda c: {'id': 'new-change-records'})
+        plain, _fake, plain_pristine, _old, _c = attempt(tmp_path / 'plain', lambda c: {})
+        assert labelled.status == plain.status == 'published', (labelled, plain)
+        published = im._analysis_of(im.load_document(pristine, 'app-abc1234'))
+        assert published == im._analysis_of(im.load_document(plain_pristine, 'app-abc1234'))
+        assert '## Change Records' in published and 'new-change-records' not in published
+        untouched = [s.text for s in im.split_sections(im._analysis_of(old)) if s.id != components.id]
+        assert all(text.rstrip('\n') in published for text in untouched)   # the document's end is trimmed
+        return
+
+    insert, later, expected = {
+        'collision': (lambda c: {'id': c.id}, (), {'index': 1, 'id_in_base': True}),
+        'reference': (lambda c: {'id': 'new-change-records'},
+                      ({'op': 'insert', 'after': 'new-change-records', 'content': '## More\n- more\n'},),
+                      {'index': 2, 'after': 'new-change-records', 'after_in_base': False}),
+        'extra key': (lambda c: {'title': 'Change Records'}, (), {'index': 1, 'keys': ['after', 'content', 'op', 'title']}),
+        'surrogate key': (lambda c: {'\ud800': 'x'}, (), {'index': 1}),
+        'surrogate content': (lambda c: {'title': 'x', 'content': '## Change Records\n- m0 \ud800 keeps them\n'}, (),
+                              {'index': 1}),
+        'surrogate replace id': (lambda c: {}, ({'op': 'replace', 'id': 'no-such-\ud800', 'expected_sha256': 'f' * 16,
+                                                  'content': '## More\n- more\n'},), {'op': 'replace', 'index': 2, 'id_in_base': False}),
+        'largest shape': (lambda c: {'id': '\x01' * 14, **{str(i) + '\x01' * 14: 'x' for i in range(15)}}, (), {'index': 1}),
+    }[case]
+    outcome, fake, pristine, old, _components = attempt(tmp_path, insert, later)
+    assert outcome.status == 'failed' and 'edits were rejected' in outcome.reason and outcome.usage['known_cost_usd'] > 0
+    assert im.load_document(pristine, 'app-abc1234').text == old.text
+    assert len(fake.stage('edit')) == 1, 'no repair request'
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 1 and state['usage']['known_cost_usd'] == outcome.usage['known_cost_usd']
+    saved = state['usage']['rejected_reply']
+    assert saved['text'].startswith('{') and len(saved['text'].encode('utf-8')) <= mr.REJECTED_REPLY_BYTES
+    assert '## Change Records' not in saved['text']
+    operation = saved['operation']
+    stored = im.state_path(pristine, 'app-abc1234').read_text(encoding='utf-8')
+    start = stored.index('"operation": ') + len('"operation": ')
+    assert len(stored[start:stored.index('\n      }', start) + 8].encode('utf-8')) <= mr.REJECTED_OPERATION_BYTES
+    expected = {'op': 'insert', **expected}
+    assert {k: operation.get(k) for k in expected} == expected
+    assert set(operation['content']) == {'bytes', 'sha256'} and 'keeps them' not in json.dumps(operation)
 
 
 def test_a_resource_limit_after_paid_map_calls_is_a_failure(monkeypatch, tmp_path):

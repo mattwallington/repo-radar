@@ -7,14 +7,16 @@
 // layer: every process is real, every fd is really inherited across a real `exec`, every flock is
 // a real kernel lock (`/usr/bin/lockf` <-> Python `fcntl.flock`, proven-conflicting in
 // __tests__/lock-interop.test.js), and every record is read back off real disk. The ONLY
-// simplification vs a real end-user run is the WORKLOAD sync_mode performs once it's running (a
-// zero-repository config, so the "real chain" proof isn't gated on network/git availability) --
-// the machinery this task exists to prove (identity/lease/handoff/terminal) is never touched.
+// simplification vs a real end-user run is the WORKLOAD sync_mode performs once it's running: a
+// zero-repository config, and a scratch launcher that runs the real `cli.main` with only sync's
+// network wait replaced (immediately ready, or a barrier held until the test kills the worker), so
+// the proof isn't gated on network timing -- the machinery this task exists to prove
+// (dependency check/identity/lease/handoff/terminal) is never touched.
 //
 // Builds on the real-process harness Task 2.4 introduced (dispatcher-activity.test.js's
 // `fakeActiveGeneration`/`runScript`, which used a STUB python planted at `$GEN/venv/bin/python`
 // only to prove the SHELL's own ordering/branching). This file replaces the stub with a REAL
-// python (a symlink to the system interpreter) and a REAL `repo_radar` package (symlinked source,
+// python (a small `exec` launcher for the verified interpreter) and a REAL `repo_radar` package (symlinked source,
 // exactly as production's generation holds copied source) so the entrypoints Tasks 1.8/2.5/2.6
 // built (`bootstrap.py`/`finalize.py`/`cli.py`/`sync_mode`) run unmodified, for real.
 //
@@ -198,23 +200,44 @@ function requirePython(t) {
   return true;
 }
 
-// A REAL (not stubbed) active generation: `venv/bin/python` is a symlink to the resolved
-// dependency-complete interpreter (verified above -- never ambient `python3` blindly trusted);
+// A REAL (not stubbed) active generation: `venv/bin/python` is a two-line `/bin/sh` launcher that
+// `exec`s the resolved dependency-complete interpreter by its absolute path, arguments unchanged. A
+// symlink there resolved to the base interpreter's prefix and lost the venv's packages (the venv is
+// found from the path it is run by), so the deps are verified again through this generated path,
+// with the child's environment and scratch HOME;
 // `repo_radar` is symlinked to the real source tree (mirrors production's "copied source in the
 // generation", per Task 2.4's own report: the launcher script's own directory is sys.path[0], so
-// no PYTHONPATH is needed for the final `exec`); `repo-radar` is a byte-for-byte copy of the real
-// launcher; `verify.py` is a trivial pass, anchored by a real shasum in `desired.json` so the
-// dispatcher's own tamper-check is exercised for real (not bypassed).
-function realActiveGeneration(home, channel) {
+// no PYTHONPATH is needed for the final `exec`); `repo-radar` is a scratch launcher that calls the
+// real `cli.main` with sync's network wait replaced by `workload` ('ready': connected at once;
+// 'barrier': blocks until the test kills the worker); `verify.py` is a trivial pass, anchored by a
+// real shasum in `desired.json` so the dispatcher's own tamper-check is exercised for real.
+const WORKLOADS = {
+  ready: 'def wait(**_kw):\n    return True\n',
+  barrier: 'def wait(**_kw):\n    threading.Event().wait()   # held until the test kills this worker\n',
+};
+
+function shQuote(s) { return `'${s.replace(/'/g, `'\\''`)}'`; }
+
+function realActiveGeneration(home, channel, workload = 'ready') {
   if (PYTHON === null) throw new Error('realActiveGeneration called without a resolved interpreter -- caller must check requirePython(t) first');
   const L = layout(home, channel);
   fs.mkdirSync(L.generations, { recursive: true, mode: 0o700 });
   const genDir = path.join(L.generations, 'gen1');
   fs.mkdirSync(path.join(genDir, 'venv', 'bin'), { recursive: true });
-  fs.symlinkSync(PYTHON, path.join(genDir, 'venv', 'bin', 'python'));
+  const genPython = path.join(genDir, 'venv', 'bin', 'python');
+  fs.writeFileSync(genPython, `#!/bin/sh\nexec ${shQuote(PYTHON)} "$@"\n`, { mode: 0o755 });
   fs.symlinkSync(path.join(REPO_ROOT, 'repo_radar'), path.join(genDir, 'repo_radar'));
-  fs.copyFileSync(path.join(REPO_ROOT, 'repo-radar'), path.join(genDir, 'repo-radar'));
-  fs.chmodSync(path.join(genDir, 'repo-radar'), 0o755);
+  try {
+    cp.execFileSync(genPython, ['-c', 'import rich, litellm, requests, inquirer'],
+      { env: { ...process.env, HOME: home }, stdio: 'ignore' });
+  } catch (e) {
+    throw new Error(`the generated ${genPython} can't import repo-radar's dependencies: ${e.message}`);
+  }
+  fs.writeFileSync(path.join(genDir, 'repo-radar'),
+    '#!/usr/bin/env python3\n# Test launcher: the real cli.main, with only sync\'s network wait replaced.\n'
+    + 'import sys\nimport threading\n\nfrom repo_radar.modes import sync\nfrom repo_radar.cli import main\n\n\n'
+    + `${WORKLOADS[workload]}\n\nsync.wait_for_network = wait\n\nif __name__ == '__main__':\n    sys.exit(main())\n`,
+    { mode: 0o755 });
   fs.writeFileSync(path.join(genDir, 'verify.py'), 'import sys\nsys.exit(0)\n');
   fs.writeFileSync(path.join(genDir, 'manifest.json'), '{}\n');
   fs.writeFileSync(path.join(genDir, '.runtime.json'), '{}\n');
@@ -226,17 +249,26 @@ function realActiveGeneration(home, channel) {
 }
 
 // Generation + the real generated dispatcher script, one call.
-function setupChain(home, channel = 'stable') {
-  realActiveGeneration(home, channel);
+function setupChain(home, channel = 'stable', workload = 'ready') {
+  realActiveGeneration(home, channel, workload);
   return emitRunSync(home, channel);
+}
+
+// Kill and reap a worker the test started if the test ends (pass or fail) with it still running.
+function reapOnExit(t, child) {
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGKILL');
+    await exited;
+  });
 }
 
 // A real, minimal, valid config: zero repositories. `sync_mode`'s own "No repositories
 // configured" branch is real, unmocked production code (not a test seam) -- it still runs the
-// full identity/network-wait/config-load path, it just has no repo work to do, so the happy-path
-// scenario is deterministic and hermetic beyond the one real TCP reachability probe
-// `wait_for_network()` itself performs (no git, no AI calls, no filesystem work beyond the
-// activity/receipt writes).
+// full identity/config-load path, it just has no repo work to do; with the 'ready' workload's
+// network wait, the happy-path scenario is deterministic and hermetic (no network, git or AI
+// calls, no filesystem work beyond the activity/receipt writes).
 function zeroRepoConfig(home) {
   const dir = path.join(home, '.config', 'repo-radar');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -304,7 +336,7 @@ test('happy path (real production chain): one continuous owner_token from mint t
     home, channel: 'stable',
     env: { ...writer.handOffEnv(), HOME: home },
     lockFd,
-    onChild: (child) => { handOffPromise = glue.handOff({ writer, child, home }); },
+    onChild: (child) => { reapOnExit(t, child); handOffPromise = glue.handOff({ writer, child, home }); },
   });
   await handOffPromise;
 
@@ -504,10 +536,9 @@ function waitForChildExit(child) {
 
 async function crashScenario(t, { cancelFirst }) {
   const home = tmpHome(t);
-  setupChain(home, 'stable');
-  // No config at all -- irrelevant here, since the process is killed long before it would ever
-  // reach config load (a real network-connectivity wait alone takes several seconds; adoption
-  // happens within milliseconds of process start).
+  setupChain(home, 'stable', 'barrier');
+  // No config at all -- irrelevant here: the 'barrier' workload holds the worker in sync's network
+  // wait, after adoption, until the test kills it, so it never reaches config load.
 
   const { writer, lockFd } = glue.beginManualActivity(home, { channel: 'stable', trigger: 'manual' });
   const activityId = writer.activityId;
@@ -522,6 +553,7 @@ async function crashScenario(t, { cancelFirst }) {
     lockFd,
     onChild: (child) => {
       capturedChild = child;
+      reapOnExit(t, child);
       // Attach BEFORE anything else that could let the child exit (Codex B5, defect 2) --
       // in particular before glue.handOff() below, which itself watches the child.
       childExitPromise = waitForChildExit(child);

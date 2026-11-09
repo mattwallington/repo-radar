@@ -1,4 +1,4 @@
-// Release child processes (archive inspection, git, the release Python, xcodebuild, gh) must get an
+// Release child processes (archive inspection, git, the release Python, xcodebuild) must get an
 // explicit minimal environment: never a publication token, Apple credential, or a variable that
 // changes how Node, Python or Git behave.
 const { test } = require('node:test');
@@ -8,7 +8,7 @@ const os = require('os');
 const path = require('path');
 const childProcess = require('child_process');
 const { inspectZips } = require('../scripts/release-artifacts');
-const { actionsContext, toolchain, localToken } = require('../scripts/release-control');
+const { actionsContext, toolchain } = require('../scripts/release-control');
 const { KEYS, PATH } = require('../scripts/release-env');
 const { makeBuild } = require('./helpers/release-fixtures');
 
@@ -43,22 +43,18 @@ test('release child processes get only the minimal environment, never a credenti
       GITHUB_REF: 'refs/heads/main', GITHUB_SHA: SOURCE, REPO_RADAR_RELEASE_PYTHON: PYTHON,
     });
     // Records every call's actual options. unzip and plutil really run on the archives; git, the
-    // release Python, xcodebuild and gh answer with canned output.
+    // release Python and xcodebuild answer with canned output.
     childProcess.execFileSync = (file, args, opts) => {
       calls.push({ file, args, opts });
       if (file === 'git') return args[1] === 'HEAD' ? `${SOURCE}\n` : `${'e'.repeat(40)}\n`;
       if (file === PYTHON) return '3.14.10\n';
       if (file === 'xcodebuild') return 'Xcode 16.4\nBuild version 16F6\n';
-      if (file === 'gh') return 'gho_canned_for_test\n';
       return real(file, args, opts);
     };
 
     assert.strictEqual(inspectZips(dir, { version: '1.0.35', channel: 'stable', source: SOURCE }).length, 2);
     assert.strictEqual(actionsContext().plan.sourceCommit, SOURCE);
     assert.strictEqual(toolchain(process.env).python, '3.14.10');
-    delete process.env.GH_TOKEN;
-    delete process.env.GITHUB_TOKEN;
-    assert.strictEqual(localToken(process.env), 'gho_canned_for_test');
   } finally {
     childProcess.execFileSync = real;
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
@@ -66,7 +62,7 @@ test('release child processes get only the minimal environment, never a credenti
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
-  assert.deepStrictEqual([...new Set(calls.map((c) => c.file))].sort(), ['/usr/bin/plutil', '/usr/bin/unzip', PYTHON, 'gh', 'git', 'xcodebuild'].sort());
+  assert.deepStrictEqual([...new Set(calls.map((c) => c.file))].sort(), ['/usr/bin/plutil', '/usr/bin/unzip', PYTHON, 'git', 'xcodebuild'].sort());
   for (const { file, args, opts } of calls) {
     const label = `${file} ${args.join(' ')}`;
     assert.ok(opts && opts.env, `${label} has an explicit env`);
@@ -76,5 +72,4 @@ test('release child processes get only the minimal environment, never a credenti
     assert.strictEqual(opts.env.DEVELOPER_DIR, XCODE, `${label} keeps the pinned Xcode`);
     assert.strictEqual(opts.env.TMPDIR, dir, `${label} keeps the temporary directory`);
   }
-  assert.ok(calls.find((c) => c.file === 'gh').args.includes('--hostname'));
 });

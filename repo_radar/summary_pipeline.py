@@ -57,7 +57,10 @@ TOOL_ROOM_NOTICE = "[unavailable: the request has no room left for this result; 
 TOOL_TRUNCATED_NOTICE = "\n[truncated: no room for the rest of this result]\n"
 TOOL_MINIMUM_NOTICE = "[unavailable]"   # what every result in a batch can always be, so none is ever blank
 FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply now with only the JSON answer."
+# The merge and editor requests' file table: its schema, stated once above one JSON row per file id.
+FILE_TABLE_LABEL = "The file ids these notes name, one JSON row each: [file_id, status, old_path, new_path]"
 REJECTED_REPLY_BYTES = 4 * 1024     # how much of a refused reply the attempt's record keeps, after redaction
+REJECTED_OPERATION_BYTES = 1024     # the most the shape of a refused section edit takes in that record, as stored
 KEY_VARIABLES = ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN')
 ATTRIBUTION_WARNING = ("File attribution is incomplete: some notes cite no file for a change, though every diff page "
                        "was processed.")
@@ -127,7 +130,9 @@ Reply with only this JSON object:
               {"op": "insert", "after": "s2", "content": "## New heading\\n..."}],
  "fields": {"brief": "...", "quick_reference": {"apis": "..."}, "related_repos": ["..."]},
  "coverage_note": "anything you could not verify, such as unavailable files"}
-Use "after": "start" to insert before the first section. Replacement and inserted content starts with a
+An insert has exactly "op", "after" and "content": it never names or assigns an "id". Its "after" is always
+one of the document's original section ids or "start", and no edit in the same patch can refer to a section another
+one inserts. Use "after": "start" to insert before the first section. Replacement and inserted content starts with a
 Markdown heading. Put only changed values in "fields". If nothing needs to change, return an empty
 "sections" list."""
 
@@ -149,13 +154,54 @@ def unpaid(budget):
     return budget.calls == 0
 
 
-def rejected_reply(call, text):
-    """What the attempt's record keeps of a refused reply, so the next failure can be diagnosed: which call,
-    and the start of its text, redacted (configured keys and known secret shapes) before it is cut."""
+def _scrub(text):
+    """Text with configured keys and known secret shapes redacted, before anything is cut or kept."""
     from repo_radar.activity.redact import Redactor
     from repo_radar.metadata import redact_secrets
-    scrubbed = redact_secrets(Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(text or ''))
-    return {'call': call, 'text': scrubbed.encode('utf-8')[:REJECTED_REPLY_BYTES].decode('utf-8', 'ignore')}
+    return redact_secrets(Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(text or ''))
+
+
+def _cut(text, size):
+    # surrogatepass: JSON can carry a lone surrogate such as "\ud800"; its bytes are dropped, not an error.
+    return text.encode('utf-8', 'surrogatepass')[:size].decode('utf-8', 'ignore')
+
+
+def _stored_bytes(record):
+    """The record's size in the attempt file: incremental_metadata.write_state's settings, with the six
+    spaces of extra indent each line gets nested as usage.rejected_reply.operation."""
+    return len(json.dumps(record, indent=2, sort_keys=True).replace('\n', '\n      ').encode('utf-8'))
+
+
+def rejected_reply(call, text, operation=None):
+    """What the attempt's record keeps of a refused reply, so the next failure can be diagnosed: which call,
+    and the start of its text, redacted (configured keys and known secret shapes) before it is cut. When one
+    section edit was at fault, `operation` is its shape (incremental_metadata._operation_shape), kept
+    redacted and bounded the same way, since the edit may lie past the kept start of the text."""
+    kept = {'call': call, 'text': _cut(_scrub(text), REJECTED_REPLY_BYTES)}
+    if operation is not None:
+        try:   # best effort: the prefix above is kept whatever happens here
+            kept['operation'] = _operation_record(operation)
+        except Exception:
+            kept['operation'] = {'unavailable': True}
+    return kept
+
+
+def _operation_record(shape):
+    """The shape with every model-chosen string redacted, then cut, so that it stays within
+    REJECTED_OPERATION_BYTES as stored: first at 48 bytes a string and eight key names, then smaller."""
+    for size, names in ((48, 8), (16, 4), (8, 0)):
+        bound = lambda value: _cut(_scrub(value if isinstance(value, str) else f"<{type(value).__name__}>"), size)
+        record = {}
+        for key, value in shape.items():
+            if key == 'keys':
+                record['keys'] = [bound(k) for k in value[:names]] + ([f"+{len(value) - names} more"] if len(value) > names else [])
+            elif key in ('op', 'id', 'after', 'type'):
+                record[key] = bound(value)
+            else:   # the index, the *_in_base flags and the content's length and hash, all app-made
+                record[key] = value
+        if _stored_bytes(record) <= REJECTED_OPERATION_BYTES:
+            return record
+    return {'index': shape.get('index'), 'unavailable': True}
 
 
 class Executor:
@@ -594,14 +640,16 @@ class Pipeline:
             not change['files'] for node in nodes for change in node.note['changes'])
 
     def _file_identities(self, nodes):
-        """What the file ids these notes cite refer to, from the app's own records, in a fixed order. It is
-        never cut short: a request that can't hold it fails its fit check instead."""
-        table = {}
+        """What the file ids these notes cite refer to, from the app's own records, in a fixed order: one JSON
+        row per id, [file_id, status, old_path, new_path] (FILE_TABLE_LABEL), with both paths and nulls kept.
+        It is never cut short: a request that can't hold it fails its fit check instead."""
+        rows = []
         for file_id in self._cited(nodes):
             ref = self.pages.files[file_id]
-            table[file_id] = {'status': ref.status, 'old_path': snap._shown(ref.old_path) if ref.old_path else None,
-                              'new_path': snap._shown(ref.new_path) if ref.new_path else None}
-        return json.dumps(table, ensure_ascii=False, separators=(',', ':'))
+            rows.append(json.dumps([file_id, ref.status, snap._shown(ref.old_path) if ref.old_path else None,
+                                    snap._shown(ref.new_path) if ref.new_path else None],
+                                   ensure_ascii=False, separators=(',', ':')))
+        return '\n'.join(rows) or 'none'
 
     def _edit_message(self, nodes):
         shown = '\n\n'.join(f"[section {s.id} sha256={s.sha256}]\n{s.text}" for s in self.sections)
@@ -613,7 +661,7 @@ class Pipeline:
                 f"Summary fields:\n{json.dumps(self.fields, indent=2)}\n\n"
                 f"Document sections:\n\n{shown}\n\n"
                 f"Notes covering every changed page:\n{notes}\n\n"
-                f"The file ids those notes name (status, old_path, new_path):\n{self._file_identities(nodes)}\n\n"
+                f"{FILE_TABLE_LABEL}\n{self._file_identities(nodes)}\n\n"
                 f"Changed paths that were not analyzed:\n{self._omission_text()}")
 
     def _edit_conversation(self, nodes):
@@ -727,7 +775,7 @@ class Pipeline:
         listing = '\n'.join(child.text for child in children)
         message = (f"Repository: {self.full_name}\nAnalyzed commit: {self.pages.base}\nNew commit: {self.pages.target}\n\n"
                    f"Existing summary sections (id: title):\n{self.titles}\n\n"
-                   f"The file ids these notes name (status, old_path, new_path):\n{self._file_identities(children)}\n\n"
+                   f"{FILE_TABLE_LABEL}\n{self._file_identities(children)}\n\n"
                    f"Notes to merge, one per line:\n{listing}")
         item = self._single_shot('merge', f"l{level}-g{index}", MERGE_SYSTEM, message, MERGE_OUTPUT, MERGE_SECONDS,
                                  MERGE_INPUT_TOKENS)
@@ -742,7 +790,8 @@ class Pipeline:
     def ready(self, nodes, level):
         """Whether the notes can go to the editor: within the direct limit, and with room in its first request
         for a tool-calling reply. With one note left and no such room, the editor answers without tools if that
-        fits. Merging follows the quoted schedule, and each level reduces the count."""
+        request, built and counted exactly as turn 1 will send it (no tool definitions, the final instruction,
+        the JSON reply option), fits. Merging follows the quoted schedule, and each level reduces the count."""
         total = sum(len(node.text.encode('utf-8')) for node in nodes)
         if total > MAX_DIRECT_NOTES_BYTES:
             return False
@@ -751,10 +800,12 @@ class Pipeline:
         if tokens + out + CONTINUATION_TOKENS <= prepared:
             return True
         if len(nodes) < 2:
-            if tokens <= prepared:
+            # A fresh conversation, so the one edit_stage sends is built from scratch the same way.
+            _request, final, _out, limit, offers_tools = self._edit_request(self._edit_conversation(nodes), 1)
+            if offers_tools or final <= self._prepared(limit):
                 return True
-            raise im.StaleUpdate(f"the notes and document ({tokens:,} tokens) would not fit the editor's "
-                                 f"{prepared:,} token limit")
+            raise im.StaleUpdate(f"the notes and document ({final:,} tokens without tools) would not fit the "
+                                 f"editor's {self._prepared(limit):,} token limit")
         return False
 
     def verify_coverage(self, nodes):
@@ -887,7 +938,7 @@ class Pipeline:
             try:
                 analysis, fields, note = im.apply_patch(self.sections, self.fields, im.parse_answer(turn.text), self.doc.sha256)
             except im.PatchError as e:
-                self.budget.extra['rejected_reply'] = rejected_reply(f"edit t{number}", turn.text)
+                self.budget.extra['rejected_reply'] = rejected_reply(f"edit t{number}", turn.text, e.operation)
                 raise im.StaleUpdate(f"the model's edits were rejected: {e}") from None
             warnings = self._app_warnings(nodes)
             if warnings:   # the app's own warnings, whatever the editor said
