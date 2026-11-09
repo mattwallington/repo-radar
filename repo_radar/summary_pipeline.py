@@ -742,7 +742,8 @@ class Pipeline:
     def ready(self, nodes, level):
         """Whether the notes can go to the editor: within the direct limit, and with room in its first request
         for a tool-calling reply. With one note left and no such room, the editor answers without tools if that
-        fits. Merging follows the quoted schedule, and each level reduces the count."""
+        request, built and counted exactly as turn 1 will send it (no tool definitions, the final instruction,
+        the JSON reply option), fits. Merging follows the quoted schedule, and each level reduces the count."""
         total = sum(len(node.text.encode('utf-8')) for node in nodes)
         if total > MAX_DIRECT_NOTES_BYTES:
             return False
@@ -751,10 +752,12 @@ class Pipeline:
         if tokens + out + CONTINUATION_TOKENS <= prepared:
             return True
         if len(nodes) < 2:
-            if tokens <= prepared:
+            # A fresh conversation, so the one edit_stage sends is built from scratch the same way.
+            _request, final, _out, limit, offers_tools = self._edit_request(self._edit_conversation(nodes), 1)
+            if offers_tools or final <= self._prepared(limit):
                 return True
-            raise im.StaleUpdate(f"the notes and document ({tokens:,} tokens) would not fit the editor's "
-                                 f"{prepared:,} token limit")
+            raise im.StaleUpdate(f"the notes and document ({final:,} tokens without tools) would not fit the "
+                                 f"editor's {self._prepared(limit):,} token limit")
         return False
 
     def verify_coverage(self, nodes):

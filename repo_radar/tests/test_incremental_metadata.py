@@ -1206,6 +1206,54 @@ def test_an_editor_continuation_has_room_for_replayed_provider_fields(monkeypatc
     assert 'tools' not in edits[0][1] and 'last turn' in edits[0][0]
 
 
+@pytest.mark.parametrize('final_tokens, publishes', [(60_000, True), (66_000, False)])
+def test_one_note_is_fitted_by_the_final_only_request_turn_1_sends(monkeypatch, tmp_path, final_tokens, publishes):
+    """With one note left, the request with tool definitions can pass the 65,536 preparation budget while
+    the final-only request turn 1 actually sends (no tools, the last-turn instruction, JSON) fits. Readiness
+    counts that request, so the edit goes out; when even it doesn't fit, nothing is sent to the editor."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    target = repo.commit('one change')
+    old = im.load_document(pristine, 'app-abc1234')
+    components = next(s for s in im.split_sections(im._analysis_of(old)) if s.text.startswith('## Key Components'))
+    patch = {'base_document_sha256': old.sha256,
+             'sections': [{'op': 'replace', 'id': components.id, 'expected_sha256': components.sha256,
+                           'content': '## Key Components\n- m0 now records a change\n'}]}
+
+    def reply(stage, text):
+        if stage == 'map':
+            return {'changes': [{'files': files_on_page(text), 'what': 'm0 changed', 'sections': [components.id]}],
+                    'questions': None, 'new_sections': None, 'no_summary_change_reason': None}
+        return patch
+    fake = GeminiFake(monkeypatch, reply)
+    counted, real_count = [], PreflightSession.count_request
+
+    def count(self, request, timeout=None):   # the tool definitions are what crowd the note out
+        result = real_count(self, request, timeout=timeout)
+        if 'covers_pages' not in json.dumps(request):
+            return result
+        counted.append(request)
+        return result._replace(tokens=70_000 if 'tools' in request else final_tokens)
+    monkeypatch.setattr(PreflightSession, 'count_request', count)
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW)
+
+    assert not fake.stage('merge') and len(fake.stage('map')) == 1
+    if not publishes:
+        assert outcome.status == 'failed' and 'without tools' in outcome.reason, outcome
+        assert not fake.stage('edit') and im.load_document(pristine, 'app-abc1234').text == old.text
+        return
+    assert outcome.status == 'published', outcome
+    assert im.load_document(pristine, 'app-abc1234').info['last_commit'] == target
+    (text, body), = fake.stage('edit')
+    final = counted[-1]
+    assert 'tools' not in body and 'tools' not in final and final['response_format'] == {'type': 'json_object'}
+    assert body['generationConfig']['response_mime_type'] == 'application/json' and 'last turn' in text
+    sent_user = [m['content'] for m in final['messages'] if m['role'] == 'user']
+    assert len(sent_user) == 2 and all(part in text for part in sent_user)
+    assert outcome.usage['edit_turns'] == 1
+
+
 def test_a_change_naming_unknown_sections_is_repaired_not_the_whole_update(monkeypatch, tmp_path):
     """The 1.0.38 failure: one map note in 202 had a change whose sections weren't ids it was given, and the
     whole update failed. Now those ids are dropped and counted, and the change reaches the editor without a
