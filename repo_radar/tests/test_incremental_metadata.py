@@ -1307,10 +1307,10 @@ def test_one_note_is_fitted_by_the_final_only_request_turn_1_sends(monkeypatch, 
     assert outcome.status == 'published', outcome
     assert im.load_document(pristine, 'app-abc1234').info['last_commit'] == target
     (text, body), = fake.stage('edit')
-    # Readiness counted the tool request twice, then the final-only one; edit_stage the same pair again.
-    assert len(counted) == 5 and ['tools' in r for r in counted] == [True, True, False, True, False]
+    # Readiness counts the tool request once, then the final-only one; edit_stage the same pair again.
+    assert len(counted) == 4 and ['tools' in r for r in counted] == [True, False, True, False]
     final = counted[-1]
-    assert counted[2] == final, "readiness counted a different final-only request from the one sent"
+    assert counted[1] == final, "readiness counted a different final-only request from the one sent"
     assert 'tools' not in body and 'tools' not in final and final['response_format'] == {'type': 'json_object'}
     assert body['generationConfig']['response_mime_type'] == 'application/json' and 'last turn' in text
     sent_user = [m['content'] for m in final['messages'] if m['role'] == 'user']
