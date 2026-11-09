@@ -21,7 +21,7 @@ from collections import namedtuple
 
 from repo_radar.files import should_include_file, under_build_output
 
-COLLECTOR_MAX_BYTES = 100 * 1024     # files.collect_repo_files skips files larger than this
+COLLECTOR_MAX_BYTES = 100 * 1024     # the full collector skips files larger than this
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
 MAX_FILE_DIFF_BYTES = 2 * 1024 * 1024 # one file's diff; larger ones are listed as omitted, not cut
 MAX_PAGE_BYTES = MAX_RESULT_BYTES - 1024   # one spooled page, its framing included

@@ -6,6 +6,7 @@ let configData = null;
 const { ipcRenderer } = require('electron');
 const { providerForModel, migrateModel, DEFAULT_MODEL, KNOWN_MODEL_IDS } = require('../model-policy');
 const spending = require('../spending-settings');
+const { parseIntervalInput, validateSchedule, savedSchedule } = require('../schedule-settings');
 
 // Settings input id for each spending config field.
 const SPENDING_INPUTS = {
@@ -14,6 +15,9 @@ const SPENDING_INPUTS = {
     [spending.WEEKLY_ENABLED_FIELD]: 'weekly-cap-enabled',
     [spending.WEEKLY_CAP_FIELD]: 'weekly-cap',
 };
+// Schedule elements that can carry an inline error (validateSchedule's `input`).
+const SCHEDULE_INPUTS = ['schedule-time', 'schedule-interval', 'schedule-days', 'schedule-weekly-time'];
+const ERROR_INPUTS = [...Object.values(SPENDING_INPUTS), ...SCHEDULE_INPUTS];
 
 // "Spend this week": read on open and focus, after a successful Save and when a sync finishes. Never
 // polled; any failure reads as unavailable, never as $0.
@@ -64,7 +68,7 @@ window.addEventListener('DOMContentLoaded', () => {
 // Handle save result
 ipcRenderer.on('config-saved', (event, success, error, field, notice) => {
     if (!success && SPENDING_INPUTS[field]) {   // main refused a spending value; nothing was written
-        showFieldError(field, error);
+        showInputError(SPENDING_INPUTS[field], error);
         return;
     }
     if (success) {
@@ -143,18 +147,18 @@ function renderSpendingSettings() {
     clearFieldErrors();
 }
 
-function showFieldError(field, message) {
+function showInputError(id, message) {
     clearFieldErrors();
-    const input = document.getElementById(SPENDING_INPUTS[field]);
-    const error = document.getElementById(`${SPENDING_INPUTS[field]}-error`);
+    const input = document.getElementById(id);
+    const error = document.getElementById(`${id}-error`);
     error.textContent = message;
     error.hidden = false;
     input.setAttribute('aria-invalid', 'true');
-    input.focus();
+    (input.querySelector('input') || input).focus();   // the days group focuses its first day
 }
 
 function clearFieldErrors() {
-    for (const id of Object.values(SPENDING_INPUTS)) {
+    for (const id of ERROR_INPUTS) {
         const error = document.getElementById(`${id}-error`);
         error.textContent = '';
         error.hidden = true;
@@ -162,7 +166,7 @@ function clearFieldErrors() {
     }
 }
 
-for (const id of Object.values(SPENDING_INPUTS)) {
+for (const id of ERROR_INPUTS) {
     document.getElementById(id).addEventListener('input', clearFieldErrors);
 }
 
@@ -456,11 +460,13 @@ function showNotification(message, type) {
 
 // Schedule enable toggle
 document.getElementById('schedule-enabled').addEventListener('change', (e) => {
+    clearFieldErrors();
     toggleScheduleOptions(e.target.checked);
 });
 
 // Schedule type change
 document.getElementById('schedule-type').addEventListener('change', (e) => {
+    clearFieldErrors();
     updateScheduleTypeVisibility(e.target.value);
 });
 
@@ -509,7 +515,24 @@ document.getElementById('save-btn').addEventListener('click', () => {
     };
     const invalid = spending.validateSpending(spendingValues);
     if (invalid) {
-        showFieldError(invalid.field, invalid.message);
+        showInputError(SPENDING_INPUTS[invalid.field], invalid.message);
+        return;
+    }
+
+    // The schedule next: a bad value is marked on its own field, and nothing is saved.
+    const schedule = {
+        enabled: document.getElementById('schedule-enabled').checked,
+        type: document.getElementById('schedule-type').value,
+        time: document.getElementById('schedule-time').value,
+        interval: parseIntervalInput(document.getElementById('schedule-interval').value),
+        days: Array.from(document.querySelectorAll('.schedule-day:checked')).map(cb => parseInt(cb.value))
+    };
+    if (schedule.type === 'weekly') {
+        schedule.time = document.getElementById('schedule-weekly-time').value;   // weekly has its own time
+    }
+    const badSchedule = validateSchedule(schedule);
+    if (badSchedule) {
+        showInputError(badSchedule.input, badSchedule.message);
         return;
     }
     Object.assign(configData, spendingValues);
@@ -522,19 +545,7 @@ document.getElementById('save-btn').addEventListener('click', () => {
     const sel = document.getElementById('ai-model');
     configData.ai_model = migrateModel(sel.value || DEFAULT_MODEL);
     
-    // Update schedule settings
-    configData.schedule = {
-        enabled: document.getElementById('schedule-enabled').checked,
-        type: document.getElementById('schedule-type').value,
-        time: document.getElementById('schedule-time').value,
-        interval: parseInt(document.getElementById('schedule-interval').value) || 6,
-        days: Array.from(document.querySelectorAll('.schedule-day:checked')).map(cb => parseInt(cb.value))
-    };
-    
-    // For weekly, use weekly-specific time
-    if (configData.schedule.type === 'weekly') {
-        configData.schedule.time = document.getElementById('schedule-weekly-time').value;
-    }
+    configData.schedule = savedSchedule(schedule);
     
     // Update last_configured
     configData.last_configured = new Date().toISOString();
@@ -563,11 +574,6 @@ document.getElementById('save-btn').addEventListener('click', () => {
             showNotification('OpenAI API key is required for GPT models', 'error');
             return;
         }
-    }
-    
-    if (configData.schedule.enabled && configData.schedule.type === 'weekly' && configData.schedule.days.length === 0) {
-        showNotification('Select at least one day for weekly sync', 'error');
-        return;
     }
     
     // Send save request (this will also update the LaunchAgent)
