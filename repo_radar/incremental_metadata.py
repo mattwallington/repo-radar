@@ -196,6 +196,12 @@ def _unfinished_full(state, doc):
     return st.get('baseline_doc_sha256') == doc.sha256
 
 
+def _weekly_due(full_rebuild_days, now, built):
+    """Whether the weekly age rule is due now: the interval is on, and the last full build is unknown or at
+    least that many days old."""
+    return bool(full_rebuild_days) and (built is None or now - built >= timedelta(days=full_rebuild_days))
+
+
 def full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
     """True when an unfinished full rebuild (_unfinished_full) is still owed under the current policy: the
     caller's interval and clock, and the document's last successful full build `built`. One owed only to the
@@ -205,9 +211,7 @@ def full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
         return False
     if _full_rebuild_origin(state) != WEEKLY_REASON:
         return True
-    if not full_rebuild_days:
-        return False
-    return built is None or now - built >= timedelta(days=full_rebuild_days)
+    return _weekly_due(full_rebuild_days, now, built)
 
 
 def consecutive_failures(state, doc):
@@ -302,7 +306,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
         return full('last full build time unknown', adopt=adopt)
     if full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
         return full(UNFINISHED_REASON, built=built, adopt=adopt)
-    if full_rebuild_days and now - built >= timedelta(days=full_rebuild_days):
+    if _weekly_due(full_rebuild_days, now, built):
         return full(WEEKLY_REASON, built=built, adopt=adopt)
 
     base_snap, target_snap = snap.GitSnapshot(repo_path, base), snap.GitSnapshot(repo_path, target)
@@ -455,6 +459,9 @@ def _apply_op(op, by_id, replaced, deleted, targets, inserts):
         extra.discard('id')
     if extra:
         raise PatchError(f"{kind} has unexpected keys {sorted(extra)}")
+    ref = 'after' if kind == 'insert' else 'id'
+    if op.get(ref) is not None and not isinstance(op[ref], str):   # an object or list can't name a section
+        raise PatchError(f"{kind} {ref} must be a string, not {type(op[ref]).__name__}")
     if kind in ('replace', 'delete'):
         section = by_id.get(op.get('id'))
         if section is None:
