@@ -944,9 +944,16 @@ def dense(size):
     return ' '.join(f'{i:x}.' for i in range(size))[:size]
 
 
+def file_table(text):
+    """The file-id table's rows in a merge or editor request, as sent."""
+    rows = text.split(mr.FILE_TABLE_LABEL + '\n', 1)[1].split('\n\n', 1)[0]
+    return [] if rows == 'none' else rows.split('\n')
+
+
 def cited_identities(text):
-    """The file-id table in a merge or editor request."""
-    return json.loads(re.search(r'\(status, old_path, new_path\):\n(\{.*\})\n', text).group(1))
+    """The file-id table in a merge or editor request, by id."""
+    return {row[0]: {'status': row[1], 'old_path': row[2], 'new_path': row[3]}
+            for row in map(json.loads, file_table(text))}
 
 
 def paths_on_page(text):
@@ -959,6 +966,7 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     (repo.path / 'lib').mkdir()
     repo.git('mv', 'src/m9.py', 'lib/renamed.py')
     repo.write('src/crlf.py', 'a = 1\r\nb = 2\r\n')
+    repo.write('src/say "hi".py', 'quoted = True\n')
     for i in range(9):
         repo.write(f'src/m{i}.py', ''.join(f'value_{i}_{n} = {n}\n' for n in range(4700)))
     target = repo.commit('rewrite everything and rename one')
@@ -1048,7 +1056,14 @@ def test_a_huge_diff_is_mapped_merged_edited_and_published(monkeypatch, tmp_path
     for text, _body in (*merges, edits[0]):
         table = cited_identities(text)
         assert table and all(table[file_id] == expected[file_id] for file_id in table)
-    assert renamed in cited_identities(edits[0][0])
+        assert len(file_table(text)) == len(table)   # one row per id, none merged
+    editor = cited_identities(edits[0][0])
+    assert renamed in editor and editor[renamed]['old_path'] == 'src/m9.py'
+    quoted = next(file_id for file_id, ref in expected.items() if ref['new_path'] == 'src/say "hi".py')
+    assert quoted in editor and json.dumps([quoted, 'A', None, 'src/say "hi".py'], separators=(',', ':')) in edits[0][0]
+    # Compact rows: the same mapping in fewer bytes than the old object per id.
+    old_encoding = json.dumps(editor, ensure_ascii=False, separators=(',', ':'))
+    assert len('\n'.join(file_table(edits[0][0])).encode()) < 0.8 * len(old_encoding.encode())
 
     # A large read is cut to fit the counted request, within the delivered-bytes cap, and the edit still
     # publishes; the last turn offers no tools.

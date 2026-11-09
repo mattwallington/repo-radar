@@ -57,6 +57,8 @@ TOOL_ROOM_NOTICE = "[unavailable: the request has no room left for this result; 
 TOOL_TRUNCATED_NOTICE = "\n[truncated: no room for the rest of this result]\n"
 TOOL_MINIMUM_NOTICE = "[unavailable]"   # what every result in a batch can always be, so none is ever blank
 FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply now with only the JSON answer."
+# The merge and editor requests' file table: its schema, stated once above one JSON row per file id.
+FILE_TABLE_LABEL = "The file ids these notes name, one JSON row each: [file_id, status, old_path, new_path]"
 REJECTED_REPLY_BYTES = 4 * 1024     # how much of a refused reply the attempt's record keeps, after redaction
 KEY_VARIABLES = ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN')
 ATTRIBUTION_WARNING = ("File attribution is incomplete: some notes cite no file for a change, though every diff page "
@@ -594,14 +596,16 @@ class Pipeline:
             not change['files'] for node in nodes for change in node.note['changes'])
 
     def _file_identities(self, nodes):
-        """What the file ids these notes cite refer to, from the app's own records, in a fixed order. It is
-        never cut short: a request that can't hold it fails its fit check instead."""
-        table = {}
+        """What the file ids these notes cite refer to, from the app's own records, in a fixed order: one JSON
+        row per id, [file_id, status, old_path, new_path] (FILE_TABLE_LABEL), with both paths and nulls kept.
+        It is never cut short: a request that can't hold it fails its fit check instead."""
+        rows = []
         for file_id in self._cited(nodes):
             ref = self.pages.files[file_id]
-            table[file_id] = {'status': ref.status, 'old_path': snap._shown(ref.old_path) if ref.old_path else None,
-                              'new_path': snap._shown(ref.new_path) if ref.new_path else None}
-        return json.dumps(table, ensure_ascii=False, separators=(',', ':'))
+            rows.append(json.dumps([file_id, ref.status, snap._shown(ref.old_path) if ref.old_path else None,
+                                    snap._shown(ref.new_path) if ref.new_path else None],
+                                   ensure_ascii=False, separators=(',', ':')))
+        return '\n'.join(rows) or 'none'
 
     def _edit_message(self, nodes):
         shown = '\n\n'.join(f"[section {s.id} sha256={s.sha256}]\n{s.text}" for s in self.sections)
@@ -613,7 +617,7 @@ class Pipeline:
                 f"Summary fields:\n{json.dumps(self.fields, indent=2)}\n\n"
                 f"Document sections:\n\n{shown}\n\n"
                 f"Notes covering every changed page:\n{notes}\n\n"
-                f"The file ids those notes name (status, old_path, new_path):\n{self._file_identities(nodes)}\n\n"
+                f"{FILE_TABLE_LABEL}\n{self._file_identities(nodes)}\n\n"
                 f"Changed paths that were not analyzed:\n{self._omission_text()}")
 
     def _edit_conversation(self, nodes):
@@ -727,7 +731,7 @@ class Pipeline:
         listing = '\n'.join(child.text for child in children)
         message = (f"Repository: {self.full_name}\nAnalyzed commit: {self.pages.base}\nNew commit: {self.pages.target}\n\n"
                    f"Existing summary sections (id: title):\n{self.titles}\n\n"
-                   f"The file ids these notes name (status, old_path, new_path):\n{self._file_identities(children)}\n\n"
+                   f"{FILE_TABLE_LABEL}\n{self._file_identities(children)}\n\n"
                    f"Notes to merge, one per line:\n{listing}")
         item = self._single_shot('merge', f"l{level}-g{index}", MERGE_SYSTEM, message, MERGE_OUTPUT, MERGE_SECONDS,
                                  MERGE_INPUT_TOKENS)
