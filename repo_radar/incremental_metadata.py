@@ -455,6 +455,9 @@ def _apply_op(op, by_id, replaced, deleted, targets, inserts):
         extra.discard('id')
     if extra:
         raise PatchError(f"{kind} has unexpected keys {sorted(extra)}")
+    ref = 'after' if kind == 'insert' else 'id'
+    if op.get(ref) is not None and not isinstance(op[ref], str):   # an object or list can't name a section
+        raise PatchError(f"{kind} {ref} must be a string, not {type(op[ref]).__name__}")
     if kind in ('replace', 'delete'):
         section = by_id.get(op.get('id'))
         if section is None:
