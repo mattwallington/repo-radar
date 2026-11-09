@@ -60,6 +60,7 @@ FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply n
 # The merge and editor requests' file table: its schema, stated once above one JSON row per file id.
 FILE_TABLE_LABEL = "The file ids these notes name, one JSON row each: [file_id, status, old_path, new_path]"
 REJECTED_REPLY_BYTES = 4 * 1024     # how much of a refused reply the attempt's record keeps, after redaction
+REJECTED_OPERATION_BYTES = 1024     # the most the shape of a refused section edit adds to that record
 KEY_VARIABLES = ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN')
 ATTRIBUTION_WARNING = ("File attribution is incomplete: some notes cite no file for a change, though every diff page "
                        "was processed.")
@@ -129,7 +130,9 @@ Reply with only this JSON object:
               {"op": "insert", "after": "s2", "content": "## New heading\\n..."}],
  "fields": {"brief": "...", "quick_reference": {"apis": "..."}, "related_repos": ["..."]},
  "coverage_note": "anything you could not verify, such as unavailable files"}
-Use "after": "start" to insert before the first section. Replacement and inserted content starts with a
+An insert has exactly "op", "after" and "content": it never names or assigns an "id". Its "after" is always
+one of the original section ids above or "start", and no edit in the same patch can refer to a section another
+one inserts. Use "after": "start" to insert before the first section. Replacement and inserted content starts with a
 Markdown heading. Put only changed values in "fields". If nothing needs to change, return an empty
 "sections" list."""
 
@@ -151,13 +154,44 @@ def unpaid(budget):
     return budget.calls == 0
 
 
-def rejected_reply(call, text):
-    """What the attempt's record keeps of a refused reply, so the next failure can be diagnosed: which call,
-    and the start of its text, redacted (configured keys and known secret shapes) before it is cut."""
+def _scrub(text):
+    """Text with configured keys and known secret shapes redacted, before anything is cut or kept."""
     from repo_radar.activity.redact import Redactor
     from repo_radar.metadata import redact_secrets
-    scrubbed = redact_secrets(Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(text or ''))
-    return {'call': call, 'text': scrubbed.encode('utf-8')[:REJECTED_REPLY_BYTES].decode('utf-8', 'ignore')}
+    return redact_secrets(Redactor([os.environ.get(name) for name in KEY_VARIABLES]).scrub(text or ''))
+
+
+def _cut(text, size):
+    return text.encode('utf-8')[:size].decode('utf-8', 'ignore')
+
+
+def rejected_reply(call, text, operation=None):
+    """What the attempt's record keeps of a refused reply, so the next failure can be diagnosed: which call,
+    and the start of its text, redacted (configured keys and known secret shapes) before it is cut. When one
+    section edit was at fault, `operation` is its shape (incremental_metadata._operation_shape), kept
+    redacted and bounded the same way, since the edit may lie past the kept start of the text."""
+    kept = {'call': call, 'text': _cut(_scrub(text), REJECTED_REPLY_BYTES)}
+    if operation is not None:
+        kept['operation'] = _operation_record(operation)
+    return kept
+
+
+def _operation_record(shape):
+    """The shape with every model-chosen string redacted, then cut, so that it stays within
+    REJECTED_OPERATION_BYTES as JSON: first at 48 bytes a string and eight key names, then smaller."""
+    for size, names in ((48, 8), (16, 4), (8, 0)):
+        bound = lambda value: _cut(_scrub(value if isinstance(value, str) else f"<{type(value).__name__}>"), size)
+        record = {}
+        for key, value in shape.items():
+            if key == 'keys':
+                record['keys'] = [bound(k) for k in value[:names]] + ([f"+{len(value) - names} more"] if len(value) > names else [])
+            elif key in ('op', 'id', 'after', 'type'):
+                record[key] = bound(value)
+            else:   # the index, the *_in_base flags and the content's length and hash, all app-made
+                record[key] = value
+        if len(json.dumps(record).encode('utf-8')) <= REJECTED_OPERATION_BYTES:
+            break
+    return record
 
 
 class Executor:
@@ -894,7 +928,7 @@ class Pipeline:
             try:
                 analysis, fields, note = im.apply_patch(self.sections, self.fields, im.parse_answer(turn.text), self.doc.sha256)
             except im.PatchError as e:
-                self.budget.extra['rejected_reply'] = rejected_reply(f"edit t{number}", turn.text)
+                self.budget.extra['rejected_reply'] = rejected_reply(f"edit t{number}", turn.text, e.operation)
                 raise im.StaleUpdate(f"the model's edits were rejected: {e}") from None
             warnings = self._app_warnings(nodes)
             if warnings:   # the app's own warnings, whatever the editor said
