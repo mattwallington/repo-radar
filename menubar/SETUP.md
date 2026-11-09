@@ -161,4 +161,4 @@ Repo Radar provisions its own Python runtime automatically — you should not ne
 
 ## Need Help?
 
-File an issue at https://github.com/mattwallington/repo-radar/issues.
+File an issue at https://github.com/ReperioHealth/repo-radar/issues.
