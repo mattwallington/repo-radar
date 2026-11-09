@@ -60,7 +60,7 @@ FINAL_TURN_MESSAGE = "This is your last turn and no tools are available. Reply n
 # The merge and editor requests' file table: its schema, stated once above one JSON row per file id.
 FILE_TABLE_LABEL = "The file ids these notes name, one JSON row each: [file_id, status, old_path, new_path]"
 REJECTED_REPLY_BYTES = 4 * 1024     # how much of a refused reply the attempt's record keeps, after redaction
-REJECTED_OPERATION_BYTES = 1024     # the most the shape of a refused section edit adds to that record
+REJECTED_OPERATION_BYTES = 1024     # the most the shape of a refused section edit takes in that record, as stored
 KEY_VARIABLES = ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN')
 ATTRIBUTION_WARNING = ("File attribution is incomplete: some notes cite no file for a change, though every diff page "
                        "was processed.")
@@ -131,7 +131,7 @@ Reply with only this JSON object:
  "fields": {"brief": "...", "quick_reference": {"apis": "..."}, "related_repos": ["..."]},
  "coverage_note": "anything you could not verify, such as unavailable files"}
 An insert has exactly "op", "after" and "content": it never names or assigns an "id". Its "after" is always
-one of the original section ids above or "start", and no edit in the same patch can refer to a section another
+one of the document's original section ids or "start", and no edit in the same patch can refer to a section another
 one inserts. Use "after": "start" to insert before the first section. Replacement and inserted content starts with a
 Markdown heading. Put only changed values in "fields". If nothing needs to change, return an empty
 "sections" list."""
@@ -162,7 +162,14 @@ def _scrub(text):
 
 
 def _cut(text, size):
-    return text.encode('utf-8')[:size].decode('utf-8', 'ignore')
+    # surrogatepass: JSON can carry a lone surrogate such as "\ud800"; its bytes are dropped, not an error.
+    return text.encode('utf-8', 'surrogatepass')[:size].decode('utf-8', 'ignore')
+
+
+def _stored_bytes(record):
+    """The record's size in the attempt file: incremental_metadata.write_state's settings, with the six
+    spaces of extra indent each line gets nested as usage.rejected_reply.operation."""
+    return len(json.dumps(record, indent=2, sort_keys=True).replace('\n', '\n      ').encode('utf-8'))
 
 
 def rejected_reply(call, text, operation=None):
@@ -172,13 +179,16 @@ def rejected_reply(call, text, operation=None):
     redacted and bounded the same way, since the edit may lie past the kept start of the text."""
     kept = {'call': call, 'text': _cut(_scrub(text), REJECTED_REPLY_BYTES)}
     if operation is not None:
-        kept['operation'] = _operation_record(operation)
+        try:   # best effort: the prefix above is kept whatever happens here
+            kept['operation'] = _operation_record(operation)
+        except Exception:
+            kept['operation'] = {'unavailable': True}
     return kept
 
 
 def _operation_record(shape):
     """The shape with every model-chosen string redacted, then cut, so that it stays within
-    REJECTED_OPERATION_BYTES as JSON: first at 48 bytes a string and eight key names, then smaller."""
+    REJECTED_OPERATION_BYTES as stored: first at 48 bytes a string and eight key names, then smaller."""
     for size, names in ((48, 8), (16, 4), (8, 0)):
         bound = lambda value: _cut(_scrub(value if isinstance(value, str) else f"<{type(value).__name__}>"), size)
         record = {}
@@ -189,9 +199,9 @@ def _operation_record(shape):
                 record[key] = bound(value)
             else:   # the index, the *_in_base flags and the content's length and hash, all app-made
                 record[key] = value
-        if len(json.dumps(record).encode('utf-8')) <= REJECTED_OPERATION_BYTES:
-            break
-    return record
+        if _stored_bytes(record) <= REJECTED_OPERATION_BYTES:
+            return record
+    return {'index': shape.get('index'), 'unavailable': True}
 
 
 class Executor:

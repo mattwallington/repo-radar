@@ -1404,12 +1404,15 @@ def test_an_editor_answer_in_a_code_fence_lands_and_prose_alone_still_fails(monk
         im.parse_answer(two)
 
 
-@pytest.mark.parametrize('case', ['unused', 'collision', 'reference', 'extra key'])
+@pytest.mark.parametrize('case', ['unused', 'collision', 'reference', 'extra key', 'surrogate key', 'surrogate content',
+                                  'surrogate replace id', 'largest shape'])
 def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatch, tmp_path, case):
     """Installed 1.0.40 on telehealth: editor turn 3 refused 'insert has unexpected keys ['id']', and the
     kept 4 KiB of the reply ended before that insert. An unused label on an insert is now ignored. A label
     that names an existing section, a later edit naming the new label, or another extra key still refuses
-    the whole patch after the spend, with no repair request, and the record keeps the edit's shape."""
+    the whole patch after the spend, with no repair request, and the record keeps the edit's shape. A lone
+    surrogate, which JSON allows, never replaces that refusal or loses the kept text, and the shape stays
+    within 1 KiB as the attempt file stores it."""
     def attempt(where, insert, later=()):
         repo, _base, pristine = setup_pristine(monkeypatch, where)
         repo.write('src/m0.py', 'changed = True\n')
@@ -1450,6 +1453,12 @@ def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatc
                       ({'op': 'insert', 'after': 'new-change-records', 'content': '## More\n- more\n'},),
                       {'index': 2, 'after': 'new-change-records', 'after_in_base': False}),
         'extra key': (lambda c: {'title': 'Change Records'}, (), {'index': 1, 'keys': ['after', 'content', 'op', 'title']}),
+        'surrogate key': (lambda c: {'\ud800': 'x'}, (), {'index': 1}),
+        'surrogate content': (lambda c: {'title': 'x', 'content': '## Change Records\n- m0 \ud800 keeps them\n'}, (),
+                              {'index': 1}),
+        'surrogate replace id': (lambda c: {}, ({'op': 'replace', 'id': 'no-such-\ud800', 'expected_sha256': 'f' * 16,
+                                                  'content': '## More\n- more\n'},), {'op': 'replace', 'index': 2, 'id_in_base': False}),
+        'largest shape': (lambda c: {'id': '\x01' * 14, **{str(i) + '\x01' * 14: 'x' for i in range(15)}}, (), {'index': 1}),
     }[case]
     outcome, fake, pristine, old, _components = attempt(tmp_path, insert, later)
     assert outcome.status == 'failed' and 'edits were rejected' in outcome.reason and outcome.usage['known_cost_usd'] > 0
@@ -1458,10 +1467,14 @@ def test_insert_label_is_ignored_without_becoming_a_section_reference(monkeypatc
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert state['consecutive_failures'] == 1 and state['usage']['known_cost_usd'] == outcome.usage['known_cost_usd']
     saved = state['usage']['rejected_reply']
-    assert len(saved['text'].encode('utf-8')) <= mr.REJECTED_REPLY_BYTES and '## Change Records' not in saved['text']
+    assert saved['text'].startswith('{') and len(saved['text'].encode('utf-8')) <= mr.REJECTED_REPLY_BYTES
+    assert '## Change Records' not in saved['text']
     operation = saved['operation']
-    assert len(json.dumps(operation).encode('utf-8')) <= mr.REJECTED_OPERATION_BYTES
-    assert operation['op'] == 'insert' and {k: operation[k] for k in expected} == expected
+    stored = im.state_path(pristine, 'app-abc1234').read_text(encoding='utf-8')
+    start = stored.index('"operation": ') + len('"operation": ')
+    assert len(stored[start:stored.index('\n      }', start) + 8].encode('utf-8')) <= mr.REJECTED_OPERATION_BYTES
+    expected = {'op': 'insert', **expected}
+    assert {k: operation.get(k) for k in expected} == expected
     assert set(operation['content']) == {'bytes', 'sha256'} and 'keeps them' not in json.dumps(operation)
 
 

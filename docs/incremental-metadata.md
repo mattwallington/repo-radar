@@ -121,8 +121,8 @@ can't show that a file holds no secret, and a PEM file can carry a private key. 
    one complete JSON object, in a code fence or among a few words, and that object is the answer, checked as usual;
    with none or several, the reply is refused. A final request with no tools defined (the one-note case)
    also asks Gemini for a JSON reply; a later final turn keeps the tool definitions its history needs and
-   doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, and the first
-   4 KiB of its text after redaction.
+   doesn't. When a reply is refused, the attempt's usage keeps `rejected_reply`: which call, the first
+   4 KiB of its text after redaction, and, for a refused section edit, its shape (at most 1 KiB, no prose).
 
 On Gemini, note and merge calls ask for low reasoning effort and a JSON reply. Other models keep their
 usual options and output floors, which are priced in. A whole update has one 20-minute allowance, from

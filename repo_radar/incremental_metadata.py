@@ -385,9 +385,9 @@ def _operation_shape(index, op, by_id):
             shape[f"{ref}_in_base"] = isinstance(value, str) and value in by_id
     if 'content' in op:
         content = op['content']
-        shape['content'] = ({'bytes': len(content.encode('utf-8')),
-                             'sha256': hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}
-                            if isinstance(content, str) else {'type': type(content).__name__})
+        raw = content.encode('utf-8', 'surrogatepass') if isinstance(content, str) else None   # JSON allows "\ud800"
+        shape['content'] = ({'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()[:16]}
+                            if raw is not None else {'type': type(content).__name__})
     return shape
 
 
@@ -510,7 +510,10 @@ def apply_patch(sections, fields, patch, base_sha):
         try:
             _apply_op(op, by_id, replaced, deleted, targets, inserts)
         except PatchError as e:
-            e.operation = _operation_shape(index, op, by_id)
+            try:   # best effort: describing the edit must never replace the refusal itself
+                e.operation = _operation_shape(index, op, by_id)
+            except Exception:
+                e.operation = {'index': index, 'unavailable': True}
             raise
 
     # (text, written by the model). Only model-written text gets a blank line added before what follows.
