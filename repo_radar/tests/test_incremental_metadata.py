@@ -2948,7 +2948,7 @@ def test_each_publication_records_its_summary_change_and_failures_keep_it(monkey
     with PreflightSession() as session:
         assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(edited, fields)).status == 'published'
     info = metadata.parse_frontmatter(page_path.read_text())
-    assert info['status'] == 'unchanged' and 'Summary text unchanged' in page_path.read_text()
+    assert info['status'] == 'unchanged' and '**Result:** Summary text unchanged.  ' in page_path.read_text()
     assert '```diff' not in page_path.read_text()
 
     # A comparison that fails is recorded as unavailable; the update still publishes.
@@ -2989,3 +2989,39 @@ def test_a_first_summary_is_labelled_and_a_long_diff_is_truncated(monkeypatch, t
     info = metadata.parse_frontmatter(page)
     assert info['status'] == 'changed' and info['truncated'] == 'true' and '_Truncated: ' in page
     assert len(page.encode('utf-8')) <= im.CHANGE_MAX_BYTES and '````diff' in page
+
+
+def test_change_pages_show_long_lines_whole_stay_in_the_cap_and_link_crlf_text(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    page_path = pristine / '.summary-changes' / 'app-abc1234.md'
+    doc_path = pristine / 'app-abc1234.md'
+    fields = im.current_fields(im.load_document(pristine, 'app-abc1234'))
+
+    # A change at the end of a long paragraph is shown whole: both endings, and nothing claimed cut.
+    paragraph = 'A long Markdown paragraph. ' * 20
+    doc_path.write_text(doc_path.read_text().replace('A payments API.\n\n', f"{paragraph}old ending\n\n", 1))
+    repo.write('src/m0.py', '# changed\n')
+    repo.commit()
+    with PreflightSession() as session:
+        edited = im._analysis_of(im.load_document(pristine, 'app-abc1234')).replace('old ending', 'new ending')
+        assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(edited, fields)).status == 'published'
+    page = page_path.read_text()
+    assert f"-{paragraph}old ending" in page and f"+{paragraph}new ending" in page
+    assert metadata.parse_frontmatter(page)['truncated'] == 'false' and '_Truncated' not in page
+
+    # An oversized analyzed commit in the old document still gives a page within the cap.
+    doc_path.write_text(re.sub(r'^last_commit: .*$', 'last_commit: ' + '界' * 12000, doc_path.read_text(), count=1, flags=re.M))
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_full_fn=lambda *a, **k: _candidate(ANALYSIS, fields)).status == 'published'
+    assert len(page_path.read_bytes()) <= im.CHANGE_MAX_BYTES
+    assert metadata.parse_frontmatter(page_path.read_text())['status'] == 'changed'
+
+    # Carriage returns in the published text: the page is made for the document readers see, so INDEX links it.
+    repo.write('src/m1.py', '# changed\n')
+    repo.commit()
+    crlf = ANALYSIS.replace('\n', '\r\n')
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(crlf, fields)).status == 'published'
+    assert b'\r\n' in doc_path.read_bytes()
+    assert metadata.parse_frontmatter(page_path.read_text())['status'] == 'unchanged'
+    assert CHANGES_LINK in _index(pristine)

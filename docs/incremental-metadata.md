@@ -280,7 +280,8 @@ removed lines, at most 64 KiB, saying when the diff is cut. A first summary is l
 that only moved the analyzed commit says "summary text unchanged". A failed, refused or no-op update leaves the
 page as it was; a comparison that fails is recorded as unavailable and the publication stands. Its header names
 the old and new document hashes and the generation ID, and `INDEX.md` links it beside View Details only while
-its new hash is the current document's.
+its new hash is the current document's. The page is a second copy of summary text: if you scrub something from a
+document by hand, delete or edit its page too.
 
 ### The hold after repeated failures
 

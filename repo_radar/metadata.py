@@ -294,7 +294,7 @@ def summary_change_link(pristine_dir, cache_name, document_text):
         return None
     try:
         info = parse_frontmatter(summary_change_path(pristine_dir, cache_name).read_text(encoding='utf-8'))
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError):   # ValueError: a NUL in a hand-edited cache name
         return None
     if not info or info.get('schema') != SUMMARY_CHANGE_SCHEMA:
         return None

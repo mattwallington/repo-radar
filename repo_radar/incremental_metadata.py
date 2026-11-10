@@ -777,7 +777,7 @@ def _link(pristine_dir, full_name, cache_name):
 # ---- the latest summary change -----------------------------------------------------------------------
 
 CHANGE_MAX_BYTES = 64 * 1024   # the whole page, header and prose included
-CHANGE_MAX_LINE = 400          # characters shown of one diff line
+CHANGE_MAX_VALUE = 200         # characters of any one header or prose value taken from the documents
 
 
 def _summary_lines(text):
@@ -797,17 +797,23 @@ def _summary_lines(text):
 
 
 def _one(value):
-    """A header value as one printable line."""
-    return ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in str(value)).split()) or 'unknown'
+    """A header or prose value as one printable line of at most CHANGE_MAX_VALUE characters."""
+    text = ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in str(value)).split()) or 'unknown'
+    return text if len(text) <= CHANGE_MAX_VALUE else text[:CHANGE_MAX_VALUE - 1] + '…'
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
 def summary_change_page(full_name, cache_name, old_text, new_text, generation_id, failure=None):
     """The "Latest summary changes" page for a publication of `new_text` over `old_text` (None for a first
     summary): a local line comparison, no model call and no source read. `failure` makes it the page for a
-    comparison that couldn't be made. Its header ties it to exactly these documents."""
+    comparison that couldn't be made. Its header ties it to exactly these documents. Diff lines are shown
+    whole, in order, while the page stays within CHANGE_MAX_BYTES; the rest are counted as truncated."""
     new_info = parse_frontmatter(new_text) or {}
     old_info = (parse_frontmatter(old_text) or {}) if old_text is not None else {}
-    diff, added, removed, truncated = [], 0, 0, 0
+    lines, added, removed = [], 0, 0
     if failure is not None:
         status, result = 'unavailable', f"Comparison unavailable ({failure}). The summary was published."
     elif old_text is None:
@@ -815,44 +821,52 @@ def summary_change_page(full_name, cache_name, old_text, new_text, generation_id
     else:
         old_lines, new_lines = _summary_lines(old_text), _summary_lines(new_text)
         if old_lines == new_lines:
-            status, result = 'unchanged', 'Summary text unchanged: only the analyzed commit moved.'
+            status, result = 'unchanged', 'Summary text unchanged.'
         else:
             import difflib
             lines = list(difflib.unified_diff(old_lines, new_lines, lineterm='', n=2))[2:]   # no file headers
             added = sum(1 for line in lines if line.startswith('+'))
             removed = sum(1 for line in lines if line.startswith('-'))
-            status = 'changed'
-            result = f"Summary updated: {added} lines added, {removed} removed."
-            room = CHANGE_MAX_BYTES - 4096
-            for n, line in enumerate(lines):
-                line = line if len(line) <= CHANGE_MAX_LINE else line[:CHANGE_MAX_LINE - 1] + '…'
-                room -= len(line.encode('utf-8')) + 1
-                if room < 0:
-                    truncated = len(lines) - n
-                    break
-                diff.append(line)
-    sha = lambda t: hashlib.sha256(t.encode('utf-8')).hexdigest()
-    header = {'schema': SUMMARY_CHANGE_SCHEMA, 'full_name': full_name, 'status': status,
-              'old_commit': old_info.get('last_commit') or 'none', 'new_commit': new_info.get('last_commit'),
-              'generated_at': new_info.get('last_updated'), 'generation_id': generation_id,
-              'old_document_sha256': sha(old_text) if old_text is not None else 'none',
-              'new_document_sha256': sha(new_text), 'truncated': 'true' if truncated else 'false'}
-    header = {k: _one(v) for k, v in header.items()}
+            status, result = 'changed', f"Summary updated: {added} lines added, {removed} removed."
+    header = {k: _one(v) for k, v in {
+        'schema': SUMMARY_CHANGE_SCHEMA, 'full_name': full_name, 'status': status,
+        'old_commit': old_info.get('last_commit') or 'none', 'new_commit': new_info.get('last_commit'),
+        'generated_at': new_info.get('last_updated'), 'generation_id': generation_id,
+        'old_document_sha256': _sha(old_text) if old_text is not None else 'none',
+        'new_document_sha256': _sha(new_text)}.items()}
     short = lambda c: c[:7] if snap.SHA.fullmatch(c) else c
-    page = ['---', *(f"{k}: {v}" for k, v in header.items()), '---', '',
-            f"# Latest summary changes: {header['full_name']}", '',
-            f"**Result:** {_one(result)}  ",
-            f"**Analyzed commits:** `{short(header['old_commit'])}` → `{short(header['new_commit'])}`  ",
-            f"**Generated:** {header['generated_at']}  ",
-            f"**[View Details](../{cache_name}.md)**", '',
-            'This compares the published summary text before and after the latest update. It does not explain '
-            'the source changes, and not every source change belongs in the summary.', '']
-    if diff:
-        fence = '`' * max(3, 1 + max((len(run) for line in diff for run in re.findall(r'`+', line)), default=0))
-        page += [fence + 'diff', *diff, fence, '']
-    if truncated:
-        page += [f"_Truncated: {truncated} more diff lines not shown._", '']
-    return '\n'.join(page)
+
+    def render(shown, truncated):
+        page = ['---', *(f"{k}: {v}" for k, v in header.items()), f"truncated: {'true' if truncated else 'false'}",
+                '---', '', f"# Latest summary changes: {header['full_name']}", '',
+                f"**Result:** {_one(result)}  ",
+                f"**Analyzed commits:** `{short(header['old_commit'])}` → `{short(header['new_commit'])}`  ",
+                f"**Generated:** {header['generated_at']}  ",
+                f"**[View Details](../{_one(cache_name)}.md)**", '',
+                'This compares the published summary text before and after the latest update. It does not explain '
+                'the source changes, and not every source change belongs in the summary.', '']
+        if shown:
+            longest = max((len(run) for line in shown for run in re.findall(r'`+', line)), default=0)
+            fence = '`' * max(3, longest + 1)
+            page += [fence + 'diff', *shown, fence, '']
+        if truncated:
+            page += [f"_Truncated: {truncated} more diff lines not shown._", '']
+        return '\n'.join(page)
+
+    # Whole lines while they fit what's left after the rest of the page (counted at its largest); then the
+    # finished page is measured, and lines come off the end until it fits, fences included.
+    room = CHANGE_MAX_BYTES - len(render([], len(lines)).encode('utf-8')) - 32
+    shown = []
+    for line in lines:
+        room -= len(line.encode('utf-8')) + 1
+        if room < 0:
+            break
+        shown.append(line)
+    page = render(shown, len(lines) - len(shown))
+    while shown and len(page.encode('utf-8')) > CHANGE_MAX_BYTES:
+        shown.pop()
+        page = render(shown, len(lines) - len(shown))
+    return page
 
 
 def write_summary_change(pristine_dir, cache_name, full_name, old_text, new_text, generation_id):
@@ -1084,8 +1098,9 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         write_text_atomic(document_path(pristine_dir, cache_name), text)   # the commit point
         committed = True
         _link(pristine_dir, full_name, cache_name)
+        published = load_document(pristine_dir, cache_name)   # compared and hashed as readers see it
         change_error = write_summary_change(pristine_dir, cache_name, full_name, current.text if current else None,
-                                            text, generation_id)
+                                            published.text if published else text, generation_id)
         if change_error:
             log(change_error)
         return finish('published', None)
