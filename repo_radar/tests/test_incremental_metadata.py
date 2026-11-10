@@ -2892,3 +2892,100 @@ def test_a_cut_tool_result_keeps_its_notice_inside_its_byte_allotment():
     item = {'content': mr.TOOL_MINIMUM_NOTICE}
     text = mr.Pipeline._fit_tool_result(pipeline, Conversation(), item, 'x' * 400, 400)
     assert text.endswith(mr.TOOL_TRUNCATED_NOTICE) and len(text.encode()) <= 400
+
+
+# ── Latest summary changes ───────────────────────────────────────────────────────────────────────
+
+def _candidate(analysis, fields):
+    return im.Candidate(analysis, fields, None, [], 0, snap.NO_EXCLUSIONS)
+
+
+def _index(pristine):
+    metadata.regenerate_index(types.SimpleNamespace(dry_run=False))
+    return (pristine / 'INDEX.md').read_text()
+
+
+CHANGES_LINK = '**[Latest summary changes](.summary-changes/app-abc1234.md)**'
+
+
+def test_each_publication_records_its_summary_change_and_failures_keep_it(monkeypatch, tmp_path):
+    """Changed text gives a bounded diff, a header-only publication says unchanged, and a failed update, a
+    no-op sync or a broken comparison never present a change that didn't publish. INDEX links the page only
+    while it belongs to the current document."""
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    page_path = pristine / '.summary-changes' / 'app-abc1234.md'
+    old = im.load_document(pristine, 'app-abc1234')
+    fields = im.current_fields(old)
+    edited = im._analysis_of(old).replace('A payments API.', 'A payments and refunds API.')
+
+    # Changed text: the analyzed range, the added and removed summary lines, owner-only.
+    repo.write('src/m0.py', '# changed\n')
+    first = repo.commit()
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(edited, fields)).status == 'published'
+    page, info = page_path.read_text(), metadata.parse_frontmatter(page_path.read_text())
+    doc = im.load_document(pristine, 'app-abc1234')
+    assert (page_path.stat().st_mode & 0o777, page_path.parent.stat().st_mode & 0o777) == (0o600, 0o700)
+    assert (info['status'], info['old_commit'], info['new_commit']) == ('changed', base, first)
+    assert (info['old_document_sha256'], info['new_document_sha256']) == (old.sha256, doc.sha256)
+    assert info['generation_id'] == doc.info['generation_id'] and info['generated_at'] == doc.info['last_updated']
+    assert '-A payments API.' in page and '+A payments and refunds API.' in page
+    assert f"`{base[:7]}` → `{first[:7]}`" in page and '1 lines added, 1 removed' in page
+    assert 'last_updated' not in page.split('---', 2)[2], 'timestamp and provenance churn is not compared'
+    assert CHANGES_LINK in _index(pristine)
+
+    # A no-op sync and a failed update both leave it byte for byte, and INDEX still links it.
+    with PreflightSession() as session:
+        assert update(pristine, repo, session).status == 'none'
+        repo.write('src/m1.py', '# changed\n')
+        repo.commit()
+        failed = update(pristine, repo, session,
+                        run_incremental_fn=lambda *a, **k: (_ for _ in ()).throw(im.StaleUpdate('refused')))
+    assert failed.status == 'failed' and page_path.read_text() == page
+    assert CHANGES_LINK in _index(pristine)
+
+    # Header only: the analyzed commit moves, the text doesn't.
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(edited, fields)).status == 'published'
+    info = metadata.parse_frontmatter(page_path.read_text())
+    assert info['status'] == 'unchanged' and 'Summary text unchanged' in page_path.read_text()
+    assert '```diff' not in page_path.read_text()
+
+    # A comparison that fails is recorded as unavailable; the update still publishes.
+    monkeypatch.setattr(im, '_summary_lines', lambda text: (_ for _ in ()).throw(ValueError('broken')))
+    repo.write('src/m2.py', '# changed\n')
+    repo.commit()
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_incremental_fn=lambda *a, **k: _candidate(ANALYSIS, fields)).status == 'published'
+    info = metadata.parse_frontmatter(page_path.read_text())
+    assert info['status'] == 'unavailable' and info['new_document_sha256'] == im.load_document(pristine, 'app-abc1234').sha256
+    assert CHANGES_LINK in _index(pristine)
+
+    # A document replaced some other way no longer matches the page, so INDEX doesn't link it.
+    doc_path = pristine / 'app-abc1234.md'
+    doc_path.write_text(doc_path.read_text().replace('Untouched schema text', 'Hand-edited schema text'))
+    assert CHANGES_LINK not in _index(pristine) and '[View Details](app-abc1234.md)' in _index(pristine)
+
+
+def test_a_first_summary_is_labelled_and_a_long_diff_is_truncated(monkeypatch, tmp_path):
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    page_path = pristine / '.summary-changes' / 'app-abc1234.md'
+    fields = im.current_fields(im.load_document(pristine, 'app-abc1234'))
+    (pristine / 'app-abc1234.md').unlink()
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, run_full_fn=lambda *a, **k: _candidate(ANALYSIS, fields)).status == 'published'
+    info = metadata.parse_frontmatter(page_path.read_text())
+    assert (info['status'], info['old_commit'], info['old_document_sha256']) == ('first', 'none', 'none')
+    assert 'First summary' in page_path.read_text() and '```diff' not in page_path.read_text()
+    assert CHANGES_LINK in _index(pristine)
+
+    # A rewrite far over the cap shows what fits, says so, and keeps a code fence in the text intact.
+    long = '## Overview\n' + ''.join(f"Line {i} ```quoted``` {'y' * 200}\n" for i in range(2000))
+    repo.write('src/m0.py', '# changed\n')
+    repo.commit()
+    with PreflightSession() as session:
+        assert update(pristine, repo, session, force=True, run_full_fn=lambda *a, **k: _candidate(long, fields)).status == 'published'
+    page = page_path.read_text()
+    info = metadata.parse_frontmatter(page)
+    assert info['status'] == 'changed' and info['truncated'] == 'true' and '_Truncated: ' in page
+    assert len(page.encode('utf-8')) <= im.CHANGE_MAX_BYTES and '````diff' in page
