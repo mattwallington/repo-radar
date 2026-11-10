@@ -270,6 +270,18 @@ an older record that shows only the generic retry reason owes nothing, and the c
 Attempt records live in `~/repos-pristine/.metadata-state/<cache>.json` (owner-only). Each one holds
 the latest attempt and its usage, never prompts or source.
 
+### Latest summary changes
+
+Each publication, incremental or full, also writes `~/repos-pristine/.summary-changes/<cache>.md` (owner-only),
+replacing the one before. It is a local line comparison of the summary text before and after: the one-line
+summary, related repositories, Quick Reference and analysis, leaving out commits, timestamps and provenance. No
+model is called and no source is read. It shows the analyzed commit range, the generation time and the added and
+removed lines, at most 64 KiB, saying when the diff is cut. A first summary is labelled as one, and an update
+that only moved the analyzed commit says "summary text unchanged". A failed, refused or no-op update leaves the
+page as it was; a comparison that fails is recorded as unavailable and the publication stands. Its header names
+the old and new document hashes and the generation ID, and `INDEX.md` links it beside View Details only while
+its new hash is the current document's.
+
 ### The hold after repeated failures
 
 Any update that ends failed, incremental or full, adds one to `consecutive_failures` in its attempt record,
