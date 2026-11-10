@@ -277,6 +277,32 @@ def read_attempt_state(pristine_dir, cache_name):
         return None
 
 
+# The latest published summary change per repository (owner-only), written by incremental_metadata after a
+# publication: plain Markdown with a header naming the documents it compares.
+SUMMARY_CHANGES_DIR_NAME = '.summary-changes'
+SUMMARY_CHANGE_SCHEMA = 'repo-radar-summary-change/1'
+
+
+def summary_change_path(pristine_dir, cache_name):
+    return Path(pristine_dir) / SUMMARY_CHANGES_DIR_NAME / f"{cache_name}.md"
+
+
+def summary_change_link(pristine_dir, cache_name, document_text):
+    """INDEX's relative link to the latest summary change page, or None unless that page was made for exactly
+    this document (its new hash is this document's)."""
+    if not cache_name or '/' in cache_name or cache_name.startswith('.'):
+        return None
+    try:
+        info = parse_frontmatter(summary_change_path(pristine_dir, cache_name).read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):   # ValueError: a NUL in a hand-edited cache name
+        return None
+    if not info or info.get('schema') != SUMMARY_CHANGE_SCHEMA:
+        return None
+    if info.get('new_document_sha256') != hashlib.sha256(document_text.encode('utf-8')).hexdigest():
+        return None
+    return f"{SUMMARY_CHANGES_DIR_NAME}/{cache_name}.md"
+
+
 def stale_label(state, document_text, info):
     """A one-line stale note when the latest attempt failed or was skipped after this document was
     written, or None when the document is current. The document's committed generation wins over a
@@ -465,6 +491,8 @@ def regenerate_index(args):
                             'metadata_file': metadata_file.name,
                             'stale': stale_label(read_attempt_state(
                                 PRISTINE_DIR, info.get('cache_dir') or metadata_file.stem), content, info),
+                            'changes': summary_change_link(PRISTINE_DIR, info.get('cache_dir') or metadata_file.stem,
+                                                           content),
                         })
         except Exception as e:
             print(f"  {YELLOW}Warning: Could not parse {metadata_file.name}:{RESET} {e}")
@@ -532,6 +560,7 @@ def regenerate_index(args):
         if not apis_str or apis_str == 'None':
             apis_str = "N/A"
         status_line = f"**Status:** ⚠ {info['stale']}\n" if info.get('stale') else ''
+        changes_link = f" · **[Latest summary changes]({info['changes']})**" if info.get('changes') else ''
 
         index_content += f"""### {info['full_name']} (`{info['cache_dir']}/`)
 **Type:** {info['type']}
@@ -540,7 +569,7 @@ def regenerate_index(args):
 **Exposes:** {apis_str}
 **Database:** {info['database']}
 **Interfaces:** {related_str}
-{status_line}**[View Details]({info['metadata_file']})**
+{status_line}**[View Details]({info['metadata_file']})**{changes_link}
 
 ---
 

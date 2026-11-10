@@ -22,8 +22,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from repo_radar.config import DEFAULT_INCREMENTAL_FAILURE_STOP, DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
-from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, parse_frontmatter, read_attempt_state,
-                                 _parse_status_of)
+from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, SUMMARY_CHANGE_SCHEMA, parse_frontmatter,
+                                 read_attempt_state, summary_change_path, _parse_status_of)
 from repo_radar import metadata_snapshot as snap
 
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
@@ -128,23 +128,28 @@ def state_path(pristine_dir, cache_name):
     return Path(pristine_dir) / STATE_DIR_NAME / f"{cache_name}.json"
 
 
-def write_state(pristine_dir, cache_name, state):
-    """Atomically replace the repository's attempt state (owner-only)."""
-    directory = Path(pristine_dir) / STATE_DIR_NAME
-    directory.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=f".{cache_name}.", suffix='.tmp')
+def _write_private(path, text):
+    """Atomically replace `path` with `text`, owner-only, in an owner-only directory."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix='.tmp')
     try:
-        with os.fdopen(fd, 'w') as handle:
-            json.dump(state, handle, indent=2, sort_keys=True)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, state_path(pristine_dir, cache_name))
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def write_state(pristine_dir, cache_name, state):
+    """Atomically replace the repository's attempt state (owner-only)."""
+    _write_private(state_path(pristine_dir, cache_name), json.dumps(state, indent=2, sort_keys=True))
 
 
 # ---- what to do --------------------------------------------------------------------------------------
@@ -769,6 +774,117 @@ def _link(pristine_dir, full_name, cache_name):
         pass
 
 
+# ---- the latest summary change -----------------------------------------------------------------------
+
+CHANGE_MAX_BYTES = 64 * 1024   # the whole page, header and prose included
+CHANGE_MAX_VALUE = 200         # characters of any one header or prose value taken from the documents
+
+
+def _summary_lines(text):
+    """A document's user-facing summary as lines: its one-line summary and related repositories from the
+    header, then its body (Quick Reference and analysis). Commits, timestamps and provenance are left out,
+    so a publication that only moves the analyzed commit compares as unchanged."""
+    info = parse_frontmatter(text)
+    if info is None:
+        raise ValueError('the document has no header')
+    try:
+        related = json.loads(info.get('related_repos') or '[]')
+    except ValueError:
+        related = [info.get('related_repos')]
+    related = ', '.join(str(r) for r in related) if isinstance(related, list) and related else 'none'
+    return [f"Summary: {info.get('brief', '')}", f"Related repositories: {related}", '',
+            *text.split('---', 2)[2].strip('\n').splitlines()]
+
+
+def _one(value):
+    """A header or prose value as one printable line of at most CHANGE_MAX_VALUE characters."""
+    text = ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in str(value)).split()) or 'unknown'
+    return text if len(text) <= CHANGE_MAX_VALUE else text[:CHANGE_MAX_VALUE - 1] + '…'
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def summary_change_page(full_name, cache_name, old_text, new_text, generation_id, failure=None):
+    """The "Latest summary changes" page for a publication of `new_text` over `old_text` (None for a first
+    summary): a local line comparison, no model call and no source read. `failure` makes it the page for a
+    comparison that couldn't be made. Its header ties it to exactly these documents. Diff lines are shown
+    whole, in order, while the page stays within CHANGE_MAX_BYTES; the rest are counted as truncated."""
+    new_info = parse_frontmatter(new_text) or {}
+    old_info = (parse_frontmatter(old_text) or {}) if old_text is not None else {}
+    lines, added, removed = [], 0, 0
+    if failure is not None:
+        status, result = 'unavailable', f"Comparison unavailable ({failure}). The summary was published."
+    elif old_text is None:
+        status, result = 'first', 'First summary: there is no earlier summary to compare with.'
+    else:
+        old_lines, new_lines = _summary_lines(old_text), _summary_lines(new_text)
+        if old_lines == new_lines:
+            status, result = 'unchanged', 'Summary text unchanged.'
+        else:
+            import difflib
+            lines = list(difflib.unified_diff(old_lines, new_lines, lineterm='', n=2))[2:]   # no file headers
+            added = sum(1 for line in lines if line.startswith('+'))
+            removed = sum(1 for line in lines if line.startswith('-'))
+            status, result = 'changed', f"Summary updated: {added} lines added, {removed} removed."
+    header = {k: _one(v) for k, v in {
+        'schema': SUMMARY_CHANGE_SCHEMA, 'full_name': full_name, 'status': status,
+        'old_commit': old_info.get('last_commit') or 'none', 'new_commit': new_info.get('last_commit'),
+        'generated_at': new_info.get('last_updated'), 'generation_id': generation_id,
+        'old_document_sha256': _sha(old_text) if old_text is not None else 'none',
+        'new_document_sha256': _sha(new_text)}.items()}
+    short = lambda c: c[:7] if snap.SHA.fullmatch(c) else c
+
+    def render(shown, truncated):
+        page = ['---', *(f"{k}: {v}" for k, v in header.items()), f"truncated: {'true' if truncated else 'false'}",
+                '---', '', f"# Latest summary changes: {header['full_name']}", '',
+                f"**Result:** {_one(result)}  ",
+                f"**Analyzed commits:** `{short(header['old_commit'])}` → `{short(header['new_commit'])}`  ",
+                f"**Generated:** {header['generated_at']}  ",
+                f"**[View Details](../{_one(cache_name)}.md)**", '',
+                'This compares the published summary text before and after the latest update. It does not explain '
+                'the source changes, and not every source change belongs in the summary.', '']
+        if shown:
+            longest = max((len(run) for line in shown for run in re.findall(r'`+', line)), default=0)
+            fence = '`' * max(3, longest + 1)
+            page += [fence + 'diff', *shown, fence, '']
+        if truncated:
+            page += [f"_Truncated: {truncated} more diff lines not shown._", '']
+        return '\n'.join(page)
+
+    # Whole lines while they fit what's left after the rest of the page (counted at its largest); then the
+    # finished page is measured, and lines come off the end until it fits, fences included.
+    room = CHANGE_MAX_BYTES - len(render([], len(lines)).encode('utf-8')) - 32
+    shown = []
+    for line in lines:
+        room -= len(line.encode('utf-8')) + 1
+        if room < 0:
+            break
+        shown.append(line)
+    page = render(shown, len(lines) - len(shown))
+    while shown and len(page.encode('utf-8')) > CHANGE_MAX_BYTES:
+        shown.pop()
+        page = render(shown, len(lines) - len(shown))
+    return page
+
+
+def write_summary_change(pristine_dir, cache_name, full_name, old_text, new_text, generation_id):
+    """Record the latest summary change after `new_text` was published; called only after a publication, so
+    a failed, refused or no-op attempt never touches the page. A comparison that fails is recorded as
+    unavailable. Never raises: returns None, or why the page couldn't be saved. Nothing is retried or undone."""
+    try:
+        try:
+            page = summary_change_page(full_name, cache_name, old_text, new_text, generation_id)
+        except Exception as e:
+            page = summary_change_page(full_name, cache_name, old_text, new_text, generation_id,
+                                       failure=type(e).__name__)
+        _write_private(summary_change_path(pristine_dir, cache_name), page)
+        return None
+    except Exception as e:
+        return safe_reason(f"summary change not saved ({type(e).__name__}: {e})")
+
+
 MAX_REASON = 240
 
 
@@ -982,6 +1098,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         write_text_atomic(document_path(pristine_dir, cache_name), text)   # the commit point
         committed = True
         _link(pristine_dir, full_name, cache_name)
+        published = load_document(pristine_dir, cache_name)   # compared and hashed as readers see it
+        change_error = write_summary_change(pristine_dir, cache_name, full_name, current.text if current else None,
+                                            published.text if published else text, generation_id)
+        if change_error:
+            log(change_error)
         return finish('published', None)
     except StaleUpdate as e:
         return finish('skipped' if e.warning else 'failed', e.reason)
