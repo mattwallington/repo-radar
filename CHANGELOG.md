@@ -4,7 +4,7 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.0.43] - 2026-11-10
 
 ### Added
 - **INDEX shows what changed in each repository's latest summary.** A "Latest summary changes" link beside View Details opens the analyzed commit range, when the summary was generated, and the lines added to and removed from its text, or says the text is unchanged when only the analyzed commit moved. It is a local comparison, with no extra model call, and a failed update never replaces it.
