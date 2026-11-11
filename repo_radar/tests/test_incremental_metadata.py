@@ -3077,3 +3077,26 @@ def test_a_build_is_refused_when_the_clone_no_longer_contains_its_commit(monkeyp
     assert (pristine / 'app-abc1234.md').read_text() == before
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert state['consecutive_failures'] == (1 if paid else 0)
+
+
+def test_an_incremental_update_reads_attributes_at_its_pinned_commit(monkeypatch, tmp_path):
+    """A fast-forward mid-build that adds `.gitattributes` marking the source `-diff` can't turn the pinned
+    change into a binary omission or hide it from search: attributes come from the analyzed commit."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'PINNED_MARKER = "at the analyzed commit"\n')
+    pinned = repo.commit('the analyzed change')
+    provider = Provider(monkeypatch)
+    old = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), tool_use('search', {'literal': 'PINNED_MARKER'}),
+                        answer({'base_document_sha256': old.sha256, 'sections': []})]
+
+    def pulled_then_built(*a, **k):
+        repo.write('.gitattributes', '*.py -diff\n')
+        repo.commit('pulled after the update chose its commit')
+        return im.run_incremental(*a, **k)
+    with PreflightSession() as session:
+        out = update(pristine, repo, session, run_incremental_fn=pulled_then_built)
+    assert (out.status, out.strategy, out.target) == ('published', 'incremental', pinned), out
+    traffic = json.dumps([b for _p, b in provider.sends])
+    assert '+PINNED_MARKER' in traffic and 'binary file' not in traffic
+    assert 'src/m0.py' in traffic and '[no matches]' not in traffic

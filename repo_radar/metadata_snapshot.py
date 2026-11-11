@@ -64,8 +64,8 @@ class Deadline:
         return self.at - self.clock()
 
 
-def _git_env():
-    return {
+def _git_env(attr_source=None):
+    env = {
         'PATH': _GIT_PATH,
         'GIT_CONFIG_NOSYSTEM': '1',
         'GIT_CONFIG_GLOBAL': os.devnull,
@@ -74,10 +74,16 @@ def _git_env():
         'GIT_LITERAL_PATHSPECS': '1',
         'LC_ALL': 'C',
     }
+    if attr_source:
+        env['GIT_ATTR_SOURCE'] = attr_source   # git 2.40+: .gitattributes from this commit, not the working tree
+    return env
 
 
-def run_git(repo, args, limit, deadline=None):
+def run_git(repo, args, limit, deadline=None, attr_source=None):
     """Run a read-only git command in `repo` and return at most `limit` bytes of its stdout.
+
+    A command whose output depends on attributes (binary detection, `-diff`) passes `attr_source`, the commit
+    it reads, so a pull that changes `.gitattributes` in the working tree mid-build can't change its result.
 
     Raises GitError on a non-zero exit, or as soon as the output exceeds `limit` (the process is
     killed rather than buffered). With a `deadline`, a watchdog kills the process when it passes, which
@@ -89,7 +95,7 @@ def run_git(repo, args, limit, deadline=None):
     cmd = [git, '-C', str(repo), '-c', 'core.fsmonitor=false', '-c', 'core.quotePath=false',
            '-c', 'diff.external=', *args]
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=_git_env())
+                            stderr=subprocess.PIPE, env=_git_env(attr_source))
     err = bytearray()
 
     def drain():
@@ -350,7 +356,7 @@ def changes_between(repo, base, target, deadline=None):
     partial list to build exclusions from."""
     raw = run_git(repo, ['diff-tree', '-r', '-z', '-M', '-C', '--find-copies-harder', '-l0', '--raw', '--no-abbrev',
                          '--no-commit-id', '--no-ext-diff', base, target], 64 * 1024 * 1024,
-                  deadline or Deadline(DISCOVERY_SECONDS))
+                  deadline or Deadline(DISCOVERY_SECONDS), attr_source=target)   # similarity treats binary apart
     fields = raw.split(b'\0')
     out = []
     i = 0
@@ -662,7 +668,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
             try:
                 text = run_git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '-M', base, target,
                                       '--', *dict.fromkeys(paths)], MAX_FILE_DIFF_BYTES,
-                               deadline).decode('utf-8', 'replace')
+                               deadline, attr_source=target).decode('utf-8', 'replace')
             except GitOutputTooLarge:
                 reason = OVERSIZED_DIFF
             else:
@@ -804,7 +810,7 @@ class SnapshotTools:
             if len(under) > MAX_SEARCH_PATHS or arg_bytes > MAX_SEARCH_ARG_BYTES:
                 return f"[{len(under)} files start with {prefix!r}; use a narrower path_prefix]"
         try:
-            raw = run_git(self.target.repo, cmd, MAX_SEARCH_OUTPUT)
+            raw = run_git(self.target.repo, cmd, MAX_SEARCH_OUTPUT, attr_source=self.target.commit)
         except GitError as e:
             if 'failed (1)' in str(e):
                 return "[no matches]"
