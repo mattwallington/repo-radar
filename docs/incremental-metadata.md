@@ -253,7 +253,9 @@ total and reasoning output counts when reported. The failure reason names the st
 
 The previous document is never replaced by a failed attempt. A pending record is written before any
 model work, and the new document replaces the old one atomically only after the update succeeded,
-the document it started from is unchanged, and the repository is still at the same commit.
+the document it started from is unchanged, and the analyzed commit is still in the repository's history. The
+build reads only that commit's git objects, so a clone that moved forward during it still gets the new
+document, recorded at the analyzed commit; the next sync updates it from there.
 
 `INDEX.md` marks such a document stale and names the analyzed revision, the attempted revision and
 the reason. A repository that has never had a document is listed as having metadata
@@ -288,8 +290,9 @@ document by hand, delete or edit its page too.
 Any update that ends failed, incremental or full, adds one to `consecutive_failures` in its attempt record,
 except a failure because the provider's API key isn't set: that is reported as failed but leaves the count
 as it was.
-A skipped update doesn't count, including one superseded by newer work or stopped by a resource or spending
-limit before anything was paid for, and a publication resets the count to 0. A document replaced some other way starts again from none.
+A skipped update doesn't count: one superseded because the document changed during it, or one stopped before
+anything was paid for by a resource or spending limit or by a clone reset or rewritten past the analyzed commit
+(after a paid call, those two are failures). A publication resets the count to 0. A document replaced some other way starts again from none.
 
 At 2 failures in a row by default (Settings can choose 1 to 10, `incremental_failure_stop`; a missing or
 invalid value means 2), a sync started by anything but a person makes no model call for that repository, even

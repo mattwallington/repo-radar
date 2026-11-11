@@ -2550,9 +2550,8 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
     old = im.load_document(pristine, 'app-abc1234')
     good = answer({'base_document_sha256': old.sha256, 'sections': []})
 
-    def moved(body):
-        repo.write('src/m9.py', 'later = 1\n')
-        repo.commit('pushed meanwhile')
+    def moved(body):   # reset past the analyzed commit; a clone that only moved forward would still publish
+        repo.git('reset', '-q', '--hard', 'HEAD~1')
         return good
 
     unsafe = {'delimiter_in_brief': {'fields': {'brief': 'Payments --- API'}},
@@ -2586,7 +2585,7 @@ def test_a_good_document_survives_a_failed_update(monkeypatch, tmp_path, failure
             assert outcome.status == 'published' and 'attempt state not saved' in outcome.state_error
         else:
             outcome = update(pristine, repo, session, force=failure == 'full_degraded')
-            assert outcome.status == ('skipped' if failure == 'repository_moved' else 'failed'), outcome
+            assert outcome.status == 'failed', outcome   # repository_moved: refused after paid calls
             if failure in unsafe:
                 assert "header is unsafe" in outcome.reason
     monkeypatch.setattr(metadata, 'write_text_atomic', real_atomic)
@@ -3025,3 +3024,79 @@ def test_change_pages_show_long_lines_whole_stay_in_the_cap_and_link_crlf_text(m
     assert b'\r\n' in doc_path.read_bytes()
     assert metadata.parse_frontmatter(page_path.read_text())['status'] == 'unchanged'
     assert CHANGES_LINK in _index(pristine)
+
+
+# ── The clone moving during a build ──────────────────────────────────────────────────────────────
+
+def _full_build_that(pristine, action):
+    """A fake full build that runs `action(budget)` before returning a candidate, as a pull landing mid-build."""
+    def built(repo_path, full_name, target, model, session, budget, **k):
+        action(budget)
+        return _candidate('## Overview\nRebuilt.\n', im.current_fields(im.load_document(pristine, 'app-abc1234')))
+    return built
+
+
+def test_a_full_build_publishes_at_its_pinned_commit_when_the_clone_moved_forward(monkeypatch, tmp_path):
+    """A pull during a full rebuild no longer throws the paid build away: it publishes at the commit it read,
+    and the next sync updates from there to the new HEAD."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    pinned = repo.commit('one change')
+
+    def pull(budget):
+        budget.calls += 1
+        repo.write('src/new.py', 'pulled = True\n')
+        repo.commit('pulled mid-build')
+    with PreflightSession() as session:
+        out = update(pristine, repo, session, allow_incremental=False, run_full_fn=_full_build_that(pristine, pull))
+    assert (out.status, out.strategy, out.target) == ('published', 'full', pinned), out
+    assert f'last_commit: {pinned}\n' in (pristine / 'app-abc1234.md').read_text()
+    head = repo.git('rev-parse', 'HEAD')
+    assert head != pinned
+    d = decide(repo, pristine)
+    assert (d.strategy, d.base, d.target) == ('incremental', pinned, head), d
+
+
+@pytest.mark.parametrize('rewrite', [('reset', '--hard', 'HEAD~1'), ('commit', '--amend', '-q', '-m', 'rewritten')])
+@pytest.mark.parametrize('paid', [False, True])
+def test_a_build_is_refused_when_the_clone_no_longer_contains_its_commit(monkeypatch, tmp_path, rewrite, paid):
+    """A reset or rewrite past the analyzed commit can't be the next update's base: the document stays, and the
+    refusal is a skip while nothing was paid for, a failure that counts toward the hold once a call was."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'changed = True\n')
+    repo.commit('one change')
+    before = (pristine / 'app-abc1234.md').read_text()
+
+    def rewrite_history(budget):
+        budget.calls += paid
+        repo.git(*rewrite)
+    with PreflightSession() as session:
+        out = update(pristine, repo, session, allow_incremental=False,
+                     run_full_fn=_full_build_that(pristine, rewrite_history))
+    assert out.status == ('failed' if paid else 'skipped') and out.reason.startswith('superseded'), out
+    assert (pristine / 'app-abc1234.md').read_text() == before
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == (1 if paid else 0)
+
+
+def test_an_incremental_update_reads_attributes_at_its_pinned_commit(monkeypatch, tmp_path):
+    """A fast-forward mid-build that adds `.gitattributes` marking the source `-diff` can't turn the pinned
+    change into a binary omission or hide it from search: attributes come from the analyzed commit."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path)
+    repo.write('src/m0.py', 'PINNED_MARKER = "at the analyzed commit"\n')
+    pinned = repo.commit('the analyzed change')
+    provider = Provider(monkeypatch)
+    old = im.load_document(pristine, 'app-abc1234')
+    provider.replies = [note(), tool_use('search', {'literal': 'PINNED_MARKER'}),
+                        answer({'base_document_sha256': old.sha256, 'sections': []})]
+
+    def pulled_then_built(*a, **k):
+        repo.write('.gitattributes', '*.py -diff\n')
+        repo.commit('pulled after the update chose its commit')
+        return im.run_incremental(*a, **k)
+    with PreflightSession() as session:
+        out = update(pristine, repo, session, run_incremental_fn=pulled_then_built)
+    assert (out.status, out.strategy, out.target) == ('published', 'incremental', pinned), out
+    traffic = json.dumps([b for _p, b in provider.sends])
+    assert '+PINNED_MARKER' in traffic and 'binary file' not in traffic
+    assert 'src/m0.py' in traffic and '[no matches]' not in traffic
