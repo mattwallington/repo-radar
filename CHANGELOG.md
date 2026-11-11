@@ -4,6 +4,11 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.44] - 2026-11-11
+
+### Fixed
+- **A summary built while the clone was pulled is published instead of thrown away.** The build reads only the commit it started from, so when the clone only moved forward during it, the new summary is now published at that commit and the next sync updates it from there. A clone reset or rewritten past that commit is still refused, and now counts toward the failure hold when the attempt had already paid for model calls.
+
 ## [1.0.43] - 2026-11-10
 
 ### Added
