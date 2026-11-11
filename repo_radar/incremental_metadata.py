@@ -1073,8 +1073,13 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:
             raise StaleUpdate('superseded: the document changed during the update', warning=True)
-        if snap.resolve_commit(repo_path, 'HEAD') != target:
-            raise StaleUpdate('superseded: the repository moved during the update', warning=True)
+        # Built only from git objects pinned to `target`, so a clone that moved forward still gets the summary,
+        # published at `target`; a rewrite or reset that dropped `target` can't be the base of the next update.
+        head = snap.resolve_commit(repo_path, 'HEAD')
+        if head != target and not (head and snap.is_ancestor(repo_path, target, head)):
+            from repo_radar.summary_pipeline import unpaid
+            raise StaleUpdate('superseded: the repository no longer contains the analyzed commit',
+                              warning=unpaid(budget))
         fields = candidate.fields
         provenance = _provenance(decision.strategy, model, decision, doc, target, now,
                                  candidate.coverage_note, candidate.omitted, candidate.outside_selection,
