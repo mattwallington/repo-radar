@@ -13,9 +13,11 @@ def under_build_output(path, roots=frozenset({''})):
     return any(part in BUILD_OUTPUT_DIRS and '/'.join(parts[:i]) in roots for i, part in enumerate(parts[:-1]))
 
 
-# Test code: summaries are written from product code, so tests are counted but never read. Folder names are
-# matched exactly and in lowercase only: a folder named "Tests" can be a product screen (a lab tests page).
-TEST_DIRS = frozenset({'test', 'tests', '__tests__', 'testdata'})
+# Test code: summaries are written from product code, so tests are counted but not collected and not sent in
+# diffs; the editor's read_file and search tools can still open one. Folder names are matched exactly and in
+# lowercase only: a folder named "Tests" can be a product screen (a lab tests page). For the same reason there is
+# no *Tests.swift, *Test.kt or *Test.java name rule: "Tests" is a product word here, and LabTests.swift would go.
+TEST_DIRS = frozenset({'test', 'tests', '__tests__', 'testdata', '__mocks__', '__snapshots__', '__fixtures__'})
 TEST_NAME_PARTS = ('.test.', '.spec.')                       # foo.test.ts, foo.spec.tsx
 TEST_NAME_SUFFIXES = ('_test.go', '_test.py', '_spec.rb', '_test.rb')
 TEST_NAME_PREFIXES = ('test_',)                              # test_*.py
@@ -24,7 +26,8 @@ TEST_NAMES = frozenset({'conftest.py'})
 
 def is_test_file(file_path):
     """True when `file_path` is test code by its name (foo.test.ts, foo.spec.js, foo_test.go, test_foo.py,
-    foo_test.py, conftest.py, foo_spec.rb) or by a folder named exactly test, tests, __tests__ or testdata.
+    foo_test.py, conftest.py, foo_spec.rb, foo_test.rb) or by a folder named exactly test, tests, __tests__,
+    testdata, __mocks__, __snapshots__ or __fixtures__.
     Case-sensitive: `Tests/` or `LabTests.tsx` is not test code."""
     parts = file_path.split('/')
     name = parts[-1]

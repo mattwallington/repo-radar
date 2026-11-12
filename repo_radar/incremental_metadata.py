@@ -28,7 +28,8 @@ from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, REBUILD_WAITIN
 from repo_radar import metadata_snapshot as snap
 
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
-# every opted-in document is rebuilt once under the new policy.
+# every opted-in document is rebuilt once under the new policy. Leaving test files out (files.is_test_file)
+# changed the collector without a bump on purpose, so no repository is rebuilt early; each weekly rebuild applies it.
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
 UNKNOWN = 'unknown'
 PIPELINE_VERSION = 'summary-pipeline/1'  # the engine; a new one doesn't force a rebuild the way a policy does
@@ -606,7 +607,7 @@ REQUEST_SECONDS = 10 * 60   # one full-build request; a full build has no attemp
 # omitted: (path, reason) for files withheld by the safety policy (credential, binary, symlink...);
 # outside_selection: for full builds, how many tracked files the collector's rules leave out;
 # exclusions: the effective credential exclusions every content read used, published with the document;
-# test_files: for full builds, how many test files were counted and left unread.
+# test_files: for full builds, how many test files were counted and not collected.
 Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions test_files',
                        defaults=(None, None, None))
 
@@ -677,7 +678,8 @@ def pinned_files(snapshot, exclusions):
     protects, and binary blobs are withheld even when the collector's rules would include them.
     Returns (files, omitted, outside_selection, test_files): omitted lists (path, reason) for withheld files,
     outside_selection counts tracked files the collector's extension and size rules leave out, and test_files
-    counts the test code it would otherwise include (files.is_test_file), which is never read.
+    counts the test code it would otherwise include (files.is_test_file), which isn't collected or sent (the
+    editor's read_file and search tools can still open one in a diff update).
     """
     files, omitted, outside, tests = [], [], 0, 0
     manifest = snapshot.manifest()

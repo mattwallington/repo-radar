@@ -91,9 +91,11 @@ can't show that a file holds no secret, and a PEM file can carry a private key. 
    `go.mod` or `pyproject.toml`); or a name ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go`
    or `_pb2.py`. A source folder named `coverage` deeper in the tree, such as `src/coverage/`, is analyzed.
    Test files are those named like `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`, `*_test.py`,
-   `conftest.py` or `*_spec.rb`, or inside a folder named exactly `test`, `tests`, `__tests__` or
-   `testdata`. Folder names are matched in lowercase only, so a product folder such as
-   `mobile-app/src/screens/Tests/` is analyzed as usual.
+   `conftest.py`, `*_spec.rb` or `*_test.rb`, or inside a folder named exactly `test`, `tests`, `__tests__`,
+   `testdata`, `__mocks__`, `__snapshots__` or `__fixtures__`. Folder names are matched in lowercase only, so
+   a product folder such as `mobile-app/src/screens/Tests/` is analyzed as usual, and there is no
+   `*Tests.swift`-style name rule, since "Tests" is a product word (a `LabTests.swift` screen). Test files
+   aren't collected and aren't sent in diffs; the editor's `read_file` and `search` tools can still open one.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
@@ -174,7 +176,7 @@ A full rebuild runs on the same request executor. Every request, whether the who
 a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
 lower). The whole repository goes as one request only when it fits; otherwise the source is split into
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
-until one remains. Test files (the same rule as diff pages above) are never selected: the published
+until one remains. Test files (the same rule as diff pages above) are not collected: the published
 coverage line counts them as "N test files left out", apart from the files outside the collector's
 selection. Every selected file reaches a chunk and every chunk reaches the final reduction: when
 something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the

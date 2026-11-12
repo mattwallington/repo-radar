@@ -1801,7 +1801,7 @@ def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch
     assert sp.summary(stopping.store, stopping.policy)['recorded_usd'] == pytest.approx(outcome.usage['known_cost_usd'], abs=1e-5)
 
 
-def test_test_files_are_counted_but_never_read(monkeypatch, tmp_path):
+def test_test_files_are_counted_but_not_collected_or_sent_in_diffs(monkeypatch, tmp_path):
     """Full builds count test code in the coverage line and never send it; diff updates list a changed test file
     the way they list a lockfile, without its body. A product folder named "Tests" is read as usual."""
     import tempfile
