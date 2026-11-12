@@ -77,6 +77,10 @@ class BudgetExceeded(BudgetError):
     pass
 
 
+class AttemptLimitReached(BudgetExceeded):
+    """The next request could pass this attempt's own limit (its cap or admitted allowance)."""
+
+
 def price_per_token(model):
     """(input, output) USD per token at uncached rates, taking the highest tier this app can be billed
     at, or None if unknown. Requests are never sent in batch. They name no service tier, which on Gemini
@@ -251,7 +255,7 @@ class Budget:
         wave = sum(upper or 0.0 for upper in uppers)
         if self.cap is not None and self.committed() + wave > self.cap + 1e-9:
             what = 'the next request' if len(requests) == 1 else f"the next {len(requests)} requests"
-            raise BudgetExceeded(f"{what} could cost up to ${wave:.2f}, which would pass this "
+            raise AttemptLimitReached(f"{what} could cost up to ${wave:.2f}, which would pass this "
                                  f"attempt's ${self.cap:.2f} limit (${self.committed():.2f} committed)")
         keys = [request_key(self.label, request) for request in requests]
         if len(set(keys)) != len(keys) or any(key in self._open for key in keys):

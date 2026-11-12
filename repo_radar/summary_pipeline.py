@@ -26,7 +26,7 @@ from pathlib import Path
 
 from repo_radar import incremental_metadata as im
 from repo_radar import metadata_snapshot as snap
-from repo_radar.metadata_budget import BudgetError, LedgerWriteError
+from repo_radar.metadata_budget import AttemptLimitReached, BudgetError, LedgerWriteError
 
 PROMPT_VERSION = 'incremental-map-reduce/2'
 
@@ -280,6 +280,8 @@ class Executor:
         try:
             reservations = self.budget.reserve_many([(self.identity(i), i.reserve_tokens, i.output) for i in items])
         except BudgetError as e:
+            if isinstance(e, AttemptLimitReached) and not self.unpaid():
+                self.budget.extra['limit_stop'] = True   # stopped by its own limit after paying: see FullBuild.estimate
             return refused, im.StaleUpdate(str(e), warning=self.unpaid())
 
         def send(item, reservation):
@@ -1036,6 +1038,7 @@ class FullBuild:
         self.syntheses = 0
         self.where, self.record = 'full', None
         self._groups = {}            # the counted reduction requests of the current level, by group index
+        self._raw = {}               # each started request's unpadded counted input, by id (cost_ratio)
 
     # ---- requests --------------------------------------------------------------------------------
 
@@ -1053,6 +1056,7 @@ class FullBuild:
     def _start(self, item, chunk=None, chunks=None):
         """Record the request about to go out, before it is reserved or sent."""
         self.sent += 1
+        self._raw[item.id] = self._raw_tokens(item)
         self.where = f"full {item.stage}{f' {chunk}/{chunks}' if chunk else ''} (call {self.sent})"
         self.record = {'stage': item.stage, 'call': self.sent, 'chunk': chunk, 'chunks': chunks, 'max_output': item.output}
         self.budget.extra['full_stage'] = self.record
@@ -1301,6 +1305,58 @@ class FullBuild:
             calls = min(llm.SYNTHESIS_MAX_CALLS, max(1, len(plan.chunks) - 1))
             synthesis = (calls, ceiling, output, reserve)
         return full_allowance(self.budget.rates, [(i.tokens, i.output, i.reserve_tokens) for i in items], synthesis)
+
+    @staticmethod
+    def _raw_tokens(item):
+        """The counted input without a local estimate's padding (preflight.local_raw_count)."""
+        from repo_radar.preflight import local_raw_count
+        return local_raw_count(item.tokens, item.request) if item.reserve_tokens != item.tokens else item.tokens
+
+    def estimate(self, plan, ratio=None):
+        """What the attempt's limit should hold for this build to finish, estimated from counts alone at the
+        attempt's rates (its Budget's rate snapshot), or None without them. Nothing is sent. An estimate, not a
+        bound: output isn't known until it is bought, and a local count isn't the billed count (on telehealth the
+        local count was about 0.95 of it).
+
+        Each send reserves its input and maximum output on top of what the earlier sends cost, so every send's
+        reservation must fit above the earlier sends' cost, and a chunked build then needs at least one reduction,
+        whose reservation (its maximum output and, when counts are local estimates, the model's whole input limit)
+        must fit above every chunk's cost. A send's cost is estimated as its counted input, without a local
+        estimate's padding, times a margin for output and reductions: ESTIMATE_MARGIN, or 1.05 times `ratio` when
+        that is higher. `ratio` is what an earlier rebuild of this repository cost per unit of that input
+        (cost_ratio), so a rebuild its own limit stopped part way is estimated at least at what it cost."""
+        from repo_radar import llm
+        from repo_radar.metadata_budget import ESTIMATE_MARGIN
+        from repo_radar.model_catalog import get_caps
+        rates = self.budget.rates
+        if rates is None:
+            return None
+        margin = max(ESTIMATE_MARGIN, 1.05 * ratio) if ratio else ESTIMATE_MARGIN
+        items = [plan.single] if plan.single else [chunk.item for chunk in plan.chunks]
+        estimated = any(item.reserve_tokens != item.tokens for item in items)
+        spent = estimate = 0.0
+        for item in items:
+            estimate = max(estimate, spent + self.budget.upper_bound(item.reserve_tokens, item.output))
+            spent += self._raw_tokens(item) * rates.input * margin
+        if plan.chunks:
+            caps = get_caps(self.model)
+            reserve = caps.max_input if estimated and caps is not None else 0
+            estimate = max(estimate, spent + self.budget.upper_bound(
+                reserve, llm.output_budget(self.model, llm.SYNTHESIS_OUTPUT_TOKENS)))
+        return estimate
+
+    def cost_ratio(self):
+        """The attempt's known cost so far per unit of the unpadded counted input cost (same rates) of the chunk
+        requests whose cost is known, or None when there are none. Chunks only: a whole-repository request is
+        mostly output, so its ratio would overstate a later chunked build, and a single-request estimate doesn't
+        use a ratio."""
+        rates = self.budget.rates
+        if rates is None:
+            return None
+        known = [self._raw[call['id']] for call in self.executor.calls
+                 if call['stage'] == 'chunk' and call.get('cost_usd') is not None and call['id'] in self._raw]
+        base = sum(known) * rates.input
+        return self.budget.cost / base if known and base > 0 else None
 
     def run(self, plan=None):
         """The full document's text, in the existing full format, from `plan` (prepare()'s, by default)."""

@@ -22,12 +22,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from repo_radar.config import DEFAULT_INCREMENTAL_FAILURE_STOP, DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
-from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, SUMMARY_CHANGE_SCHEMA, parse_frontmatter,
-                                 read_attempt_state, summary_change_path, _parse_status_of)
+from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, REBUILD_WAITING, SUMMARY_CHANGE_SCHEMA,
+                                 parse_frontmatter, read_attempt_state, summary_change_path, _parse_status_of)
 from repo_radar import metadata_snapshot as snap
 
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
-# every opted-in document is rebuilt once under the new policy.
+# every opted-in document is rebuilt once under the new policy. Leaving test files out (files.is_test_file)
+# changed the collector without a bump on purpose, so no repository is rebuilt early; each weekly rebuild applies it.
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
 UNKNOWN = 'unknown'
 PIPELINE_VERSION = 'summary-pipeline/1'  # the engine; a new one doesn't force a rebuild the way a policy does
@@ -45,6 +46,31 @@ UNFINISHED_REASON = 'previous full rebuild did not finish'
 # Failed updates in a row before only a person can start another, unless Settings chose another number.
 HOLD_AFTER_FAILURES = DEFAULT_INCREMENTAL_FAILURE_STOP
 FAILURE_STREAK_DOC = 'failure_streak_doc_sha256'   # the document those failures were from
+# What the last full rebuild that published, or that its own limit stopped after paying, cost per unit of its
+# counted input (FullBuild.cost_ratio). Top level, never cleared, so it survives the daily updates that publish
+# while a rebuild waits; it only raises later estimates (FullBuild.estimate).
+REBUILD_COST_RATIO = 'rebuild_cost_ratio'
+
+
+# A usable measurement. A real chunked rebuild costs about 1 to 4 times its unpadded chunk input (output is at
+# most a chunk's output limit, and reductions read the chunks' output), so anything outside this range is a
+# corrupt record, treated as no measurement: never saved, and never used (the 1.25 margin applies instead).
+RATIO_RANGE = (0.5, 20.0)
+
+
+def _valid_ratio(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        ratio = float(value)   # a huge JSON integer raises OverflowError here
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return ratio if RATIO_RANGE[0] <= ratio <= RATIO_RANGE[1] else None   # also false for NaN
+
+
+def _usd(amount):
+    """An amount for a reason line, always short, so the reason keeps its limit and explanation."""
+    return f"${amount:.2f}" if amount < 1e6 else "over $1,000,000"
 
 
 def document_path(pristine_dir, cache_name):
@@ -594,9 +620,10 @@ REQUEST_SECONDS = 10 * 60   # one full-build request; a full build has no attemp
 
 # omitted: (path, reason) for files withheld by the safety policy (credential, binary, symlink...);
 # outside_selection: for full builds, how many tracked files the collector's rules leave out;
-# exclusions: the effective credential exclusions every content read used, published with the document.
-Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions',
-                       defaults=(None, None))
+# exclusions: the effective credential exclusions every content read used, published with the document;
+# test_files: for full builds, how many test files were counted and not collected.
+Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions test_files',
+                       defaults=(None, None, None))
 
 
 class StaleUpdate(Exception):
@@ -606,6 +633,16 @@ class StaleUpdate(Exception):
     def __init__(self, reason, warning=False):
         super().__init__(reason)
         self.reason, self.warning = reason, warning
+
+
+class RebuildRefused(StaleUpdate):
+    """A full rebuild refused before anything was admitted, reserved or sent, because its estimate
+    (FullBuild.estimate) is over its limit. A skip, never a failure: nothing was bought. The estimate can be
+    wrong either way; a wrong refusal costs nothing, and a wrong admission is paid for once (the existing stop
+    caps it, and what it cost raises the next estimate: REBUILD_COST_RATIO)."""
+
+    def __init__(self, reason):
+        super().__init__(reason, warning=True)
 
 
 def run_incremental(repo_path, full_name, doc, decision, model, session, budget, clock=None, log=None,
@@ -653,15 +690,20 @@ def pinned_files(snapshot, exclusions):
 
     The same safety policy as the read tools applies first: credential files, anything `exclusions`
     protects, and binary blobs are withheld even when the collector's rules would include them.
-    Returns (files, omitted, outside_selection): omitted lists (path, reason) for withheld files, and
-    outside_selection counts tracked files the collector's extension and size rules leave out.
+    Returns (files, omitted, outside_selection, test_files): omitted lists (path, reason) for withheld files,
+    outside_selection counts tracked files the collector's extension and size rules leave out, and test_files
+    counts the test code it would otherwise include (files.is_test_file), which isn't collected or sent (the
+    editor's read_file and search tools can still open one in a diff update).
     """
-    files, omitted, outside = [], [], 0
+    files, omitted, outside, tests = [], [], 0, 0
     manifest = snapshot.manifest()
     roots = snap.build_roots(manifest)
     for path, entry in sorted(manifest.items()):
         if not snap.collector_eligible(entry, roots):
-            outside += 1
+            if snap.collector_eligible(entry, roots, include_tests=True):
+                tests += 1
+            else:
+                outside += 1
             continue
         reason = snap.omission_reason(entry, exclusions)
         if reason is None:
@@ -673,11 +715,11 @@ def pinned_files(snapshot, exclusions):
             continue
         content = data.decode('utf-8', errors='ignore')
         files.append({'path': path, 'size': len(content), 'content': content})
-    return files, omitted, outside
+    return files, omitted, outside, tests
 
 
 def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited,
-             estimate_allowance=False):
+             estimate_allowance=False, cost_ratio=None):
     """A complete document built from the pinned commit by the shared summary pipeline's full adapter
     (summary_pipeline.FullBuild), with the existing full-generation prompts and output format. Never written
     directly: the caller publishes it. `inherited` is the previous document's credential exclusions
@@ -692,7 +734,11 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     The build's first stage is prepared (counted and fitted, nothing sent) before the attempt is admitted
     against the weekly cap, and that same plan is what's sent. An opted-in repository's rebuild is admitted for
     the whole full cap; with `estimate_allowance` (a full-only repository) it is admitted for the plan's own
-    estimate (FullBuild.allowance), which is also its hard limit."""
+    estimate (FullBuild.allowance), which is also its hard limit. A plan whose estimate (FullBuild.estimate, at
+    the price that applies on this run's date, using `cost_ratio` from an earlier rebuild when there is one) is
+    over that limit raises RebuildRefused before admission. Admission promises only that the estimate fit; the
+    existing hard stop still caps the attempt. budget.extra['cost_ratio'] is what this attempt cost per unit of
+    counted input, however it ended."""
     from repo_radar import summary_pipeline
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
@@ -702,7 +748,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         base_manifest = snap.GitSnapshot(repo_path, baseline).manifest()
         changes = snap.changes_between(repo_path, baseline, target)
     exclusions = snap.credential_exclusions(inherited, base_manifest, target_snap.manifest(), changes)
-    files, omitted, outside = pinned_files(target_snap, exclusions)
+    files, omitted, outside, tests = pinned_files(target_snap, exclusions)
     if not files:
         raise StaleUpdate("no analyzable source")
     budget.extra['pipeline_version'] = PIPELINE_VERSION
@@ -710,16 +756,27 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     build = summary_pipeline.FullBuild(full_name, files, model, session, budget)
     plan = build.prepare()
     allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
+    estimate = build.estimate(plan, cost_ratio)
+    if estimate is not None:
+        budget.extra['estimate_usd'] = round(estimate, 6)
+        if estimate > allowance + 1e-9:   # likely to stop part way, after spending: refuse before anything is admitted
+            rate = budget.rates.input * 1e6
+            measured = '; the estimate uses what the last rebuild cost' if cost_ratio else ''
+            raise RebuildRefused(f"this rebuild is estimated at {_usd(estimate)}, over its {_usd(allowance)} limit (at "
+                                 f"{_usd(rate)} per million input tokens); nothing was spent{measured}")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
-    text = build.run(plan)
+    try:
+        text = build.run(plan)
+    finally:   # what it cost corrects the next estimate (update_repository keeps it)
+        budget.extra['cost_ratio'] = build.cost_ratio()
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
     if problems or not parsed['analysis'].strip():
         raise StaleUpdate(f"the generated metadata is degraded: {'; '.join(problems) or 'no analysis'}")
     quick = {k: v for k, v in parsed['quick_ref'].items() if k in QUICK_REF_FIELDS}
     fields = {'brief': parsed['brief'], 'quick_reference': quick, 'related_repos': parsed['related_repos']}
-    return Candidate(parsed['analysis'], fields, None, omitted, outside, exclusions)
+    return Candidate(parsed['analysis'], fields, None, omitted, outside, exclusions, tests)
 
 
 # ---- one opted-in repository -------------------------------------------------------------------------
@@ -728,7 +785,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
 Outcome = namedtuple('Outcome', 'status strategy reason base target usage elapsed state_error', defaults=(None,))
 
 
-def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None):
+def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None, test_files=None):
     """What a generation examined, scoped honestly: an incremental update examined the required diff,
     a full build analyzed the collector-selected source. Neither claims exhaustive coverage."""
     parts = ['required diff examined' if strategy == 'incremental' else 'collector-selected source analyzed']
@@ -737,13 +794,15 @@ def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None)
                      f"({', '.join(sorted({why for _p, why in omitted}))})")
     if outside_selection:
         parts.append(f"{outside_selection} tracked files outside the collector's selection")
+    if test_files:
+        parts.append(f"{test_files} test files left out")
     if coverage_note:
         parts.append('limits noted')
     return '; '.join(parts)
 
 
 def _provenance(strategy, model, decision, doc, target, now, coverage_note, omitted, outside_selection=None,
-                exclusions=None):
+                exclusions=None, test_files=None):
     if exclusions is None:   # every publication carries its protection forward
         raise StaleUpdate('the candidate carries no credential exclusions')
     if strategy == 'full':
@@ -753,7 +812,7 @@ def _provenance(strategy, model, decision, doc, target, now, coverage_note, omit
     else:  # adopted legacy document: its own commit and time, model unknown
         full = {'full_build_commit': doc.info['last_commit'],
                 'full_build_at': decision.full_built_at.isoformat(), 'full_build_model': UNKNOWN}
-    coverage = coverage_line(strategy, omitted, coverage_note, outside_selection)
+    coverage = coverage_line(strategy, omitted, coverage_note, outside_selection, test_files)
     record = {'generation_strategy': strategy, 'generation_model': model, 'configured_model': model,
               'semantic_policy': SEMANTIC_POLICY, 'base_commit': decision.base or 'none', **full,
               'coverage': coverage, EXCLUSIONS_KEY: snap.encode_exclusions(exclusions)}
@@ -987,6 +1046,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
         usage = budget.summary() if budget else {}
+        if (attempt is not None and decision is not None and decision.strategy == 'full'
+                and (status == 'published' or usage.get('limit_stop'))):
+            ratio = _valid_ratio(usage.get('cost_ratio'))
+            if ratio:
+                attempt[REBUILD_COST_RATIO] = ratio
         if attempt is not None and status == 'published':   # discharged
             attempt.pop('dropped_full_attempt', None)
             attempt.pop('full_rebuild_origin', None)
@@ -1052,7 +1116,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         else:   # a retry carries the first reason forward; decision_reason stays the latest, for display
             attempt['full_rebuild_origin'] = (_full_rebuild_origin(state) if decision.reason == UNFINISHED_REASON
                                               else decision.reason)
-        for stale in ('finished_at', 'usage'):
+        for stale in ('finished_at', 'usage', REBUILD_WAITING):
             attempt.pop(stale, None)
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
         log(f"{decision.strategy}: {decision.reason}")
@@ -1066,9 +1130,39 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
                                                                 budget, log=log, deadline=deadline)
         else:
-            candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
-                                                  baseline=document_commit(repo_path, doc), inherited=inherited,
-                                                  estimate_allowance=not allow_incremental)
+            candidate = None
+            try:
+                candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
+                                                      baseline=document_commit(repo_path, doc), inherited=inherited,
+                                                      estimate_allowance=not allow_incremental,
+                                                      cost_ratio=_valid_ratio(state.get(REBUILD_COST_RATIO)))
+            except (RebuildRefused, WeeklyCapRefused) as refusal:
+                # Refused before anything was admitted or sent. Only a rebuild the weekly rule owes waits while the
+                # daily update runs; any other rebuild (forced, model or policy change, unusable baseline) stops
+                # here as before. A failure after spending never comes here.
+                if budget.calls or attempt.get('full_rebuild_origin') != WEEKLY_REASON or not allow_incremental:
+                    if isinstance(refusal, RebuildRefused):   # nothing runs in its place (FOLLOWUPS: a way out)
+                        raise RebuildRefused(f"{refusal.reason}; this repository's updates wait until the rebuild "
+                                             f"fits") from None
+                    raise
+                attempt[REBUILD_WAITING] = safe_reason(str(refusal))
+                log(f"rebuild waiting: {attempt[REBUILD_WAITING]}")
+                budget.close_spending()
+                # A new attempt in the same sync, with its own time: what decide would choose without the weekly rule.
+                deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)
+                daily = decide(repo_path, full_name, doc, state, model, target, now, full_rebuild_days=0,
+                               deadline=deadline)
+                if daily.strategy != 'incremental':   # nothing changed since the document: only the rebuild waits
+                    raise
+                decision = daily
+                attempt.update(strategy='incremental', decision_reason=daily.reason, base_commit=daily.base)
+                attempt.pop('full_rebuild_origin', None)   # the doc's full-build time keeps the rebuild due
+                write_state(pristine_dir, cache_name, attempt)
+                log(f"incremental: {daily.reason}")
+                budget = Budget(model, cap=update_limit, label='incremental', spending=spending, owner=full_name)
+            if candidate is None:
+                candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
+                                                                    budget, log=log, deadline=deadline)
         # Publish only what was built from exactly this document and this commit.
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:
@@ -1083,7 +1177,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         fields = candidate.fields
         provenance = _provenance(decision.strategy, model, decision, doc, target, now,
                                  candidate.coverage_note, candidate.omitted, candidate.outside_selection,
-                                 candidate.exclusions)
+                                 candidate.exclusions, candidate.test_files)
         generation_id = uuid.uuid4().hex
         from repo_radar.metadata import UnsafeHeader, degradation_reasons
         try:
@@ -1116,7 +1210,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('skipped', 'the sync was stopped')
     except WeeklyCapRefused as e:
         # Only admission refuses, before any send: the previous document, failure count, last counted failure
-        # and any full-rebuild obligation all stay. No retry, fallback or other strategy follows.
+        # and any full-rebuild obligation all stay. No retry or other strategy follows, except the daily update
+        # in place of a refused weekly rebuild (above).
         return finish('skipped', str(e))
     except SpendingError as e:   # an accounting problem, never a refusal; before any send it isn't a bought failure
         return finish('failed', f"spending record: {e}", counts=bool(budget and budget.calls))
