@@ -192,6 +192,23 @@ never authorizes a send without a price). The admitted amount is the attempt's h
 in attempt usage as `admitted_usd`; a later request that can't fit stops the attempt, with no top-up,
 retry or switch to a diff.
 
+**Fit check.** Also before admission, the prepared counts are compared with that limit, at the price that
+applies on the run's date (so from December 31, Gemini 3.8 Flash's January price). The check adds up the
+least the requests must hold: each request's reservation on top of the earlier requests' counted input, and,
+for chunks, one reduction's reservation on top of every chunk's input. A local estimate's own 10% and framing
+allowance is taken back out, and output not yet bought is left out, so the figure understates the bill. When
+even that can't fit, the rebuild is refused with nothing admitted or sent, and the reason gives the figure,
+the limit and the input price. It is a skip, not a failure, so it doesn't move the failure count toward the
+hold. The figure is recorded in attempt usage as `floor_usd` when the rebuild goes ahead.
+
+**Rebuild waiting.** When a rebuild owed only to the weekly rule is refused before any spend, by the fit
+check or by the weekly spending limit, the same sync runs the ordinary diff update instead (decided as if no
+weekly rebuild were due, with its own 20 minutes), and `INDEX.md` adds "rebuild waiting" and the reason to
+that repository's status. The document keeps its last full-build time, so the rebuild is tried again on the
+next sync. With nothing changed since the document, there is nothing to update and the attempt is only a
+skip. Any other rebuild, forced, after a model or policy change, or with no usable document, is refused as
+before, with no update in its place. A rebuild that fails after spending has begun is a failure, as before.
+
 A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
 whole reservation: a timeout, a dropped connection, or a 500, 502 or 504, since a gateway can fail after the
@@ -211,8 +228,9 @@ channel, repository, model, times and amounts, never prompts, replies, credentia
   An attempt is admitted only if the week's committed money (recorded charges, unknown-cost reservations and
   every running attempt's whole hold) plus its own hold fits the limit.
 - **A refusal** is a skip before any send: the previous summary, the failure count, the last failure and any
-  owed full rebuild stay, with no retry, fallback or other strategy. The reason says what the update needed
-  and what remains until the week resets.
+  owed full rebuild stay, with no retry or other strategy, except that a refused weekly rebuild is followed
+  by the ordinary diff update (see "Rebuild waiting" above). The reason says what the update needed and
+  what remains until the week resets.
 - **During and after an attempt.** Each send is recorded inside the hold before it goes out and its cost as
   soon as the reply arrives. When the attempt ends, however it ends, its known charges and unresolved
   reservations stay and the rest of its hold is released. A cost above its reservation is recorded in full

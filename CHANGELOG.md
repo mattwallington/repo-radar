@@ -4,6 +4,11 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+- **A full rebuild that can't fit its spending limit is refused before it spends anything, and the daily update still runs.** Before its first paid call, a rebuild now checks its counted input, at the price for that day (Gemini's doubles from December 31), against its limit. If it can't fit, nothing is spent and it says what it needs and what the limit is; it doesn't count as a failure. When a weekly rebuild is refused this way, or by the weekly spending limit, the same sync makes the ordinary daily update instead, and INDEX shows "rebuild waiting" with the reason. Before, such a rebuild could spend close to its whole $40, publish nothing, and stop the daily updates.
+
 ## [1.0.44] - 2026-11-11
 
 ### Fixed

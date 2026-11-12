@@ -1960,6 +1960,122 @@ def test_a_chunked_full_only_plan_fits_its_whole_send_sequence(monkeypatch, tmp_
     assert outcome.usage['known_cost_usd'] < outcome.usage['admitted_usd'] < 40
 
 
+# ── A weekly rebuild that can't fit waits; the daily update runs ─────────────────────────────────
+
+def _on_date(monkeypatch, day):
+    """Pin the clock the attempt's prices are read from (metadata_budget.rate_snapshot)."""
+    from repo_radar import metadata_budget
+
+    class Pinned(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(*day, 12, tzinfo=timezone.utc).astimezone(tz) if tz else datetime(*day, 12)
+    monkeypatch.setattr(metadata_budget, 'datetime', Pinned)
+
+
+def _weekly_rebuild_due(monkeypatch, tmp_path, change=True):
+    """A Gemini repository whose weekly rebuild is due, ten source files counted at 100,000 tokens each (ten
+    chunks, about $0.68 of input today and twice that from January), and, with `change`, one changed file for
+    the daily update. Full sends fail the test unless a test answers them."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=8))
+    if change:
+        repo.write('src/m0.py', 'changed = True\n')
+        repo.commit('one change')
+    doc = im.load_document(pristine, 'app-abc1234')
+
+    def reply(stage, text):
+        if stage == 'map':
+            return {'changes': [], 'questions': None, 'new_sections': None, 'no_summary_change_reason': 'no effect'}
+        if stage == 'edit':
+            return {'base_document_sha256': doc.sha256, 'sections': []}
+        assert stage == 'full', stage
+        return FULL_REPLY if 'Please synthesize' in text else '## Analysis\nOne file.\n'
+    return repo, pristine, GeminiFake(monkeypatch, reply)
+
+
+@pytest.mark.parametrize('day, limit, rebuilt', [
+    ((2026, 11, 12), 1.00, False),   # its counted input alone passes the limit
+    ((2026, 11, 12), 2.25, True),    # it fits: the rebuild runs as before
+    ((2027, 1, 2), 2.25, False),     # the same size at January's price no longer fits
+])
+def test_a_weekly_rebuild_that_cant_fit_waits_while_the_daily_update_runs(monkeypatch, tmp_path, day, limit, rebuilt):
+    """Before any paid call, a rebuild whose counts alone can't fit its limit (at the price on the run's date) is
+    refused: nothing is admitted or sent, and the same sync publishes the daily incremental update instead.
+    INDEX says the rebuild is waiting and why; the weekly rebuild stays due for the next sync."""
+    from repo_radar import metadata_budget, spending as sp
+    _on_date(monkeypatch, day)
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', limit)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
+    record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
+    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(100_000),
+                                   now=NOW, spending=record, trigger='schedule')
+    assert outcome.status == 'published', outcome
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    published = im.load_document(pristine, 'app-abc1234')
+    attempts = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    if rebuilt:
+        assert outcome.strategy == 'full' and len(fake.stage('full')) == 11 and im.REBUILD_WAITING not in state
+        assert published.info['generation_strategy'] == 'full'
+        assert 'rebuild waiting' not in _index(pristine)
+        return
+
+    rate = '1.50' if day[0] == 2027 else '0.75'
+    waiting = state[im.REBUILD_WAITING]
+    assert re.fullmatch(rf"this rebuild can't finish within its \${limit:.2f} limit: its counted requests need at least "
+                        rf"\$\d+\.\d\d \(at \${rate} per million input tokens\); nothing was spent", waiting), waiting
+    assert fake.stage('full') == [] and len(fake.stage('map')) == 1 and len(fake.stage('edit')) == 1
+    assert (outcome.strategy, state['strategy'], state['consecutive_failures']) == ('incremental', 'incremental', 0)
+    assert published.info['generation_strategy'] == 'incremental' and published.info['last_commit'] == outcome.target
+    assert [a['kind'] for a in attempts] == ['incremental']   # the rebuild was never admitted
+    assert f"**Status:** ⚠ rebuild waiting: {waiting}" in _index(pristine)
+    assert decide(repo, pristine, model=GEMINI).reason == im.WEEKLY_REASON   # still due next time
+
+
+def test_a_weekly_cap_refusal_also_falls_through_to_the_daily_update(monkeypatch, tmp_path):
+    """The weekly cap refusing the rebuild's $40 is also a refusal before any spend: the daily update runs and is
+    admitted for its own small quote. A forced rebuild refused the same way only skips, as before."""
+    from repo_radar import spending as sp
+    _on_date(monkeypatch, (2026, 11, 12))
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
+    tight = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 5.0))
+    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(1_000),
+                                   now=NOW, spending=tight, trigger='schedule')
+    assert (outcome.status, outcome.strategy) == ('published', 'incremental'), outcome
+    assert fake.stage('full') == [] and len(fake.stage('edit')) == 1
+    waiting = metadata.read_attempt_state(pristine, 'app-abc1234')[im.REBUILD_WAITING]
+    assert waiting.startswith('Weekly spending limit: this update needs up to $40.00; $5.00 remains until ')
+    [attempt] = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
+    assert attempt['kind'] == 'incremental' and attempt['allowance'] < 5_000_000
+
+    forced = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(1_000),
+                                  now=NOW, spending=tight, force=True)
+    assert (forced.status, forced.strategy) == ('skipped', 'full') and forced.reason.startswith('Weekly spending limit')
+    assert fake.stage('full') == [] and len(fake.stage('edit')) == 1
+
+
+def test_a_refused_rebuild_with_nothing_to_update_keeps_the_failure_streak(monkeypatch, tmp_path):
+    """With no source change since the document there is no daily update to run: the refused rebuild is a skip,
+    not a failure, so the streak and its last counted failure stay as they were, and INDEX says why once."""
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.00)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, change=False)
+    doc = im.load_document(pristine, 'app-abc1234')
+    im.write_state(pristine, 'app-abc1234', {
+        'strategy': 'full', 'status': 'failed', 'decision_reason': im.WEEKLY_REASON, 'reason': 'turn limit',
+        'full_rebuild_origin': im.WEEKLY_REASON, 'baseline_doc_sha256': doc.sha256, 'consecutive_failures': 1,
+        'last_failure_reason': 'turn limit', im.FAILURE_STREAK_DOC: doc.sha256})
+    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(100_000),
+                                   now=NOW, trigger='schedule')
+    assert (outcome.status, outcome.strategy) == ('skipped', 'full') and not fake.sends, outcome
+    assert outcome.reason.startswith("this rebuild can't finish within its $1.00 limit")
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (state['consecutive_failures'], state['last_failure_reason']) == (1, 'turn limit')
+    assert im.load_document(pristine, 'app-abc1234').text == doc.text
+    index = _index(pristine)
+    assert index.count(outcome.reason) == 1 and 'rebuild waiting' not in index
+
+
 def test_a_count_lost_after_paid_work_is_a_failure_that_holds(monkeypatch, tmp_path):
     """Once anything has been paid for, a count that stops being available ends the attempt as failed, not
     skipped, so the failure streak advances and automatic syncs can't keep buying the same work."""

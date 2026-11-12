@@ -22,8 +22,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from repo_radar.config import DEFAULT_INCREMENTAL_FAILURE_STOP, DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS
-from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, SUMMARY_CHANGE_SCHEMA, parse_frontmatter,
-                                 read_attempt_state, summary_change_path, _parse_status_of)
+from repo_radar.metadata import (STATE_DIR_NAME, PARSE_STATUS_OK, REBUILD_WAITING, SUMMARY_CHANGE_SCHEMA,
+                                 parse_frontmatter, read_attempt_state, summary_change_path, _parse_status_of)
 from repo_radar import metadata_snapshot as snap
 
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
@@ -1069,7 +1069,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         else:   # a retry carries the first reason forward; decision_reason stays the latest, for display
             attempt['full_rebuild_origin'] = (_full_rebuild_origin(state) if decision.reason == UNFINISHED_REASON
                                               else decision.reason)
-        for stale in ('finished_at', 'usage'):
+        for stale in ('finished_at', 'usage', REBUILD_WAITING):
             attempt.pop(stale, None)
         write_state(pristine_dir, cache_name, attempt)  # before any model work, so a crash stays visible
         log(f"{decision.strategy}: {decision.reason}")
@@ -1083,9 +1083,35 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
                                                                 budget, log=log, deadline=deadline)
         else:
-            candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
-                                                  baseline=document_commit(repo_path, doc), inherited=inherited,
-                                                  estimate_allowance=not allow_incremental)
+            candidate = None
+            try:
+                candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
+                                                      baseline=document_commit(repo_path, doc), inherited=inherited,
+                                                      estimate_allowance=not allow_incremental)
+            except (RebuildRefused, WeeklyCapRefused) as refusal:
+                # Refused before anything was admitted or sent. Only a rebuild the weekly rule owes waits while the
+                # daily update runs; any other rebuild (forced, model or policy change, unusable baseline) stops
+                # here as before. A failure after spending never comes here.
+                if budget.calls or attempt.get('full_rebuild_origin') != WEEKLY_REASON or not allow_incremental:
+                    raise
+                attempt[REBUILD_WAITING] = safe_reason(str(refusal))
+                log(f"rebuild waiting: {attempt[REBUILD_WAITING]}")
+                budget.close_spending()
+                # A new attempt in the same sync, with its own time: what decide would choose without the weekly rule.
+                deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)
+                daily = decide(repo_path, full_name, doc, state, model, target, now, full_rebuild_days=0,
+                               deadline=deadline)
+                if daily.strategy != 'incremental':   # nothing changed since the document: only the rebuild waits
+                    raise
+                decision = daily
+                attempt.update(strategy='incremental', decision_reason=daily.reason, base_commit=daily.base)
+                attempt.pop('full_rebuild_origin', None)   # the doc's full-build time keeps the rebuild due
+                write_state(pristine_dir, cache_name, attempt)
+                log(f"incremental: {daily.reason}")
+                budget = Budget(model, cap=update_limit, label='incremental', spending=spending, owner=full_name)
+            if candidate is None:
+                candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
+                                                                    budget, log=log, deadline=deadline)
         # Publish only what was built from exactly this document and this commit.
         current = load_document(pristine_dir, cache_name)
         if (current.sha256 if current else None) != attempt['baseline_doc_sha256']:
@@ -1133,7 +1159,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         return finish('skipped', 'the sync was stopped')
     except WeeklyCapRefused as e:
         # Only admission refuses, before any send: the previous document, failure count, last counted failure
-        # and any full-rebuild obligation all stay. No retry, fallback or other strategy follows.
+        # and any full-rebuild obligation all stay. No retry or other strategy follows, except the daily update
+        # in place of a refused weekly rebuild (above).
         return finish('skipped', str(e))
     except SpendingError as e:   # an accounting problem, never a refusal; before any send it isn't a bought failure
         return finish('failed', f"spending record: {e}", counts=bool(budget and budget.calls))
