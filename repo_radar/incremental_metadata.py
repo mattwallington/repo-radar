@@ -14,7 +14,6 @@ A failure never replaces a good document: it stays as it was, and INDEX marks it
 
 import hashlib
 import json
-import math
 import os
 import re
 import tempfile
@@ -53,10 +52,25 @@ FAILURE_STREAK_DOC = 'failure_streak_doc_sha256'   # the document those failures
 REBUILD_COST_RATIO = 'rebuild_cost_ratio'
 
 
+# A usable measurement. A real chunked rebuild costs about 1 to 4 times its unpadded chunk input (output is at
+# most a chunk's output limit, and reductions read the chunks' output), so anything outside this range is a
+# corrupt record, treated as no measurement: never saved, and never used (the 1.25 margin applies instead).
+RATIO_RANGE = (0.5, 20.0)
+
+
 def _valid_ratio(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) and value > 0 else None
+    try:
+        ratio = float(value)   # a huge JSON integer raises OverflowError here
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return ratio if RATIO_RANGE[0] <= ratio <= RATIO_RANGE[1] else None   # also false for NaN
+
+
+def _usd(amount):
+    """An amount for a reason line, always short, so the reason keeps its limit and explanation."""
+    return f"${amount:.2f}" if amount < 1e6 else "over $1,000,000"
 
 
 def document_path(pristine_dir, cache_name):
@@ -748,8 +762,8 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         if estimate > allowance + 1e-9:   # likely to stop part way, after spending: refuse before anything is admitted
             rate = budget.rates.input * 1e6
             measured = '; the estimate uses what the last rebuild cost' if cost_ratio else ''
-            raise RebuildRefused(f"this rebuild is estimated at ${estimate:.2f}, over its ${allowance:.2f} limit (at "
-                                 f"${rate:.2f} per million input tokens); nothing was spent{measured}")
+            raise RebuildRefused(f"this rebuild is estimated at {_usd(estimate)}, over its {_usd(allowance)} limit (at "
+                                 f"{_usd(rate)} per million input tokens); nothing was spent{measured}")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
     try:

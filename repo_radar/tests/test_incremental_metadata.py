@@ -1707,21 +1707,14 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
     assert im.load_document(pristine, 'app-abc1234').text == old.text
 
-    # Stopped by its own limit after paying, it is remembered: the same rebuild is now estimated from what it
-    # cost and refused before anything is sent.
-    state = metadata.read_attempt_state(pristine, 'app-abc1234')
-    assert state[im.REBUILD_COST_RATIO] == pytest.approx(3 * per_chunk / (3 * rate_in * mr.FullBuild._raw_tokens(
-        types.SimpleNamespace(tokens=101_000, reserve_tokens=0, request={'messages': [{}]}))), rel=0.01)
-    fake = GeminiFake(monkeypatch, lambda stage, text: pytest.fail('a remembered limit stop was bought again'))
-    again = full_build(pristine, repo, counts)
-    assert again.status == 'skipped' and again.reason.startswith('this rebuild is estimated at $'), again
-    assert 'uses what the last rebuild cost' in again.reason and again.reason.endswith('wait until the rebuild fits')
+    # These fake replies bill about 194 times the counted input, far outside any real chunked rebuild, so that
+    # ratio is no measurement and isn't kept (test_a_wrong_admission_is_paid_for_once covers a real one).
+    assert im.REBUILD_COST_RATIO not in metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert usage['cost_ratio'] > im.RATIO_RANGE[1]
 
-    # Cheap replies, in a normal sync's weekly record, once that memory is gone: the same build finishes under the
-    # cap, with every chunk and one reduction. It was admitted for the whole $40, recorded each reply once inside
-    # that hold, and closing released the rest.
-    im.write_state(pristine, 'app-abc1234', {k: v for k, v in metadata.read_attempt_state(pristine, 'app-abc1234').items()
-                                             if k != im.REBUILD_COST_RATIO})
+    # Cheap replies, in a normal sync's weekly record: the same build finishes under the cap, with every chunk
+    # and one reduction. It was admitted for the whole $40, recorded each reply once inside that hold, and
+    # closing released the rest.
     from repo_radar import spending as sp
     record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
@@ -2134,6 +2127,30 @@ def test_a_wrong_admission_is_paid_for_once(monkeypatch, tmp_path):
     monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 2.00)
     fourth = _sync(pristine, repo)
     assert (fourth.status, fourth.strategy) == ('published', 'full') and len(fake.stage('full')) == 11, fourth
+
+
+@pytest.mark.parametrize('saved, refused', [(1e308, False), (10 ** 1000, False), (3.0, True)])
+def test_a_saved_cost_ratio_is_used_only_when_it_is_a_usable_measurement(monkeypatch, tmp_path, saved, refused):
+    """A corrupt remembered ratio (far too large, or a JSON integer too big for a float) is no measurement: the
+    1.25 margin applies and the rebuild that fits runs. An in-range one still refuses the same rebuild, with a
+    reason that names the estimate and the limit, and the daily update runs."""
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 2.25)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
+    im.write_state(pristine, 'app-abc1234', {im.REBUILD_COST_RATIO: saved})
+    outcome = _sync(pristine, repo)
+    assert outcome.status == 'published', outcome
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    if not refused:
+        assert outcome.strategy == 'full' and len(fake.stage('full')) == 11
+        assert im.RATIO_RANGE[0] <= state[im.REBUILD_COST_RATIO] <= im.RATIO_RANGE[1]   # replaced by a real one
+        return
+    assert outcome.strategy == 'incremental' and fake.stage('full') == [] and state[im.REBUILD_COST_RATIO] == saved
+    assert re.fullmatch(r"this rebuild is estimated at \$\d+\.\d\d, over its \$2\.25 limit \(at \$0\.75 per million "
+                        r"input tokens\); nothing was spent; the estimate uses what the last rebuild cost",
+                        state[im.REBUILD_WAITING]), state[im.REBUILD_WAITING]
+    assert [im._valid_ratio(v) for v in (0.49, 0.5, 20.0, 20.01, float('nan'), '3')] == [None, 0.5, 20.0, None, None, None]
 
 
 def test_a_wrong_refusal_costs_nothing(monkeypatch, tmp_path):
