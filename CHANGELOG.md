@@ -4,6 +4,12 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.45] - 2026-11-12
+
+### Changed
+- **A full rebuild estimated not to fit its spending limit is refused before it spends anything, and the daily update still runs.** Before its first paid call, a rebuild is now estimated from its counted input, at the price for that day (Gemini's doubles from December 31), and compared with its limit. If the estimate is over, nothing is spent and the reason gives the estimate and the limit; it doesn't count as a failure. If a rebuild that was let through is still stopped by its limit after spending, what it cost is remembered and the same rebuild is refused before spending from then on, so that mistake is paid for once. When a weekly rebuild is refused this way, or by the weekly spending limit, the same sync makes the ordinary daily update instead, and INDEX shows "rebuild waiting" with the reason. Before, such a rebuild could spend close to its whole $40, publish nothing, and stop the daily updates.
+- **Test files are no longer collected or sent in diffs for summaries, in every repository.** Summaries are written from product code, migrations and docs. A full rebuild counts test files in its coverage line ("N test files left out") without sending them, and a daily update lists changed test files without their contents, the way it lists lockfiles; the editor's file tools can still open one when it asks. Test files are ones named like `*.test.*`, `*.spec.*`, `*_test.go` or `test_*.py`, or inside a lowercase `test`, `tests`, `__tests__`, `testdata`, `__mocks__`, `__snapshots__` or `__fixtures__` folder; a folder named `Tests` (such as a product screen) is still read. In telehealth, tests were about 42% of what a weekly rebuild read.
+
 ## [1.0.44] - 2026-11-11
 
 ### Fixed

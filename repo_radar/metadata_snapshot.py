@@ -19,7 +19,7 @@ import threading
 import time
 from collections import namedtuple
 
-from repo_radar.files import should_include_file, under_build_output
+from repo_radar.files import is_test_file, should_include_file, under_build_output
 
 COLLECTOR_MAX_BYTES = 100 * 1024     # the full collector skips files larger than this
 MAX_RESULT_BYTES = 64 * 1024          # one tool result, or one diff page
@@ -341,11 +341,12 @@ class GitSnapshot:
         return run_git(self.repo, ['cat-file', 'blob', entry.oid], limit)
 
 
-def collector_eligible(entry, roots=frozenset({''})):
+def collector_eligible(entry, roots=frozenset({''}), include_tests=False):
     """Whether the full collector includes this file (path rules, with `roots` the build roots, and its
-    100 KiB ceiling). Only regular files count: the pinned reader never follows symlinks."""
+    100 KiB ceiling). Only regular files count: the pinned reader never follows symlinks. Test code is left
+    out; `include_tests` asks whether a file would be included if it weren't."""
     return (entry is not None and entry.mode in REGULAR_MODES
-            and should_include_file(entry.path, roots) and entry.size <= COLLECTOR_MAX_BYTES)
+            and should_include_file(entry.path, roots, include_tests) and entry.size <= COLLECTOR_MAX_BYTES)
 
 
 def changes_between(repo, base, target, deadline=None):
@@ -450,6 +451,7 @@ BUILD_MANIFESTS = frozenset({'package.json', 'go.mod', 'composer.json', 'gemfile
                              'cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'mix.exs', 'pubspec.yaml'})
 GENERATED_SUFFIXES = ('.min.js', '.min.css', '.js.map', '.css.map', '.pb.go', '_pb2.py')
 OVERSIZED_DIFF = 'diff larger than 2 MiB'
+TEST_FILE = 'test file'
 
 FileRef = namedtuple('FileRef', 'id status old_path new_path')
 Omission = namedtuple('Omission', 'file_id status path reason')
@@ -476,6 +478,8 @@ def generated_reason(path, roots=frozenset({''})):
     if (any(part in GENERATED_DIRS for part in parts[:-1]) or parts[-1].endswith(GENERATED_SUFFIXES)
             or under_build_output(path, roots)):
         return 'generated or vendored'
+    if is_test_file(path):   # by the path as written: a "Tests" folder isn't test code
+        return TEST_FILE
     return None
 
 
@@ -642,7 +646,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
     """Spool the filtered diff of an update as complete pages in owner-only `spool_dir`.
 
     Files whose contents are unavailable (credentials and anything `exclusions` protects, symlinks,
-    submodules, binary files), known lockfiles and generated artifacts, and any single diff larger than
+    submodules, binary files), known lockfiles, generated artifacts and test code, and any single diff larger than
     MAX_FILE_DIFF_BYTES become omission records with path, status and reason instead of bodies, on their
     own pages at the end. Only a Git output-size limit can become an oversized-diff omission; a failed
     Git read raises. `deadline` bounds the whole loop and each file's diff. Raises ResourceLimit past the
@@ -681,7 +685,7 @@ def prepare_pages(repo, base, target, base_manifest, target_manifest, changes, e
     writer.flush()
     writer.kind = 'omissions'
     for record in omissions:
-        changed = ' changed' if record.reason == 'lockfile' else ''
+        changed = ' changed' if record.reason in ('lockfile', TEST_FILE) else ''
         writer._stream(files[record.file_id], [f"{record.reason}{changed}; body not analyzed\n"])
     writer.flush()
     return PageSet(base, target, files, omissions, writer.pages, writer.total)

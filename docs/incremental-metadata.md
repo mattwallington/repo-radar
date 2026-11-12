@@ -83,13 +83,19 @@ can't show that a file holds no secret, and a PEM file can carry a private key. 
 1. **Pages.** The filtered diff is spooled to an owner-only directory as pages of at most 63 KiB, up to
    256 MiB in all, and removed afterwards. Each page names its commits and its files, breaks at a file
    or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
-   files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
+   files, test files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
    which need no model call. They're listed as not analyzed, never described as analyzed source.
    Generated or vendored means an explicit list: a directory named `node_modules`, `.next`, `.nuxt`,
    `__pycache__`, `Pods`, `.gradle` or `.terraform` at any depth; a `vendor`, `dist` or `coverage` directory
    at a build root (the repository root, or a folder holding a build manifest such as `package.json`,
    `go.mod` or `pyproject.toml`); or a name ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go`
    or `_pb2.py`. A source folder named `coverage` deeper in the tree, such as `src/coverage/`, is analyzed.
+   Test files are those named like `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`, `*_test.py`,
+   `conftest.py`, `*_spec.rb` or `*_test.rb`, or inside a folder named exactly `test`, `tests`, `__tests__`,
+   `testdata`, `__mocks__`, `__snapshots__` or `__fixtures__`. Folder names are matched in lowercase only, so
+   a product folder such as `mobile-app/src/screens/Tests/` is analyzed as usual, and there is no
+   `*Tests.swift`-style name rule, since "Tests" is a product word (a `LabTests.swift` screen). Test files
+   aren't collected and aren't sent in diffs; the editor's `read_file` and `search` tools can still open one.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
@@ -170,7 +176,9 @@ A full rebuild runs on the same request executor. Every request, whether the who
 a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
 lower). The whole repository goes as one request only when it fits; otherwise the source is split into
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
-until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
+until one remains. Test files (the same rule as diff pages above) are not collected: the published
+coverage line counts them as "N test files left out", apart from the files outside the collector's
+selection. Every selected file reaches a chunk and every chunk reaches the final reduction: when
 something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
 document stays, rather than send excerpts. A full rebuild is capped at **$40** per attempt
 (`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and
@@ -192,6 +200,35 @@ never authorizes a send without a price). The admitted amount is the attempt's h
 in attempt usage as `admitted_usd`; a later request that can't fit stops the attempt, with no top-up,
 retry or switch to a diff.
 
+**Fit check.** Also before admission, the rebuild is estimated from its prepared counts, at the price that
+applies on the run's date (so from December 31, Gemini 3.8 Flash's January price), and compared with that
+limit. The estimate is each request's reservation on top of the earlier requests' estimated cost, and, for
+chunks, one reduction's reservation on top of every chunk's. A request's cost is estimated as its counted
+input, without a local count's own 10% and framing allowance, times a margin for output and reductions: 1.25,
+or 1.05 times what the last rebuild of that repository cost per unit of that input, when that is higher. It is
+an estimate, not a bound: output isn't known before it is bought, and a local count isn't the billed count (on
+telehealth the unpadded local count was about 0.95 of the billed count). When the estimate is over the limit,
+the rebuild is refused with nothing admitted, reserved or sent, and the reason gives the estimate, the limit
+and the input price, and says when it used what the last rebuild cost. It is a skip, not a failure, so it
+doesn't move the failure count toward the hold. The estimate is recorded in attempt usage as `estimate_usd`.
+
+The estimate can be wrong either way. A wrong refusal costs nothing, and INDEX says why. A wrong admission is
+paid for once: the existing per-attempt stop still caps it, and when that stop ends a rebuild after spending,
+or a rebuild publishes, what it cost per unit of counted chunk input is kept in the attempt record
+(`rebuild_cost_ratio`, never cleared, so it survives the daily updates that publish meanwhile). From then on
+the same rebuild is estimated at least at what it cost and refused before spending. While a rebuild waits,
+each sync counts its plan again before anything else, which takes about 3 to 5 minutes for telehealth.
+
+**Rebuild waiting.** When a rebuild owed only to the weekly rule is refused before any spend, by the fit
+check or by the weekly spending limit, the same sync runs the ordinary diff update instead (decided as if no
+weekly rebuild were due, with its own 20 minutes), and `INDEX.md` adds "rebuild waiting" and the reason to
+that repository's status. The document keeps its last full-build time, so the rebuild is tried again on the
+next sync. With nothing changed since the document, there is nothing to update and the attempt is only a
+skip. Any other rebuild, forced, after a model or policy change, or with no usable document, is refused as
+before, with no update in its place: its reason ends "this repository's updates wait until the rebuild
+fits", and that repository's updates wait until the rebuild's estimate fits its limit. A rebuild that fails
+after spending has begun is a failure, as before.
+
 A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
 whole reservation: a timeout, a dropped connection, or a 500, 502 or 504, since a gateway can fail after the
@@ -211,8 +248,9 @@ channel, repository, model, times and amounts, never prompts, replies, credentia
   An attempt is admitted only if the week's committed money (recorded charges, unknown-cost reservations and
   every running attempt's whole hold) plus its own hold fits the limit.
 - **A refusal** is a skip before any send: the previous summary, the failure count, the last failure and any
-  owed full rebuild stay, with no retry, fallback or other strategy. The reason says what the update needed
-  and what remains until the week resets.
+  owed full rebuild stay, with no retry or other strategy, except that a refused weekly rebuild is followed
+  by the ordinary diff update (see "Rebuild waiting" above). The reason says what the update needed and
+  what remains until the week resets.
 - **During and after an attempt.** Each send is recorded inside the hold before it goes out and its cost as
   soon as the reply arrives. When the attempt ends, however it ends, its known charges and unresolved
   reservations stay and the rest of its hold is released. A cost above its reservation is recorded in full

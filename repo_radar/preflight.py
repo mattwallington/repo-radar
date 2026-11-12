@@ -435,3 +435,10 @@ def _local_request_count(request):
     items = len(request.get("messages") or request.get("input") or [])
     tokens = int(raw * _LOCAL_FACTOR) + _LOCAL_REQUEST_FRAMING + _LOCAL_ITEM_FRAMING * items
     return PreflightResult(tokens, False, "local estimate")
+
+
+def local_raw_count(tokens, request):
+    """A local estimate of `request` (_local_request_count) without its padding: the raw count it started from,
+    rounded down. Still an estimate, not the billed count."""
+    items = len(request.get("messages") or request.get("input") or [])
+    return max(0, int((tokens - _LOCAL_REQUEST_FRAMING - _LOCAL_ITEM_FRAMING * items) / _LOCAL_FACTOR))

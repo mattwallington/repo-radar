@@ -249,6 +249,8 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
 # Incremental metadata keeps its latest attempt per repository here, owner-only, so INDEX can say
 # when a document is stale (an update failed or was skipped after it was written).
 STATE_DIR_NAME = '.metadata-state'
+# Attempt-state key: why a weekly rebuild was refused before any spend; the daily update ran in its place.
+REBUILD_WAITING = 'rebuild_waiting'
 
 
 def parse_frontmatter(content):
@@ -317,6 +319,19 @@ def stale_label(state, document_text, info):
     attempted = (state.get('target_commit') or 'unknown')[:7]
     reason = state.get('reason') or ('interrupted' if state.get('status') == 'pending' else 'update failed')
     return f"stale: analyzed {analyzed}, update to {attempted} {state.get('status')}: {reason}"
+
+
+def rebuild_waiting_label(state, document_text, info):
+    """'rebuild waiting: <why>' when the latest attempt, made from this document or publishing it, refused its
+    weekly rebuild before any spend, or None. The daily update ran in its place, so the document can be current
+    while its rebuild still waits."""
+    waiting = (state or {}).get(REBUILD_WAITING)
+    if not waiting or state.get('reason') == waiting:   # a skipped attempt's stale note already says why
+        return None
+    published = bool(state.get('generation_id')) and state.get('generation_id') == info.get('generation_id')
+    if not published and state.get('baseline_doc_sha256') != hashlib.sha256(document_text.encode('utf-8')).hexdigest():
+        return None
+    return f"rebuild waiting: {waiting}"
 
 
 def write_text_atomic(path, text):
@@ -476,6 +491,8 @@ def regenerate_index(args):
                                 key, value = line.split(':', 1)
                                 info[key.strip()] = value.strip()
 
+                        cache_name = info.get('cache_dir') or metadata_file.stem
+                        state = read_attempt_state(PRISTINE_DIR, cache_name)
                         repos_info.append({
                             'full_name': info.get('full_name', ''),
                             'cache_dir': info.get('cache_dir', ''),
@@ -489,10 +506,9 @@ def regenerate_index(args):
                             'related_repos': info.get('related_repos', '[]'),
                             'parse_status': _parse_status_of(info),
                             'metadata_file': metadata_file.name,
-                            'stale': stale_label(read_attempt_state(
-                                PRISTINE_DIR, info.get('cache_dir') or metadata_file.stem), content, info),
-                            'changes': summary_change_link(PRISTINE_DIR, info.get('cache_dir') or metadata_file.stem,
-                                                           content),
+                            'stale': stale_label(state, content, info),
+                            'waiting': rebuild_waiting_label(state, content, info),
+                            'changes': summary_change_link(PRISTINE_DIR, cache_name, content),
                         })
         except Exception as e:
             print(f"  {YELLOW}Warning: Could not parse {metadata_file.name}:{RESET} {e}")
@@ -519,6 +535,11 @@ def regenerate_index(args):
         names = ', '.join(i['full_name'] or i['metadata_file'] for i in stale)
         degraded_note += (f"\n> **{len(stale)} of {len(repos_info)} entries are stale** (their latest metadata "
                           f"update failed or was skipped; the previous metadata is shown): {names}\n")
+    waiting = [i for i in repos_info if i.get('waiting')]
+    if waiting:
+        names = ', '.join(i['full_name'] or i['metadata_file'] for i in waiting)
+        degraded_note += (f"\n> **{len(waiting)} of {len(repos_info)} entries have a rebuild waiting** (refused "
+                          f"before any spend; daily updates continue): {names}\n")
     unavailable = _unavailable_attempts({i['cache_dir'] for i in repos_info})
     if unavailable:
         degraded_note += f"\n> **Metadata unavailable:** {'; '.join(unavailable)}\n"
@@ -559,7 +580,8 @@ def regenerate_index(args):
         apis_str = info.get('apis', 'None')
         if not apis_str or apis_str == 'None':
             apis_str = "N/A"
-        status_line = f"**Status:** ⚠ {info['stale']}\n" if info.get('stale') else ''
+        status = '; '.join(s for s in (info.get('stale'), info.get('waiting')) if s)
+        status_line = f"**Status:** ⚠ {status}\n" if status else ''
         changes_link = f" · **[Latest summary changes]({info['changes']})**" if info.get('changes') else ''
 
         index_content += f"""### {info['full_name']} (`{info['cache_dir']}/`)
