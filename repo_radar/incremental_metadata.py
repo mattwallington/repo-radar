@@ -594,9 +594,10 @@ REQUEST_SECONDS = 10 * 60   # one full-build request; a full build has no attemp
 
 # omitted: (path, reason) for files withheld by the safety policy (credential, binary, symlink...);
 # outside_selection: for full builds, how many tracked files the collector's rules leave out;
-# exclusions: the effective credential exclusions every content read used, published with the document.
-Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions',
-                       defaults=(None, None))
+# exclusions: the effective credential exclusions every content read used, published with the document;
+# test_files: for full builds, how many test files were counted and left unread.
+Candidate = namedtuple('Candidate', 'analysis fields coverage_note omitted outside_selection exclusions test_files',
+                       defaults=(None, None, None))
 
 
 class StaleUpdate(Exception):
@@ -661,15 +662,19 @@ def pinned_files(snapshot, exclusions):
 
     The same safety policy as the read tools applies first: credential files, anything `exclusions`
     protects, and binary blobs are withheld even when the collector's rules would include them.
-    Returns (files, omitted, outside_selection): omitted lists (path, reason) for withheld files, and
-    outside_selection counts tracked files the collector's extension and size rules leave out.
+    Returns (files, omitted, outside_selection, test_files): omitted lists (path, reason) for withheld files,
+    outside_selection counts tracked files the collector's extension and size rules leave out, and test_files
+    counts the test code it would otherwise include (files.is_test_file), which is never read.
     """
-    files, omitted, outside = [], [], 0
+    files, omitted, outside, tests = [], [], 0, 0
     manifest = snapshot.manifest()
     roots = snap.build_roots(manifest)
     for path, entry in sorted(manifest.items()):
         if not snap.collector_eligible(entry, roots):
-            outside += 1
+            if snap.collector_eligible(entry, roots, include_tests=True):
+                tests += 1
+            else:
+                outside += 1
             continue
         reason = snap.omission_reason(entry, exclusions)
         if reason is None:
@@ -681,7 +686,7 @@ def pinned_files(snapshot, exclusions):
             continue
         content = data.decode('utf-8', errors='ignore')
         files.append({'path': path, 'size': len(content), 'content': content})
-    return files, omitted, outside
+    return files, omitted, outside, tests
 
 
 def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited,
@@ -711,7 +716,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         base_manifest = snap.GitSnapshot(repo_path, baseline).manifest()
         changes = snap.changes_between(repo_path, baseline, target)
     exclusions = snap.credential_exclusions(inherited, base_manifest, target_snap.manifest(), changes)
-    files, omitted, outside = pinned_files(target_snap, exclusions)
+    files, omitted, outside, tests = pinned_files(target_snap, exclusions)
     if not files:
         raise StaleUpdate("no analyzable source")
     budget.extra['pipeline_version'] = PIPELINE_VERSION
@@ -736,7 +741,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         raise StaleUpdate(f"the generated metadata is degraded: {'; '.join(problems) or 'no analysis'}")
     quick = {k: v for k, v in parsed['quick_ref'].items() if k in QUICK_REF_FIELDS}
     fields = {'brief': parsed['brief'], 'quick_reference': quick, 'related_repos': parsed['related_repos']}
-    return Candidate(parsed['analysis'], fields, None, omitted, outside, exclusions)
+    return Candidate(parsed['analysis'], fields, None, omitted, outside, exclusions, tests)
 
 
 # ---- one opted-in repository -------------------------------------------------------------------------
@@ -745,7 +750,7 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
 Outcome = namedtuple('Outcome', 'status strategy reason base target usage elapsed state_error', defaults=(None,))
 
 
-def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None):
+def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None, test_files=None):
     """What a generation examined, scoped honestly: an incremental update examined the required diff,
     a full build analyzed the collector-selected source. Neither claims exhaustive coverage."""
     parts = ['required diff examined' if strategy == 'incremental' else 'collector-selected source analyzed']
@@ -754,13 +759,15 @@ def coverage_line(strategy, omitted, coverage_note=None, outside_selection=None)
                      f"({', '.join(sorted({why for _p, why in omitted}))})")
     if outside_selection:
         parts.append(f"{outside_selection} tracked files outside the collector's selection")
+    if test_files:
+        parts.append(f"{test_files} test files left out")
     if coverage_note:
         parts.append('limits noted')
     return '; '.join(parts)
 
 
 def _provenance(strategy, model, decision, doc, target, now, coverage_note, omitted, outside_selection=None,
-                exclusions=None):
+                exclusions=None, test_files=None):
     if exclusions is None:   # every publication carries its protection forward
         raise StaleUpdate('the candidate carries no credential exclusions')
     if strategy == 'full':
@@ -770,7 +777,7 @@ def _provenance(strategy, model, decision, doc, target, now, coverage_note, omit
     else:  # adopted legacy document: its own commit and time, model unknown
         full = {'full_build_commit': doc.info['last_commit'],
                 'full_build_at': decision.full_built_at.isoformat(), 'full_build_model': UNKNOWN}
-    coverage = coverage_line(strategy, omitted, coverage_note, outside_selection)
+    coverage = coverage_line(strategy, omitted, coverage_note, outside_selection, test_files)
     record = {'generation_strategy': strategy, 'generation_model': model, 'configured_model': model,
               'semantic_policy': SEMANTIC_POLICY, 'base_commit': decision.base or 'none', **full,
               'coverage': coverage, EXCLUSIONS_KEY: snap.encode_exclusions(exclusions)}
@@ -1126,7 +1133,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
         fields = candidate.fields
         provenance = _provenance(decision.strategy, model, decision, doc, target, now,
                                  candidate.coverage_note, candidate.omitted, candidate.outside_selection,
-                                 candidate.exclusions)
+                                 candidate.exclusions, candidate.test_files)
         generation_id = uuid.uuid4().hex
         from repo_radar.metadata import UnsafeHeader, degradation_reasons
         try:

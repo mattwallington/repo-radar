@@ -13,9 +13,32 @@ def under_build_output(path, roots=frozenset({''})):
     return any(part in BUILD_OUTPUT_DIRS and '/'.join(parts[:i]) in roots for i, part in enumerate(parts[:-1]))
 
 
-def should_include_file(file_path, roots=frozenset({''})):
+# Test code: summaries are written from product code, so tests are counted but never read. Folder names are
+# matched exactly and in lowercase only: a folder named "Tests" can be a product screen (a lab tests page).
+TEST_DIRS = frozenset({'test', 'tests', '__tests__', 'testdata'})
+TEST_NAME_PARTS = ('.test.', '.spec.')                       # foo.test.ts, foo.spec.tsx
+TEST_NAME_SUFFIXES = ('_test.go', '_test.py', '_spec.rb', '_test.rb')
+TEST_NAME_PREFIXES = ('test_',)                              # test_*.py
+TEST_NAMES = frozenset({'conftest.py'})
+
+
+def is_test_file(file_path):
+    """True when `file_path` is test code by its name (foo.test.ts, foo.spec.js, foo_test.go, test_foo.py,
+    foo_test.py, conftest.py, foo_spec.rb) or by a folder named exactly test, tests, __tests__ or testdata.
+    Case-sensitive: `Tests/` or `LabTests.tsx` is not test code."""
+    parts = file_path.split('/')
+    name = parts[-1]
+    if any(part in TEST_DIRS for part in parts[:-1]) or name in TEST_NAMES:
+        return True
+    if any(part in name for part in TEST_NAME_PARTS) or name.endswith(TEST_NAME_SUFFIXES):
+        return True
+    return name.startswith(TEST_NAME_PREFIXES) and name.endswith('.py')
+
+
+def should_include_file(file_path, roots=frozenset({''}), include_tests=False):
     """Check if a file should be included in metadata generation. `roots` are the build roots where a
-    `vendor`, `dist` or `coverage` folder is build output (under_build_output)."""
+    `vendor`, `dist` or `coverage` folder is build output (under_build_output). Test code (is_test_file) is
+    left out unless `include_tests`, which only says whether a test file would otherwise be selected."""
     # Source code extensions
     source_exts = [
         '.js', '.ts', '.jsx', '.tsx', '.py', '.go', '.java', '.rb', '.php',
@@ -48,6 +71,8 @@ def should_include_file(file_path, roots=frozenset({''})):
         if pattern in file_path:
             return False
     if under_build_output(file_path, roots):
+        return False
+    if not include_tests and is_test_file(file_path):
         return False
 
     # Check file name

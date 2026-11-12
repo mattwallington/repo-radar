@@ -8,6 +8,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 - **A full rebuild that can't fit its spending limit is refused before it spends anything, and the daily update still runs.** Before its first paid call, a rebuild now checks its counted input, at the price for that day (Gemini's doubles from December 31), against its limit. If it can't fit, nothing is spent and it says what it needs and what the limit is; it doesn't count as a failure. When a weekly rebuild is refused this way, or by the weekly spending limit, the same sync makes the ordinary daily update instead, and INDEX shows "rebuild waiting" with the reason. Before, such a rebuild could spend close to its whole $40, publish nothing, and stop the daily updates.
+- **Test files are no longer read for summaries, in every repository.** Summaries are written from product code, migrations and docs. A full rebuild counts test files in its coverage line ("N test files left out") without sending them, and a daily update lists changed test files without their contents, the way it lists lockfiles. Test files are ones named like `*.test.*`, `*.spec.*`, `*_test.go` or `test_*.py`, or inside a lowercase `test`, `tests`, `__tests__` or `testdata` folder; a folder named `Tests` (such as a product screen) is still read. In telehealth, tests were about 42% of what a weekly rebuild read.
 
 ## [1.0.44] - 2026-11-11
 

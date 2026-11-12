@@ -83,13 +83,17 @@ can't show that a file holds no secret, and a PEM file can carry a private key. 
 1. **Pages.** The filtered diff is spooled to an owner-only directory as pages of at most 63 KiB, up to
    256 MiB in all, and removed afterwards. Each page names its commits and its files, breaks at a file
    or hunk boundary when it can, and marks any continuation. Known lockfiles, generated or vendored
-   files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
+   files, test files and any single diff over 2 MiB get an omission record instead of a body, on their own pages,
    which need no model call. They're listed as not analyzed, never described as analyzed source.
    Generated or vendored means an explicit list: a directory named `node_modules`, `.next`, `.nuxt`,
    `__pycache__`, `Pods`, `.gradle` or `.terraform` at any depth; a `vendor`, `dist` or `coverage` directory
    at a build root (the repository root, or a folder holding a build manifest such as `package.json`,
    `go.mod` or `pyproject.toml`); or a name ending in `.min.js`, `.min.css`, `.js.map`, `.css.map`, `.pb.go`
    or `_pb2.py`. A source folder named `coverage` deeper in the tree, such as `src/coverage/`, is analyzed.
+   Test files are those named like `*.test.*`, `*.spec.*`, `*_test.go`, `test_*.py`, `*_test.py`,
+   `conftest.py` or `*_spec.rb`, or inside a folder named exactly `test`, `tests`, `__tests__` or
+   `testdata`. Folder names are matched in lowercase only, so a product folder such as
+   `mobile-app/src/screens/Tests/` is analyzed as usual.
 2. **Notes.** Each diff page gets one model call of its own, at most four at a time: at most 2,048 output
    tokens and 60 seconds. It sees only that page, the commits and the section titles, and returns a
    validated note of at most 3 KiB.
@@ -170,7 +174,9 @@ A full rebuild runs on the same request executor. Every request, whether the who
 a chunk or a reduction, is counted complete and must fit 128,000 input tokens (or the model's own limit, if
 lower). The whole repository goes as one request only when it fits; otherwise the source is split into
 chunks, a file too large for one chunk is split into ordered parts, and the chunk analyses are reduced
-until one remains. Every selected file reaches a chunk and every chunk reaches the final reduction: when
+until one remains. Test files (the same rule as diff pages above) are never selected: the published
+coverage line counts them as "N test files left out", apart from the files outside the collector's
+selection. Every selected file reaches a chunk and every chunk reaches the final reduction: when
 something can't fit, or the four-level and 32-call reduction limits run out, the rebuild stops and the
 document stays, rather than send excerpts. A full rebuild is capped at **$40** per attempt
 (`FULL_CAP_USD`). There's no up-front quote: each request reserves its worst case before it's sent, and

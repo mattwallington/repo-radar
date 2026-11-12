@@ -1789,6 +1789,45 @@ def test_a_protected_rate_limit_gives_its_share_back_and_still_fails(monkeypatch
     assert sp.summary(stopping.store, stopping.policy)['recorded_usd'] == pytest.approx(outcome.usage['known_cost_usd'], abs=1e-5)
 
 
+def test_test_files_are_counted_but_never_read(monkeypatch, tmp_path):
+    """Full builds count test code in the coverage line and never send it; diff updates list a changed test file
+    the way they list a lockfile, without its body. A product folder named "Tests" is read as usual."""
+    import tempfile
+    repo, base, pristine = setup_pristine(monkeypatch, tmp_path)
+    tests = {'web-app/src/api.test.ts': 'SENTINEL-JEST', 'supabase/tests/rls.sql': 'SENTINEL-SQL',
+             'scripts/__tests__/deploy.ts': 'SENTINEL-DUNDER', 'mobile-api/plan_test.go': 'SENTINEL-GO',
+             'ai-service/tests/test_triage.py': 'SENTINEL-PY'}
+    for path, text in tests.items():
+        repo.write(path, f'// {text}\n')
+    repo.write('mobile-app/src/screens/Tests/LabResults.tsx', 'export const LabResults = "PRODUCT-SCREEN"\n')
+    target = repo.commit('tests and a lab tests screen')
+
+    files, _omitted, _outside, counted = im.pinned_files(snap.GitSnapshot(repo.path, target), snap.NO_EXCLUSIONS)
+    assert counted == len(tests) and 'mobile-app/src/screens/Tests/LabResults.tsx' in {f['path'] for f in files}
+    provider = Provider(monkeypatch)
+    provider.replies = [claude([{"type": "text", "text": FULL_REPLY}])]
+    with PreflightSession() as session:
+        outcome = update(pristine, repo, session, force=True)
+    assert outcome.status == 'published', outcome
+    traffic = json.dumps([b for _p, b in provider.sends]) + json.dumps(provider.counts)
+    assert 'SENTINEL' not in traffic and 'PRODUCT-SCREEN' in traffic
+    assert f"{len(tests)} test files left out" in im.load_document(pristine, 'app-abc1234').info['coverage']
+
+    # A diff update: the changed test files are listed, their bodies aren't, and the screen's diff is there.
+    for path, text in tests.items():
+        repo.write(path, f'// {text} changed\n')
+    repo.write('mobile-app/src/screens/Tests/LabResults.tsx', 'export const LabResults = "PRODUCT-CHANGE"\n')
+    changed = repo.commit('change them all')
+    base_snap, target_snap = snap.GitSnapshot(repo.path, target), snap.GitSnapshot(repo.path, changed)
+    changes = snap.changes_between(repo.path, target, changed)
+    pages = snap.prepare_pages(repo.path, target, changed, base_snap.manifest(), target_snap.manifest(), changes,
+                               snap.NO_EXCLUSIONS, tempfile.mkdtemp(dir=tmp_path))
+    text = ''.join(pages.read(p) for p in pages.pages)
+    assert set(pages.omitted) == {(path, 'test file') for path in tests}
+    assert 'SENTINEL' not in text and 'PRODUCT-CHANGE' in text
+    assert text.count('test file changed; body not analyzed') == len(tests)
+
+
 def test_vendor_dist_and_coverage_are_generated_only_at_a_build_root():
     """A source folder named like a build output (an insurance `coverage` module) is analyzed, by incremental
     updates and full builds alike; the same name at the repository root or beside a build manifest is still
