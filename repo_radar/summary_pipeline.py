@@ -1302,6 +1302,36 @@ class FullBuild:
             synthesis = (calls, ceiling, output, reserve)
         return full_allowance(self.budget.rates, [(i.tokens, i.output, i.reserve_tokens) for i in items], synthesis)
 
+    def floor(self, plan):
+        """The least the attempt's limit must hold for this build to finish, from counts alone and at the
+        attempt's rates (its Budget's rate snapshot), or None without them. Nothing is sent.
+
+        Each send reserves its input and maximum output on top of what the earlier sends cost, and those cost at
+        least their input. So every send's reservation must fit above the earlier sends' input, and a chunked
+        build then needs at least one reduction, whose reservation (its maximum output and, when counts are local
+        estimates, the model's whole input limit) must fit above every chunk's input. Input is the counted input,
+        without a local estimate's padding (preflight.local_count_floor); output not yet bought is left out. It
+        understates what a build needs, so a build it refuses could not have finished under that limit."""
+        from repo_radar import llm
+        from repo_radar.model_catalog import get_caps
+        from repo_radar.preflight import local_count_floor
+        rates = self.budget.rates
+        if rates is None:
+            return None
+        items = [plan.single] if plan.single else [chunk.item for chunk in plan.chunks]
+        estimated = any(item.reserve_tokens != item.tokens for item in items)
+        spent = floor = 0.0
+        for item in items:
+            floor = max(floor, spent + self.budget.upper_bound(item.reserve_tokens, item.output))
+            tokens = local_count_floor(item.tokens, item.request) if item.reserve_tokens != item.tokens else item.tokens
+            spent += tokens * rates.input
+        if plan.chunks:
+            caps = get_caps(self.model)
+            reserve = caps.max_input if estimated and caps is not None else 0
+            floor = max(floor, spent + self.budget.upper_bound(
+                reserve, llm.output_budget(self.model, llm.SYNTHESIS_OUTPUT_TOKENS)))
+        return floor
+
     def run(self, plan=None):
         """The full document's text, in the existing full format, from `plan` (prepare()'s, by default)."""
         plan = plan or self.prepare()

@@ -608,6 +608,14 @@ class StaleUpdate(Exception):
         self.reason, self.warning = reason, warning
 
 
+class RebuildRefused(StaleUpdate):
+    """A full rebuild refused before anything was admitted or sent, because what its counts alone say it needs
+    (FullBuild.floor) doesn't fit its limit. A skip, never a failure: nothing was bought."""
+
+    def __init__(self, reason):
+        super().__init__(reason, warning=True)
+
+
 def run_incremental(repo_path, full_name, doc, decision, model, session, budget, clock=None, log=None,
                     spool_dir=None, evidence_dir=None, case=None, deadline=None):
     """Update `doc` from its analyzed commit to decision.target: map each diff page, merge the notes, edit
@@ -692,7 +700,8 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     The build's first stage is prepared (counted and fitted, nothing sent) before the attempt is admitted
     against the weekly cap, and that same plan is what's sent. An opted-in repository's rebuild is admitted for
     the whole full cap; with `estimate_allowance` (a full-only repository) it is admitted for the plan's own
-    estimate (FullBuild.allowance), which is also its hard limit."""
+    estimate (FullBuild.allowance), which is also its hard limit. A plan whose counts alone (FullBuild.floor, at
+    the price that applies on this run's date) can't fit that limit raises RebuildRefused before admission."""
     from repo_radar import summary_pipeline
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
@@ -710,6 +719,14 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     build = summary_pipeline.FullBuild(full_name, files, model, session, budget)
     plan = build.prepare()
     allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
+    floor = build.floor(plan)
+    if floor is not None:
+        budget.extra['floor_usd'] = round(floor, 6)
+        if floor > allowance + 1e-9:   # it would stop part way, after spending: refuse before anything is admitted
+            rate = budget.rates.input * 1e6
+            raise RebuildRefused(f"this rebuild can't finish within its ${allowance:.2f} limit: its counted requests "
+                                 f"need at least ${floor:.2f} (at ${rate:.2f} per million input tokens); nothing was "
+                                 f"spent")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
     text = build.run(plan)

@@ -435,3 +435,11 @@ def _local_request_count(request):
     items = len(request.get("messages") or request.get("input") or [])
     tokens = int(raw * _LOCAL_FACTOR) + _LOCAL_REQUEST_FRAMING + _LOCAL_ITEM_FRAMING * items
     return PreflightResult(tokens, False, "local estimate")
+
+
+def local_count_floor(tokens, request):
+    """A local estimate of `request` (_local_request_count) without the allowance it adds: the raw count it
+    started from, rounded down. Where a bound must not overstate a bill, such as refusing a rebuild before any
+    spend, this keeps the estimator's own padding out of it."""
+    items = len(request.get("messages") or request.get("input") or [])
+    return max(0, int((tokens - _LOCAL_REQUEST_FRAMING - _LOCAL_ITEM_FRAMING * items) / _LOCAL_FACTOR))
