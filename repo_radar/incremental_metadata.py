@@ -14,6 +14,7 @@ A failure never replaces a good document: it stays as it was, and INDEX marks it
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -45,6 +46,16 @@ UNFINISHED_REASON = 'previous full rebuild did not finish'
 # Failed updates in a row before only a person can start another, unless Settings chose another number.
 HOLD_AFTER_FAILURES = DEFAULT_INCREMENTAL_FAILURE_STOP
 FAILURE_STREAK_DOC = 'failure_streak_doc_sha256'   # the document those failures were from
+# What the last full rebuild that published, or that its own limit stopped after paying, cost per unit of its
+# counted input (FullBuild.cost_ratio). Top level, never cleared, so it survives the daily updates that publish
+# while a rebuild waits; it only raises later estimates (FullBuild.estimate).
+REBUILD_COST_RATIO = 'rebuild_cost_ratio'
+
+
+def _valid_ratio(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 def document_path(pristine_dir, cache_name):
@@ -610,8 +621,10 @@ class StaleUpdate(Exception):
 
 
 class RebuildRefused(StaleUpdate):
-    """A full rebuild refused before anything was admitted or sent, because what its counts alone say it needs
-    (FullBuild.floor) doesn't fit its limit. A skip, never a failure: nothing was bought."""
+    """A full rebuild refused before anything was admitted, reserved or sent, because its estimate
+    (FullBuild.estimate) is over its limit. A skip, never a failure: nothing was bought. The estimate can be
+    wrong either way; a wrong refusal costs nothing, and a wrong admission is paid for once (the existing stop
+    caps it, and what it cost raises the next estimate: REBUILD_COST_RATIO)."""
 
     def __init__(self, reason):
         super().__init__(reason, warning=True)
@@ -690,7 +703,7 @@ def pinned_files(snapshot, exclusions):
 
 
 def run_full(repo_path, full_name, target, model, session, budget, baseline=None, *, inherited,
-             estimate_allowance=False):
+             estimate_allowance=False, cost_ratio=None):
     """A complete document built from the pinned commit by the shared summary pipeline's full adapter
     (summary_pipeline.FullBuild), with the existing full-generation prompts and output format. Never written
     directly: the caller publishes it. `inherited` is the previous document's credential exclusions
@@ -705,8 +718,11 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     The build's first stage is prepared (counted and fitted, nothing sent) before the attempt is admitted
     against the weekly cap, and that same plan is what's sent. An opted-in repository's rebuild is admitted for
     the whole full cap; with `estimate_allowance` (a full-only repository) it is admitted for the plan's own
-    estimate (FullBuild.allowance), which is also its hard limit. A plan whose counts alone (FullBuild.floor, at
-    the price that applies on this run's date) can't fit that limit raises RebuildRefused before admission."""
+    estimate (FullBuild.allowance), which is also its hard limit. A plan whose estimate (FullBuild.estimate, at
+    the price that applies on this run's date, using `cost_ratio` from an earlier rebuild when there is one) is
+    over that limit raises RebuildRefused before admission. Admission promises only that the estimate fit; the
+    existing hard stop still caps the attempt. budget.extra['cost_ratio'] is what this attempt cost per unit of
+    counted input, however it ended."""
     from repo_radar import summary_pipeline
     from repo_radar.metadata import parse_llm_response, degradation_reasons
 
@@ -724,17 +740,20 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     build = summary_pipeline.FullBuild(full_name, files, model, session, budget)
     plan = build.prepare()
     allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
-    floor = build.floor(plan)
-    if floor is not None:
-        budget.extra['floor_usd'] = round(floor, 6)
-        if floor > allowance + 1e-9:   # it would stop part way, after spending: refuse before anything is admitted
+    estimate = build.estimate(plan, cost_ratio)
+    if estimate is not None:
+        budget.extra['estimate_usd'] = round(estimate, 6)
+        if estimate > allowance + 1e-9:   # likely to stop part way, after spending: refuse before anything is admitted
             rate = budget.rates.input * 1e6
-            raise RebuildRefused(f"this rebuild can't finish within its ${allowance:.2f} limit: its counted requests "
-                                 f"need at least ${floor:.2f} (at ${rate:.2f} per million input tokens); nothing was "
-                                 f"spent")
+            measured = '; the estimate uses what the last rebuild cost' if cost_ratio else ''
+            raise RebuildRefused(f"this rebuild is estimated at ${estimate:.2f}, over its ${allowance:.2f} limit (at "
+                                 f"${rate:.2f} per million input tokens); nothing was spent{measured}")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
-    text = build.run(plan)
+    try:
+        text = build.run(plan)
+    finally:   # what it cost corrects the next estimate (update_repository keeps it)
+        budget.extra['cost_ratio'] = build.cost_ratio()
     parsed = parse_llm_response(text)
     problems = degradation_reasons(parsed)
     if problems or not parsed['analysis'].strip():
@@ -1011,6 +1030,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             # The new document is in place: report what failed afterwards, never the old one as kept.
             after, status, reason = reason, 'published', None
         usage = budget.summary() if budget else {}
+        if (attempt is not None and decision is not None and decision.strategy == 'full'
+                and (status == 'published' or usage.get('limit_stop'))):
+            ratio = _valid_ratio(usage.get('cost_ratio'))
+            if ratio:
+                attempt[REBUILD_COST_RATIO] = ratio
         if attempt is not None and status == 'published':   # discharged
             attempt.pop('dropped_full_attempt', None)
             attempt.pop('full_rebuild_origin', None)
@@ -1094,12 +1118,16 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             try:
                 candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
                                                       baseline=document_commit(repo_path, doc), inherited=inherited,
-                                                      estimate_allowance=not allow_incremental)
+                                                      estimate_allowance=not allow_incremental,
+                                                      cost_ratio=_valid_ratio(state.get(REBUILD_COST_RATIO)))
             except (RebuildRefused, WeeklyCapRefused) as refusal:
                 # Refused before anything was admitted or sent. Only a rebuild the weekly rule owes waits while the
                 # daily update runs; any other rebuild (forced, model or policy change, unusable baseline) stops
                 # here as before. A failure after spending never comes here.
                 if budget.calls or attempt.get('full_rebuild_origin') != WEEKLY_REASON or not allow_incremental:
+                    if isinstance(refusal, RebuildRefused):   # nothing runs in its place (FOLLOWUPS: a way out)
+                        raise RebuildRefused(f"{refusal.reason}; this repository's updates wait until the rebuild "
+                                             f"fits") from None
                     raise
                 attempt[REBUILD_WAITING] = safe_reason(str(refusal))
                 log(f"rebuild waiting: {attempt[REBUILD_WAITING]}")

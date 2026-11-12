@@ -1707,9 +1707,21 @@ def test_a_full_build_stops_before_a_request_that_could_pass_its_cap(monkeypatch
     assert usage['full_stage'] == {'stage': 'chunk', 'call': 4, 'chunk': 4, 'chunks': 5, 'max_output': 8192}
     assert im.load_document(pristine, 'app-abc1234').text == old.text
 
-    # Cheap replies, in a normal sync's weekly record: the same build finishes under the cap, with every chunk
-    # and one reduction. It was admitted for the whole $40, recorded each reply once inside that hold, and
-    # closing released the rest.
+    # Stopped by its own limit after paying, it is remembered: the same rebuild is now estimated from what it
+    # cost and refused before anything is sent.
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state[im.REBUILD_COST_RATIO] == pytest.approx(3 * per_chunk / (3 * rate_in * mr.FullBuild._raw_tokens(
+        types.SimpleNamespace(tokens=101_000, reserve_tokens=0, request={'messages': [{}]}))), rel=0.01)
+    fake = GeminiFake(monkeypatch, lambda stage, text: pytest.fail('a remembered limit stop was bought again'))
+    again = full_build(pristine, repo, counts)
+    assert again.status == 'skipped' and again.reason.startswith('this rebuild is estimated at $'), again
+    assert 'uses what the last rebuild cost' in again.reason and again.reason.endswith('wait until the rebuild fits')
+
+    # Cheap replies, in a normal sync's weekly record, once that memory is gone: the same build finishes under the
+    # cap, with every chunk and one reduction. It was admitted for the whole $40, recorded each reply once inside
+    # that hold, and closing released the rest.
+    im.write_state(pristine, 'app-abc1234', {k: v for k, v in metadata.read_attempt_state(pristine, 'app-abc1234').items()
+                                             if k != im.REBUILD_COST_RATIO})
     from repo_radar import spending as sp
     record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
     fake = GeminiFake(monkeypatch, lambda stage, text: FULL_REPLY if 'Please synthesize' in text else '## Analysis\nTwo files.\n')
@@ -2012,62 +2024,139 @@ def _on_date(monkeypatch, day):
     monkeypatch.setattr(metadata_budget, 'datetime', Pinned)
 
 
-def _weekly_rebuild_due(monkeypatch, tmp_path, change=True):
-    """A Gemini repository whose weekly rebuild is due, ten source files counted at 100,000 tokens each (ten
-    chunks, about $0.68 of input today and twice that from January), and, with `change`, one changed file for
-    the daily update. Full sends fail the test unless a test answers them."""
+def _weekly_rebuild_due(monkeypatch, tmp_path, change=True, chunk=(91_000, 2_000), synthesis=(20_000, 2_000)):
+    """A Gemini repository whose weekly rebuild is due: ten source files counted at 100,000 tokens each, so ten
+    chunks of about 90,900 unpadded tokens and an estimate of about $1.70 today ($3.40 from January). With
+    `change`, one changed file for the daily update. Full replies report realistic usage, `chunk` and
+    `synthesis` as (input, output) tokens: never the fake's 100 in and 20 out, which would hide what output costs."""
     repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=8))
     if change:
         repo.write('src/m0.py', 'changed = True\n')
         repo.commit('one change')
-    doc = im.load_document(pristine, 'app-abc1234')
 
     def reply(stage, text):
         if stage == 'map':
             return {'changes': [], 'questions': None, 'new_sections': None, 'no_summary_change_reason': 'no effect'}
         if stage == 'edit':
-            return {'base_document_sha256': doc.sha256, 'sections': []}
+            return {'base_document_sha256': im.load_document(pristine, 'app-abc1234').sha256, 'sections': []}
         assert stage == 'full', stage
-        return FULL_REPLY if 'Please synthesize' in text else '## Analysis\nOne file.\n'
+        final = 'Please synthesize' in text
+        tokens, output = synthesis if final else chunk
+        data = gemini_text(FULL_REPLY if final else '## Analysis\nOne file.\n', tokens).json()
+        data['usageMetadata'].update(candidatesTokenCount=output, totalTokenCount=tokens + output)
+        return httpx.Response(200, json=data)
     return repo, pristine, GeminiFake(monkeypatch, reply)
 
 
+def _sync(pristine, repo, **kw):
+    return im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(100_000),
+                                now=NOW, trigger='schedule', **kw)
+
+
 @pytest.mark.parametrize('day, limit, rebuilt', [
-    ((2026, 11, 12), 1.00, False),   # its counted input alone passes the limit
+    ((2026, 11, 12), 1.00, False),   # estimated over the limit
     ((2026, 11, 12), 2.25, True),    # it fits: the rebuild runs as before
-    ((2027, 1, 2), 2.25, False),     # the same size at January's price no longer fits
+    ((2027, 1, 2), 2.25, False),     # the same size at January's price is estimated over it
 ])
-def test_a_weekly_rebuild_that_cant_fit_waits_while_the_daily_update_runs(monkeypatch, tmp_path, day, limit, rebuilt):
-    """Before any paid call, a rebuild whose counts alone can't fit its limit (at the price on the run's date) is
-    refused: nothing is admitted or sent, and the same sync publishes the daily incremental update instead.
-    INDEX says the rebuild is waiting and why; the weekly rebuild stays due for the next sync."""
+def test_a_weekly_rebuild_estimated_over_its_limit_waits_while_the_daily_update_runs(monkeypatch, tmp_path, day,
+                                                                                    limit, rebuilt):
+    """Before any paid call, a rebuild estimated over its limit (at the price on the run's date) is refused:
+    nothing is admitted or sent, and the same sync publishes the daily incremental update instead. INDEX says the
+    rebuild is waiting and why; the weekly rebuild stays due for the next sync. One that fits runs, and what it
+    cost per unit of counted input is kept for the next estimate."""
     from repo_radar import metadata_budget, spending as sp
     _on_date(monkeypatch, day)
     monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', limit)
     repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
     record = sp.Spending('stable', store=sp.Store(tmp_path / 'spending'), policy=lambda: (True, 75.0))
-    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(100_000),
-                                   now=NOW, spending=record, trigger='schedule')
+    outcome = _sync(pristine, repo, spending=record)
     assert outcome.status == 'published', outcome
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     published = im.load_document(pristine, 'app-abc1234')
     attempts = json.loads((tmp_path / 'spending' / sp.LEDGER_NAME).read_text())['attempts'].values()
     if rebuilt:
         assert outcome.strategy == 'full' and len(fake.stage('full')) == 11 and im.REBUILD_WAITING not in state
-        assert published.info['generation_strategy'] == 'full'
-        assert 'rebuild waiting' not in _index(pristine)
+        assert published.info['generation_strategy'] == 'full' and 'rebuild waiting' not in _index(pristine)
+        assert outcome.usage['estimate_usd'] < limit
+        # Cost per unit of the chunks' unpadded counted input: their output and the reduction on top of it.
+        assert state[im.REBUILD_COST_RATIO] == outcome.usage['cost_ratio'] and 1.05 < state[im.REBUILD_COST_RATIO] < 1.25
         return
 
     rate = '1.50' if day[0] == 2027 else '0.75'
     waiting = state[im.REBUILD_WAITING]
-    assert re.fullmatch(rf"this rebuild can't finish within its \${limit:.2f} limit: its counted requests need at least "
-                        rf"\$\d+\.\d\d \(at \${rate} per million input tokens\); nothing was spent", waiting), waiting
+    assert re.fullmatch(rf"this rebuild is estimated at \$\d+\.\d\d, over its \${limit:.2f} limit \(at \${rate} per "
+                        rf"million input tokens\); nothing was spent", waiting), waiting
     assert fake.stage('full') == [] and len(fake.stage('map')) == 1 and len(fake.stage('edit')) == 1
     assert (outcome.strategy, state['strategy'], state['consecutive_failures']) == ('incremental', 'incremental', 0)
     assert published.info['generation_strategy'] == 'incremental' and published.info['last_commit'] == outcome.target
     assert [a['kind'] for a in attempts] == ['incremental']   # the rebuild was never admitted
     assert f"**Status:** ⚠ rebuild waiting: {waiting}" in _index(pristine)
     assert decide(repo, pristine, model=GEMINI).reason == im.WEEKLY_REASON   # still due next time
+
+
+def test_a_wrong_admission_is_paid_for_once(monkeypatch, tmp_path):
+    """Replies near the counted input with near-maximum output: the estimate fits a $1.76 limit but the bill
+    doesn't, so the existing stop ends the rebuild before its reduction, after paying for every chunk. What that
+    cost is remembered, so the next syncs refuse the same rebuild before spending and the daily update runs,
+    even after a daily update publishes a new document. A higher limit admits it again."""
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.76)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, change=False, chunk=(91_000, 8_000))
+
+    first = _sync(pristine, repo)   # admitted at about $1.70; the reduction's reservation needs about $1.83
+    assert first.status == 'failed' and 'limit' in first.reason and len(fake.stage('full')) == 10, first
+    assert first.usage['estimate_usd'] <= 1.76 and first.usage['limit_stop'] is True
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    paid, ratio = first.usage['known_cost_usd'], state[im.REBUILD_COST_RATIO]
+    assert state['consecutive_failures'] == 1 and ratio == first.usage['cost_ratio'] > 1.25
+
+    repo.write('src/m1.py', 'changed = True\n')
+    repo.commit('one change')
+    fake.sends.clear()
+    second = _sync(pristine, repo)
+    assert (second.status, second.strategy) == ('published', 'incremental') and fake.stage('full') == [], second
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['consecutive_failures'] == 0 and state[im.REBUILD_COST_RATIO] == ratio
+    assert 'uses what the last rebuild cost' in state[im.REBUILD_WAITING]
+    estimate = float(re.search(r'estimated at \$(\d+\.\d\d)', state[im.REBUILD_WAITING]).group(1))
+    from repo_radar.model_catalog import get_caps
+    from repo_radar import llm
+    reduction = Budget(GEMINI).upper_bound(get_caps(GEMINI).max_input, llm.output_budget(GEMINI, llm.SYNTHESIS_OUTPUT_TOKENS))
+    assert estimate >= round(1.05 * paid + reduction, 2) > 1.76   # at least what it paid, plus the refused reservation
+    assert 'rebuild waiting' in _index(pristine)
+
+    fake.sends.clear()   # the memory survived that publish: still refused, and with nothing changed, only a skip
+    third = _sync(pristine, repo)
+    assert (third.status, third.strategy) == ('skipped', 'full') and not fake.sends, third
+    assert 'uses what the last rebuild cost' in third.reason
+
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 2.00)
+    fourth = _sync(pristine, repo)
+    assert (fourth.status, fourth.strategy) == ('published', 'full') and len(fake.stage('full')) == 11, fourth
+
+
+def test_a_wrong_refusal_costs_nothing(monkeypatch, tmp_path):
+    """Replies at 80% of the counted input with 20 output tokens would have fit a $1.65 limit, but the estimate
+    (about $1.70) doesn't, so the rebuild is refused before spending and the daily update runs. An accepted
+    mistake: it costs $0 and INDEX says why, where a wrong admission costs a whole attempt."""
+    from repo_radar import metadata_budget, llm
+    from repo_radar.model_catalog import get_caps
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.65)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, chunk=(80_800, 20), synthesis=(1_000, 20))
+    refused = _sync(pristine, repo)
+    assert (refused.status, refused.strategy) == ('published', 'incremental') and fake.stage('full') == [], refused
+    assert 'estimated at $1.70' in metadata.read_attempt_state(pristine, 'app-abc1234')[im.REBUILD_WAITING]
+
+    # The same rebuild, admitted under a higher limit, never needed more than $1.65: its whole bill plus the
+    # reduction's reservation (the most it ever had committed) is well under it.
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.75)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path / 'again', chunk=(80_800, 20), synthesis=(1_000, 20))
+    admitted = _sync(pristine, repo)
+    assert (admitted.status, admitted.strategy) == ('published', 'full'), admitted
+    reduction = Budget(GEMINI).upper_bound(get_caps(GEMINI).max_input, llm.output_budget(GEMINI, llm.SYNTHESIS_OUTPUT_TOKENS))
+    assert admitted.usage['known_cost_usd'] + reduction < 1.65
 
 
 def test_a_weekly_cap_refusal_also_falls_through_to_the_daily_update(monkeypatch, tmp_path):
@@ -2104,10 +2193,9 @@ def test_a_refused_rebuild_with_nothing_to_update_keeps_the_failure_streak(monke
         'strategy': 'full', 'status': 'failed', 'decision_reason': im.WEEKLY_REASON, 'reason': 'turn limit',
         'full_rebuild_origin': im.WEEKLY_REASON, 'baseline_doc_sha256': doc.sha256, 'consecutive_failures': 1,
         'last_failure_reason': 'turn limit', im.FAILURE_STREAK_DOC: doc.sha256})
-    outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, FileCounts(100_000),
-                                   now=NOW, trigger='schedule')
+    outcome = _sync(pristine, repo)
     assert (outcome.status, outcome.strategy) == ('skipped', 'full') and not fake.sends, outcome
-    assert outcome.reason.startswith("this rebuild can't finish within its $1.00 limit")
+    assert outcome.reason.startswith("this rebuild is estimated at $") and 'over its $1.00 limit' in outcome.reason
     state = metadata.read_attempt_state(pristine, 'app-abc1234')
     assert (state['consecutive_failures'], state['last_failure_reason']) == (1, 'turn limit')
     assert im.load_document(pristine, 'app-abc1234').text == doc.text

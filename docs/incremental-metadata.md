@@ -198,14 +198,24 @@ never authorizes a send without a price). The admitted amount is the attempt's h
 in attempt usage as `admitted_usd`; a later request that can't fit stops the attempt, with no top-up,
 retry or switch to a diff.
 
-**Fit check.** Also before admission, the prepared counts are compared with that limit, at the price that
-applies on the run's date (so from December 31, Gemini 3.8 Flash's January price). The check adds up the
-least the requests must hold: each request's reservation on top of the earlier requests' counted input, and,
-for chunks, one reduction's reservation on top of every chunk's input. A local estimate's own 10% and framing
-allowance is taken back out, and output not yet bought is left out, so the figure understates the bill. When
-even that can't fit, the rebuild is refused with nothing admitted or sent, and the reason gives the figure,
-the limit and the input price. It is a skip, not a failure, so it doesn't move the failure count toward the
-hold. The figure is recorded in attempt usage as `floor_usd` when the rebuild goes ahead.
+**Fit check.** Also before admission, the rebuild is estimated from its prepared counts, at the price that
+applies on the run's date (so from December 31, Gemini 3.8 Flash's January price), and compared with that
+limit. The estimate is each request's reservation on top of the earlier requests' estimated cost, and, for
+chunks, one reduction's reservation on top of every chunk's. A request's cost is estimated as its counted
+input, without a local count's own 10% and framing allowance, times a margin for output and reductions: 1.25,
+or 1.05 times what the last rebuild of that repository cost per unit of that input, when that is higher. It is
+an estimate, not a bound: output isn't known before it is bought, and a local count isn't the billed count (on
+telehealth the unpadded local count was about 0.95 of the billed count). When the estimate is over the limit,
+the rebuild is refused with nothing admitted, reserved or sent, and the reason gives the estimate, the limit
+and the input price, and says when it used what the last rebuild cost. It is a skip, not a failure, so it
+doesn't move the failure count toward the hold. The estimate is recorded in attempt usage as `estimate_usd`.
+
+The estimate can be wrong either way. A wrong refusal costs nothing, and INDEX says why. A wrong admission is
+paid for once: the existing per-attempt stop still caps it, and when that stop ends a rebuild after spending,
+or a rebuild publishes, what it cost per unit of counted chunk input is kept in the attempt record
+(`rebuild_cost_ratio`, never cleared, so it survives the daily updates that publish meanwhile). From then on
+the same rebuild is estimated at least at what it cost and refused before spending. While a rebuild waits,
+each sync counts its plan again before anything else, which takes about 3 to 5 minutes for telehealth.
 
 **Rebuild waiting.** When a rebuild owed only to the weekly rule is refused before any spend, by the fit
 check or by the weekly spending limit, the same sync runs the ordinary diff update instead (decided as if no
@@ -213,7 +223,9 @@ weekly rebuild were due, with its own 20 minutes), and `INDEX.md` adds "rebuild 
 that repository's status. The document keeps its last full-build time, so the rebuild is tried again on the
 next sync. With nothing changed since the document, there is nothing to update and the attempt is only a
 skip. Any other rebuild, forced, after a model or policy change, or with no usable document, is refused as
-before, with no update in its place. A rebuild that fails after spending has begun is a failure, as before.
+before, with no update in its place: its reason ends "this repository's updates wait until the rebuild
+fits", and that repository's updates wait until the rebuild's estimate fits its limit. A rebuild that fails
+after spending has begun is a failure, as before.
 
 A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
