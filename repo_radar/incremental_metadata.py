@@ -29,6 +29,8 @@ from repo_radar import metadata_snapshot as snap
 # Bump when what a document means changes (prompt contract, edit protocol, collector rules), so
 # every opted-in document is rebuilt once under the new policy. Leaving test files out (files.is_test_file)
 # changed the collector without a bump on purpose, so no repository is rebuilt early; each weekly rebuild applies it.
+# Whoever bumps it checks first that telehealth's rebuild estimate fits its limit: a policy-change rebuild that is
+# refused has no daily update in its place, so that repository's summary would stop updating.
 SEMANTIC_POLICY = 'repo-radar-metadata/1'
 UNKNOWN = 'unknown'
 PIPELINE_VERSION = 'summary-pipeline/1'  # the engine; a new one doesn't force a rebuild the way a policy does
@@ -297,7 +299,8 @@ def prepare_diff(repo_path, doc, base, target, spool_dir, deadline=None):
 
 
 def decide(repo_path, full_name, doc, state, model, target, now, force=False,
-           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, deadline=None, allow_incremental=True):
+           full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, deadline=None, allow_incremental=True,
+           rebuild_rules=True):
     """Choose 'full', 'incremental' or 'none' for a repository at commit `target`.
 
     Pure apart from read-only Git: no model calls, token counts or state writes, so dry runs can
@@ -310,6 +313,10 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
 
     Without `allow_incremental` (a repository not opted in to incremental updates) the same baseline checks
     apply, there is no age-triggered rebuild, and a changed tree means full, with no diff listed.
+
+    Without `rebuild_rules`, the four rules that only ask for a rebuild are skipped (forced, configured model
+    changed, unfinished rebuild owed, weekly due); every check that says a diff is impossible or unsafe stays.
+    That is the daily update run in place of a rebuild refused before any spend.
     """
     deadline = deadline or snap.Deadline(ATTEMPT_SECONDS)
     if not allow_incremental:
@@ -318,7 +325,7 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     def full(reason, change=None, built=None, adopt=None):
         return Decision('full', reason, None, target, built, None, change, adopt)
 
-    if force:
+    if force and rebuild_rules:
         return full('regeneration requested')
     ok, why = usable_baseline(doc, full_name)
     if not ok:
@@ -331,13 +338,13 @@ def decide(repo_path, full_name, doc, state, model, target, now, force=False,
     if doc.info.get('semantic_policy') not in (None, SEMANTIC_POLICY):
         return full('metadata policy changed')
     built, full_model, configured, adopt = _full_build(doc, state, model)
-    if configured not in (None, model):
+    if configured not in (None, model) and rebuild_rules:
         return full('configured model changed', adopt=adopt)
     if built is None:
         return full('last full build time unknown', adopt=adopt)
-    if full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
+    if rebuild_rules and full_rebuild_unfinished(state, doc, full_rebuild_days, now, built):
         return full(UNFINISHED_REASON, built=built, adopt=adopt)
-    if _weekly_due(full_rebuild_days, now, built):
+    if rebuild_rules and _weekly_due(full_rebuild_days, now, built):
         return full(WEEKLY_REASON, built=built, adopt=adopt)
 
     base_snap, target_snap = snap.GitSnapshot(repo_path, base), snap.GitSnapshot(repo_path, target)
@@ -1137,22 +1144,33 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                                                       estimate_allowance=not allow_incremental,
                                                       cost_ratio=_valid_ratio(state.get(REBUILD_COST_RATIO)))
             except (RebuildRefused, WeeklyCapRefused) as refusal:
-                # Refused before anything was admitted or sent. Only a rebuild the weekly rule owes waits while the
-                # daily update runs; any other rebuild (forced, model or policy change, unusable baseline) stops
-                # here as before. A failure after spending never comes here.
-                if budget.calls or attempt.get('full_rebuild_origin') != WEEKLY_REASON or not allow_incremental:
-                    if isinstance(refusal, RebuildRefused):   # nothing runs in its place (FOLLOWUPS: a way out)
-                        raise RebuildRefused(f"{refusal.reason}; this repository's updates wait until the rebuild "
-                                             f"fits") from None
+                # Refused before anything was admitted or sent: the daily update runs in its place when a diff from
+                # the current document is possible. Any rebuild the estimate refuses qualifies; a weekly-cap refusal
+                # only for the weekly rebuild (a forced or model-change one clears itself when the week resets). A
+                # failure after spending never comes here, and full-only repositories have no daily update.
+                origin = attempt.get('full_rebuild_origin')
+                waits = RebuildRefused(f"{refusal}; this repository's updates wait until the rebuild fits")
+                if budget.calls or not allow_incremental or not (
+                        origin == WEEKLY_REASON or isinstance(refusal, RebuildRefused)):
+                    if isinstance(refusal, RebuildRefused):
+                        raise waits from None
                     raise
-                attempt[REBUILD_WAITING] = safe_reason(str(refusal))
-                log(f"rebuild waiting: {attempt[REBUILD_WAITING]}")
                 budget.close_spending()
-                # A new attempt in the same sync, with its own time: what decide would choose without the weekly rule.
+                # A new attempt in the same sync, with its own time: what decide chooses without the rules that only
+                # ask for a rebuild. Policy changes and unusable documents still need one: nothing runs in its place.
                 deadline = snap.Deadline(ATTEMPT_SECONDS, clock or time.monotonic)
-                daily = decide(repo_path, full_name, doc, state, model, target, now, full_rebuild_days=0,
-                               deadline=deadline)
+                daily = decide(repo_path, full_name, doc, state, model, target, now, deadline=deadline,
+                               rebuild_rules=False)
+                if daily.strategy == 'full':
+                    if isinstance(refusal, RebuildRefused):
+                        raise waits from None
+                    raise
+                why = str(refusal) if origin == WEEKLY_REASON else f"{origin}: {refusal}"
+                attempt[REBUILD_WAITING] = safe_reason(why)
+                log(f"rebuild waiting: {attempt[REBUILD_WAITING]}")
                 if daily.strategy != 'incremental':   # nothing changed since the document: only the rebuild waits
+                    if why != str(refusal):
+                        raise RebuildRefused(why) from None
                     raise
                 decision = daily
                 attempt.update(strategy='incremental', decision_reason=daily.reason, base_commit=daily.base)
