@@ -2017,12 +2017,13 @@ def _on_date(monkeypatch, day):
     monkeypatch.setattr(metadata_budget, 'datetime', Pinned)
 
 
-def _weekly_rebuild_due(monkeypatch, tmp_path, change=True, chunk=(91_000, 2_000), synthesis=(20_000, 2_000)):
+def _weekly_rebuild_due(monkeypatch, tmp_path, change=True, chunk=(91_000, 2_000), synthesis=(20_000, 2_000), age=8):
     """A Gemini repository whose weekly rebuild is due: ten source files counted at 100,000 tokens each, so ten
     chunks of about 90,900 unpadded tokens and an estimate of about $1.70 today ($3.40 from January). With
     `change`, one changed file for the daily update. Full replies report realistic usage, `chunk` and
-    `synthesis` as (input, output) tokens: never the fake's 100 in and 20 out, which would hide what output costs."""
-    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=8))
+    `synthesis` as (input, output) tokens: never the fake's 100 in and 20 out, which would hide what output costs.
+    `age` is the document's age in days; under 7, no weekly rebuild is due."""
+    repo, _base, pristine = setup_pristine(monkeypatch, tmp_path, updated=NOW - timedelta(days=age))
     if change:
         repo.write('src/m0.py', 'changed = True\n')
         repo.commit('one change')
@@ -2151,6 +2152,114 @@ def test_a_saved_cost_ratio_is_used_only_when_it_is_a_usable_measurement(monkeyp
                         r"input tokens\); nothing was spent; the estimate uses what the last rebuild cost",
                         state[im.REBUILD_WAITING]), state[im.REBUILD_WAITING]
     assert [im._valid_ratio(v) for v in (0.49, 0.5, 20.0, 20.01, float('nan'), '3')] == [None, 0.5, 20.0, None, None, None]
+
+
+@pytest.mark.parametrize('ask', ['forced', 'model change'])
+def test_a_refused_forced_or_model_change_rebuild_lets_the_daily_update_run(monkeypatch, tmp_path, ask):
+    """A forced or model-change rebuild estimated over its limit sends nothing, and the same sync publishes the
+    daily update in its place, with INDEX saying the rebuild waits and what asked for it. The refusal answers the
+    request: the next ordinary sync is a plain daily update. After a model change the document records the model
+    picked; a second forced sync is refused again."""
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.00)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, age=1)   # no weekly rebuild due
+    if ask == 'model change':   # the document was adopted under another model the day before
+        doc = im.load_document(pristine, 'app-abc1234')
+        im.write_state(pristine, 'app-abc1234', {'adoption': {
+            'doc_sha256': doc.sha256, 'full_built_at': (NOW - timedelta(days=1)).isoformat(),
+            'configured_model': MODEL, 'policy': im.SEMANTIC_POLICY}})
+    origin = 'regeneration requested' if ask == 'forced' else 'configured model changed'
+
+    outcome = _sync(pristine, repo, force=ask == 'forced')
+    assert (outcome.status, outcome.strategy) == ('published', 'incremental') and fake.stage('full') == [], outcome
+    assert len(fake.stage('edit')) == 1
+    waiting = metadata.read_attempt_state(pristine, 'app-abc1234')[im.REBUILD_WAITING]
+    assert waiting.startswith(f"{origin}: this rebuild is estimated at $")
+    assert f"**Status:** ⚠ rebuild waiting: {waiting}" in _index(pristine)
+    published = im.load_document(pristine, 'app-abc1234')
+    assert published.info['generation_model'] == published.info['configured_model'] == GEMINI
+
+    repo.write('src/m1.py', 'changed = True\n')
+    repo.commit('another change')
+    fake.sends.clear()
+    ordinary = _sync(pristine, repo)
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert (ordinary.status, ordinary.strategy) == ('published', 'incremental') and fake.stage('full') == [], ordinary
+    assert im.REBUILD_WAITING not in state and state['decision_reason'] != origin
+    assert 'rebuild waiting' not in _index(pristine)
+
+    if ask == 'forced':   # asked again, refused again; with nothing changed there is nothing to run instead
+        again = _sync(pristine, repo, force=True)
+        assert (again.status, again.strategy) == ('skipped', 'full') and fake.stage('full') == [], again
+        assert again.reason.startswith('regeneration requested: this rebuild is estimated at $')
+
+
+def test_a_refused_policy_change_rebuild_still_runs_nothing(monkeypatch, tmp_path):
+    """A rebuild after a policy change, estimated over its limit, has no daily update in its place: editing a
+    document written under an older policy isn't known to be safe. Nothing is sent and the reason says the
+    repository's updates wait."""
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 1.00)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, age=1)
+    path = pristine / 'app-abc1234.md'
+    path.write_text(path.read_text().replace(
+        'parse_status: ok\n', f"parse_status: ok\nsemantic_policy: repo-radar-metadata/0\n"
+                              f"{im.EXCLUSIONS_KEY}: {snap.encode_exclusions(snap.NO_EXCLUSIONS)}\n", 1))
+    assert decide(repo, pristine, model=GEMINI).reason == 'metadata policy changed'
+    outcome = _sync(pristine, repo)
+    assert (outcome.status, outcome.strategy) == ('skipped', 'full') and not fake.sends, outcome
+    assert outcome.reason.endswith("; this repository's updates wait until the rebuild fits")
+    assert im.REBUILD_WAITING not in metadata.read_attempt_state(pristine, 'app-abc1234')
+
+
+@pytest.mark.parametrize('tokenizer', ['working', 'unavailable'])
+def test_a_rough_token_count_is_marked(monkeypatch, tmp_path, tokenizer):
+    """When litellm's tokenizer fails, the count is the text length divided by 3, which runs high: the refusal
+    reason and the attempt's usage say so. With the tokenizer working, neither does."""
+    import litellm
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 0.50)   # under one request's reservation
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path, change=False)
+    if tokenizer == 'unavailable':
+        monkeypatch.setattr(litellm, 'token_counter', lambda **k: (_ for _ in ()).throw(RuntimeError('no tokenizer')))
+    logged = []
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                       trigger='schedule', log=logged.append)
+    assert outcome.status == 'skipped' and not fake.sends and 'this rebuild is estimated at' in outcome.reason, outcome
+    note = '1 of 1 request counts are rough (the tokenizer was unavailable), so the estimate may be high'
+    if tokenizer == 'working':
+        assert 'rough' not in outcome.reason and 'rough_counts' not in outcome.usage and note not in logged
+        return
+    assert '(rough counts)' in outcome.reason and outcome.usage['rough_counts'] == 1 and logged.count(note) == 1
+
+
+def test_a_refused_rebuild_keeps_its_facts_when_the_daily_update_runs(monkeypatch, tmp_path):
+    """The rough-count rebuild above, with a change to update: the daily update runs in its place, and the refused
+    rebuild's estimate and rough counts stay in the record, nested so they don't read as the daily update's own.
+    The reason carries the short mark, uncut; the log says how many counts were rough, once."""
+    import litellm
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 0.50)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
+    monkeypatch.setattr(litellm, 'token_counter', lambda **k: (_ for _ in ()).throw(RuntimeError('no tokenizer')))
+    logged = []
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                       trigger='schedule', log=lambda *a, **k: logged.append(a[0] if a else None))
+    assert (outcome.status, outcome.strategy) == ('published', 'incremental') and fake.stage('full') == [], outcome
+    refused = outcome.usage['refused_rebuild']
+    assert (refused['rough_counts'], refused['counted_requests']) == (1, 1) and refused['estimate_usd'] > 0.50
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['usage']['refused_rebuild'] == refused
+    assert 'rough_counts' not in outcome.usage and 'rough_counts' not in state['usage']
+    assert '(rough counts)' in state[im.REBUILD_WAITING] and not state[im.REBUILD_WAITING].endswith('…')
+    note = '1 of 1 request counts are rough (the tokenizer was unavailable), so the estimate may be high'
+    assert logged.count(note) == 1
 
 
 def test_a_wrong_refusal_costs_nothing(monkeypatch, tmp_path):

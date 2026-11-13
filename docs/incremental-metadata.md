@@ -219,15 +219,35 @@ or a rebuild publishes, what it cost per unit of counted chunk input is kept in 
 the same rebuild is estimated at least at what it cost and refused before spending. While a rebuild waits,
 each sync counts its plan again before anything else, which takes about 3 to 5 minutes for telehealth.
 
-**Rebuild waiting.** When a rebuild owed only to the weekly rule is refused before any spend, by the fit
-check or by the weekly spending limit, the same sync runs the ordinary diff update instead (decided as if no
-weekly rebuild were due, with its own 20 minutes), and `INDEX.md` adds "rebuild waiting" and the reason to
-that repository's status. The document keeps its last full-build time, so the rebuild is tried again on the
-next sync. With nothing changed since the document, there is nothing to update and the attempt is only a
-skip. Any other rebuild, forced, after a model or policy change, or with no usable document, is refused as
-before, with no update in its place: its reason ends "this repository's updates wait until the rebuild
-fits", and that repository's updates wait until the rebuild's estimate fits its limit. A rebuild that fails
-after spending has begun is a failure, as before.
+**Rebuild waiting.** When the fit check refuses a rebuild before any spend, and a diff update from the
+current document is possible, the same sync runs the ordinary diff update instead (decided without the rules
+that only ask for a rebuild: forced, model changed, an unfinished rebuild owed, weekly due; with its own 20
+minutes). `INDEX.md` adds "rebuild waiting" and the reason to that repository's status; for a rebuild that
+wasn't weekly, the reason starts with what asked for it, such as "configured model changed: this rebuild is
+estimated at ...". The refusal answers the request:
+- A weekly rebuild stays due, since the document keeps its last full-build time, so it is tried again on the
+  next sync.
+- After a model change, the daily update is written by the model picked and the document records it, so
+  the model rule stops asking. The weekly rebuild asks again on its schedule. With the weekly rebuild turned
+  off, only a forced sync asks again.
+- A forced rebuild's request is answered; the next forced sync asks again.
+
+With nothing changed since the document, there is nothing to update and the attempt is only a skip. A forced or model-change request then
+stays open: each later sync counts the plan again and is refused the same way, at no cost, until a change
+lands and the daily update runs. A weekly
+rebuild refused by the weekly spending limit also gets the daily update; a forced or model-change rebuild
+refused by that limit is only a skip, which clears itself when the week resets. A rebuild after a policy
+change, or with no usable document, is refused with no update in its place, since editing a document written
+under an older policy isn't known to be safe: its reason ends "this repository's updates wait until the
+rebuild fits", and that repository's updates wait until the rebuild's estimate fits its limit. A rebuild that
+fails after spending has begun is a failure, as before.
+
+**Rough counts.** When litellm's tokenizer fails, a local count falls back to the text length divided by 3,
+which runs high. Such a count is marked: a refusal's reason says "(rough counts)" right after the estimate, and
+the sync log says once "N of M request counts are rough (the tokenizer was unavailable), so the estimate may be
+high". The attempt's usage records `rough_counts` and `counted_requests`; when the daily update ran in the
+refused rebuild's place, they are under `refused_rebuild`, with the rebuild's `estimate_usd`, so they don't read
+as the daily update's own. A rough count can still only make a refusal more likely, never an admission.
 
 A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
