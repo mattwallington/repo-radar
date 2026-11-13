@@ -141,7 +141,8 @@ Markdown heading. Put only changed values in "fields". If nothing needs to chang
 Node = namedtuple('Node', 'id pages files note text')
 # A request ready to send: `tokens` is its counted input, which must fit `limit`; `output` is the output it
 # asks for; `reserve_tokens` is the input its cost reservation prices, which can be more than was counted.
-Prepared = namedtuple('Prepared', 'stage id request tokens limit output seconds reserve_tokens')
+# rough: the count is preflight's characters / 3 stand-in for a failed tokenizer, which runs high.
+Prepared = namedtuple('Prepared', 'stage id request tokens limit output seconds reserve_tokens rough', defaults=(False,))
 Quote = namedtuple('Quote', 'total_usd map_calls merge_calls edit_turns map_input_tokens edit_base_tokens '
                             'pages diff_pages omission_pages')
 
@@ -259,7 +260,9 @@ class Executor:
                 raise im.StaleUpdate(f"no input limit is known for {self.model}, so the request can't be bounded",
                                      warning=self.unpaid())
             reserve = caps.max_input
-        return Prepared(stage, item_id, request, counted.tokens, limit, output, seconds, reserve)
+        from repo_radar.preflight import ROUGH_COUNT_REASON
+        rough = getattr(counted, 'reason', None) == ROUGH_COUNT_REASON
+        return Prepared(stage, item_id, request, counted.tokens, limit, output, seconds, reserve, rough)
 
     def wave(self, items):
         """Reserve `items` together, send them concurrently and account for every one, whatever else went
@@ -1284,6 +1287,11 @@ class FullBuild:
             if item.tokens <= item.limit:
                 return FullPlan(item, None)
         return FullPlan(None, self.chunks())
+
+    def rough_counts(self, plan):
+        """(how many of the plan's requests have a rough count, how many requests the plan has)."""
+        items = [plan.single] if plan.single else [chunk.item for chunk in plan.chunks]
+        return sum(1 for item in items if item.rough), len(items)
 
     def allowance(self, plan):
         """What a full-only attempt is admitted for (metadata_budget.full_allowance): the plan's counted

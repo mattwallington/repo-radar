@@ -240,6 +240,11 @@ under an older policy isn't known to be safe: its reason ends "this repository's
 rebuild fits", and that repository's updates wait until the rebuild's estimate fits its limit. A rebuild that
 fails after spending has begun is a failure, as before.
 
+**Rough counts.** When litellm's tokenizer fails, a local count falls back to the text length divided by 3,
+which runs high. Such a count is marked: the attempt's usage records `rough_counts`, a refusal's reason ends
+"N of M request counts are rough (the tokenizer was unavailable), so the estimate may be high", and the sync
+log says the same once. A rough count can still only make a refusal more likely, never an admission.
+
 A send the provider clearly refused without charging, a rate limit (429) or a service unavailable or
 overloaded reply (503, 529), gives its reservation back. Any other send whose cost is unknown keeps its
 whole reservation: a timeout, a dropped connection, or a 500, 502 or 504, since a gateway can fail after the

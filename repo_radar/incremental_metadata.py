@@ -642,6 +642,11 @@ class StaleUpdate(Exception):
         self.reason, self.warning = reason, warning
 
 
+def rough_note(rough, requests):
+    return (f"{rough} of {requests} request counts are rough (the tokenizer was unavailable), so the estimate may "
+            f"be high")
+
+
 class RebuildRefused(StaleUpdate):
     """A full rebuild refused before anything was admitted, reserved or sent, because its estimate
     (FullBuild.estimate) is over its limit. A skip, never a failure: nothing was bought. The estimate can be
@@ -764,13 +769,17 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
     plan = build.prepare()
     allowance = build.allowance(plan) if estimate_allowance else FULL_CAP_USD
     estimate = build.estimate(plan, cost_ratio)
+    rough, requests = build.rough_counts(plan)
+    if rough:
+        budget.extra.update(rough_counts=rough, counted_requests=requests)
     if estimate is not None:
         budget.extra['estimate_usd'] = round(estimate, 6)
         if estimate > allowance + 1e-9:   # likely to stop part way, after spending: refuse before anything is admitted
             rate = budget.rates.input * 1e6
             measured = '; the estimate uses what the last rebuild cost' if cost_ratio else ''
             raise RebuildRefused(f"this rebuild is estimated at {_usd(estimate)}, over its {_usd(allowance)} limit (at "
-                                 f"{_usd(rate)} per million input tokens); nothing was spent{measured}")
+                                 f"{_usd(rate)} per million input tokens); nothing was spent{measured}"
+                                 f"{'; ' + rough_note(rough, requests) if rough else ''}")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
     try:
@@ -1005,6 +1014,12 @@ def _cleared_setup_failure(state, now):
     return state
 
 
+def _log_rough(budget, log):
+    """Say once, whether the rebuild was refused or admitted, when its estimate rests on rough counts."""
+    if budget.extra.get('rough_counts'):
+        log(rough_note(budget.extra['rough_counts'], budget.extra.get('counted_requests')))
+
+
 def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, session, force=False,
                       now=None, run_incremental_fn=None, run_full_fn=None, log=lambda *a, **k: None,
                       missing_credential=None, full_rebuild_days=DEFAULT_INCREMENTAL_FULL_REBUILD_DAYS, clock=None,
@@ -1137,7 +1152,7 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
             candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
                                                                 budget, log=log, deadline=deadline)
         else:
-            candidate = None
+            candidate, full_budget = None, budget
             try:
                 candidate = (run_full_fn or run_full)(repo_path, full_name, target, model, session, budget,
                                                       baseline=document_commit(repo_path, doc), inherited=inherited,
@@ -1178,6 +1193,8 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                 write_state(pristine_dir, cache_name, attempt)
                 log(f"incremental: {daily.reason}")
                 budget = Budget(model, cap=update_limit, label='incremental', spending=spending, owner=full_name)
+            finally:   # refused, admitted or failed after admission: said once
+                _log_rough(full_budget, log)
             if candidate is None:
                 candidate = (run_incremental_fn or run_incremental)(repo_path, full_name, doc, decision, model, session,
                                                                     budget, log=log, deadline=deadline)
