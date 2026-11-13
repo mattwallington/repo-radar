@@ -419,6 +419,8 @@ async def _count_request_once(request, timeout_s):
 
 
 # Local counts are estimates: allow 10% plus fixed framing per request and per message/item.
+# The reason a count gives when litellm's tokenizer failed and the text length divided by 3 stood in; it runs high.
+ROUGH_COUNT_REASON = "rough estimate (characters / 3)"
 _LOCAL_FACTOR = 1.10
 _LOCAL_REQUEST_FRAMING = 1024
 _LOCAL_ITEM_FRAMING = 16
@@ -428,13 +430,14 @@ def _local_request_count(request):
     model = request["model"]
     payload = {k: request.get(k) for k in ("instructions", "messages", "input", "tools") if k in request}
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    reason = "local estimate"
     try:
         raw = litellm.token_counter(model=model, text=text)
     except Exception:
-        raw = int(len(text) / 3.0)
+        raw, reason = int(len(text) / 3.0), ROUGH_COUNT_REASON
     items = len(request.get("messages") or request.get("input") or [])
     tokens = int(raw * _LOCAL_FACTOR) + _LOCAL_REQUEST_FRAMING + _LOCAL_ITEM_FRAMING * items
-    return PreflightResult(tokens, False, "local estimate")
+    return PreflightResult(tokens, False, reason)
 
 
 def local_raw_count(tokens, request):

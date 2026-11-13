@@ -249,7 +249,7 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
 # Incremental metadata keeps its latest attempt per repository here, owner-only, so INDEX can say
 # when a document is stale (an update failed or was skipped after it was written).
 STATE_DIR_NAME = '.metadata-state'
-# Attempt-state key: why a weekly rebuild was refused before any spend; the daily update ran in its place.
+# Attempt-state key: why a rebuild was refused before any spend; the daily update ran in its place when one was possible.
 REBUILD_WAITING = 'rebuild_waiting'
 
 
@@ -322,9 +322,10 @@ def stale_label(state, document_text, info):
 
 
 def rebuild_waiting_label(state, document_text, info):
-    """'rebuild waiting: <why>' when the latest attempt, made from this document or publishing it, refused its
-    weekly rebuild before any spend, or None. The daily update ran in its place, so the document can be current
-    while its rebuild still waits."""
+    """'rebuild waiting: <why>' when the latest attempt, made from this document or publishing it, had its
+    rebuild refused before any spend, or None. The daily update ran in its place, so the document can be current
+    while its rebuild still waits; for a rebuild that wasn't weekly, <why> starts with what asked for it (a forced
+    sync, a model change)."""
     waiting = (state or {}).get(REBUILD_WAITING)
     if not waiting or state.get('reason') == waiting:   # a skipped attempt's stale note already says why
         return None

@@ -4,6 +4,12 @@ All notable changes to Repo Radar are documented in this file.
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.0.46] - 2026-11-12
+
+### Changed
+- **A refused rebuild no longer freezes the summary.** When you pick another model, or force a rebuild, and that rebuild is estimated over its spending limit, nothing is spent and the same sync now makes the ordinary daily update instead, written by the model you picked. INDEX shows "rebuild waiting" with what asked for it and why it was refused. The refusal answers the request: the weekly rebuild asks again on its schedule, and with the weekly rebuild turned off, only a forced sync asks again. Before, the summary stopped updating until a new release. A rebuild after a summary-format change is still refused with nothing in its place.
+- **A rough token count is marked.** When the tokenizer is unavailable, token counts fall back to a rough figure that runs high. A refused rebuild's reason is marked "(rough counts)", and its usage record and the sync log say how many counts were rough.
+
 ## [1.0.45] - 2026-11-12
 
 ### Changed
