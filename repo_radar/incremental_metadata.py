@@ -777,9 +777,9 @@ def run_full(repo_path, full_name, target, model, session, budget, baseline=None
         if estimate > allowance + 1e-9:   # likely to stop part way, after spending: refuse before anything is admitted
             rate = budget.rates.input * 1e6
             measured = '; the estimate uses what the last rebuild cost' if cost_ratio else ''
-            raise RebuildRefused(f"this rebuild is estimated at {_usd(estimate)}, over its {_usd(allowance)} limit (at "
-                                 f"{_usd(rate)} per million input tokens); nothing was spent{measured}"
-                                 f"{'; ' + rough_note(rough, requests) if rough else ''}")
+            marked = ' (rough counts)' if rough else ''   # at the front, so it is never cut; the log says how many
+            raise RebuildRefused(f"this rebuild is estimated at {_usd(estimate)}{marked}, over its {_usd(allowance)} "
+                                 f"limit (at {_usd(rate)} per million input tokens); nothing was spent{measured}")
     budget.acquire(allowance)   # ready to send: admitted against the weekly cap before the first call
     budget.extra['admitted_usd'] = allowance   # only once it was admitted
     try:
@@ -1193,6 +1193,11 @@ def update_repository(pristine_dir, repo_path, cache_name, repo_config, model, s
                 write_state(pristine_dir, cache_name, attempt)
                 log(f"incremental: {daily.reason}")
                 budget = Budget(model, cap=update_limit, label='incremental', spending=spending, owner=full_name)
+                # The refused rebuild's facts, nested so they don't read as the daily update's own; no money fields.
+                refused = {k: full_budget.extra[k] for k in ('estimate_usd', 'rough_counts', 'counted_requests')
+                           if k in full_budget.extra}
+                if refused:
+                    budget.extra['refused_rebuild'] = refused
             finally:   # refused, admitted or failed after admission: said once
                 _log_rough(full_budget, log)
             if candidate is None:

@@ -249,7 +249,7 @@ def save_degraded_response(pristine_dir, cache_name, response_text):
 # Incremental metadata keeps its latest attempt per repository here, owner-only, so INDEX can say
 # when a document is stale (an update failed or was skipped after it was written).
 STATE_DIR_NAME = '.metadata-state'
-# Attempt-state key: why a weekly rebuild was refused before any spend; the daily update ran in its place.
+# Attempt-state key: why a rebuild was refused before any spend; the daily update ran in its place when one was possible.
 REBUILD_WAITING = 'rebuild_waiting'
 
 

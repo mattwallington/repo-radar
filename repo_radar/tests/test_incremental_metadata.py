@@ -2234,7 +2234,32 @@ def test_a_rough_token_count_is_marked(monkeypatch, tmp_path, tokenizer):
     if tokenizer == 'working':
         assert 'rough' not in outcome.reason and 'rough_counts' not in outcome.usage and note not in logged
         return
-    assert outcome.reason.endswith(note) and outcome.usage['rough_counts'] == 1 and logged.count(note) == 1
+    assert '(rough counts)' in outcome.reason and outcome.usage['rough_counts'] == 1 and logged.count(note) == 1
+
+
+def test_a_refused_rebuild_keeps_its_facts_when_the_daily_update_runs(monkeypatch, tmp_path):
+    """The rough-count rebuild above, with a change to update: the daily update runs in its place, and the refused
+    rebuild's estimate and rough counts stay in the record, nested so they don't read as the daily update's own.
+    The reason carries the short mark, uncut; the log says how many counts were rough, once."""
+    import litellm
+    from repo_radar import metadata_budget
+    _on_date(monkeypatch, (2026, 11, 12))
+    monkeypatch.setattr(metadata_budget, 'FULL_CAP_USD', 0.50)
+    repo, pristine, fake = _weekly_rebuild_due(monkeypatch, tmp_path)
+    monkeypatch.setattr(litellm, 'token_counter', lambda **k: (_ for _ in ()).throw(RuntimeError('no tokenizer')))
+    logged = []
+    with PreflightSession() as session:
+        outcome = im.update_repository(pristine, repo.path, 'app-abc1234', REPO_CONFIG, GEMINI, session, now=NOW,
+                                       trigger='schedule', log=lambda *a, **k: logged.append(a[0] if a else None))
+    assert (outcome.status, outcome.strategy) == ('published', 'incremental') and fake.stage('full') == [], outcome
+    refused = outcome.usage['refused_rebuild']
+    assert (refused['rough_counts'], refused['counted_requests']) == (1, 1) and refused['estimate_usd'] > 0.50
+    state = metadata.read_attempt_state(pristine, 'app-abc1234')
+    assert state['usage']['refused_rebuild'] == refused
+    assert 'rough_counts' not in outcome.usage and 'rough_counts' not in state['usage']
+    assert '(rough counts)' in state[im.REBUILD_WAITING] and not state[im.REBUILD_WAITING].endswith('…')
+    note = '1 of 1 request counts are rough (the tokenizer was unavailable), so the estimate may be high'
+    assert logged.count(note) == 1
 
 
 def test_a_wrong_refusal_costs_nothing(monkeypatch, tmp_path):
